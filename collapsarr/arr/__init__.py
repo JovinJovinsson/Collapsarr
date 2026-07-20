@@ -1,8 +1,8 @@
-"""Sonarr/Radarr instance connection management (COL-11).
+"""Sonarr/Radarr instance connection management (COL-11, COL-12).
 
 Home for arr-integration concerns per ``docs/TRACKER.md``: instance config
-model, connectivity/version checks, and (in later tickets) API polling,
-webhooks, and remote path mapping.
+model, connectivity/version checks, the monitored-file-list client, and (in
+later tickets) webhooks and remote path mapping.
 
 This module is imported for its side effect of registering
 :class:`~collapsarr.arr.models.ArrInstance` with
@@ -13,6 +13,7 @@ This module is imported for its side effect of registering
 from __future__ import annotations
 
 from .client import ConnectivityResult, check_connectivity
+from .files import AudioInfo, MonitoredFile, fetch_monitored_files
 from .models import ArrInstance, ConnectivityStatus, InstanceType
 from .service import (
     InstanceNotFoundError,
@@ -25,13 +26,16 @@ from .service import (
 
 __all__ = [
     "ArrInstance",
+    "AudioInfo",
     "ConnectivityResult",
     "ConnectivityStatus",
     "InstanceNotFoundError",
     "InstanceType",
+    "MonitoredFile",
     "check_connectivity",
     "create_instance",
     "delete_instance",
+    "fetch_monitored_files",
     "get_instance",
     "list_instances",
     "update_instance",

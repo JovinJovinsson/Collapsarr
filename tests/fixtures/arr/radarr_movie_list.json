@@ -1,0 +1,76 @@
+[
+  {
+    "id": 1,
+    "title": "Interstellar",
+    "monitored": true,
+    "hasFile": true,
+    "path": "/movies/Interstellar (2014)",
+    "movieFile": {
+      "id": 501,
+      "movieId": 1,
+      "relativePath": "Interstellar (2014) Bluray-1080p.mkv",
+      "path": "/movies/Interstellar (2014)/Interstellar (2014) Bluray-1080p.mkv",
+      "size": 12345678901,
+      "dateAdded": "2023-02-01T10:00:00Z",
+      "quality": { "quality": { "id": 7, "name": "Bluray-1080p" } },
+      "mediaInfo": {
+        "audioBitrate": 768000,
+        "audioChannels": 7.1,
+        "audioCodec": "DTS-HD MA",
+        "audioLanguages": "eng",
+        "audioStreamCount": 2,
+        "videoCodec": "x264",
+        "resolution": "1920x1080"
+      }
+    }
+  },
+  {
+    "id": 2,
+    "title": "Not Yet Downloaded",
+    "monitored": true,
+    "hasFile": false,
+    "path": "/movies/Not Yet Downloaded (2023)",
+    "movieFile": null
+  },
+  {
+    "id": 3,
+    "title": "Unmonitored Movie",
+    "monitored": false,
+    "hasFile": true,
+    "path": "/movies/Unmonitored Movie (2020)",
+    "movieFile": {
+      "id": 503,
+      "movieId": 3,
+      "relativePath": "Unmonitored Movie (2020) WEBDL-1080p.mkv",
+      "path": "/movies/Unmonitored Movie (2020)/Unmonitored Movie (2020) WEBDL-1080p.mkv",
+      "size": 5000000000,
+      "dateAdded": "2023-03-01T10:00:00Z",
+      "quality": { "quality": { "id": 6, "name": "WEBDL-1080p" } },
+      "mediaInfo": {
+        "audioBitrate": 384000,
+        "audioChannels": 2.0,
+        "audioCodec": "AAC",
+        "audioLanguages": "eng",
+        "audioStreamCount": 1,
+        "videoCodec": "x264",
+        "resolution": "1920x1080"
+      }
+    }
+  },
+  {
+    "id": 4,
+    "title": "Silent Film",
+    "monitored": true,
+    "hasFile": true,
+    "path": "/movies/Silent Film (1921)",
+    "movieFile": {
+      "id": 504,
+      "movieId": 4,
+      "relativePath": "Silent Film (1921) DVD.mkv",
+      "path": "/movies/Silent Film (1921)/Silent Film (1921) DVD.mkv",
+      "size": 1500000000,
+      "dateAdded": "2023-04-01T10:00:00Z",
+      "quality": { "quality": { "id": 2, "name": "DVD" } }
+    }
+  }
+]
