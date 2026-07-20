@@ -25,7 +25,9 @@ from collapsarr.downmix.probe import (
     AudioStreamInfo,
     FfprobeError,
     FfprobeNotFoundError,
+    MediaSummary,
     probe_audio_streams,
+    probe_media_summary,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "downmix"
@@ -277,3 +279,86 @@ def test_empty_streams_list_returns_empty_list() -> None:
     _, runner = _stub_runner(stdout=json.dumps({"streams": []}))
 
     assert probe_audio_streams("/media/silent-video.mkv", runner=runner) == []  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# probe_media_summary: whole-file duration + total stream count (COL-18 input).
+# ---------------------------------------------------------------------------
+
+
+@requires_ffprobe
+def test_media_summary_reports_container_duration_and_total_stream_count() -> None:
+    """video_audio_subs.mkv has 3 streams (video+audio+subtitle) and a ~1s duration."""
+    summary = probe_media_summary(FIXTURES_DIR / "video_audio_subs.mkv")
+
+    assert summary.stream_count == 3
+    assert summary.duration_seconds == pytest.approx(1.0, abs=0.1)
+
+
+@requires_ffprobe
+def test_media_summary_counts_all_stream_types_not_just_audio() -> None:
+    """A multi-audio file with no video reports both audio streams in the count."""
+    summary = probe_media_summary(FIXTURES_DIR / "multi_lang.mkv")
+
+    assert summary.stream_count == 2
+    assert summary.duration_seconds > 0
+
+
+@requires_ffprobe
+def test_media_summary_on_nonexistent_file_raises_ffprobe_error() -> None:
+    with pytest.raises(FfprobeError):
+        probe_media_summary(FIXTURES_DIR / "does_not_exist.mkv")
+
+
+def test_media_summary_requests_format_and_all_streams() -> None:
+    """The ffprobe invocation asks for format + every stream (no -select_streams)."""
+    calls, runner = _stub_runner(
+        stdout=json.dumps({"format": {"duration": "12.5"}, "streams": [{}, {}]})
+    )
+
+    probe_media_summary("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert calls == [
+        [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            "/media/movie.mkv",
+        ]
+    ]
+
+
+def test_media_summary_parses_duration_and_stream_count() -> None:
+    payload = {
+        "format": {"duration": "3600.500000"},
+        "streams": [{"index": 0}, {"index": 1}, {"index": 2}],
+    }
+    _, runner = _stub_runner(stdout=json.dumps(payload))
+
+    summary = probe_media_summary("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert summary == MediaSummary(duration_seconds=3600.5, stream_count=3)
+
+
+def test_media_summary_missing_duration_raises_rather_than_defaulting() -> None:
+    """A payload with no numeric duration must error, never silently pass validation."""
+    _, runner = _stub_runner(stdout=json.dumps({"format": {}, "streams": [{}]}))
+
+    with pytest.raises(FfprobeError, match="duration"):
+        probe_media_summary("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+
+def test_media_summary_missing_streams_array_raises() -> None:
+    _, runner = _stub_runner(stdout=json.dumps({"format": {"duration": "10.0"}}))
+
+    with pytest.raises(FfprobeError, match="streams"):
+        probe_media_summary("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+
+def test_media_summary_reuses_shared_binary_not_found_handling() -> None:
+    with pytest.raises(FfprobeNotFoundError):
+        probe_media_summary("irrelevant.mkv", ffprobe_path="definitely-not-a-real-binary")

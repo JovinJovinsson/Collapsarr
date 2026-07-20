@@ -7,7 +7,20 @@ and validate + atomic swap.
 
 from __future__ import annotations
 
-from .probe import AudioStreamInfo, FfprobeError, FfprobeNotFoundError, probe_audio_streams
+from .apply import (
+    DEFAULT_DURATION_TOLERANCE_SECONDS,
+    ApplyFailureReason,
+    ApplyResult,
+    apply_remux_result,
+)
+from .probe import (
+    AudioStreamInfo,
+    FfprobeError,
+    FfprobeNotFoundError,
+    MediaSummary,
+    probe_audio_streams,
+    probe_media_summary,
+)
 from .remux import RemuxResult, build_remux_command, run_remux
 from .targets import (
     DownmixSettings,
@@ -17,15 +30,21 @@ from .targets import (
 )
 
 __all__ = [
+    "DEFAULT_DURATION_TOLERANCE_SECONDS",
+    "ApplyFailureReason",
+    "ApplyResult",
     "AudioStreamInfo",
     "DownmixSettings",
     "DownmixTarget",
     "FfprobeError",
     "FfprobeNotFoundError",
+    "MediaSummary",
     "QualifyingTarget",
     "RemuxResult",
+    "apply_remux_result",
     "build_remux_command",
     "detect_qualifying_targets",
     "probe_audio_streams",
+    "probe_media_summary",
     "run_remux",
 ]

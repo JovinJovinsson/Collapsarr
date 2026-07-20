@@ -69,6 +69,23 @@ class AudioStreamInfo:
     language: str
 
 
+@dataclass(frozen=True, slots=True)
+class MediaSummary:
+    """Whole-file container duration + total stream count, as reported by ffprobe.
+
+    Deliberately coarse — the two numbers the remux-safety validation
+    (COL-18) compares between an original file and its produced temp file
+    before an atomic swap. ``duration_seconds`` is the *container* duration
+    (ffprobe's ``format.duration``), i.e. the file as a whole rather than any
+    single stream. ``stream_count`` counts **all** streams (video, audio,
+    subtitle, ...), not just audio, so a remux that silently drops or adds a
+    non-audio stream is still caught.
+    """
+
+    duration_seconds: float
+    stream_count: int
+
+
 def probe_audio_streams(
     file_path: str | Path,
     *,
@@ -101,6 +118,78 @@ def probe_audio_streams(
         "a",
         str(file_path),
     ]
+    payload = _run_ffprobe_json(
+        command,
+        file_path=file_path,
+        ffprobe_path=ffprobe_path,
+        timeout=timeout,
+        runner=runner,
+    )
+    return _parse_audio_streams(payload)
+
+
+def probe_media_summary(
+    file_path: str | Path,
+    *,
+    ffprobe_path: str = _DEFAULT_FFPROBE_PATH,
+    timeout: float = _DEFAULT_TIMEOUT,
+    runner: _Runner | None = None,
+) -> MediaSummary:
+    """Return the container duration + total stream count of ``file_path``.
+
+    Runs ``ffprobe -show_format -show_streams`` (no ``-select_streams``, so
+    *every* stream is counted, not just audio) and reads ``format.duration``.
+    Shares the exact subprocess/error/JSON handling of
+    :func:`probe_audio_streams` via :func:`_run_ffprobe_json`, and the same
+    injectable ``runner`` seam.
+
+    Intentionally strict: this feeds the remux-safety validation (COL-18),
+    where being unable to establish a file's duration or stream count must
+    never be silently treated as a match. A missing/non-numeric duration or a
+    missing streams array therefore raises :class:`FfprobeError` rather than
+    guessing a default.
+
+    Raises:
+        FfprobeNotFoundError: ``ffprobe_path`` could not be found/executed.
+        FfprobeError: ffprobe timed out, exited non-zero, produced non-JSON
+            output, or omitted a numeric duration / streams array.
+    """
+    command = [
+        ffprobe_path,
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(file_path),
+    ]
+    payload = _run_ffprobe_json(
+        command,
+        file_path=file_path,
+        ffprobe_path=ffprobe_path,
+        timeout=timeout,
+        runner=runner,
+    )
+    return _parse_media_summary(payload, file_path)
+
+
+def _run_ffprobe_json(
+    command: Sequence[str],
+    *,
+    file_path: str | Path,
+    ffprobe_path: str,
+    timeout: float,
+    runner: _Runner | None,
+) -> object:
+    """Run an ffprobe command and return its parsed JSON payload.
+
+    The shared core of :func:`probe_audio_streams` and
+    :func:`probe_media_summary`: identical binary-not-found / timeout /
+    non-zero-exit / unparseable-JSON handling, so both entry points surface
+    the same error types and messages regardless of which ffprobe view they
+    requested.
+    """
     run = runner or _run_ffprobe
 
     try:
@@ -121,20 +210,47 @@ def probe_audio_streams(
         )
 
     try:
-        payload = json.loads(result.stdout)
+        return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise FfprobeError(
             f"ffprobe returned output that could not be parsed as JSON "
             f"probing {str(file_path)!r}"
         ) from exc
 
-    return _parse_audio_streams(payload)
-
 
 def _run_ffprobe(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603 - command is built from fixed flags + a path, not shell text
         list(command), capture_output=True, text=True, timeout=timeout, check=False
     )
+
+
+def _parse_media_summary(payload: object, file_path: str | Path) -> MediaSummary:
+    """Normalize an ffprobe ``-show_format -show_streams`` payload into a summary.
+
+    Strict on purpose (see :func:`probe_media_summary`): anything that would
+    leave duration or stream count undetermined raises :class:`FfprobeError`,
+    since a wrong-but-plausible value here could green-light an unsafe swap.
+    """
+    if not isinstance(payload, dict):
+        raise FfprobeError(f"ffprobe returned an unexpected payload probing {str(file_path)!r}")
+
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        raise FfprobeError(
+            f"ffprobe reported no streams array probing {str(file_path)!r}"
+        )
+
+    fmt = payload.get("format")
+    raw_duration = fmt.get("duration") if isinstance(fmt, dict) else None
+    try:
+        duration_seconds = float(raw_duration)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise FfprobeError(
+            f"ffprobe did not report a numeric container duration probing "
+            f"{str(file_path)!r}"
+        ) from exc
+
+    return MediaSummary(duration_seconds=duration_seconds, stream_count=len(streams))
 
 
 def _parse_audio_streams(payload: object) -> list[AudioStreamInfo]:
