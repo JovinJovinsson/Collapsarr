@@ -65,7 +65,7 @@ def init_db(engine: Engine) -> None:
     ``create_all`` runs without introducing an import-time cycle back to this
     module (they import :class:`Base` from here).
     """
-    from . import arr, jobs, settings  # noqa: F401
+    from . import arr, jobs, media, settings  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
 
