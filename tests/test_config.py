@@ -15,6 +15,7 @@ def test_defaults() -> None:
     assert settings.host == "0.0.0.0"
     assert settings.port == 8282
     assert settings.log_level == "INFO"
+    assert settings.job_max_concurrency == 1
     assert settings.sqlalchemy_url == "sqlite:////config/collapsarr.db"
 
 
@@ -28,6 +29,15 @@ def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.port == 9000
     assert settings.database_path == "/data/test.db"
     assert settings.sqlalchemy_url == "sqlite:////data/test.db"
+
+
+def test_job_max_concurrency_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The job queue's concurrency cap is configurable via the environment."""
+    monkeypatch.setenv("COLLAPSARR_JOB_MAX_CONCURRENCY", "4")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.job_max_concurrency == 4
 
 
 def test_database_url_overrides_path() -> None:
