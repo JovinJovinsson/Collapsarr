@@ -23,6 +23,7 @@ from .arr.webhooks import (
     parse_webhook_payload,
     resolve_webhook_file,
 )
+from .auth import api_key_middleware
 from .config import Settings, get_settings
 from .database import (
     create_engine_from_settings,
@@ -90,6 +91,9 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.on_file_ready = on_file_ready or default_on_file_ready_hook
+
+    # Enforce the auto-generated API key on every /api route (COL-26).
+    app.middleware("http")(api_key_middleware)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:
