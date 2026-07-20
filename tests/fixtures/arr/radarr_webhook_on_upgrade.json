@@ -1,0 +1,39 @@
+{
+  "movie": {
+    "id": 4,
+    "title": "Silent Film",
+    "year": 1921,
+    "releaseDate": "1921-01-01",
+    "folderPath": "/movies/Silent Film (1921)",
+    "tmdbId": 424242,
+    "imdbId": "tt0012345"
+  },
+  "remoteMovie": {
+    "tmdbId": 424242,
+    "imdbId": "tt0012345",
+    "title": "Silent Film",
+    "year": 1921
+  },
+  "movieFile": {
+    "id": 504,
+    "relativePath": "Silent Film (1921) Remux-1080p.mkv",
+    "path": "/movies/Silent Film (1921)/Silent Film (1921) Remux-1080p.mkv",
+    "quality": "Remux-1080p",
+    "qualityVersion": 1,
+    "releaseGroup": "GROUP",
+    "size": 22345678901,
+    "dateAdded": "2023-06-01T10:00:00Z",
+    "mediaInfo": {
+      "audioChannels": 2.0,
+      "audioCodec": "FLAC",
+      "audioLanguages": "eng",
+      "videoCodec": "x264"
+    }
+  },
+  "isUpgrade": true,
+  "downloadClient": "SABnzbd",
+  "downloadClientType": "sabnzbd",
+  "downloadId": "SABnzbd_nzo_jkl012",
+  "eventType": "Download",
+  "instanceName": "Radarr"
+}

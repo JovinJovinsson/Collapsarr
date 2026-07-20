@@ -59,6 +59,12 @@ select = ["E", "F", "I", "UP", "B", "W"]
 [tool.ruff.lint.isort]
 known-first-party = ["collapsarr"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection pattern requires calling Depends(...) (and
+# similarly Query/Path/Body) in argument defaults; B008 would otherwise flag
+# every route that uses it.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Body"]
+
 [tool.mypy]
 python_version = "3.12"
 files = ["collapsarr", "tests"]

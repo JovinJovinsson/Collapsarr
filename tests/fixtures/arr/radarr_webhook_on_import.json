@@ -1,0 +1,39 @@
+{
+  "movie": {
+    "id": 1,
+    "title": "Interstellar",
+    "year": 2014,
+    "releaseDate": "2014-11-05",
+    "folderPath": "/movies/Interstellar (2014)",
+    "tmdbId": 157336,
+    "imdbId": "tt0816692"
+  },
+  "remoteMovie": {
+    "tmdbId": 157336,
+    "imdbId": "tt0816692",
+    "title": "Interstellar",
+    "year": 2014
+  },
+  "movieFile": {
+    "id": 501,
+    "relativePath": "Interstellar (2014) Bluray-1080p.mkv",
+    "path": "/movies/Interstellar (2014)/Interstellar (2014) Bluray-1080p.mkv",
+    "quality": "Bluray-1080p",
+    "qualityVersion": 1,
+    "releaseGroup": "GROUP",
+    "size": 12345678901,
+    "dateAdded": "2023-02-01T10:00:00Z",
+    "mediaInfo": {
+      "audioChannels": 7.1,
+      "audioCodec": "DTS-HD MA",
+      "audioLanguages": "eng",
+      "videoCodec": "x264"
+    }
+  },
+  "isUpgrade": false,
+  "downloadClient": "SABnzbd",
+  "downloadClientType": "sabnzbd",
+  "downloadId": "SABnzbd_nzo_ghi789",
+  "eventType": "Download",
+  "instanceName": "Radarr"
+}

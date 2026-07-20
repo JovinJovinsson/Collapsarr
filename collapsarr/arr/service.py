@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .client import check_connectivity
-from .models import ArrInstance, ConnectivityStatus, InstanceType
+from .models import ArrInstance, ConnectivityStatus, InstanceType, RemotePathMapping
 
 
 class InstanceNotFoundError(LookupError):
@@ -119,3 +119,20 @@ def delete_instance(session: Session, instance_id: int) -> None:
         raise InstanceNotFoundError(f"No arr instance with id={instance_id}")
     session.delete(instance)
     session.commit()
+
+
+def list_path_mappings(session: Session, instance_id: int) -> list[RemotePathMapping]:
+    """Return an instance's path mappings in their configured application order.
+
+    Used by the webhook handler (COL-14) to resolve a webhook-reported remote
+    path to a local one via :func:`collapsarr.arr.models.resolve_path`. Does
+    not raise for an unknown ``instance_id`` -- it simply returns an empty
+    list, matching :func:`resolve_path`'s "no mappings" pass-through.
+    """
+    return list(
+        session.scalars(
+            select(RemotePathMapping)
+            .where(RemotePathMapping.instance_id == instance_id)
+            .order_by(RemotePathMapping.order)
+        )
+    )
