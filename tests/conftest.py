@@ -1,9 +1,11 @@
 """Shared pytest fixtures.
 
 Provides an isolated :class:`~collapsarr.config.Settings` pointed at a temporary
-SQLite database and a :class:`~fastapi.testclient.TestClient` built from the
-application factory. Entering the client's context runs the app's lifespan, so
-the engine, session factory, and schema are all set up per test.
+SQLite database, a :class:`~fastapi.testclient.TestClient` built from the
+application factory, and a bare :class:`~sqlalchemy.orm.Session` (with schema
+already created) for service-layer tests that don't need the HTTP app.
+Entering the client's context runs the app's lifespan, so the engine, session
+factory, and schema are all set up per test.
 """
 
 from __future__ import annotations
@@ -13,8 +15,10 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
+from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
 from collapsarr.main import create_app
 
 
@@ -31,3 +35,14 @@ def client(settings: Settings) -> Iterator[TestClient]:
     app = create_app(settings=settings)
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def session(settings: Settings) -> Iterator[Session]:
+    """A schema-initialised DB session for service-layer tests (no HTTP app)."""
+    engine = create_engine_from_settings(settings)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as db_session:
+        yield db_session
+    engine.dispose()

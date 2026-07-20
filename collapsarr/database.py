@@ -58,7 +58,15 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
 
 
 def init_db(engine: Engine) -> None:
-    """Create any tables registered on :class:`Base` that do not yet exist."""
+    """Create any tables registered on :class:`Base` that do not yet exist.
+
+    Feature packages (e.g. :mod:`collapsarr.arr`) are imported here, not at
+    module scope, so their models register with ``Base.metadata`` before
+    ``create_all`` runs without introducing an import-time cycle back to this
+    module (they import :class:`Base` from here).
+    """
+    from . import arr  # noqa: F401
+
     Base.metadata.create_all(bind=engine)
 
 
