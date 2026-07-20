@@ -14,6 +14,13 @@ its current state. It upserts by ``job_id`` so the same
 calls rather than duplicated.
 
 :func:`list_job_history` and :func:`get_job_history` are the read path.
+
+:func:`make_history_recorder` bridges this module to
+:class:`~collapsarr.jobs.queue.JobQueue`'s ``history_recorder`` hook, so
+every job run gets persisted automatically as it completes rather than
+relying on a caller to remember to call :func:`record_job_history`. This
+module (not :mod:`collapsarr.jobs.queue`, which cannot import this module
+back without a cycle) owns that bridge.
 """
 
 from __future__ import annotations
@@ -22,10 +29,10 @@ from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from .models import JobHistory
-from .queue import Job, JobStatus
+from .queue import HistoryRecorder, Job, JobStatus
 
 
 def _exit_code(job: Job) -> int | None:
@@ -115,3 +122,32 @@ def list_job_history(
     if status is not None:
         stmt = stmt.where(JobHistory.status == status)
     return list(session.scalars(stmt))
+
+
+def make_history_recorder(session_factory: sessionmaker[Session]) -> HistoryRecorder:
+    """Build a :class:`~collapsarr.jobs.queue.JobQueue`-compatible ``history_recorder``.
+
+    The returned callable opens a **fresh** :class:`~sqlalchemy.orm.Session`
+    from ``session_factory`` on every call and closes it again before
+    returning -- never reusing or sharing one session across calls. That
+    matters because :class:`~collapsarr.jobs.queue.JobQueue` invokes
+    ``history_recorder`` from whichever worker thread just finished running
+    the job (up to ``max_concurrency`` threads may call it concurrently);
+    SQLAlchemy sessions are not safe to share across threads, but a
+    ``sessionmaker`` is safe to call from any thread to obtain an
+    independent one, which is exactly the pattern
+    :func:`collapsarr.database.get_session` already uses per-request.
+
+    Typical use::
+
+        session_factory = create_session_factory(engine)
+        queue = JobQueue.from_settings(
+            history_recorder=make_history_recorder(session_factory)
+        )
+    """
+
+    def recorder(job: Job) -> None:
+        with session_factory() as session:
+            record_job_history(session, job)
+
+    return recorder

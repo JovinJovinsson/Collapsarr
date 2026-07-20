@@ -13,12 +13,25 @@ This module is imported for its side effect of registering
 
 from __future__ import annotations
 
-from .history import get_job_history, list_job_history, record_job_history
+from .history import (
+    get_job_history,
+    list_job_history,
+    make_history_recorder,
+    record_job_history,
+)
 from .models import JobHistory
-from .queue import DEFAULT_MAX_CONCURRENCY, Job, JobQueue, JobStatus, PipelineRunner
+from .queue import (
+    DEFAULT_MAX_CONCURRENCY,
+    HistoryRecorder,
+    Job,
+    JobQueue,
+    JobStatus,
+    PipelineRunner,
+)
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
+    "HistoryRecorder",
     "Job",
     "JobHistory",
     "JobQueue",
@@ -26,5 +39,6 @@ __all__ = [
     "PipelineRunner",
     "get_job_history",
     "list_job_history",
+    "make_history_recorder",
     "record_job_history",
 ]

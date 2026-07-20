@@ -9,8 +9,18 @@ queue: :meth:`JobQueue.enqueue` a file plus its target/language context (a
 
 Each job's execution invokes the pipeline synchronously in a worker thread
 and captures whatever it returns (or, as a safety net, whatever it raises)
-onto the :class:`Job` itself -- ``status`` plus ``result``/``error`` -- ready
-for a future job-history feature (COL-21) to persist.
+onto the :class:`Job` itself -- ``status`` plus ``result``/``error``. When a
+``history_recorder`` is configured (see :class:`JobQueue`), that same
+worker thread calls it once the job reaches a terminal status, so every job
+run is persisted (COL-21, :mod:`collapsarr.jobs.history`) without the
+caller having to remember to do it.
+
+This module deliberately does not import :mod:`collapsarr.jobs.history`
+itself (that module imports *this* one, for :class:`Job`/:class:`JobStatus`
+-- importing it back here would be circular). Instead ``history_recorder``
+is a plain injected callable, the same seam ``pipeline_runner`` already
+uses; :func:`collapsarr.jobs.history.make_history_recorder` builds one bound
+to a session factory.
 
 Threads, not asyncio: every stage of the downmix pipeline shells out to
 ``ffprobe``/``ffmpeg`` via blocking :mod:`subprocess` calls, so a small
@@ -93,6 +103,11 @@ class Job:
     ended_at: datetime | None = None
 
 
+#: Signature a ``history_recorder`` must match: takes the just-terminated
+#: ``Job`` and persists it (see :func:`collapsarr.jobs.history.make_history_recorder`).
+HistoryRecorder = Callable[[Job], None]
+
+
 class JobQueue:
     """Bounded-concurrency queue that runs the downmix pipeline per enqueued file.
 
@@ -111,6 +126,19 @@ class JobQueue:
     simple and fully deterministic for tests; a long-running background
     worker loop is left for a future scheduler ticket to build on top of
     this primitive.
+
+    ``history_recorder``, when set, is called with each :class:`Job` from
+    the same worker thread that ran it, right after it reaches a terminal
+    status (``SUCCEEDED``/``FAILED``) -- see :func:`collapsarr.jobs.history.
+    make_history_recorder` for the constructor that builds one bound to a
+    real DB session factory. Since :meth:`run_pending` runs jobs across a
+    :class:`~concurrent.futures.ThreadPoolExecutor` (up to ``max_concurrency``
+    at once), ``history_recorder`` must itself be safe to call concurrently
+    from multiple threads; :func:`~collapsarr.jobs.history.
+    make_history_recorder` satisfies this by opening a fresh
+    :class:`~sqlalchemy.orm.Session` per call rather than sharing one --
+    SQLAlchemy sessions aren't thread-safe, but a ``sessionmaker`` safely
+    creates independent sessions from any thread.
     """
 
     def __init__(
@@ -119,12 +147,14 @@ class JobQueue:
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
         pipeline_runner: PipelineRunner = run_downmix_pipeline,
         pipeline_kwargs: Mapping[str, Any] | None = None,
+        history_recorder: HistoryRecorder | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
         self._max_concurrency = max_concurrency
         self._pipeline_runner = pipeline_runner
         self._pipeline_kwargs = dict(pipeline_kwargs or {})
+        self._history_recorder = history_recorder
         self._lock = threading.Lock()
         self._jobs: dict[UUID, Job] = {}
 
@@ -135,19 +165,24 @@ class JobQueue:
         *,
         pipeline_runner: PipelineRunner = run_downmix_pipeline,
         pipeline_kwargs: Mapping[str, Any] | None = None,
+        history_recorder: HistoryRecorder | None = None,
     ) -> JobQueue:
         """Build a :class:`JobQueue` whose concurrency cap comes from Settings.
 
         ``settings`` defaults to the process-wide cached
         :func:`~collapsarr.config.get_settings`. Its ``job_max_concurrency``
         (default 1, env ``COLLAPSARR_JOB_MAX_CONCURRENCY``) becomes
-        ``max_concurrency``.
+        ``max_concurrency``. ``history_recorder`` is passed straight through
+        (not derived from ``settings`` -- callers construct it explicitly,
+        typically via :func:`collapsarr.jobs.history.make_history_recorder`
+        bound to the app's real session factory).
         """
         resolved = settings or get_settings()
         return cls(
             max_concurrency=resolved.job_max_concurrency,
             pipeline_runner=pipeline_runner,
             pipeline_kwargs=pipeline_kwargs,
+            history_recorder=history_recorder,
         )
 
     @property
@@ -187,7 +222,9 @@ class JobQueue:
 
         Blocks until the whole batch has finished. Returns an empty list if
         nothing was pending. Each returned :class:`Job` has been updated in
-        place with its final ``status`` and ``result``/``error``.
+        place with its final ``status`` and ``result``/``error``, and -- if
+        this queue was built with a ``history_recorder`` -- already
+        persisted via it.
         """
         with self._lock:
             batch = [job for job in self._jobs.values() if job.status is JobStatus.PENDING]
@@ -202,7 +239,15 @@ class JobQueue:
         return batch
 
     def _run_job(self, job: Job) -> None:
-        """Execute one job's pipeline run and record its outcome onto ``job``."""
+        """Execute one job's pipeline run, record its outcome, and persist it.
+
+        Runs entirely on the calling (worker) thread. Once ``job`` reaches
+        its terminal status (``SUCCEEDED``/``FAILED``), ``self._history_recorder``
+        (if configured) is called with it -- outside ``self._lock``, since by
+        that point only this thread ever touches this particular ``job``
+        (each job is submitted to the executor exactly once), so there is
+        nothing left to race against.
+        """
         with self._lock:
             job.status = JobStatus.RUNNING
             job.started_at = datetime.now(UTC)
@@ -214,9 +259,16 @@ class JobQueue:
                 job.error = exc
                 job.status = JobStatus.FAILED
                 job.ended_at = datetime.now(UTC)
+            self._record_history(job)
             return
 
         with self._lock:
             job.result = result
             job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
             job.ended_at = datetime.now(UTC)
+        self._record_history(job)
+
+    def _record_history(self, job: Job) -> None:
+        """Persist ``job``'s just-reached terminal state, if configured to."""
+        if self._history_recorder is not None:
+            self._history_recorder(job)

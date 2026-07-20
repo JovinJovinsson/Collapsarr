@@ -5,6 +5,15 @@ Drives real :class:`~collapsarr.jobs.queue.JobQueue` runs (with an injected
 :func:`~collapsarr.jobs.history.record_job_history`, then asserts what ends
 up persisted and queryable via the ``session`` fixture (a schema-initialised
 DB session -- see ``conftest.py``).
+
+The "automatic persistence" tests below (bottom section) instead wire
+:func:`~collapsarr.jobs.history.make_history_recorder` into
+:class:`~collapsarr.jobs.queue.JobQueue` itself and prove history shows up
+after :meth:`~collapsarr.jobs.queue.JobQueue.run_pending` *without* the test
+ever calling ``record_job_history`` -- those build their own engine/session
+factory (via the ``settings`` fixture) rather than the single shared
+``session`` fixture, since they need a ``sessionmaker`` to hand to
+``make_history_recorder``, not a live ``Session``.
 """
 
 from __future__ import annotations
@@ -14,10 +23,17 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from collapsarr.config import Settings
+from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.remux import RemuxResult
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
-from collapsarr.jobs.history import get_job_history, list_job_history, record_job_history
+from collapsarr.jobs.history import (
+    get_job_history,
+    list_job_history,
+    make_history_recorder,
+    record_job_history,
+)
 from collapsarr.jobs.models import JobHistory
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
 
@@ -235,9 +251,132 @@ def test_job_history_importable_from_package_root() -> None:
     from collapsarr.jobs import JobHistory as ReexportedJobHistory
     from collapsarr.jobs import get_job_history as reexported_get
     from collapsarr.jobs import list_job_history as reexported_list
+    from collapsarr.jobs import make_history_recorder as reexported_make_recorder
     from collapsarr.jobs import record_job_history as reexported_record
 
     assert ReexportedJobHistory is JobHistory
     assert reexported_get is get_job_history
     assert reexported_list is list_job_history
     assert reexported_record is record_job_history
+    assert reexported_make_recorder is make_history_recorder
+
+
+# ---------------------------------------------------------------------------
+# Automatic persistence: JobQueue(history_recorder=...) requires no explicit
+# record_job_history call from the caller.
+# ---------------------------------------------------------------------------
+
+
+def test_run_pending_automatically_persists_history_when_a_recorder_is_configured(
+    settings: Settings,
+) -> None:
+    """Every job run is persisted by run_pending() itself -- no manual call."""
+    engine = create_engine_from_settings(settings)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(_SUCCESS),
+        history_recorder=make_history_recorder(session_factory),
+    )
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()  # note: no record_job_history(...) call anywhere here
+
+    with session_factory() as read_session:
+        rows = list_job_history(read_session)
+
+    assert len(rows) == 1
+    assert rows[0].job_id == str(job.id)
+    assert rows[0].file_path == "/media/movie.mkv"
+    assert rows[0].status is JobStatus.SUCCEEDED
+    assert rows[0].started_at is not None
+    assert rows[0].ended_at is not None
+    engine.dispose()
+
+
+def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> None:
+    engine = create_engine_from_settings(settings)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(_REMUX_FAILURE),
+        history_recorder=make_history_recorder(session_factory),
+    )
+    queue.enqueue("/media/b.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    with session_factory() as read_session:
+        rows = list_job_history(read_session, status=JobStatus.FAILED)
+
+    assert len(rows) == 1
+    assert rows[0].exit_code == 1
+    assert rows[0].error_text == _REMUX_FAILURE.detail
+
+
+def test_run_pending_with_no_history_recorder_persists_nothing(settings: Settings) -> None:
+    """No history_recorder configured -> run_pending works, nothing persisted."""
+    engine = create_engine_from_settings(settings)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))  # no history_recorder
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    jobs = queue.run_pending()
+
+    assert jobs[0].status is JobStatus.SUCCEEDED  # the job itself still ran fine
+    with session_factory() as read_session:
+        assert list_job_history(read_session) == []
+    engine.dispose()
+
+
+def test_run_pending_persists_history_for_every_concurrently_run_job(
+    settings: Settings,
+) -> None:
+    """A stronger proof that make_history_recorder is safe under real concurrency:
+
+    max_concurrency=3 means up to 3 worker threads call the recorder at
+    once; every one of 6 jobs must still land its own row, with no lost
+    writes or cross-thread session sharing errors.
+    """
+    engine = create_engine_from_settings(settings)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    queue = JobQueue(
+        max_concurrency=3,
+        pipeline_runner=_stub_runner(_SUCCESS),
+        history_recorder=make_history_recorder(session_factory),
+    )
+    jobs = [queue.enqueue(f"/media/{i}.mkv", DownmixSettings()) for i in range(6)]
+
+    queue.run_pending()
+
+    with session_factory() as read_session:
+        rows = list_job_history(read_session)
+
+    assert {row.job_id for row in rows} == {str(job.id) for job in jobs}
+    assert all(row.status is JobStatus.SUCCEEDED for row in rows)
+    engine.dispose()
+
+
+def test_from_settings_threads_history_recorder_through(settings: Settings) -> None:
+    engine = create_engine_from_settings(settings)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    queue = JobQueue.from_settings(
+        settings,
+        pipeline_runner=_stub_runner(_SUCCESS),
+        history_recorder=make_history_recorder(session_factory),
+    )
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    with session_factory() as read_session:
+        assert len(list_job_history(read_session)) == 1
+    engine.dispose()
