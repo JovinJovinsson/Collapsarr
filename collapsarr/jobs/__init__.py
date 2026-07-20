@@ -13,6 +13,7 @@ This module is imported for its side effect of registering
 
 from __future__ import annotations
 
+from .failure_notify import make_failure_notifier, notify_job_failure
 from .history import (
     get_job_history,
     list_job_history,
@@ -22,6 +23,7 @@ from .history import (
 from .models import JobHistory
 from .queue import (
     DEFAULT_MAX_CONCURRENCY,
+    FailureNotifier,
     HistoryRecorder,
     Job,
     JobQueue,
@@ -31,6 +33,7 @@ from .queue import (
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
+    "FailureNotifier",
     "HistoryRecorder",
     "Job",
     "JobHistory",
@@ -39,6 +42,8 @@ __all__ = [
     "PipelineRunner",
     "get_job_history",
     "list_job_history",
+    "make_failure_notifier",
     "make_history_recorder",
+    "notify_job_failure",
     "record_job_history",
 ]

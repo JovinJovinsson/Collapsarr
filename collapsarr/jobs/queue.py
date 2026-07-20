@@ -13,14 +13,20 @@ onto the :class:`Job` itself -- ``status`` plus ``result``/``error``. When a
 ``history_recorder`` is configured (see :class:`JobQueue`), that same
 worker thread calls it once the job reaches a terminal status, so every job
 run is persisted (COL-21, :mod:`collapsarr.jobs.history`) without the
-caller having to remember to do it.
+caller having to remember to do it. Likewise, when a ``failure_notifier`` is
+configured, that same worker thread calls it -- but only for a job that
+reached ``FAILED`` -- so a downmix failure fans out to the configured
+notifiers (COL-37, :mod:`collapsarr.jobs.failure_notify`) without the
+caller having to remember to do it either.
 
-This module deliberately does not import :mod:`collapsarr.jobs.history`
-itself (that module imports *this* one, for :class:`Job`/:class:`JobStatus`
--- importing it back here would be circular). Instead ``history_recorder``
-is a plain injected callable, the same seam ``pipeline_runner`` already
-uses; :func:`collapsarr.jobs.history.make_history_recorder` builds one bound
-to a session factory.
+This module deliberately does not import :mod:`collapsarr.jobs.history` or
+:mod:`collapsarr.jobs.failure_notify` itself (those modules import *this*
+one, for :class:`Job`/:class:`JobStatus` -- importing them back here would
+be circular). Instead ``history_recorder``/``failure_notifier`` are plain
+injected callables, the same seam ``pipeline_runner`` already uses;
+:func:`collapsarr.jobs.history.make_history_recorder` and
+:func:`collapsarr.jobs.failure_notify.make_failure_notifier` build ones
+bound to a session factory.
 
 Threads, not asyncio: every stage of the downmix pipeline shells out to
 ``ffprobe``/``ffmpeg`` via blocking :mod:`subprocess` calls, so a small
@@ -107,6 +113,13 @@ class Job:
 #: ``Job`` and persists it (see :func:`collapsarr.jobs.history.make_history_recorder`).
 HistoryRecorder = Callable[[Job], None]
 
+#: Signature a ``failure_notifier`` must match: takes the just-terminated
+#: ``Job`` (only ever called for one with ``status is JobStatus.FAILED``) and
+#: dispatches a notification for it (see :func:`collapsarr.jobs.
+#: failure_notify.make_failure_notifier`). Must never raise -- see
+#: :meth:`JobQueue._notify_failure`.
+FailureNotifier = Callable[[Job], None]
+
 
 class JobQueue:
     """Bounded-concurrency queue that runs the downmix pipeline per enqueued file.
@@ -139,6 +152,17 @@ class JobQueue:
     :class:`~sqlalchemy.orm.Session` per call rather than sharing one --
     SQLAlchemy sessions aren't thread-safe, but a ``sessionmaker`` safely
     creates independent sessions from any thread.
+
+    ``failure_notifier``, when set, is called the same way -- same worker
+    thread, right after the job reaches its terminal status -- but only for
+    a job whose terminal status is ``FAILED`` (a ``SUCCEEDED`` job never
+    triggers it). See :func:`collapsarr.jobs.failure_notify.
+    make_failure_notifier` for the constructor that dispatches to the
+    configured notifiers (COL-37); it must be safe to call concurrently for
+    the same reason ``history_recorder`` must, and -- like
+    ``history_recorder`` -- any exception it raises is swallowed by
+    :meth:`_notify_failure` so a notifier problem can never fail the job it
+    is reporting on.
     """
 
     def __init__(
@@ -148,6 +172,7 @@ class JobQueue:
         pipeline_runner: PipelineRunner = run_downmix_pipeline,
         pipeline_kwargs: Mapping[str, Any] | None = None,
         history_recorder: HistoryRecorder | None = None,
+        failure_notifier: FailureNotifier | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
@@ -155,6 +180,7 @@ class JobQueue:
         self._pipeline_runner = pipeline_runner
         self._pipeline_kwargs = dict(pipeline_kwargs or {})
         self._history_recorder = history_recorder
+        self._failure_notifier = failure_notifier
         self._lock = threading.Lock()
         self._jobs: dict[UUID, Job] = {}
 
@@ -166,6 +192,7 @@ class JobQueue:
         pipeline_runner: PipelineRunner = run_downmix_pipeline,
         pipeline_kwargs: Mapping[str, Any] | None = None,
         history_recorder: HistoryRecorder | None = None,
+        failure_notifier: FailureNotifier | None = None,
     ) -> JobQueue:
         """Build a :class:`JobQueue` whose concurrency cap comes from Settings.
 
@@ -174,58 +201,74 @@ class JobQueue:
         (default 1, env ``COLLAPSARR_JOB_MAX_CONCURRENCY``) becomes
         ``max_concurrency``.
 
-        Unlike the raw :meth:`__init__` (where ``history_recorder`` defaults
-        to ``None`` -- the right default for lightweight unit construction
-        that doesn't want DB writes, e.g. COL-20's concurrency tests), this
-        factory is the production path: when ``history_recorder`` isn't
-        passed explicitly, it defaults to a *real* one -- built via
-        :func:`collapsarr.jobs.history.make_history_recorder`, bound to a
-        session factory for ``resolved``'s database (schema created via
-        :func:`~collapsarr.database.init_db` if not already present) --
-        rather than staying ``None``. This mirrors how ``pipeline_runner``
-        already defaults to the real :func:`~collapsarr.downmix.pipeline.
-        run_downmix_pipeline` in the raw ``__init__``: a bare
-        ``JobQueue.from_settings()`` call, with no extra plumbing, persists
-        history for real. Pass ``history_recorder`` explicitly (or ``None``
-        isn't obtainable here -- construct via :meth:`__init__` directly
-        instead) to opt out.
+        Unlike the raw :meth:`__init__` (where ``history_recorder``/
+        ``failure_notifier`` default to ``None`` -- the right default for
+        lightweight unit construction that doesn't want DB writes, e.g.
+        COL-20's concurrency tests), this factory is the production path:
+        when either isn't passed explicitly, it defaults to a *real* one --
+        ``history_recorder`` via :func:`collapsarr.jobs.history.
+        make_history_recorder` and ``failure_notifier`` via
+        :func:`collapsarr.jobs.failure_notify.make_failure_notifier`, both
+        bound to the same session factory for ``resolved``'s database
+        (schema created via :func:`~collapsarr.database.init_db` if not
+        already present) -- rather than staying ``None``. This mirrors how
+        ``pipeline_runner`` already defaults to the real
+        :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline` in the raw
+        ``__init__``: a bare ``JobQueue.from_settings()`` call, with no extra
+        plumbing, persists history and dispatches failure notifications for
+        real. Pass either explicitly (or ``None`` isn't obtainable here --
+        construct via :meth:`__init__` directly instead) to opt out.
 
-        The database engine backing that default recorder is created once,
-        here, for this :class:`JobQueue` instance; it is not shared with
-        the FastAPI app's own request-scoped engine (see
-        :mod:`collapsarr.main`). For SQLite (this project's only supported
-        backend today) that's safe -- both point at the same on-disk file --
-        but it does mean calling this factory repeatedly opens a new engine
-        each time, so production code should call it once and hold onto the
-        resulting :class:`JobQueue` (e.g. on ``app.state``), the same way it
-        already holds onto one session factory.
+        The database engine backing those defaults is created at most once,
+        here, for this :class:`JobQueue` instance -- shared between
+        ``history_recorder`` and ``failure_notifier`` when both need
+        defaulting, but not shared with the FastAPI app's own request-scoped
+        engine (see :mod:`collapsarr.main`). For SQLite (this project's only
+        supported backend today) that's safe -- both point at the same
+        on-disk file -- but it does mean calling this factory repeatedly
+        opens a new engine each time, so production code should call it once
+        and hold onto the resulting :class:`JobQueue` (e.g. on
+        ``app.state``), the same way it already holds onto one session
+        factory.
 
-        The import of :mod:`collapsarr.jobs.history` below is deferred
-        (inside this method, not at module scope) because that module
-        imports *this* one (for :class:`Job`/:class:`JobStatus`) -- the same
-        defer-to-break-a-cycle trick :func:`collapsarr.database.init_db`
-        already uses for its own model-registration imports.
+        The imports of :mod:`collapsarr.jobs.history` and
+        :mod:`collapsarr.jobs.failure_notify` below are deferred (inside this
+        method, not at module scope) because those modules import *this* one
+        (for :class:`Job`/:class:`JobStatus`) -- the same defer-to-break-a-
+        cycle trick :func:`collapsarr.database.init_db` already uses for its
+        own model-registration imports.
         """
         resolved = settings or get_settings()
 
         resolved_history_recorder = history_recorder
-        if resolved_history_recorder is None:
+        resolved_failure_notifier = failure_notifier
+        if resolved_history_recorder is None or resolved_failure_notifier is None:
             from collapsarr.database import (
                 create_engine_from_settings,
                 create_session_factory,
                 init_db,
             )
-            from collapsarr.jobs.history import make_history_recorder
 
             engine = create_engine_from_settings(resolved)
             init_db(engine)
-            resolved_history_recorder = make_history_recorder(create_session_factory(engine))
+            session_factory = create_session_factory(engine)
+
+            if resolved_history_recorder is None:
+                from collapsarr.jobs.history import make_history_recorder
+
+                resolved_history_recorder = make_history_recorder(session_factory)
+
+            if resolved_failure_notifier is None:
+                from collapsarr.jobs.failure_notify import make_failure_notifier
+
+                resolved_failure_notifier = make_failure_notifier(session_factory)
 
         return cls(
             max_concurrency=resolved.job_max_concurrency,
             pipeline_runner=pipeline_runner,
             pipeline_kwargs=pipeline_kwargs,
             history_recorder=resolved_history_recorder,
+            failure_notifier=resolved_failure_notifier,
         )
 
     @property
@@ -282,14 +325,16 @@ class JobQueue:
         return batch
 
     def _run_job(self, job: Job) -> None:
-        """Execute one job's pipeline run, record its outcome, and persist it.
+        """Execute one job's pipeline run, record its outcome, and persist/notify.
 
         Runs entirely on the calling (worker) thread. Once ``job`` reaches
         its terminal status (``SUCCEEDED``/``FAILED``), ``self._history_recorder``
-        (if configured) is called with it -- outside ``self._lock``, since by
-        that point only this thread ever touches this particular ``job``
-        (each job is submitted to the executor exactly once), so there is
-        nothing left to race against.
+        (if configured) is called with it, followed by ``self._notify_failure``
+        (a no-op unless the job actually ``FAILED`` and a ``failure_notifier``
+        is configured) -- both outside ``self._lock``, since by that point
+        only this thread ever touches this particular ``job`` (each job is
+        submitted to the executor exactly once), so there is nothing left to
+        race against.
         """
         with self._lock:
             job.status = JobStatus.RUNNING
@@ -303,6 +348,7 @@ class JobQueue:
                 job.status = JobStatus.FAILED
                 job.ended_at = datetime.now(UTC)
             self._record_history(job)
+            self._notify_failure(job)
             return
 
         with self._lock:
@@ -310,8 +356,27 @@ class JobQueue:
             job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
             job.ended_at = datetime.now(UTC)
         self._record_history(job)
+        self._notify_failure(job)
 
     def _record_history(self, job: Job) -> None:
         """Persist ``job``'s just-reached terminal state, if configured to."""
         if self._history_recorder is not None:
             self._history_recorder(job)
+
+    def _notify_failure(self, job: Job) -> None:
+        """Dispatch a failure notification for ``job``, if configured and it failed.
+
+        A no-op for a job that reached ``SUCCEEDED``, or when no
+        ``failure_notifier`` was configured. ``self._failure_notifier`` is
+        expected to never raise on its own (COL-37's
+        :func:`~collapsarr.jobs.failure_notify.notify_job_failure` guarantees
+        this), but it is called inside a defensive ``try``/``except`` anyway
+        -- a notification problem must never be able to fail the job it is
+        reporting on, or the worker thread running it.
+        """
+        if self._failure_notifier is None or job.status is not JobStatus.FAILED:
+            return
+        try:
+            self._failure_notifier(job)
+        except Exception:  # noqa: BLE001 - a notifier failure must never fail the job
+            pass

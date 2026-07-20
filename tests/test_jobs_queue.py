@@ -262,3 +262,67 @@ def test_job_dataclass_is_importable_from_package_root() -> None:
 
     assert ReexportedJob is Job
     assert ReexportedJobQueue is JobQueue
+
+
+# ---------------------------------------------------------------------------
+# failure_notifier hook (COL-37): called only for a job that reached FAILED.
+# ---------------------------------------------------------------------------
+
+
+def test_failure_notifier_is_called_for_a_failed_job() -> None:
+    notified: list[Job] = []
+    queue = JobQueue(pipeline_runner=_stub_runner(_FAILED), failure_notifier=notified.append)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    assert notified == [job]
+    assert job.status is JobStatus.FAILED
+
+
+def test_failure_notifier_is_not_called_for_a_succeeded_job() -> None:
+    notified: list[Job] = []
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS), failure_notifier=notified.append)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    assert notified == []
+
+
+def test_failure_notifier_is_called_when_the_runner_raises_unexpectedly() -> None:
+    def raising_runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        raise RuntimeError("boom")
+
+    notified: list[Job] = []
+    queue = JobQueue(pipeline_runner=raising_runner, failure_notifier=notified.append)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    assert notified == [job]
+
+
+def test_a_raising_failure_notifier_does_not_fail_the_job_or_run_pending() -> None:
+    """AC: notification failures must never crash or fail the job itself."""
+
+    def raising_notifier(job: Job) -> None:
+        raise RuntimeError("webhook unreachable")
+
+    queue = JobQueue(pipeline_runner=_stub_runner(_FAILED), failure_notifier=raising_notifier)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    jobs = queue.run_pending()  # must not raise
+
+    assert jobs == [job]
+    assert job.status is JobStatus.FAILED
+
+
+def test_no_failure_notifier_configured_is_a_noop() -> None:
+    """Default (no failure_notifier passed) behaves exactly as before COL-37."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_FAILED))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    assert job.status is JobStatus.FAILED
