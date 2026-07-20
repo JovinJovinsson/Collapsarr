@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -33,8 +34,23 @@ from collapsarr.arr.webhooks import (
 )
 from collapsarr.config import Settings
 from collapsarr.main import create_app
+from collapsarr.settings.service import get_global_settings
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "arr"
+
+
+def _auth_headers(client: TestClient) -> dict[str, str]:
+    """The API-key header for the app's auto-generated key (COL-26).
+
+    The ``/api/webhook`` route is API-key protected like every other ``/api``
+    route, so the endpoint tests must present the key the app minted on first
+    run. Read it back through the app's own session factory.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    with session_factory() as session:
+        return {"X-Api-Key": get_global_settings(session).api_key}
 
 
 def _load_fixture(name: str) -> dict[str, Any]:
@@ -232,6 +248,7 @@ def test_webhook_endpoint_accepts_sonarr_import_and_returns_200(
         response = client.post(
             f"/api/webhook/arr/{instance.id}",
             json=_load_fixture("sonarr_webhook_on_import.json"),
+            headers=_auth_headers(client),
         )
 
     assert response.status_code == 200
@@ -253,6 +270,7 @@ def test_webhook_endpoint_accepts_radarr_upgrade_and_returns_200(
         response = client.post(
             f"/api/webhook/arr/{instance.id}",
             json=_load_fixture("radarr_webhook_on_upgrade.json"),
+            headers=_auth_headers(client),
         )
 
     assert response.status_code == 200
@@ -279,6 +297,7 @@ def test_webhook_endpoint_resolves_path_via_instance_mapping(
         response = client.post(
             f"/api/webhook/arr/{instance.id}",
             json=_load_fixture("sonarr_webhook_on_import.json"),
+            headers=_auth_headers(client),
         )
 
     assert response.status_code == 200
@@ -298,6 +317,7 @@ def test_webhook_endpoint_default_hook_does_not_raise_when_unset(
         response = client.post(
             f"/api/webhook/arr/{instance.id}",
             json=_load_fixture("sonarr_webhook_on_import.json"),
+            headers=_auth_headers(client),
         )
 
     assert response.status_code == 200
@@ -315,6 +335,7 @@ def test_webhook_endpoint_ignores_non_download_event(
         response = client.post(
             f"/api/webhook/arr/{instance.id}",
             json=_load_fixture("sonarr_webhook_test.json"),
+            headers=_auth_headers(client),
         )
 
     assert response.status_code == 200
@@ -327,6 +348,7 @@ def test_webhook_endpoint_returns_404_for_unknown_instance(settings: Settings) -
         response = client.post(
             "/api/webhook/arr/999",
             json=_load_fixture("sonarr_webhook_on_import.json"),
+            headers=_auth_headers(client),
         )
 
     assert response.status_code == 404
@@ -343,6 +365,7 @@ def test_webhook_endpoint_rejects_malformed_download_payload(
         response = client.post(
             f"/api/webhook/arr/{instance.id}",
             json={"eventType": "Download"},
+            headers=_auth_headers(client),
         )
 
     assert response.status_code == 422
@@ -355,7 +378,11 @@ def test_webhook_endpoint_rejects_payload_missing_event_type(
 
     app = create_app(settings=settings)
     with TestClient(app) as client:
-        response = client.post(f"/api/webhook/arr/{instance.id}", json={"foo": "bar"})
+        response = client.post(
+            f"/api/webhook/arr/{instance.id}",
+            json={"foo": "bar"},
+            headers=_auth_headers(client),
+        )
 
     assert response.status_code == 422
 
@@ -365,7 +392,11 @@ def test_webhook_endpoint_rejects_non_object_body(settings: Settings, session: S
 
     app = create_app(settings=settings)
     with TestClient(app) as client:
-        response = client.post(f"/api/webhook/arr/{instance.id}", json=["not", "an", "object"])
+        response = client.post(
+            f"/api/webhook/arr/{instance.id}",
+            json=["not", "an", "object"],
+            headers=_auth_headers(client),
+        )
 
     assert response.status_code == 422
 
@@ -376,6 +407,7 @@ def test_webhook_endpoint_rejects_non_integer_instance_id(settings: Settings) ->
         response = client.post(
             "/api/webhook/arr/not-an-int",
             json=_load_fixture("sonarr_webhook_on_import.json"),
+            headers=_auth_headers(client),
         )
 
     assert response.status_code == 422
@@ -390,7 +422,11 @@ def test_webhook_endpoint_does_not_crash_app_on_repeated_malformed_requests(
     app = create_app(settings=settings)
     with TestClient(app) as client:
         for _ in range(3):
-            response = client.post(f"/api/webhook/arr/{instance.id}", json={"bad": True})
+            response = client.post(
+                f"/api/webhook/arr/{instance.id}",
+                json={"bad": True},
+                headers=_auth_headers(client),
+            )
             assert response.status_code == 422
 
         health = client.get("/health")

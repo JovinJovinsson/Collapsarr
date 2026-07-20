@@ -16,13 +16,14 @@ This module is imported for its side effect of registering
 
 from __future__ import annotations
 
-from .models import SETTINGS_ID, GlobalSettings
+from .models import SETTINGS_ID, GlobalSettings, generate_api_key
 from .service import as_downmix_settings, get_global_settings, update_global_settings
 
 __all__ = [
     "SETTINGS_ID",
     "GlobalSettings",
     "as_downmix_settings",
+    "generate_api_key",
     "get_global_settings",
     "update_global_settings",
 ]
