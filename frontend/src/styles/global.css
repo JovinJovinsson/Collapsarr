@@ -269,6 +269,119 @@ a {
   color: var(--c-text-faint);
 }
 
+/* ---- Activity table ---------------------------------------------------- */
+
+.activity-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.activity-filters__input,
+.activity-filters__select {
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-md);
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+}
+
+.activity-filters__input {
+  flex: 1 1 240px;
+  min-width: 200px;
+}
+
+.activity-filters__input::placeholder {
+  color: var(--c-text-faint);
+}
+
+.activity-filters__input:focus,
+.activity-filters__select:focus {
+  outline: none;
+  border-color: var(--c-accent);
+}
+
+.activity-panel {
+  overflow-x: auto;
+}
+
+.activity-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.activity-table th,
+.activity-table td {
+  padding: var(--sp-3) var(--sp-4);
+  text-align: left;
+  vertical-align: top;
+}
+
+.activity-table thead th {
+  color: var(--c-text-muted);
+  font-weight: 600;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--c-border);
+  white-space: nowrap;
+}
+
+.activity-table tbody tr + tr td {
+  border-top: 1px solid var(--c-border);
+}
+
+.activity-table__title {
+  font-weight: 600;
+  color: var(--c-text);
+  white-space: nowrap;
+}
+
+.activity-table__path {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-text-muted);
+  word-break: break-all;
+}
+
+.activity-table__error {
+  color: var(--c-text-muted);
+  max-width: 32ch;
+}
+
+.activity-table__status {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+}
+
+.activity-table__status--succeeded {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+}
+
+.activity-table__status--failed {
+  color: var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.activity-table__status--running {
+  color: var(--c-accent-hover);
+  background: var(--c-accent-tint);
+}
+
+.activity-table__status--pending {
+  color: var(--c-text-muted);
+  background: var(--c-surface-raised);
+}
+
 /* ---- Responsive: collapse the sidebar to a top bar on narrow screens - */
 
 @media (max-width: 640px) {

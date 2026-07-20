@@ -28,6 +28,12 @@
   --c-accent-tint: rgba(139, 92, 246, 0.14);
   --c-accent-tint-strong: rgba(139, 92, 246, 0.22);
 
+  /* Status accents — job history (succeeded/failed) status badges. */
+  --c-success: #34d399;
+  --c-success-tint: rgba(52, 211, 153, 0.14);
+  --c-danger: #f87171;
+  --c-danger-tint: rgba(248, 113, 113, 0.14);
+
   /* Type. System stack keeps the wheel self-contained (no bundled webfonts). */
   --font-body: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
     Arial, sans-serif;
