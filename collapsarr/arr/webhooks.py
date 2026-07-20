@@ -18,10 +18,11 @@ instance + path-mapping logic used elsewhere -- so a webhook-reported
 container path arrives at the "file ready" hook already translated to a
 host-local path.
 
-The "file ready" hook itself is intentionally pluggable: this ticket only
-needs a stub/log implementation (:func:`default_on_file_ready_hook`); a later
-epic (Job Queue & Scheduler) wires a real hook in via
-``create_app(on_file_ready=...)``.
+The "file ready" hook itself is intentionally pluggable: this module ships a
+stub/log implementation (:func:`default_on_file_ready_hook`), and the Job
+Queue & Scheduler epic (COL-22) wires the real one --
+:meth:`collapsarr.jobs.scheduler.JobScheduler.on_file_ready`, which enqueues a
+downmix job -- in via ``create_app(enable_scheduler=True)``.
 """
 
 from __future__ import annotations
@@ -78,8 +79,9 @@ OnFileReadyHook = Callable[[ResolvedWebhookFile], None]
 def default_on_file_ready_hook(file: ResolvedWebhookFile) -> None:
     """Stub "file ready" hook: logs the resolved file.
 
-    Replaced by a real hook (enqueueing onto the Job Queue) once that epic
-    lands; wire a custom hook in via ``create_app(on_file_ready=...)``.
+    The default fallback when no scheduler is wired. In production the real
+    hook (:meth:`collapsarr.jobs.scheduler.JobScheduler.on_file_ready`, which
+    enqueues a downmix job) is wired in via ``create_app(enable_scheduler=True)``.
     """
     action = "upgraded" if file.is_upgrade else "imported"
     logger.info(

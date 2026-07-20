@@ -30,19 +30,32 @@ from .database import (
     get_session,
     init_db,
 )
+from .jobs.queue import JobQueue
+from .jobs.scheduler import JobScheduler
 
 
 def create_app(
     settings: Settings | None = None,
     on_file_ready: OnFileReadyHook | None = None,
+    *,
+    enable_scheduler: bool = False,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
     Passing ``settings`` overrides the cached process configuration, which is
     how tests inject an isolated database. ``on_file_ready`` overrides the
     "file ready" hook invoked by the arr webhook endpoint (see
-    :mod:`collapsarr.arr.webhooks`); it defaults to a log-only stub until a
-    later epic (Job Queue & Scheduler) wires in the real one.
+    :mod:`collapsarr.arr.webhooks`); it defaults to a log-only stub.
+
+    ``enable_scheduler`` (opt-in; the production ``app`` below sets it) wires
+    the real Job Queue & Scheduler (COL-22): the webhook's "file ready" hook
+    becomes :meth:`~collapsarr.jobs.scheduler.JobScheduler.on_file_ready`
+    (enqueuing a real downmix job) and a background thread runs a periodic
+    full-library scan. It is off by default so tests get the lightweight stub
+    hook and no background thread unless they ask for it. An explicit
+    ``on_file_ready`` always wins, so a test can inject its own hook regardless.
+    The live :class:`~collapsarr.jobs.scheduler.JobScheduler` is exposed on
+    ``app.state.job_scheduler`` (and its queue on ``app.state.job_queue``).
     """
     resolved_settings = settings or get_settings()
 
@@ -50,11 +63,23 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = create_engine_from_settings(resolved_settings)
         app.state.engine = engine
-        app.state.session_factory = create_session_factory(engine)
+        session_factory = create_session_factory(engine)
+        app.state.session_factory = session_factory
         init_db(engine)
+
+        scheduler: JobScheduler | None = None
+        if on_file_ready is None and enable_scheduler:
+            queue = JobQueue.from_settings(resolved_settings)
+            scheduler = JobScheduler(queue, session_factory, resolved_settings)
+            app.state.job_queue = queue
+            app.state.job_scheduler = scheduler
+            app.state.on_file_ready = scheduler.on_file_ready
+            scheduler.start()
         try:
             yield
         finally:
+            if scheduler is not None:
+                scheduler.stop()
             engine.dispose()
 
     app = FastAPI(
@@ -113,4 +138,4 @@ def create_app(
     return app
 
 
-app = create_app()
+app = create_app(enable_scheduler=True)
