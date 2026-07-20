@@ -1,0 +1,22 @@
+[
+  {
+    "id": 1,
+    "title": "Breaking Bad",
+    "sortTitle": "breaking bad",
+    "status": "ended",
+    "monitored": true,
+    "seasonFolder": true,
+    "tvdbId": 81189,
+    "path": "/tv/Breaking Bad"
+  },
+  {
+    "id": 2,
+    "title": "Unmonitored Show",
+    "sortTitle": "unmonitored show",
+    "status": "continuing",
+    "monitored": false,
+    "seasonFolder": true,
+    "tvdbId": 12345,
+    "path": "/tv/Unmonitored Show"
+  }
+]

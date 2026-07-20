@@ -1,0 +1,13 @@
+{
+  "series": {
+    "id": 0,
+    "title": "",
+    "path": "",
+    "tvdbId": 0,
+    "imdbId": "",
+    "type": "standard"
+  },
+  "episodes": [],
+  "eventType": "Test",
+  "instanceName": "Sonarr"
+}
