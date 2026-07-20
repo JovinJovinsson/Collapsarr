@@ -15,6 +15,8 @@ Environment variable             Default                     Description
 ``COLLAPSARR_HOST``              ``0.0.0.0``                 Bind address for the API server.
 ``COLLAPSARR_PORT``              ``8282``                    Bind port for the API server.
 ``COLLAPSARR_LOG_LEVEL``         ``INFO``                    Log level (passed to uvicorn).
+``COLLAPSARR_JOB_MAX_CONCURRENCY`` ``1``                      Max downmix jobs run concurrently.
+``COLLAPSARR_SCAN_INTERVAL_HOURS`` ``6.0``                    Hours between periodic library scans.
 ===============================  ==========================  ==================================
 """
 
@@ -53,6 +55,27 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", description="API server bind address.")
     port: int = Field(default=8282, description="API server bind port.")
     log_level: str = Field(default="INFO", description="Log level for the server.")
+    job_max_concurrency: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Maximum number of downmix jobs the job queue (collapsarr.jobs) runs "
+            "concurrently. Read by JobQueue.from_settings()."
+        ),
+    )
+    scan_interval_hours: float = Field(
+        default=6.0,
+        gt=0,
+        description=(
+            "Interval, in hours, between periodic full-library scans that enqueue "
+            "downmix jobs for monitored files with qualifying targets. Read by the "
+            "background scheduler (collapsarr.jobs.scheduler.JobScheduler), which "
+            "also uses it as the de-duplication window: a file whose most recent job "
+            "reached a terminal state within this window is not re-enqueued, so a "
+            "webhook and a scheduled scan overlapping within one cycle can't "
+            "double-enqueue it."
+        ),
+    )
 
     @property
     def sqlalchemy_url(self) -> str:
