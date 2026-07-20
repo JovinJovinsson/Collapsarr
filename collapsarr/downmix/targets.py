@@ -62,7 +62,7 @@ _TARGET_ORDER: tuple[DownmixTarget, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class DownmixSettings:
-    """Settings-shaped input for target detection.
+    """Settings-shaped input for target detection and the FFmpeg remux (COL-17).
 
     Not a persisted model — a plain, immutable stand-in for the real
     Settings page (``docs/plans/2026-07-20-collapsarr-v1-design.md``) that a
@@ -73,10 +73,21 @@ class DownmixSettings:
     default) evaluates every language present on the file; a non-``None``
     set restricts evaluation to just those languages — languages outside it
     are silently omitted from the result, never errored.
+
+    The remaining fields are the "advanced settings" codec/bitrate
+    overrides from the product design: AAC for Stereo, AC3 @ 448kbps for
+    2.1/5.1, both configurable. ``stereo_bitrate_kbps`` defaults to
+    ``None`` (no explicit ``-b:a``, letting the AAC encoder pick its own
+    default quality) since the design only calls out a fixed bitrate for
+    the surround targets.
     """
 
     enabled_targets: frozenset[DownmixTarget] = frozenset({DownmixTarget.STEREO})
     language_allow_list: frozenset[str] | None = None
+    stereo_codec: str = "aac"
+    stereo_bitrate_kbps: int | None = None
+    surround_codec: str = "ac3"
+    surround_bitrate_kbps: int | None = 448
 
 
 @dataclass(frozen=True, slots=True)
