@@ -16,7 +16,7 @@ import enum
 from datetime import UTC, datetime
 
 from sqlalchemy import Enum as SAEnum
-from sqlalchemy import String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from collapsarr.database import Base
@@ -82,3 +82,66 @@ class ArrInstance(Base):
 
     def __repr__(self) -> str:
         return f"ArrInstance(id={self.id!r}, name={self.name!r}, type={self.type!r})"
+
+
+class RemotePathMapping(Base):
+    """A remote-to-local path prefix mapping for an ArrInstance.
+
+    Ordered mappings allow Collapsarr to translate container-relative paths
+    (e.g., ``/tv/Show/Season 01/file.mkv`` reported by a Sonarr/Radarr API
+    running in Docker) into host-local paths (e.g., ``/mnt/media/...``) that
+    Collapsarr can actually read/write on disk.
+
+    Mappings are applied in order; the first matching remote_prefix wins.
+    Unmapped paths pass through unchanged.
+    """
+
+    __tablename__ = "remote_path_mappings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    instance_id: Mapped[int] = mapped_column(
+        ForeignKey("arr_instances.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    remote_prefix: Mapped[str] = mapped_column(String(500), nullable=False)
+    local_prefix: Mapped[str] = mapped_column(String(500), nullable=False)
+    order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)
+
+    def __repr__(self) -> str:
+        return (
+            f"RemotePathMapping(id={self.id!r}, instance_id={self.instance_id!r}, "
+            f"remote_prefix={self.remote_prefix!r}, local_prefix={self.local_prefix!r})"
+        )
+
+
+def resolve_path(
+    file_path: str, mappings: list[RemotePathMapping] | None = None
+) -> str:
+    """Resolve a remote file path to a local path using configured mappings.
+
+    Applies the ordered list of path mappings to transform a file path as
+    reported by a Sonarr/Radarr API (e.g., a container-relative path) into
+    the local file path Collapsarr can actually read/write on disk.
+
+    The first mapping whose ``remote_prefix`` matches the start of
+    ``file_path`` is applied; subsequent mappings are ignored. If no mapping
+    matches, the original ``file_path`` is returned unchanged.
+
+    Args:
+        file_path: The path to resolve (typically as reported by Arr API).
+        mappings: Ordered list of RemotePathMapping objects. When ``None`` or
+            empty, ``file_path`` is returned unchanged.
+
+    Returns:
+        The resolved local path, or ``file_path`` if no mapping applies.
+    """
+    if not mappings:
+        return file_path
+
+    for mapping in mappings:
+        if file_path.startswith(mapping.remote_prefix):
+            return file_path.replace(mapping.remote_prefix, mapping.local_prefix, 1)
+
+    return file_path
