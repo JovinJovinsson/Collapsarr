@@ -1,0 +1,61 @@
+# ---- Secrets & local config (NEVER commit these) ----
+.env
+.env.*
+!.env.example
+*.local
+docker-compose.override.yml
+
+# ---- App runtime data (arr apps store a SQLite DB + config) ----
+/config/
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+logs/
+*.log
+
+# ---- Test media / FFmpeg scratch output ----
+# keep small committed fixtures under tests/fixtures/, ignore the rest
+/samples/
+/media/
+*.mkv
+*.mp4
+*.srt
+!tests/fixtures/**
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Node / frontend ----
+node_modules/
+.npm
+npm-debug.log*
+yarn-error.log*
+.pnp.*
+.vite/
+coverage/
+
+# ---- Editors / OS junk ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ---- Agents ----
+.agents/
+.claude/
+docs/
