@@ -1,6 +1,6 @@
 """Wire the webhook and a periodic library scan into the job queue (COL-22).
 
-Two triggers feed the same de-duplicating enqueue path:
+Two automatic triggers feed the same de-duplicating enqueue path:
 
 - **Real-time (webhook):** :meth:`JobScheduler.on_file_ready` is the "file
   ready" hook the arr webhook receiver (COL-14) calls once per imported/upgraded
@@ -17,6 +17,20 @@ Both funnel through :meth:`enqueue_file`, which probes the file
 :func:`~collapsarr.downmix.targets.detect_qualifying_targets` whether any target
 actually qualifies, and enqueues a real :class:`~collapsarr.jobs.queue.Job` only
 when one does -- a file with nothing to do is never enqueued.
+
+COL-23 adds two manual, on-demand entry points for a future API/UI ("Scan now"
+and "trigger this file") to call, on top of the automatic ones above:
+
+- :meth:`scan_now` -- an intention-revealing alias for :meth:`scan_once`. The
+  scan logic already runs synchronously and doesn't wait on the background
+  loop, so "run it immediately" needs no new logic, only a name a manual
+  trigger can call without reaching for the periodic-scan method directly.
+- :meth:`trigger_file` -- like :meth:`enqueue_file`, but lets the caller pass
+  ``extra_languages`` to reach languages the scheduler's
+  ``language_allow_list`` would otherwise exclude, for a one-off manual
+  override (e.g. a user forcing a downmix for a language they normally don't
+  want auto-processed) without mutating the process-wide
+  ``self._downmix_settings`` used by every other trigger.
 
 De-duplication
 --------------
@@ -62,7 +76,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -162,7 +177,13 @@ class JobScheduler:
         logger.info("webhook: enqueued job %s for %s", job.id, file.file_path)
         self._wake.set()
 
-    def enqueue_file(self, file_path: str | Path, *, session: Session | None = None) -> Job | None:
+    def enqueue_file(
+        self,
+        file_path: str | Path,
+        *,
+        session: Session | None = None,
+        settings: DownmixSettings | None = None,
+    ) -> Job | None:
         """Enqueue a downmix job for ``file_path`` unless it should be skipped.
 
         Returns the created :class:`~collapsarr.jobs.queue.Job`, or ``None`` when
@@ -171,12 +192,19 @@ class JobScheduler:
         is reused for the history-based dedup lookup; otherwise a short-lived one
         is opened.
 
+        ``settings`` overrides :attr:`_downmix_settings` for this call only --
+        used by :meth:`trigger_file` (COL-23) to pass a per-call allow-list
+        override without mutating the scheduler's own default. It defaults to
+        ``self._downmix_settings``, which is what :meth:`on_file_ready` and
+        :meth:`scan_once` implicitly use.
+
         The cheap dedup check runs first so an already-handled file isn't probed
         needlessly. It is re-checked under :attr:`_enqueue_lock` immediately
         before enqueuing so two concurrent triggers can't both enqueue the same
         file.
         """
         path = Path(file_path)
+        effective_settings = settings if settings is not None else self._downmix_settings
 
         if self._is_duplicate(path, session):
             return None
@@ -187,13 +215,61 @@ class JobScheduler:
             logger.warning("skipping %s: could not probe audio streams: %s", path, exc)
             return None
 
-        if not detect_qualifying_targets(streams, self._downmix_settings):
+        if not detect_qualifying_targets(streams, effective_settings):
             return None
 
         with self._enqueue_lock:
             if self._is_duplicate(path, session):
                 return None
-            return self._queue.enqueue(path, self._downmix_settings)
+            return self._queue.enqueue(path, effective_settings)
+
+    def trigger_file(
+        self,
+        file_path: str | Path,
+        *,
+        extra_languages: Iterable[str] | None = None,
+        session: Session | None = None,
+    ) -> Job | None:
+        """Manually trigger a downmix job for one file on demand (COL-23).
+
+        The entry point a future "trigger this file" API/UI action calls
+        (COL-29) -- unlike the automatic triggers (:meth:`on_file_ready`,
+        :meth:`scan_once`), which always enqueue against the scheduler's fixed
+        ``self._downmix_settings``, this lets the caller pass
+        ``extra_languages`` to reach languages the scheduler's
+        ``language_allow_list`` would otherwise exclude, for the
+        manual-override use case (e.g. a user wants a language downmixed just
+        this once even though it's not in the global allow-list).
+
+        ``extra_languages`` is unioned onto ``self._downmix_settings.language_allow_list``
+        for this call only:
+
+        - If that allow-list is ``None`` (no restriction -- every language is
+          already evaluated), ``extra_languages`` has no effect.
+        - If it is a concrete set, the languages named in ``extra_languages``
+          are unioned in just for this trigger; ``self._downmix_settings``
+          itself, and every other trigger, are unaffected.
+
+        Still goes through the same dedup and qualifying-target detection as
+        the automatic triggers -- the acceptance criteria ask to bypass the
+        *language allow-list* specifically, not dedup or "does this file
+        actually need downmixing". Returns the created
+        :class:`~collapsarr.jobs.queue.Job`, or ``None`` for the same reasons
+        :meth:`enqueue_file` would (duplicate, unprobeable, or still no
+        qualifying target even with the extra languages included).
+        """
+        settings = self._settings_with_extra_languages(extra_languages)
+        return self.enqueue_file(file_path, session=session, settings=settings)
+
+    def _settings_with_extra_languages(
+        self, extra_languages: Iterable[str] | None
+    ) -> DownmixSettings:
+        """``self._downmix_settings`` with ``extra_languages`` unioned onto its allow-list."""
+        allow_list = self._downmix_settings.language_allow_list
+        extra = frozenset(extra_languages) if extra_languages is not None else frozenset()
+        if not extra or allow_list is None:
+            return self._downmix_settings
+        return replace(self._downmix_settings, language_allow_list=allow_list | extra)
 
     def _is_duplicate(self, path: Path, session: Session | None) -> bool:
         """Whether ``path`` is already queued/running or was recently processed."""
@@ -225,6 +301,20 @@ class JobScheduler:
         return False
 
     # -- Periodic full-library scan -----------------------------------------
+
+    def scan_now(self) -> list[Job]:
+        """Manually trigger a full-library scan immediately (COL-23).
+
+        An intention-revealing alias for :meth:`scan_once` -- the entry point
+        a future "Scan now" API/UI action calls (COL-29). The scan already
+        runs synchronously and doesn't depend on the background loop being
+        started, so no new scan logic is needed here; this just gives the
+        manual-trigger use case its own named method rather than requiring
+        callers to know :meth:`scan_once` (the periodic loop's internal
+        entry point) doubles as the manual one. Returns the jobs enqueued by
+        this pass, same as :meth:`scan_once`.
+        """
+        return self.scan_once()
 
     def scan_once(self) -> list[Job]:
         """Scan every configured instance's monitored files and enqueue qualifying ones.

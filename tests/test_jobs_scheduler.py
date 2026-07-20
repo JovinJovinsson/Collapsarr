@@ -84,6 +84,7 @@ def _make_scheduler(
     probe: scheduler_module.ProbeFn,
     queue: JobQueue | None = None,
     now: datetime = _FIXED_NOW,
+    downmix_settings: DownmixSettings | None = None,
 ) -> JobScheduler:
     return JobScheduler(
         queue or JobQueue(pipeline_runner=_stub_runner()),
@@ -91,6 +92,7 @@ def _make_scheduler(
         settings,
         probe=probe,
         now=lambda: now,
+        downmix_settings=downmix_settings,
     )
 
 
@@ -384,6 +386,153 @@ def test_scan_once_continues_past_an_unreachable_instance(
 
     assert len(enqueued) == 1
     assert enqueued[0].file_path == Path("/tv/a.mkv")
+
+
+# ---------------------------------------------------------------------------
+# Manual on-demand triggers (COL-23).
+# ---------------------------------------------------------------------------
+
+
+# A jpn-only 5.1 stream, used to exercise the language allow-list bypass:
+# under an eng-only allow-list this language is invisible unless the trigger
+# explicitly widens it via `extra_languages`.
+_SURROUND_JPN: list[AudioStreamInfo] = [
+    AudioStreamInfo(index=0, codec="ac3", channels=6, channel_layout="5.1(side)", language="jpn")
+]
+
+
+def test_scan_now_runs_the_scan_immediately(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`scan_now` is the manual-trigger entry point -- equivalent to `scan_once`."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_now()
+
+    assert len(enqueued) == 1
+    assert enqueued[0].file_path == Path("/tv/a.mkv")
+
+
+def test_scan_now_works_standalone_without_the_background_loop(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manual scan-now must not require `start()` to ever have been called."""
+    _patch_fetch(monkeypatch, {})
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    assert scheduler.scan_now() == []  # no instances configured; must not raise
+
+
+def test_trigger_file_enqueues_like_enqueue_file_by_default(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.trigger_file("/media/movie.mkv")
+
+    assert job is not None
+    assert job.file_path == Path("/media/movie.mkv")
+
+
+def test_trigger_file_respects_dedup(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    first = scheduler.trigger_file("/media/movie.mkv")
+    second = scheduler.trigger_file("/media/movie.mkv")
+
+    assert first is not None
+    assert second is None
+    assert len(scheduler._queue.list_jobs()) == 1
+
+
+def test_trigger_file_with_extra_languages_bypasses_the_allow_list(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A jpn-only stream is invisible under an eng-only allow-list -- unless bypassed."""
+    downmix_settings = DownmixSettings(language_allow_list=frozenset({"eng"}))
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND_JPN),
+        downmix_settings=downmix_settings,
+    )
+
+    # Without the bypass, the global allow-list excludes "jpn" entirely.
+    assert scheduler.trigger_file("/media/movie.mkv") is None
+    assert scheduler._queue.list_jobs() == []
+
+    # With the bypass, "jpn" is unioned in for this one call and qualifies.
+    job = scheduler.trigger_file("/media/movie.mkv", extra_languages={"jpn"})
+
+    assert job is not None
+    assert job.settings.language_allow_list == frozenset({"eng", "jpn"})
+
+
+def test_trigger_file_extra_languages_does_not_mutate_scheduler_settings(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """The override is scoped to one call -- the automatic triggers stay unaffected."""
+    downmix_settings = DownmixSettings(language_allow_list=frozenset({"eng"}))
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND_JPN),
+        downmix_settings=downmix_settings,
+    )
+
+    job = scheduler.trigger_file("/media/movie.mkv", extra_languages={"jpn"})
+    assert job is not None
+
+    # The scheduler's own settings (used by webhook/scan triggers) is untouched.
+    assert scheduler._downmix_settings.language_allow_list == frozenset({"eng"})
+    # A fresh automatic-path enqueue of a jpn-only file is still excluded.
+    assert scheduler.enqueue_file("/media/other.mkv") is None
+
+
+def test_trigger_file_extra_languages_is_a_noop_when_allow_list_is_none(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """No allow-list already evaluates every language -- extra_languages changes nothing."""
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND_JPN),
+        downmix_settings=DownmixSettings(),  # language_allow_list=None
+    )
+
+    job = scheduler.trigger_file("/media/movie.mkv", extra_languages={"jpn"})
+
+    assert job is not None
+    assert job.settings.language_allow_list is None
+
+
+def test_trigger_file_skips_a_file_with_nothing_to_do_even_with_extra_languages(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """extra_languages only widens languages considered, not the qualifying-target gate."""
+    downmix_settings = DownmixSettings(language_allow_list=frozenset({"eng"}))
+    stereo_jpn: list[AudioStreamInfo] = [
+        AudioStreamInfo(index=0, codec="aac", channels=2, channel_layout="stereo", language="jpn")
+    ]
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(stereo_jpn),
+        downmix_settings=downmix_settings,
+    )
+
+    assert scheduler.trigger_file("/media/movie.mkv", extra_languages={"jpn"}) is None
 
 
 # ---------------------------------------------------------------------------
