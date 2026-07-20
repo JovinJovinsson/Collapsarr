@@ -1,0 +1,43 @@
+{
+  "series": {
+    "id": 1,
+    "title": "Breaking Bad",
+    "path": "/tv/Breaking Bad",
+    "tvdbId": 81189,
+    "imdbId": "tt0903747",
+    "type": "standard"
+  },
+  "episodes": [
+    {
+      "id": 102,
+      "episodeNumber": 2,
+      "seasonNumber": 1,
+      "title": "Cat's in the Bag...",
+      "airDate": "2008-01-27",
+      "airDateUtc": "2008-01-27T02:00:00Z"
+    }
+  ],
+  "episodeFile": {
+    "id": 102,
+    "relativePath": "Season 01/Breaking Bad - S01E02 - Cats in the Bag.mkv",
+    "path": "/tv/Breaking Bad/Season 01/Breaking Bad - S01E02 - Cats in the Bag.mkv",
+    "quality": "WEBDL-2160p",
+    "qualityVersion": 1,
+    "releaseGroup": "GROUP",
+    "sceneName": "Breaking.Bad.S01E02.2160p.WEB-DL.x265-GROUP",
+    "size": 4234567890,
+    "dateAdded": "2023-05-02T10:00:00Z",
+    "mediaInfo": {
+      "audioChannels": 5.1,
+      "audioCodec": "EAC3",
+      "audioLanguages": "eng",
+      "videoCodec": "x265"
+    }
+  },
+  "isUpgrade": true,
+  "downloadClient": "SABnzbd",
+  "downloadClientType": "sabnzbd",
+  "downloadId": "SABnzbd_nzo_def456",
+  "eventType": "Download",
+  "instanceName": "Sonarr"
+}

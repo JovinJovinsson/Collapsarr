@@ -1,0 +1,42 @@
+[
+  {
+    "id": 101,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "relativePath": "Season 01/Breaking Bad - S01E01 - Pilot.mkv",
+    "path": "/tv/Breaking Bad/Season 01/Breaking Bad - S01E01 - Pilot.mkv",
+    "size": 1234567890,
+    "dateAdded": "2023-01-15T10:00:00Z",
+    "sceneName": "Breaking.Bad.S01E01.Pilot.1080p.BluRay.x264-GROUP",
+    "quality": { "quality": { "id": 7, "name": "Bluray-1080p" } },
+    "mediaInfo": {
+      "audioBitrate": 384000,
+      "audioChannels": 5.1,
+      "audioCodec": "AC3",
+      "audioLanguages": "eng",
+      "audioStreamCount": 1,
+      "videoCodec": "x264",
+      "resolution": "1920x1080"
+    }
+  },
+  {
+    "id": 102,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "relativePath": "Season 01/Breaking Bad - S01E02 - Cats in the Bag.mkv",
+    "path": "/tv/Breaking Bad/Season 01/Breaking Bad - S01E02 - Cats in the Bag.mkv",
+    "size": 987654321,
+    "dateAdded": "2023-01-16T10:00:00Z",
+    "sceneName": null,
+    "quality": { "quality": { "id": 7, "name": "Bluray-1080p" } },
+    "mediaInfo": {
+      "audioBitrate": 128000,
+      "audioChannels": 2.0,
+      "audioCodec": "AAC",
+      "audioLanguages": "eng",
+      "audioStreamCount": 1,
+      "videoCodec": "x264",
+      "resolution": "1920x1080"
+    }
+  }
+]

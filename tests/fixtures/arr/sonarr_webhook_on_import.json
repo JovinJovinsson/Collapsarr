@@ -1,0 +1,43 @@
+{
+  "series": {
+    "id": 1,
+    "title": "Breaking Bad",
+    "path": "/tv/Breaking Bad",
+    "tvdbId": 81189,
+    "imdbId": "tt0903747",
+    "type": "standard"
+  },
+  "episodes": [
+    {
+      "id": 101,
+      "episodeNumber": 1,
+      "seasonNumber": 1,
+      "title": "Pilot",
+      "airDate": "2008-01-20",
+      "airDateUtc": "2008-01-20T02:00:00Z"
+    }
+  ],
+  "episodeFile": {
+    "id": 101,
+    "relativePath": "Season 01/Breaking Bad - S01E01 - Pilot.mkv",
+    "path": "/tv/Breaking Bad/Season 01/Breaking Bad - S01E01 - Pilot.mkv",
+    "quality": "Bluray-1080p",
+    "qualityVersion": 1,
+    "releaseGroup": "GROUP",
+    "sceneName": "Breaking.Bad.S01E01.Pilot.1080p.BluRay.x264-GROUP",
+    "size": 1234567890,
+    "dateAdded": "2023-01-15T10:00:00Z",
+    "mediaInfo": {
+      "audioChannels": 5.1,
+      "audioCodec": "AC3",
+      "audioLanguages": "eng",
+      "videoCodec": "x264"
+    }
+  },
+  "isUpgrade": false,
+  "downloadClient": "SABnzbd",
+  "downloadClientType": "sabnzbd",
+  "downloadId": "SABnzbd_nzo_abc123",
+  "eventType": "Download",
+  "instanceName": "Sonarr"
+}
