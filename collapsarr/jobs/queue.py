@@ -34,6 +34,7 @@ import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -63,10 +64,11 @@ class JobStatus(Enum):
 class Job:
     """One enqueued unit of work: a file plus its downmix target/language context.
 
-    ``id`` uniquely identifies the job (useful once a job-history feature,
-    COL-21, needs a stable key to persist against). ``status`` and
-    ``result``/``error`` start empty and are filled in by the queue as the
-    job runs -- never mutate them directly.
+    ``id`` uniquely identifies the job -- COL-21's job-history layer
+    (:mod:`collapsarr.jobs.history`) persists against it as ``job_id``.
+    ``status``, ``result``/``error``, and ``started_at``/``ended_at`` start
+    empty and are filled in by the queue as the job runs -- never mutate
+    them directly.
 
     ``result`` carries the pipeline's :class:`~collapsarr.downmix.pipeline.PipelineResult`
     when the pipeline ran (success, no-op, or a captured failure at any
@@ -74,6 +76,11 @@ class Job:
     the pipeline runner itself raised rather than returning a result (the
     real pipeline never does this -- see its own docstring -- but an
     injected runner in a test, or a future alternate runner, might).
+
+    ``started_at``/``ended_at`` are stamped (UTC) by :meth:`JobQueue._run_job`
+    when the job transitions to ``RUNNING`` and when it reaches a terminal
+    status, respectively -- the start/end timestamps COL-21's job history
+    persists. Both stay ``None`` for a job that has never run.
     """
 
     file_path: Path
@@ -82,6 +89,8 @@ class Job:
     status: JobStatus = JobStatus.PENDING
     result: PipelineResult | None = None
     error: BaseException | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
 
 
 class JobQueue:
@@ -196,6 +205,7 @@ class JobQueue:
         """Execute one job's pipeline run and record its outcome onto ``job``."""
         with self._lock:
             job.status = JobStatus.RUNNING
+            job.started_at = datetime.now(UTC)
 
         try:
             result = self._pipeline_runner(job.file_path, job.settings, **self._pipeline_kwargs)
@@ -203,8 +213,10 @@ class JobQueue:
             with self._lock:
                 job.error = exc
                 job.status = JobStatus.FAILED
+                job.ended_at = datetime.now(UTC)
             return
 
         with self._lock:
             job.result = result
             job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
+            job.ended_at = datetime.now(UTC)
