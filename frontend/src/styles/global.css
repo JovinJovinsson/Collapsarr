@@ -1,0 +1,272 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--c-bg);
+  color: var(--c-text);
+  font-family: var(--font-body);
+  font-size: var(--fs-base);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+p,
+ul {
+  margin: 0;
+}
+
+ul {
+  list-style: none;
+  padding: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* ---- Layout shell ---------------------------------------------------- */
+
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  min-height: 100%;
+}
+
+.app-shell__content {
+  min-width: 0;
+  padding: var(--sp-6);
+  overflow-x: auto;
+}
+
+/* ---- Sidebar --------------------------------------------------------- */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--c-sidebar);
+  border-right: 1px solid var(--c-border);
+  padding: var(--sp-4) var(--sp-3);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+
+.sidebar__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-2) var(--sp-5);
+  color: var(--c-text);
+}
+
+.sidebar__brand-mark {
+  display: inline-flex;
+  color: var(--c-accent);
+}
+
+.sidebar__brand-name {
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.sidebar__nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  flex: 1;
+}
+
+.sidebar__link {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-md);
+  color: var(--c-text-muted);
+  font-weight: 500;
+  border-left: 2px solid transparent;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+
+.sidebar__link:hover {
+  background: var(--c-surface);
+  color: var(--c-text);
+}
+
+.sidebar__link:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 1px;
+}
+
+.sidebar__link--active,
+.sidebar__link--active:hover {
+  background: var(--c-accent-tint);
+  color: var(--c-text);
+  border-left-color: var(--c-accent);
+}
+
+.sidebar__link--active .sidebar__link-icon {
+  color: var(--c-accent);
+}
+
+.sidebar__link-icon {
+  display: inline-flex;
+  color: var(--c-text-faint);
+}
+
+.sidebar__link:hover .sidebar__link-icon {
+  color: inherit;
+}
+
+.sidebar__footer {
+  padding: var(--sp-3) var(--sp-3) var(--sp-1);
+  border-top: 1px solid var(--c-border);
+  margin-top: var(--sp-3);
+}
+
+.sidebar__version {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-text-faint);
+}
+
+/* ---- Views ----------------------------------------------------------- */
+
+.view {
+  max-width: 1100px;
+}
+
+.view__header {
+  padding-bottom: var(--sp-5);
+  margin-bottom: var(--sp-5);
+  border-bottom: 1px solid var(--c-border);
+}
+
+.view__title {
+  font-size: var(--fs-xl);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.view__summary {
+  margin-top: var(--sp-2);
+  color: var(--c-text-muted);
+  font-size: var(--fs-sm);
+}
+
+/* ---- Panels / empty states ------------------------------------------ */
+
+.panel {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-lg);
+}
+
+.panel--empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  text-align: center;
+  padding: var(--sp-6);
+}
+
+.panel__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--c-accent-tint);
+  color: var(--c-accent);
+}
+
+.panel__message {
+  color: var(--c-text-muted);
+  max-width: 42ch;
+}
+
+.panel__tag {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-accent-hover);
+  background: var(--c-accent-tint);
+  border: 1px solid var(--c-accent-tint-strong);
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+}
+
+/* ---- Responsive: collapse the sidebar to a top bar on narrow screens - */
+
+@media (max-width: 640px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: static;
+    height: auto;
+    flex-direction: row;
+    align-items: center;
+    border-right: none;
+    border-bottom: 1px solid var(--c-border);
+    padding: var(--sp-2) var(--sp-3);
+    gap: var(--sp-2);
+  }
+
+  .sidebar__brand {
+    padding: var(--sp-2);
+  }
+
+  .sidebar__brand-name {
+    display: none;
+  }
+
+  .sidebar__nav {
+    flex-direction: row;
+    flex: 1;
+    overflow-x: auto;
+  }
+
+  .sidebar__link {
+    border-left: none;
+    border-bottom: 2px solid transparent;
+  }
+
+  .sidebar__link--active,
+  .sidebar__link--active:hover {
+    border-left-color: transparent;
+    border-bottom-color: var(--c-accent);
+  }
+
+  .sidebar__footer {
+    display: none;
+  }
+
+  .app-shell__content {
+    padding: var(--sp-4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+  }
+}

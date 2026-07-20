@@ -1,0 +1,57 @@
+/*
+ * Collapsarr design tokens.
+ *
+ * Dark, high-density utility palette in the Sonarr/Radarr/Bazarr tradition:
+ * near-black slate surfaces, low-chroma greys for structure, and a single
+ * purple accent (#8B5CF6) — the family colour claimed for Collapsarr in the
+ * v1 design doc. The app is dark-only by design (matching the *arr family),
+ * so there is intentionally no light theme here.
+ */
+:root {
+  /* Surfaces — from deepest (app background) to raised (cards). */
+  --c-bg: #16181d;
+  --c-sidebar: #1b1e24;
+  --c-surface: #21252c;
+  --c-surface-raised: #262b33;
+  --c-border: #2d333c;
+  --c-border-strong: #3a414c;
+
+  /* Text. */
+  --c-text: #dfe2e7;
+  --c-text-muted: #9aa1ac;
+  --c-text-faint: #6b7280;
+
+  /* Accent — Collapsarr purple. */
+  --c-accent: #8b5cf6;
+  --c-accent-hover: #a181f8;
+  --c-accent-press: #7a4ff0;
+  --c-accent-tint: rgba(139, 92, 246, 0.14);
+  --c-accent-tint-strong: rgba(139, 92, 246, 0.22);
+
+  /* Type. System stack keeps the wheel self-contained (no bundled webfonts). */
+  --font-body: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo,
+    Consolas, monospace;
+
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.8125rem;
+  --fs-base: 0.9375rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: 1.5rem;
+
+  /* Space + radius. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  --sidebar-w: 216px;
+
+  color-scheme: dark;
+}
