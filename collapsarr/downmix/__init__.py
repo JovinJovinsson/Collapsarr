@@ -8,10 +8,20 @@ and validate + atomic swap.
 from __future__ import annotations
 
 from .probe import AudioStreamInfo, FfprobeError, FfprobeNotFoundError, probe_audio_streams
+from .targets import (
+    DownmixSettings,
+    DownmixTarget,
+    QualifyingTarget,
+    detect_qualifying_targets,
+)
 
 __all__ = [
     "AudioStreamInfo",
+    "DownmixSettings",
+    "DownmixTarget",
     "FfprobeError",
     "FfprobeNotFoundError",
+    "QualifyingTarget",
+    "detect_qualifying_targets",
     "probe_audio_streams",
 ]
