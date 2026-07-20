@@ -13,6 +13,7 @@ from .apply import (
     ApplyResult,
     apply_remux_result,
 )
+from .pipeline import PipelineOutcome, PipelineResult, run_downmix_pipeline
 from .probe import (
     AudioStreamInfo,
     FfprobeError,
@@ -39,6 +40,8 @@ __all__ = [
     "FfprobeError",
     "FfprobeNotFoundError",
     "MediaSummary",
+    "PipelineOutcome",
+    "PipelineResult",
     "QualifyingTarget",
     "RemuxResult",
     "apply_remux_result",
@@ -46,5 +49,6 @@ __all__ = [
     "detect_qualifying_targets",
     "probe_audio_streams",
     "probe_media_summary",
+    "run_downmix_pipeline",
     "run_remux",
 ]
