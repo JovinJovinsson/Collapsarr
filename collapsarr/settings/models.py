@@ -25,6 +25,7 @@ only intended way to read or create that row.
 
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime
 
 from sqlalchemy import Boolean, CheckConstraint, Integer, String
@@ -35,6 +36,22 @@ from collapsarr.downmix.targets import DownmixTarget
 
 SETTINGS_ID = 1
 """The fixed primary key of the single :class:`GlobalSettings` row."""
+
+API_KEY_BYTES = 16
+"""Entropy of a generated API key. 16 bytes renders as a 32-char hex string,
+matching Sonarr/Radarr's own API-key format."""
+
+
+def generate_api_key() -> str:
+    """Return a fresh, cryptographically-random API key.
+
+    A 32-character lowercase hex string (``secrets.token_hex(16)``), matching
+    the *arr-family convention so the key is a drop-in for existing tooling.
+    Used as the column default so a key is minted automatically the first time
+    the singleton settings row is created (see
+    :func:`collapsarr.settings.service.get_global_settings`).
+    """
+    return secrets.token_hex(API_KEY_BYTES)
 
 
 def _utcnow() -> datetime:
@@ -53,6 +70,10 @@ class GlobalSettings(Base):
     ``language_allow_list`` of ``None`` (the default) means "no allow-list --
     evaluate every language present on a file", matching
     :attr:`~collapsarr.downmix.targets.DownmixSettings.language_allow_list`.
+
+    ``api_key`` is auto-generated (via :func:`generate_api_key`) the first time
+    the row is created and enforced on every ``/api`` request by
+    :func:`collapsarr.auth.api_key_middleware`.
     """
 
     __tablename__ = "global_settings"
@@ -61,6 +82,7 @@ class GlobalSettings(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=SETTINGS_ID)
+    api_key: Mapped[str] = mapped_column(String(64), nullable=False, default=generate_api_key)
     enabled_targets: Mapped[str] = mapped_column(
         String(50), nullable=False, default=DownmixTarget.STEREO.value
     )

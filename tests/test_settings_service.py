@@ -7,9 +7,13 @@ Uses the shared ``session`` fixture (a schema-initialised DB session -- see
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from collapsarr.config import Settings
+from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.settings.models import GlobalSettings
 from collapsarr.settings.service import (
@@ -17,6 +21,13 @@ from collapsarr.settings.service import (
     get_global_settings,
     update_global_settings,
 )
+
+
+def _fresh_session(settings: Settings) -> Session:
+    """Build a schema-initialised session for a standalone Settings/database."""
+    engine = create_engine_from_settings(settings)
+    init_db(engine)
+    return create_session_factory(engine)()
 
 # ---------------------------------------------------------------------------
 # Default creation on first run.
@@ -52,6 +63,35 @@ def test_get_global_settings_does_not_duplicate_the_row_across_calls(session: Se
 
     assert first.id == second.id
     assert session.scalars(select(GlobalSettings)).all() == [first]
+
+
+# ---------------------------------------------------------------------------
+# Auto-generated API key (COL-26).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_generates_an_api_key_on_first_run(session: Session) -> None:
+    settings = get_global_settings(session)
+
+    # 32-char lowercase hex, matching the *arr API-key format.
+    assert len(settings.api_key) == 32
+    assert all(char in "0123456789abcdef" for char in settings.api_key)
+
+
+def test_api_key_is_stable_across_reads(session: Session) -> None:
+    first = get_global_settings(session).api_key
+
+    assert get_global_settings(session).api_key == first
+
+
+def test_api_key_is_unique_per_database(settings: Settings, tmp_path: Path) -> None:
+    """Each fresh install mints its own key rather than a shared constant."""
+    first = get_global_settings(session=_fresh_session(settings)).api_key
+
+    other_settings = Settings(database_path=str(tmp_path / "other.db"))
+    second = get_global_settings(session=_fresh_session(other_settings)).api_key
+
+    assert first != second
 
 
 # ---------------------------------------------------------------------------

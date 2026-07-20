@@ -23,6 +23,10 @@ class InstanceNotFoundError(LookupError):
     """Raised when an operation targets an instance id that does not exist."""
 
 
+class PathMappingNotFoundError(LookupError):
+    """Raised when an operation targets a path-mapping id that does not exist."""
+
+
 def _apply_connectivity_check(
     instance: ArrInstance, *, transport: httpx.BaseTransport | None
 ) -> None:
@@ -136,3 +140,83 @@ def list_path_mappings(session: Session, instance_id: int) -> list[RemotePathMap
             .order_by(RemotePathMapping.order)
         )
     )
+
+
+def get_path_mapping(session: Session, mapping_id: int) -> RemotePathMapping | None:
+    """Return the path mapping with ``mapping_id``, or ``None`` if it doesn't exist."""
+    return session.get(RemotePathMapping, mapping_id)
+
+
+def create_path_mapping(
+    session: Session,
+    instance_id: int,
+    *,
+    remote_prefix: str,
+    local_prefix: str,
+    order: int = 0,
+) -> RemotePathMapping:
+    """Create a path mapping for an instance and return it.
+
+    Raises:
+        InstanceNotFoundError: if ``instance_id`` does not exist. Mappings are
+            meaningless without their instance, so creation is rejected rather
+            than leaving a dangling row.
+    """
+    if get_instance(session, instance_id) is None:
+        raise InstanceNotFoundError(f"No arr instance with id={instance_id}")
+
+    mapping = RemotePathMapping(
+        instance_id=instance_id,
+        remote_prefix=remote_prefix,
+        local_prefix=local_prefix,
+        order=order,
+    )
+    session.add(mapping)
+    session.commit()
+    session.refresh(mapping)
+    return mapping
+
+
+def update_path_mapping(
+    session: Session,
+    mapping_id: int,
+    *,
+    remote_prefix: str | None = None,
+    local_prefix: str | None = None,
+    order: int | None = None,
+) -> RemotePathMapping:
+    """Update the given fields on a path mapping and return it.
+
+    Only fields passed explicitly (non-``None``) are changed, matching
+    :func:`update_instance`.
+
+    Raises:
+        PathMappingNotFoundError: if ``mapping_id`` does not exist.
+    """
+    mapping = get_path_mapping(session, mapping_id)
+    if mapping is None:
+        raise PathMappingNotFoundError(f"No path mapping with id={mapping_id}")
+
+    if remote_prefix is not None:
+        mapping.remote_prefix = remote_prefix
+    if local_prefix is not None:
+        mapping.local_prefix = local_prefix
+    if order is not None:
+        mapping.order = order
+
+    session.commit()
+    session.refresh(mapping)
+    return mapping
+
+
+def delete_path_mapping(session: Session, mapping_id: int) -> None:
+    """Delete a path mapping.
+
+    Raises:
+        PathMappingNotFoundError: if ``mapping_id`` does not exist.
+    """
+    mapping = get_path_mapping(session, mapping_id)
+    if mapping is None:
+        raise PathMappingNotFoundError(f"No path mapping with id={mapping_id}")
+    session.delete(mapping)
+    session.commit()

@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from . import __version__
+from .arr.routes import router as arr_router
 from .arr.service import get_instance, list_path_mappings
 from .arr.webhooks import (
     OnFileReadyHook,
@@ -23,6 +24,7 @@ from .arr.webhooks import (
     parse_webhook_payload,
     resolve_webhook_file,
 )
+from .auth import api_key_middleware
 from .config import Settings, get_settings
 from .database import (
     create_engine_from_settings,
@@ -31,7 +33,10 @@ from .database import (
     init_db,
 )
 from .jobs.queue import JobQueue
+from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
+from .media.routes import router as wanted_router
+from .settings.routes import router as settings_router
 
 
 def create_app(
@@ -90,6 +95,19 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.on_file_ready = on_file_ready or default_on_file_ready_hook
+
+    # Enforce the auto-generated API key on every /api route (COL-26).
+    app.middleware("http")(api_key_middleware)
+
+    # Instance config & path-mapping CRUD endpoints (COL-27), under /api.
+    app.include_router(arr_router)
+
+    # Global settings GET/PUT and the wanted-list GET (COL-28), under /api.
+    app.include_router(settings_router)
+    app.include_router(wanted_router)
+
+    # Job history GET + on-demand scan/trigger POSTs (COL-29), under /api.
+    app.include_router(jobs_router)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:
