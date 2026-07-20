@@ -34,6 +34,8 @@ from .database import (
 )
 from .jobs.queue import JobQueue
 from .jobs.scheduler import JobScheduler
+from .media.routes import router as wanted_router
+from .settings.routes import router as settings_router
 
 
 def create_app(
@@ -98,6 +100,10 @@ def create_app(
 
     # Instance config & path-mapping CRUD endpoints (COL-27), under /api.
     app.include_router(arr_router)
+
+    # Global settings GET/PUT and the wanted-list GET (COL-28), under /api.
+    app.include_router(settings_router)
+    app.include_router(wanted_router)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:
