@@ -45,6 +45,17 @@ export function SettingsIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Warning: an alert triangle, used by the app-health banner (COL-38).
+export function WarningIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <path d="M12 3.5 2.5 20h19L12 3.5Z" />
+      <path d="M12 9.5v5" />
+      <circle cx="12" cy="17" r="0.75" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 // Wordmark glyph: converging channels funneling into two bars, echoing the
 // downmix concept. Placeholder mark only — final logo lands in COL-9.
 export function BrandMark(props: SVGProps<SVGSVGElement>) {
