@@ -382,6 +382,11 @@ a {
   background: var(--c-surface-raised);
 }
 
+.activity-table__status--missing {
+  color: var(--c-text-muted);
+  background: var(--c-surface-raised);
+}
+
 /* ---- Buttons ----------------------------------------------------------- */
 
 .btn {
@@ -784,6 +789,44 @@ a {
   flex-wrap: wrap;
   gap: var(--sp-2);
   align-items: center;
+}
+
+/* ---- File detail page (COL-34) ------------------------------------------- */
+
+.file-detail__back {
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+
+.file-detail__back a {
+  color: var(--c-accent-hover);
+}
+
+.file-detail__back a:hover {
+  color: var(--c-accent);
+}
+
+.file-detail__path {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  word-break: break-all;
+}
+
+.file-detail__panel {
+  padding: var(--sp-5);
+  margin-bottom: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.file-detail__panel:last-child {
+  margin-bottom: 0;
+}
+
+.file-detail__hint {
+  max-width: none;
 }
 
 /* ---- Responsive: collapse the sidebar to a top bar on narrow screens - */

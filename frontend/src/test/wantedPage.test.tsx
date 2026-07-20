@@ -1,8 +1,18 @@
 import { render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { WantedPage } from "../pages/WantedPage";
 import type { WantedFile } from "../types/wanted";
+
+/** `WantedPage` links each row to `/wanted/:fileId` (COL-34), so it needs a router. */
+function renderWantedPage() {
+  return render(
+    <MemoryRouter>
+      <WantedPage />
+    </MemoryRouter>,
+  );
+}
 
 const wantedResponse: WantedFile[] = [
   {
@@ -46,7 +56,7 @@ describe("WantedPage", () => {
 
   it("lists wanted files with title, path, and missing target(s)", async () => {
     mockFetchResolved(wantedResponse);
-    render(<WantedPage />);
+    renderWantedPage();
 
     const titleCell = await screen.findByText("Interstellar");
     const row = titleCell.closest("tr");
@@ -65,7 +75,7 @@ describe("WantedPage", () => {
 
   it("renders a sensible empty state when nothing is wanted", async () => {
     mockFetchResolved([]);
-    render(<WantedPage />);
+    renderWantedPage();
 
     expect(await screen.findByText(/nothing wanted right now/i)).toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
@@ -73,14 +83,14 @@ describe("WantedPage", () => {
 
   it("renders an error state when the request fails", async () => {
     mockFetchRejected(new Error("network down"));
-    render(<WantedPage />);
+    renderWantedPage();
 
     expect(await screen.findByText(/couldn't load the wanted list: network down/i)).toBeInTheDocument();
   });
 
   it("renders an error state on a non-ok response", async () => {
     mockFetchResolved({}, false, 500);
-    render(<WantedPage />);
+    renderWantedPage();
 
     expect(await screen.findByText(/failed to load wanted list \(500\)/i)).toBeInTheDocument();
   });

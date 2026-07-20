@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { fetchWantedList } from "../api/wanted";
 import { WantedIcon } from "../components/icons";
@@ -98,7 +99,9 @@ export function WantedPage() {
             <tbody>
               {state.files.map((file) => (
                 <tr key={file.id}>
-                  <td className="wanted-table__title">{titleFromPath(file.file_path)}</td>
+                  <td className="wanted-table__title">
+                    <Link to={`/wanted/${file.id}`}>{titleFromPath(file.file_path)}</Link>
+                  </td>
                   <td className="wanted-table__path">{file.file_path}</td>
                   <td>
                     {file.missing_targets.length === 0 ? (
