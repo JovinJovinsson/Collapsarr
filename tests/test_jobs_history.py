@@ -380,3 +380,34 @@ def test_from_settings_threads_history_recorder_through(settings: Settings) -> N
     with session_factory() as read_session:
         assert len(list_job_history(read_session)) == 1
     engine.dispose()
+
+
+def test_from_settings_with_no_history_recorder_arg_still_persists_by_default(
+    settings: Settings,
+) -> None:
+    """The production path: JobQueue.from_settings() with zero extra plumbing.
+
+    Unlike the raw JobQueue() constructor (where history_recorder stays
+    None unless given), from_settings() is the factory real callers (and
+    COL-22's future scheduler wiring) use, so it must default to a real
+    recorder -- proven here by never passing history_recorder, or touching
+    make_history_recorder/record_job_history, anywhere in this test.
+    """
+    queue = JobQueue.from_settings(settings, pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    # Read back through an independent engine/session -- proves the data
+    # actually landed in settings' database, not just in some in-memory
+    # stub, and that from_settings() built its own working session factory
+    # internally rather than silently doing nothing.
+    read_engine = create_engine_from_settings(settings)
+    with create_session_factory(read_engine)() as read_session:
+        rows = list_job_history(read_session)
+    read_engine.dispose()
+
+    assert len(rows) == 1
+    assert rows[0].job_id == str(job.id)
+    assert rows[0].file_path == "/media/movie.mkv"
+    assert rows[0].status is JobStatus.SUCCEEDED

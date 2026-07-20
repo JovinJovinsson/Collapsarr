@@ -153,16 +153,22 @@ def test_run_pending_only_runs_jobs_pending_at_call_time() -> None:
     assert all(job.status is JobStatus.SUCCEEDED for job in queue.list_jobs())
 
 
-def test_from_settings_reads_max_concurrency_from_settings() -> None:
-    settings = Settings(_env_file=None, job_max_concurrency=5)
+def test_from_settings_reads_max_concurrency_from_settings(tmp_path: Path) -> None:
+    # database_path must point somewhere writable: from_settings() defaults
+    # history_recorder to a real one (COL-21) when none is passed, which
+    # opens a real engine against it -- the bare Settings() default
+    # (/config/collapsarr.db) isn't writable outside a container.
+    settings = Settings(
+        _env_file=None, job_max_concurrency=5, database_path=str(tmp_path / "collapsarr.db")
+    )
 
     queue = JobQueue.from_settings(settings, pipeline_runner=_stub_runner(_SUCCESS))
 
     assert queue.max_concurrency == 5
 
 
-def test_from_settings_defaults_to_one() -> None:
-    settings = Settings(_env_file=None)
+def test_from_settings_defaults_to_one(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
 
     queue = JobQueue.from_settings(settings, pipeline_runner=_stub_runner(_SUCCESS))
 

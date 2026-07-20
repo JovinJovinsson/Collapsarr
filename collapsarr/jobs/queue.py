@@ -172,17 +172,60 @@ class JobQueue:
         ``settings`` defaults to the process-wide cached
         :func:`~collapsarr.config.get_settings`. Its ``job_max_concurrency``
         (default 1, env ``COLLAPSARR_JOB_MAX_CONCURRENCY``) becomes
-        ``max_concurrency``. ``history_recorder`` is passed straight through
-        (not derived from ``settings`` -- callers construct it explicitly,
-        typically via :func:`collapsarr.jobs.history.make_history_recorder`
-        bound to the app's real session factory).
+        ``max_concurrency``.
+
+        Unlike the raw :meth:`__init__` (where ``history_recorder`` defaults
+        to ``None`` -- the right default for lightweight unit construction
+        that doesn't want DB writes, e.g. COL-20's concurrency tests), this
+        factory is the production path: when ``history_recorder`` isn't
+        passed explicitly, it defaults to a *real* one -- built via
+        :func:`collapsarr.jobs.history.make_history_recorder`, bound to a
+        session factory for ``resolved``'s database (schema created via
+        :func:`~collapsarr.database.init_db` if not already present) --
+        rather than staying ``None``. This mirrors how ``pipeline_runner``
+        already defaults to the real :func:`~collapsarr.downmix.pipeline.
+        run_downmix_pipeline` in the raw ``__init__``: a bare
+        ``JobQueue.from_settings()`` call, with no extra plumbing, persists
+        history for real. Pass ``history_recorder`` explicitly (or ``None``
+        isn't obtainable here -- construct via :meth:`__init__` directly
+        instead) to opt out.
+
+        The database engine backing that default recorder is created once,
+        here, for this :class:`JobQueue` instance; it is not shared with
+        the FastAPI app's own request-scoped engine (see
+        :mod:`collapsarr.main`). For SQLite (this project's only supported
+        backend today) that's safe -- both point at the same on-disk file --
+        but it does mean calling this factory repeatedly opens a new engine
+        each time, so production code should call it once and hold onto the
+        resulting :class:`JobQueue` (e.g. on ``app.state``), the same way it
+        already holds onto one session factory.
+
+        The import of :mod:`collapsarr.jobs.history` below is deferred
+        (inside this method, not at module scope) because that module
+        imports *this* one (for :class:`Job`/:class:`JobStatus`) -- the same
+        defer-to-break-a-cycle trick :func:`collapsarr.database.init_db`
+        already uses for its own model-registration imports.
         """
         resolved = settings or get_settings()
+
+        resolved_history_recorder = history_recorder
+        if resolved_history_recorder is None:
+            from collapsarr.database import (
+                create_engine_from_settings,
+                create_session_factory,
+                init_db,
+            )
+            from collapsarr.jobs.history import make_history_recorder
+
+            engine = create_engine_from_settings(resolved)
+            init_db(engine)
+            resolved_history_recorder = make_history_recorder(create_session_factory(engine))
+
         return cls(
             max_concurrency=resolved.job_max_concurrency,
             pipeline_runner=pipeline_runner,
             pipeline_kwargs=pipeline_kwargs,
-            history_recorder=history_recorder,
+            history_recorder=resolved_history_recorder,
         )
 
     @property
