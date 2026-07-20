@@ -15,6 +15,7 @@ Environment variable             Default                     Description
 ``COLLAPSARR_HOST``              ``0.0.0.0``                 Bind address for the API server.
 ``COLLAPSARR_PORT``              ``8282``                    Bind port for the API server.
 ``COLLAPSARR_LOG_LEVEL``         ``INFO``                    Log level (passed to uvicorn).
+``COLLAPSARR_JOB_MAX_CONCURRENCY`` ``1``                      Max downmix jobs run concurrently.
 ===============================  ==========================  ==================================
 """
 
@@ -53,6 +54,14 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", description="API server bind address.")
     port: int = Field(default=8282, description="API server bind port.")
     log_level: str = Field(default="INFO", description="Log level for the server.")
+    job_max_concurrency: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Maximum number of downmix jobs the job queue (collapsarr.jobs) runs "
+            "concurrently. Read by JobQueue.from_settings()."
+        ),
+    )
 
     @property
     def sqlalchemy_url(self) -> str:
