@@ -7,10 +7,12 @@ routes together. A module-level ``app`` is provided for ASGI servers
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from sqlalchemy.orm import Session
 
@@ -32,11 +34,15 @@ from .database import (
     get_session,
     init_db,
 )
+from .health import FfmpegCheckResult, check_ffmpeg, notify_ffmpeg_missing
 from .jobs.queue import JobQueue
 from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .media.routes import router as wanted_router
+from .notify.routes import router as notifiers_router
 from .settings.routes import router as settings_router
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -44,6 +50,8 @@ def create_app(
     on_file_ready: OnFileReadyHook | None = None,
     *,
     enable_scheduler: bool = False,
+    ffmpeg_checker: Callable[[], FfmpegCheckResult] | None = None,
+    notify_transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -61,6 +69,13 @@ def create_app(
     ``on_file_ready`` always wins, so a test can inject its own hook regardless.
     The live :class:`~collapsarr.jobs.scheduler.JobScheduler` is exposed on
     ``app.state.job_scheduler`` (and its queue on ``app.state.job_queue``).
+
+    ``ffmpeg_checker`` overrides the FFmpeg startup health check (COL-38;
+    defaults to :func:`~collapsarr.health.check_ffmpeg`), letting tests
+    simulate a present/missing FFmpeg without touching the real binary.
+    ``notify_transport`` is forwarded to
+    :func:`~collapsarr.health.notify_ffmpeg_missing` (tests inject an
+    ``httpx.MockTransport``; production leaves it ``None``).
     """
     resolved_settings = settings or get_settings()
 
@@ -71,6 +86,18 @@ def create_app(
         session_factory = create_session_factory(engine)
         app.state.session_factory = session_factory
         init_db(engine)
+
+        # FFmpeg presence check (COL-38): run once at startup rather than let
+        # a missing binary surface as a cryptic mid-job failure. The result is
+        # exposed on /health as a "degraded" warning; a missing FFmpeg also
+        # fans a notification out to every enabled notifier, if configured.
+        checker = ffmpeg_checker or check_ffmpeg
+        ffmpeg_check = checker()
+        app.state.ffmpeg_check = ffmpeg_check
+        if not ffmpeg_check.available:
+            logger.error("Startup health check failed: %s", ffmpeg_check.detail)
+            with session_factory() as health_session:
+                notify_ffmpeg_missing(health_session, ffmpeg_check, transport=notify_transport)
 
         scheduler: JobScheduler | None = None
         if on_file_ready is None and enable_scheduler:
@@ -109,10 +136,30 @@ def create_app(
     # Job history GET + on-demand scan/trigger POSTs (COL-29), under /api.
     app.include_router(jobs_router)
 
+    # Notifier config GET/PUT (COL-36), under /api.
+    app.include_router(notifiers_router)
+
     @app.get("/health", tags=["system"])
-    def health() -> dict[str, str]:
-        """Liveness probe. Returns 200 with the running app version."""
-        return {"status": "ok", "version": __version__}
+    def health(request: Request) -> dict[str, object]:
+        """Liveness probe. Returns 200 with the running app version and any
+        startup health warnings (COL-38).
+
+        ``status`` is ``"ok"`` unless a startup check failed -- currently just
+        FFmpeg availability -- in which case it is ``"degraded"`` and
+        ``warnings`` carries one entry per failed check. The app still starts
+        and serves requests either way (so the UI and API stay usable), but a
+        "degraded" status is the health-page signal that downmix jobs will
+        fail until the underlying issue (e.g. installing FFmpeg) is fixed.
+        """
+        ffmpeg_check: FfmpegCheckResult = request.app.state.ffmpeg_check
+        warnings: list[dict[str, str]] = []
+        if not ffmpeg_check.available:
+            warnings.append({"code": "ffmpeg_missing", "message": ffmpeg_check.detail})
+        return {
+            "status": "ok" if not warnings else "degraded",
+            "version": __version__,
+            "warnings": warnings,
+        }
 
     @app.post("/api/webhook/arr/{instance_id}", tags=["webhooks"])
     def arr_webhook(

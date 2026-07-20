@@ -28,7 +28,10 @@ mypy
 
 # Run the server (defaults to http://0.0.0.0:8282)
 python -m collapsarr
-# then: curl http://localhost:8282/health  ->  {"status":"ok","version":"..."}
+# then: curl http://localhost:8282/health
+#   ->  {"status":"ok","version":"...","warnings":[]}
+#   (or, if FFmpeg is missing: {"status":"degraded","version":"...",
+#    "warnings":[{"code":"ffmpeg_missing","message":"..."}]})
 ```
 
 ## Configuration
