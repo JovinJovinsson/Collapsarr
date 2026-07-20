@@ -36,6 +36,7 @@ from .jobs.queue import JobQueue
 from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .media.routes import router as wanted_router
+from .notify.routes import router as notifiers_router
 from .settings.routes import router as settings_router
 
 
@@ -108,6 +109,9 @@ def create_app(
 
     # Job history GET + on-demand scan/trigger POSTs (COL-29), under /api.
     app.include_router(jobs_router)
+
+    # Notifier config GET/PUT (COL-36), under /api.
+    app.include_router(notifiers_router)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:
