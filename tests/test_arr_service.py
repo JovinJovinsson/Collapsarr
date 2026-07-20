@@ -17,11 +17,17 @@ from sqlalchemy.orm import Session
 from collapsarr.arr.models import ConnectivityStatus, InstanceType
 from collapsarr.arr.service import (
     InstanceNotFoundError,
+    PathMappingNotFoundError,
     create_instance,
+    create_path_mapping,
     delete_instance,
+    delete_path_mapping,
     get_instance,
+    get_path_mapping,
     list_instances,
+    list_path_mappings,
     update_instance,
+    update_path_mapping,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "arr"
@@ -201,3 +207,96 @@ def test_deleting_one_instance_leaves_others_untouched(session: Session) -> None
 
     remaining = list_instances(session)
     assert [i.id for i in remaining] == [keep.id]
+
+
+# --- path-mapping CRUD --------------------------------------------------------
+
+
+def _instance(session: Session) -> int:
+    instance = create_instance(
+        session,
+        name="Sonarr",
+        instance_type=InstanceType.SONARR,
+        base_url="http://sonarr.local:8989",
+        api_key="key",
+        transport=_ok_transport("4.0.1.929"),
+    )
+    return instance.id
+
+
+def test_create_path_mapping_persists_under_instance(session: Session) -> None:
+    instance_id = _instance(session)
+
+    mapping = create_path_mapping(
+        session,
+        instance_id,
+        remote_prefix="/tv",
+        local_prefix="/mnt/media/tv",
+        order=1,
+    )
+
+    assert mapping.id is not None
+    assert mapping.instance_id == instance_id
+    assert mapping.remote_prefix == "/tv"
+    assert mapping.local_prefix == "/mnt/media/tv"
+    assert mapping.order == 1
+
+
+def test_create_path_mapping_raises_for_unknown_instance(session: Session) -> None:
+    with pytest.raises(InstanceNotFoundError):
+        create_path_mapping(
+            session, 999, remote_prefix="/tv", local_prefix="/mnt/tv"
+        )
+
+
+def test_list_path_mappings_returns_in_order(session: Session) -> None:
+    instance_id = _instance(session)
+    create_path_mapping(
+        session, instance_id, remote_prefix="/b", local_prefix="/mnt/b", order=2
+    )
+    create_path_mapping(
+        session, instance_id, remote_prefix="/a", local_prefix="/mnt/a", order=1
+    )
+
+    mappings = list_path_mappings(session, instance_id)
+
+    assert [m.remote_prefix for m in mappings] == ["/a", "/b"]
+
+
+def test_get_path_mapping_returns_none_when_missing(session: Session) -> None:
+    assert get_path_mapping(session, 999) is None
+
+
+def test_update_path_mapping_changes_only_given_fields(session: Session) -> None:
+    instance_id = _instance(session)
+    mapping = create_path_mapping(
+        session, instance_id, remote_prefix="/tv", local_prefix="/mnt/tv", order=0
+    )
+
+    updated = update_path_mapping(session, mapping.id, local_prefix="/data/tv")
+
+    assert updated.id == mapping.id
+    assert updated.remote_prefix == "/tv"  # untouched
+    assert updated.local_prefix == "/data/tv"
+
+
+def test_update_path_mapping_raises_for_unknown_id(session: Session) -> None:
+    with pytest.raises(PathMappingNotFoundError):
+        update_path_mapping(session, 999, remote_prefix="/x")
+
+
+def test_delete_path_mapping_removes_it(session: Session) -> None:
+    instance_id = _instance(session)
+    mapping = create_path_mapping(
+        session, instance_id, remote_prefix="/tv", local_prefix="/mnt/tv"
+    )
+
+    delete_path_mapping(session, mapping.id)
+
+    assert get_path_mapping(session, mapping.id) is None
+    assert list_path_mappings(session, instance_id) == []
+
+
+def test_delete_path_mapping_raises_for_unknown_id(session: Session) -> None:
+    with pytest.raises(PathMappingNotFoundError):
+        delete_path_mapping(session, 999)

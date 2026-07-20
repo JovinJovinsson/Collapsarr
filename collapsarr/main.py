@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from . import __version__
+from .arr.routes import router as arr_router
 from .arr.service import get_instance, list_path_mappings
 from .arr.webhooks import (
     OnFileReadyHook,
@@ -94,6 +95,9 @@ def create_app(
 
     # Enforce the auto-generated API key on every /api route (COL-26).
     app.middleware("http")(api_key_middleware)
+
+    # Instance config & path-mapping CRUD endpoints (COL-27), under /api.
+    app.include_router(arr_router)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:
