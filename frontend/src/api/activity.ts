@@ -1,4 +1,5 @@
 import type { JobHistoryEntry } from "../types/activity";
+import { apiErrorMessage, apiFetch } from "./client";
 
 /**
  * Fetches persisted job history (`GET /api/jobs/history`, COL-29).
@@ -12,16 +13,14 @@ import type { JobHistoryEntry } from "../types/activity";
  * tests.
  *
  * Uses a relative URL -- per `frontend/README.md`, the backend eventually
- * serves this bundle from its own origin, so no base URL is needed. The
- * `/api` prefix requires the `X-Api-Key` header (COL-26); the frontend
- * doesn't have anywhere to source/store that key yet, so it isn't sent here
- * -- that lands with the Settings/Connect view (COL-33), the natural home
- * for an API-key-aware fetch client the whole app can share.
+ * serves this bundle from its own origin, so no base URL is needed. Routed
+ * through `apiFetch` (COL-33's `client.ts`) so the `X-Api-Key` header
+ * (COL-26) rides along, same as every other `/api` call.
  */
 export async function fetchJobHistory(): Promise<JobHistoryEntry[]> {
-  const response = await fetch("/api/jobs/history");
+  const response = await apiFetch("/api/jobs/history");
   if (!response.ok) {
-    throw new Error(`Failed to load job history (${response.status})`);
+    throw new Error(await apiErrorMessage(response, `Failed to load job history (${response.status})`));
   }
   return (await response.json()) as JobHistoryEntry[];
 }
