@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "collapsarr"
+version = "0.1.0"
+description = "An *arr-family companion app that adds downmixed (stereo/2.1/5.1) audio tracks to media missing them, via FFmpeg."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Jovin Jovinsson" }]
+keywords = ["arr", "sonarr", "radarr", "ffmpeg", "audio", "downmix"]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Framework :: FastAPI",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+collapsarr = "collapsarr.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/JovinJovinsson/Collapsarr"
+Repository = "https://github.com/JovinJovinsson/Collapsarr"
+
+[tool.hatch.build.targets.wheel]
+packages = ["collapsarr"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["collapsarr", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["collapsarr"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["collapsarr", "tests"]
+strict = true
+plugins = ["pydantic.mypy"]
