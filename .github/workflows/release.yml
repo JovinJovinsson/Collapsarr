@@ -1,0 +1,217 @@
+# Tag-triggered release pipeline (COL-41).
+#
+# Fires on a semver tag (v*.*.*) that lives on `main`, then:
+#   1. guard        — refuse to release a tag that is not contained in main.
+#   2. test-*       — backend (pytest/ruff/mypy) + frontend (vitest/tsc/eslint);
+#                     any failure fails the pipeline before anything is published.
+#   3. build-wheel  — build the frontend FIRST, then `python -m build` so the
+#                     wheel bundles frontend/dist -> collapsarr/static (COL-40).
+#   4. docker       — multi-arch (amd64+arm64) image build & push to Docker Hub.
+#   5. pypi-publish — publish the wheel/sdist to PyPI via OIDC Trusted Publishing.
+#   6. github-release — cut a GitHub Release with the built artifacts attached.
+#
+# Credentials come from GitHub Actions secrets / OIDC that the HITL epic (COL-9)
+# populates; this workflow only wires them up. It is intentionally reviewable and
+# dry-runnable before those secrets exist — nothing here is evaluated until a real
+# tag is pushed.
+#
+# Named secrets / tokens this workflow reads:
+#   - Docker Hub push : secrets.DOCKERHUB_USERNAME + secrets.DOCKERHUB_TOKEN
+#   - GitHub Release  : secrets.GITHUB_TOKEN (auto-provided by Actions)
+#   - PyPI push       : OIDC Trusted Publishing (no secret; requires a PyPI
+#                       "pending publisher" configured for this repo/workflow).
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: odxnsson/collapsarr
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '20'
+
+jobs:
+  # ---- Guard: enforce the "tag pushed to main" acceptance criterion -----------
+  guard:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Ensure the tagged commit is contained in main
+        run: |
+          git fetch origin main
+          if git merge-base --is-ancestor "${GITHUB_SHA}" FETCH_HEAD; then
+            echo "Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is on main — proceeding."
+          else
+            echo "::error::Tag ${GITHUB_REF_NAME} is not on main; refusing to release."
+            exit 1
+          fi
+
+  # ---- Test suite (must pass before any build/publish) ------------------------
+  test-backend:
+    name: Backend tests (pytest / ruff / mypy)
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install backend with dev extras
+        run: pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check collapsarr tests
+      - name: Mypy
+        run: mypy
+      - name: Pytest
+        run: pytest
+
+  test-frontend:
+    name: Frontend tests (vitest / tsc / eslint)
+    needs: guard
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm run test
+
+  # ---- Build the wheel + sdist ------------------------------------------------
+  # Order matters: the frontend is built FIRST so frontend/dist exists when
+  # `python -m build` runs, otherwise the wheel ships without the UI (COL-40).
+  build-wheel:
+    name: Build wheel + sdist
+    needs: [test-backend, test-frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend (produces frontend/dist)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Stamp package version from the git tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Releasing version ${VERSION}"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - name: Verify the frontend was bundled into the wheel
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          wheels = glob.glob("dist/*.whl")
+          if not wheels:
+              sys.exit("no wheel produced")
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          if not any(n.startswith("collapsarr/static/") for n in names):
+              sys.exit("frontend assets missing from wheel (collapsarr/static/ not found)")
+          print("OK: frontend bundled into", wheels[0])
+          PY
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # ---- Multi-arch Docker image build & push -----------------------------------
+  docker:
+    name: Build & push multi-arch image
+    needs: [test-backend, test-frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive image version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE_NAME }}:latest
+          provenance: false
+
+  # ---- Publish to PyPI (OIDC Trusted Publishing — no API token needed) --------
+  pypi-publish:
+    name: Publish to PyPI
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  # ---- Cut the GitHub Release -------------------------------------------------
+  github-release:
+    name: Create GitHub Release
+    needs: [build-wheel, docker, pypi-publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

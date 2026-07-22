@@ -34,6 +34,7 @@ from .database import (
     get_session,
     init_db,
 )
+from .frontend import mount_frontend
 from .health import FfmpegCheckResult, check_ffmpeg, notify_ffmpeg_missing
 from .jobs.queue import JobQueue
 from .jobs.routes import router as jobs_router
@@ -199,6 +200,11 @@ def create_app(
             hook(resolved)
 
         return {"status": "ok"}
+
+    # Serve the bundled single-page frontend (COL-40). Registered last so the
+    # catch-all SPA mount at "/" does not shadow the API/health routes above.
+    # No-op in a source checkout without a built frontend (API stays usable).
+    mount_frontend(app)
 
     return app
 
