@@ -4,27 +4,16 @@
 
 **Never get stuck without a downmix again.**
 
-<!--
-  Stub row: static "pending" badges, deliberately not pointed at real
-  endpoints yet. Swap for live dynamic badges once COL-8 (Packaging &
-  Release) ships a release.yml workflow and the DockerHub repo is live:
-    CI      -> https://github.com/JovinJovinsson/Collapsarr/actions/workflows/release.yml/badge.svg
-    Docker  -> https://img.shields.io/docker/pulls/odxnsson/collapsarr
-    Release -> https://img.shields.io/github/v/release/JovinJovinsson/Collapsarr
--->
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-8B5CF6.svg)](LICENSE)
-[![CI](https://img.shields.io/badge/CI-pending-lightgrey.svg)](https://github.com/JovinJovinsson/Collapsarr/actions)
-[![Docker](https://img.shields.io/badge/docker-pending-lightgrey.svg)](https://hub.docker.com/r/odxnsson/collapsarr)
-[![Release](https://img.shields.io/badge/release-pending-lightgrey.svg)](https://github.com/JovinJovinsson/Collapsarr/releases)
+[![CI](https://github.com/JovinJovinsson/Collapsarr/actions/workflows/release.yml/badge.svg)](https://github.com/JovinJovinsson/Collapsarr/actions/workflows/release.yml)
+[![Docker](https://img.shields.io/docker/v/odxnsson/collapsarr?label=docker)](https://hub.docker.com/r/odxnsson/collapsarr)
+[![PyPI](https://img.shields.io/pypi/v/collapsarr)](https://pypi.org/project/collapsarr/)
+[![Release](https://img.shields.io/github/v/release/JovinJovinsson/Collapsarr)](https://github.com/JovinJovinsson/Collapsarr/releases)
 
 Collapsarr is a companion application for Sonarr and Radarr. It watches your
 library for media missing a lower-channel-count audio track — a 7.1 release
 with no stereo fallback, a 5.1 file your soundbar can't decode — and adds one
 automatically via FFmpeg, without touching the track that's already there.
-
-> **Status:** core backend and Web UI are built; packaging (PyPI + Docker) is
-> in progress. Until that ships, run from source — see
-> [Development](#development) below.
 
 ## Why
 
@@ -58,11 +47,7 @@ automatically via FFmpeg, without touching the track that's already there.
 
 ## Quick start
 
-<!--
-  Drafted now, finalized once COL-8 (Packaging & Release) ships: this image
-  isn't published to Docker Hub yet, so this is the target shape, not a
-  working pull today.
--->
+**Docker (recommended):**
 
 ```yaml
 services:
@@ -85,6 +70,18 @@ container comes back automatically whenever it stops unexpectedly or the
 Docker daemon restarts (e.g. after a host reboot) — see
 [Running on startup](#running-on-startup) if you need it to survive a reboot
 on a bare-metal/PyPI install instead.
+
+**PyPI (bare-metal):**
+
+```bash
+pip install collapsarr
+collapsarr
+```
+
+Requires FFmpeg on `PATH` — see [Requirements](#requirements) below. Open
+`http://localhost:8282`; see [Configuration](#configuration) to change the
+port/bind address or database path, and
+[Running on startup](#running-on-startup) for a systemd unit.
 
 ## Requirements
 
