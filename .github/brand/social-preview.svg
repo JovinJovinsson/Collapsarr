@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <rect x="0" y="0" width="1280" height="640" fill="#18151f"/>
+
+  <!-- glyph: Outer Survivors, scaled 1.3x -->
+  <g fill="#8B5CF6">
+    <rect x="176.0" y="203" width="44.2" height="130" rx="7.8"/>
+    <rect x="257.9" y="138" width="44.2" height="195" rx="7.8"/>
+    <rect x="339.8" y="203" width="44.2" height="130" rx="7.8"/>
+    <rect x="85.0"  y="203" width="62.4" height="299" rx="13"/>
+    <rect x="412.6" y="203" width="62.4" height="299" rx="13"/>
+  </g>
+
+  <text x="560" y="240" font-family="Menlo, ui-monospace, monospace" font-size="20"
+        letter-spacing="3" fill="#8B5CF6">AUDIO DOWNMIX FOR SONARR &amp; RADARR</text>
+
+  <text x="557" y="345" font-family="Futura, Avenir Next, sans-serif" font-weight="bold"
+        font-size="104" fill="#f3f1fa">Collapsarr</text>
+
+  <text x="560" y="392" font-family="Helvetica Neue, Helvetica, sans-serif" font-size="30"
+        fill="#9791ae">Enjoy your media on any speaker setup.</text>
+</svg>
