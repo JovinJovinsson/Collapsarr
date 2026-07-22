@@ -44,17 +44,25 @@ Repository = "https://github.com/JovinJovinsson/Collapsarr"
 # package data under collapsarr/static and served by FastAPI at runtime
 # (COL-40, Bazarr's approach). `python -m build` does NOT run `npm run build`;
 # the frontend must be built first (Dockerfile stage 1 / the release pipeline
-# in COL-41 do this before invoking the wheel build). `artifacts` overrides the
-# .gitignore exclusion of frontend/dist so it is picked up in both the sdist
-# and the wheel; `force-include` remaps it into the installed package.
+# in COL-41 do this before invoking the wheel build).
+#
+# `artifacts` overrides the .gitignore exclusion of frontend/dist so the
+# sdist picks it up naturally (its file selection isn't restricted to
+# `packages`, unlike the wheel). The wheel instead bundles it via the
+# hatch_build.py hook, scoped to the wheel target only: hatchling reserves
+# any path passed to `force_include`, which — if this hook applied
+# globally — would silently prune frontend/dist out of the sdist's natural
+# inclusion without actually force-including it there either. Scoping to
+# wheel also means `pip install -e` (which never touches the wheel's
+# "standard" version) doesn't require frontend/dist to exist.
 [tool.hatch.build]
-artifacts = ["frontend/dist"]
+artifacts = ["frontend/dist/**"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["collapsarr"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"frontend/dist" = "collapsarr/static"
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

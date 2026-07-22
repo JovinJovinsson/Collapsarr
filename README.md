@@ -80,7 +80,11 @@ services:
     restart: unless-stopped
 ```
 
-Then open `http://localhost:8282`.
+Then open `http://localhost:8282`. `restart: unless-stopped` above means the
+container comes back automatically whenever it stops unexpectedly or the
+Docker daemon restarts (e.g. after a host reboot) — see
+[Running on startup](#running-on-startup) if you need it to survive a reboot
+on a bare-metal/PyPI install instead.
 
 ## Requirements
 
@@ -132,6 +136,52 @@ directory. See [`.env.example`](.env.example).
 | `COLLAPSARR_HOST` | `0.0.0.0` | API server bind address. |
 | `COLLAPSARR_PORT` | `8282` | API server bind port. |
 | `COLLAPSARR_LOG_LEVEL` | `INFO` | Log level. |
+
+## Running on startup
+
+**Docker:** the `restart: unless-stopped` line in the [Quick start](#quick-start)
+compose file already handles this — Docker restarts the container whenever it
+stops unexpectedly or the Docker daemon itself restarts. On Linux this
+happens automatically on boot, since `dockerd` runs as a systemd service
+enabled by default (`systemctl is-enabled docker` to confirm). On
+Docker Desktop (macOS/Windows), enable **Settings → General → Start Docker
+Desktop when you log in** so the daemon — and in turn the container — comes
+up after a reboot.
+
+**Bare-metal / PyPI install:** run Collapsarr as a systemd service so it
+starts on boot and restarts if it crashes. Create
+`/etc/systemd/system/collapsarr.service`:
+
+```ini
+[Unit]
+Description=Collapsarr
+After=network.target
+
+[Service]
+Type=simple
+User=collapsarr
+Group=collapsarr
+WorkingDirectory=/opt/collapsarr
+EnvironmentFile=/opt/collapsarr/.env
+ExecStart=/opt/collapsarr/.venv/bin/collapsarr
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Adjust `User`/`Group`, `WorkingDirectory`, and the `.venv` path to match
+where you installed it; `EnvironmentFile` should point at an `.env`
+containing the `COLLAPSARR_*` variables from [Configuration](#configuration)
+(see [`.env.example`](.env.example)). Then enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now collapsarr
+```
+
+Check status/logs with `systemctl status collapsarr` and `journalctl -u collapsarr -f`.
 
 ## Docs
 
