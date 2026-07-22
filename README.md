@@ -1,18 +1,103 @@
+<img src="frontend/public/favicon.svg" width="72" align="right" alt="Collapsarr logo" />
+
 # Collapsarr
 
-An *arr family app to collapse audio channels into simpler configurations.
+**Never get stuck without a downmix again.**
 
-Collapsarr detects monitored media files that are missing a lower-channel-count
-audio track (e.g. a stereo downmix of a 5.1/7.1 source) and adds one via FFmpeg,
-without ever touching or replacing the original track.
+<!--
+  Stub row: static "pending" badges, deliberately not pointed at real
+  endpoints yet. Swap for live dynamic badges once COL-8 (Packaging &
+  Release) ships a release.yml workflow and the DockerHub repo is live:
+    CI      -> https://github.com/JovinJovinsson/Collapsarr/actions/workflows/release.yml/badge.svg
+    Docker  -> https://img.shields.io/docker/pulls/odxnsson/collapsarr
+    Release -> https://img.shields.io/github/v/release/JovinJovinsson/Collapsarr
+-->
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-8B5CF6.svg)](LICENSE)
+[![CI](https://img.shields.io/badge/CI-pending-lightgrey.svg)](https://github.com/JovinJovinsson/Collapsarr/actions)
+[![Docker](https://img.shields.io/badge/docker-pending-lightgrey.svg)](https://hub.docker.com/r/odxnsson/collapsarr)
+[![Release](https://img.shields.io/badge/release-pending-lightgrey.svg)](https://github.com/JovinJovinsson/Collapsarr/releases)
 
-> Status: early development. This repository currently contains the backend
-> skeleton (FastAPI app, SQLite persistence layer, configuration, tests).
+Collapsarr is a companion application for Sonarr and Radarr. It watches your
+library for media missing a lower-channel-count audio track — a 7.1 release
+with no stereo fallback, a 5.1 file your soundbar can't decode — and adds one
+automatically via FFmpeg, without touching the track that's already there.
+
+> **Status:** core backend and Web UI are built; packaging (PyPI + Docker) is
+> in progress. Until that ships, run from source — see
+> [Development](#development) below.
+
+## Why
+
+- **No upmixing, ever.** Collapsarr only adds tracks the source can actually
+  support (a stereo/2.1/5.1 downmix from a higher channel count) — it will
+  never fake a 5.1 track out of a stereo source.
+- **Originals are never at risk.** The remux writes to a temp file, validates
+  duration and stream count, then atomically swaps it in. Any failure at any
+  stage leaves the original file completely untouched — no partial writes, no
+  orphaned backups.
+- **Fits into the \*arr stack you already run.** Sonarr/Radarr integration
+  (webhooks + periodic scan), a dark UI in the same style as the rest of the
+  family, and a REST API following the same conventions.
+
+## Features
+
+- Sonarr and Radarr integration — instance config, connectivity check, remote
+  path mapping, multiple concurrent instances
+- Per-target, per-language detection that stacks additional targets without
+  duplicating what's already there
+- FFmpeg remux: stream-copies existing tracks, encodes new audio (AAC for
+  Stereo, AC3 @ 448kbps for 2.1/5.1)
+- Job queue with configurable concurrency — triggered by webhook, periodic
+  full-library scan, on-demand scan, or manual per-file trigger
+- Full job history: status, timestamps, FFmpeg exit code, error text
+- Web UI in the same dark theme as Sonarr/Radarr/Bazarr — Wanted view,
+  Activity/History, per-file detail view with a manual trigger
+- Webhook + Discord notifications on job failure or app health issues (e.g.
+  FFmpeg missing)
+- REST API with \*arr-convention auth (API key)
+
+## Quick start
+
+<!--
+  Drafted now, finalized once COL-8 (Packaging & Release) ships: this image
+  isn't published to Docker Hub yet, so this is the target shape, not a
+  working pull today.
+-->
+
+```yaml
+services:
+  collapsarr:
+    image: odxnsson/collapsarr:latest
+    container_name: collapsarr
+    ports:
+      - "8282:8282"
+    volumes:
+      - ./config:/config
+      - /path/to/media:/media
+    environment:
+      - PUID=1000
+      - PGID=1000
+    restart: unless-stopped
+```
+
+Then open `http://localhost:8282`.
 
 ## Requirements
 
 - Python 3.12+
-- FFmpeg (external system dependency, checked at startup — not bundled)
+- FFmpeg — external system dependency, checked at startup and reported on the
+  health page if missing. Bundled in the Docker image; install it yourself
+  for a bare-metal/PyPI setup:
+
+  | OS | Command |
+  | --- | --- |
+  | Debian / Ubuntu | `sudo apt install ffmpeg` |
+  | Fedora | `sudo dnf install ffmpeg` |
+  | Arch | `sudo pacman -S ffmpeg` |
+  | macOS (Homebrew) | `brew install ffmpeg` |
+  | Windows (winget) | `winget install ffmpeg` |
+
+  Verify with `ffmpeg -version`. Official builds/source: [ffmpeg.org/download.html](https://ffmpeg.org/download.html).
 
 ## Development
 
@@ -47,6 +132,10 @@ directory. See [`.env.example`](.env.example).
 | `COLLAPSARR_HOST` | `0.0.0.0` | API server bind address. |
 | `COLLAPSARR_PORT` | `8282` | API server bind port. |
 | `COLLAPSARR_LOG_LEVEL` | `INFO` | Log level. |
+
+## Docs
+
+Fuller docs live on the [GitHub Wiki](https://github.com/JovinJovinsson/Collapsarr/wiki).
 
 ## License
 
