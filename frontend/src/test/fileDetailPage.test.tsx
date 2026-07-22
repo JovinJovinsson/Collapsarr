@@ -126,7 +126,7 @@ describe("FileDetailPage", () => {
     expect(within(missingRow).getByText("Missing")).toBeInTheDocument();
     expect(within(missingRow).getByText("en")).toBeInTheDocument();
 
-    const succeededRow = screen.getByText("Stereo").closest("tr") as HTMLElement;
+    const succeededRow = (await screen.findByText("Stereo")).closest("tr") as HTMLElement;
     expect(within(succeededRow).getByText("Succeeded")).toBeInTheDocument();
 
     expect(screen.getByText(/global language allow-list/i)).toBeInTheDocument();
