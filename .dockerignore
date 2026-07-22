@@ -1,0 +1,56 @@
+# Keep the build context small and reproducible. The frontend bundle and Python
+# wheel are rebuilt inside the image, so host-built artifacts are excluded.
+
+# VCS / tooling
+.git
+.gitignore
+.gitattributes
+.github
+.claude
+.agents
+
+# Python caches & local envs
+**/__pycache__
+*.py[cod]
+*.egg-info
+.venv
+venv
+env
+build
+dist
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Node / frontend (deps + host build output rebuilt in-image)
+node_modules
+frontend/node_modules
+frontend/dist
+
+# Runtime data & secrets
+.env
+.env.*
+!.env.example
+/config
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+logs
+*.log
+
+# Test media / scratch
+/samples
+/media
+
+# Docs & editor/OS junk
+docs
+*.md
+!README.md
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db

@@ -40,8 +40,21 @@ collapsarr = "collapsarr.__main__:main"
 Homepage = "https://github.com/JovinJovinsson/Collapsarr"
 Repository = "https://github.com/JovinJovinsson/Collapsarr"
 
+# The built Vite/React frontend (frontend/dist) is bundled into the wheel as
+# package data under collapsarr/static and served by FastAPI at runtime
+# (COL-40, Bazarr's approach). `python -m build` does NOT run `npm run build`;
+# the frontend must be built first (Dockerfile stage 1 / the release pipeline
+# in COL-41 do this before invoking the wheel build). `artifacts` overrides the
+# .gitignore exclusion of frontend/dist so it is picked up in both the sdist
+# and the wheel; `force-include` remaps it into the installed package.
+[tool.hatch.build]
+artifacts = ["frontend/dist"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["collapsarr"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"frontend/dist" = "collapsarr/static"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
