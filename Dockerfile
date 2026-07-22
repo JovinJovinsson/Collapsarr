@@ -2,9 +2,10 @@
 #
 # Multi-stage, multi-arch (linux/amd64 + linux/arm64) build:
 #   1. `frontend`  — Node stage that builds the Vite/React UI into /frontend/dist.
-#   2. `builder`   — Python stage that builds the collapsarr wheel via hatchling.
-#   3. final       — python:3.12-slim + FFmpeg that installs the wheel, drops in
-#                    the built UI assets, and runs as a PUID/PGID-adjustable user
+#   2. `builder`   — Python stage that builds the collapsarr wheel via hatchling,
+#                    bundling the frontend stage's output into it (COL-40).
+#   3. final       — python:3.12-slim + FFmpeg that installs the wheel (UI
+#                    included) and runs as a PUID/PGID-adjustable user
 #                    (linuxserver.io convention).
 #
 # Build for one arch locally:
@@ -30,8 +31,12 @@ WORKDIR /build
 RUN pip install --no-cache-dir build
 
 # pyproject reads README.md (readme) and LICENSE (license-files) at build time.
-COPY pyproject.toml README.md LICENSE ./
+# hatch_build.py is the custom build hook that bundles frontend/dist into the
+# wheel as collapsarr/static (COL-40) — it requires frontend/dist to exist,
+# hence copying the frontend stage's output in before building.
+COPY pyproject.toml README.md LICENSE hatch_build.py ./
 COPY collapsarr/ ./collapsarr/
+COPY --from=frontend /frontend/dist ./frontend/dist
 
 RUN python -m build --wheel --outdir /dist
 
@@ -50,13 +55,11 @@ RUN apt-get update \
 RUN groupadd -g 1000 abc \
     && useradd -o -m -u 1000 -g abc -d /config -s /usr/sbin/nologin abc
 
-# Install the app from the wheel built in the previous stage.
+# Install the app from the wheel built in the previous stage. The wheel already
+# bundles the built UI as collapsarr/static (COL-40) and FastAPI serves it
+# directly from there — no separate copy of the frontend build needed here.
 COPY --from=builder /dist/*.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl && rm -rf /tmp/*.whl
-
-# Ship the built UI assets. FastAPI does not serve these yet — COL-40 bundles them
-# into the wheel proper — but they are placed here so the image is UI-complete.
-COPY --from=frontend /frontend/dist /app/frontend/dist
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
