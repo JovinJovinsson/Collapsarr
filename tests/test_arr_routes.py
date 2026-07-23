@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from collapsarr.arr.models import ArrInstance, InstanceType, RemotePathMapping
-from collapsarr.settings.service import get_global_settings
+from collapsarr.settings.service import get_global_settings, update_global_settings
 
 # Nothing listens here, so the service's connectivity check fails immediately
 # rather than blocking on a DNS/connect timeout.
@@ -278,6 +278,7 @@ def _seed_ids(session: Session) -> tuple[int, int]:
 
 def test_every_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     instance_id, mapping_id = _seed_ids(session)
+    update_global_settings(session, ui_auth_enabled=True)
 
     base = "/api/instances"
     requests = [

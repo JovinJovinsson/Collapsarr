@@ -28,7 +28,7 @@ from collapsarr.jobs.models import JobHistory
 from collapsarr.jobs.queue import Job, JobStatus
 from collapsarr.jobs.routes import get_job_scheduler
 from collapsarr.main import create_app
-from collapsarr.settings.service import get_global_settings
+from collapsarr.settings.service import get_global_settings, update_global_settings
 
 
 def _auth_headers(client: TestClient) -> dict[str, str]:
@@ -289,14 +289,17 @@ def test_trigger_rejects_unknown_body_fields(client: TestClient) -> None:
 # --- auth-required behaviour --------------------------------------------------
 
 
-def test_history_endpoint_requires_the_api_key(client: TestClient) -> None:
+def test_history_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
     assert client.get("/api/jobs/history").status_code == 401
 
 
-def test_scan_endpoint_requires_the_api_key(client: TestClient) -> None:
+def test_scan_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
     assert client.post("/api/jobs/scan").status_code == 401
 
 
-def test_trigger_endpoint_requires_the_api_key(client: TestClient) -> None:
+def test_trigger_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
     response = client.post("/api/jobs/trigger", json={"file_path": "/media/movie.mkv"})
     assert response.status_code == 401

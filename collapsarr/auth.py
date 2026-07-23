@@ -1,6 +1,7 @@
 """API-key authentication for the HTTP API (COL-26).
 
-Every request under the ``/api`` prefix must present the instance's
+When :attr:`~collapsarr.settings.models.GlobalSettings.ui_auth_enabled` is on,
+every request under the ``/api`` prefix must present the instance's
 auto-generated API key, matching the Sonarr/Radarr convention: the
 ``X-Api-Key`` request header (or, as a fallback for callers that can only set a
 query string -- e.g. a Sonarr/Radarr webhook URL -- an ``apikey`` query
@@ -9,6 +10,11 @@ parameter). The key itself lives on the persisted
 run (see :func:`collapsarr.settings.models.generate_api_key`), so it is
 retrievable and rotatable through the same Settings surface as every other
 setting.
+
+``ui_auth_enabled`` defaults to ``False``: a fresh install has no way to learn
+its auto-generated key without an already-authenticated request, so
+enforcement is opt-in. Flip it on once the key has been copied out of
+Settings.
 
 Non-``/api`` routes (the ``/health`` liveness probe and the interactive API
 docs) are intentionally left open -- ``/health`` is an unauthenticated probe by
@@ -60,18 +66,25 @@ async def api_key_middleware(
 ) -> Response:
     """Reject ``/api`` requests lacking a valid API key with ``401``.
 
-    Non-API routes pass straight through. For API routes the expected key is
-    read from the singleton settings row (created on demand, so the very first
-    request already has a key to check against) and compared to the presented
-    one in constant time; a missing or mismatched key yields a ``401`` before
-    the route handler ever runs.
+    Enforcement is gated on :attr:`~collapsarr.settings.models.GlobalSettings.ui_auth_enabled`
+    (default ``False``), so a fresh install -- which has no way to learn its
+    auto-generated key without first calling ``/api`` -- works out of the box:
+    every route, including ``GET /api/settings`` where the key is displayed, is
+    open until the user opts into requiring it. Non-API routes always pass
+    straight through. When enabled, the expected key is read from the
+    singleton settings row and compared to the presented one in constant time;
+    a missing or mismatched key yields a ``401`` before the route handler ever
+    runs.
     """
     if not _requires_api_key(request.url.path):
         return await call_next(request)
 
     session_factory: sessionmaker[Session] = request.app.state.session_factory
     with session_factory() as session:
-        expected: str = get_global_settings(session).api_key
+        global_settings = get_global_settings(session)
+        if not global_settings.ui_auth_enabled:
+            return await call_next(request)
+        expected: str = global_settings.api_key
 
     provided = _extract_key(request)
     if provided is None or not secrets.compare_digest(provided, expected):

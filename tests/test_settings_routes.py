@@ -11,8 +11,9 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
-from collapsarr.settings.service import get_global_settings
+from collapsarr.settings.service import get_global_settings, update_global_settings
 
 
 def _auth_headers(client: TestClient) -> dict[str, str]:
@@ -122,7 +123,9 @@ def test_put_settings_rejects_unknown_target(client: TestClient) -> None:
 # --- auth-required behaviour ---------------------------------------------------
 
 
-def test_settings_endpoints_require_the_api_key(client: TestClient) -> None:
+def test_settings_endpoints_require_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+
     for method in ("get", "put"):
         response = client.request(method, "/api/settings", json={})
         assert response.status_code == 401, f"{method.upper()} /api/settings was not gated"
