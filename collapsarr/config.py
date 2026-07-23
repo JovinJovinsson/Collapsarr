@@ -1,30 +1,41 @@
 """Application configuration.
 
 All settings load from environment variables (prefix ``COLLAPSARR_``) with the
-documented defaults below, so a bare ``docker run`` or ``pip install`` works
+documented defaults below, so a bare ``docker run`` or ``pipx install`` works
 without any configuration. An optional ``.env`` file in the working directory is
 also read (see ``.env.example``).
 
 Documented environment variables and their defaults:
 
-===============================  ==========================  ==================================
-Environment variable             Default                     Description
-===============================  ==========================  ==================================
-``COLLAPSARR_DATABASE_PATH``     ``/config/collapsarr.db``   Filesystem path to the SQLite DB.
-``COLLAPSARR_DATABASE_URL``      *(derived from path)*       Full SQLAlchemy URL override.
-``COLLAPSARR_HOST``              ``0.0.0.0``                 Bind address for the API server.
-``COLLAPSARR_PORT``              ``8282``                    Bind port for the API server.
-``COLLAPSARR_LOG_LEVEL``         ``INFO``                    Log level (passed to uvicorn).
-``COLLAPSARR_JOB_MAX_CONCURRENCY`` ``1``                      Max downmix jobs run concurrently.
-``COLLAPSARR_SCAN_INTERVAL_HOURS`` ``6.0``                    Hours between periodic library scans.
-===============================  ==========================  ==================================
+==================================  =========================  =======================
+Environment variable                Default                    Description
+==================================  =========================  =======================
+``COLLAPSARR_DATA_DIR``              *(OS user-data dir)*       App data root (DB now, logs later).
+``COLLAPSARR_DATABASE_PATH``         *(derived from data dir)*  SQLite DB file path.
+``COLLAPSARR_DATABASE_URL``          *(derived from path)*      Full SQLAlchemy URL override.
+``COLLAPSARR_HOST``                  ``0.0.0.0``                API server bind address.
+``COLLAPSARR_PORT``                  ``8282``                   API server bind port.
+``COLLAPSARR_LOG_LEVEL``             ``INFO``                   Log level (passed to uvicorn).
+``COLLAPSARR_JOB_MAX_CONCURRENCY``   ``1``                      Max concurrent downmix jobs.
+``COLLAPSARR_SCAN_INTERVAL_HOURS``   ``6.0``                    Hours between periodic scans.
+==================================  =========================  =======================
+
+``data_dir`` defaults to ``platformdirs.user_data_dir("collapsarr")`` — e.g.
+``~/.local/share/collapsarr`` on Linux, native per-OS locations elsewhere —
+so a bare-metal/PyPI install has a writable location with no configuration.
+The Docker image continues to set
+``COLLAPSARR_DATABASE_PATH=/config/collapsarr.db`` explicitly (see
+``Dockerfile``), which — being a higher-precedence override — is unaffected
+by this default.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
-from pydantic import Field
+import platformdirs as platformdirs
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,9 +54,22 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    data_dir: str = Field(
+        default_factory=lambda: platformdirs.user_data_dir("collapsarr"),
+        description=(
+            "Root directory for application data. The SQLite database lives "
+            "here by default (and, later, logs/backups). Created on startup "
+            "if missing. Defaults to the OS-appropriate per-user data "
+            "directory (e.g. ~/.local/share/collapsarr on Linux)."
+        ),
+    )
     database_path: str = Field(
-        default="/config/collapsarr.db",
-        description="Filesystem path to the SQLite database file.",
+        default="",
+        description=(
+            "Filesystem path to the SQLite database file. Empty (the "
+            "default) resolves to <data_dir>/collapsarr.db; set explicitly "
+            "to override, taking precedence over data_dir."
+        ),
     )
     database_url: str | None = Field(
         default=None,
@@ -76,6 +100,18 @@ class Settings(BaseSettings):
             "double-enqueue it."
         ),
     )
+
+    @model_validator(mode="after")
+    def _derive_database_path(self) -> Settings:
+        """Resolve an unset ``database_path`` to ``<data_dir>/collapsarr.db``.
+
+        Runs after field validation, so an explicit ``COLLAPSARR_DATABASE_PATH``
+        (or a ``database_path`` kwarg) has already populated the field and is
+        left untouched — only the empty default is derived from ``data_dir``.
+        """
+        if not self.database_path:
+            self.database_path = str(Path(self.data_dir).expanduser() / "collapsarr.db")
+        return self
 
     @property
     def sqlalchemy_url(self) -> str:

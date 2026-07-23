@@ -30,12 +30,18 @@ class Base(DeclarativeBase):
 def create_engine_from_settings(settings: Settings) -> Engine:
     """Create a SQLAlchemy :class:`Engine` from application settings.
 
-    For file-based SQLite URLs the parent directory is created if missing (the
-    ``/config`` volume in the Docker image), and ``check_same_thread`` is
-    disabled so the connection can be shared across FastAPI's worker threads.
+    The ``data_dir`` root is created if missing (the platform user-data
+    directory on a bare-metal install, or the ``/config`` volume in the
+    Docker image) so the app boots with zero configuration. For file-based
+    SQLite URLs the database's own parent directory is also created if
+    missing (relevant when ``database_path`` points outside ``data_dir``),
+    and ``check_same_thread`` is disabled so the connection can be shared
+    across FastAPI's worker threads.
     """
     url = settings.sqlalchemy_url
     connect_args: dict[str, object] = {}
+
+    Path(settings.data_dir).expanduser().mkdir(parents=True, exist_ok=True)
 
     if url.startswith("sqlite"):
         connect_args["check_same_thread"] = False

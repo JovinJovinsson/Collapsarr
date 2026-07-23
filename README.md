@@ -74,18 +74,19 @@ on a bare-metal/PyPI install instead.
 **PyPI (bare-metal):**
 
 ```bash
-pip install collapsarr
-COLLAPSARR_DATABASE_PATH=~/.local/share/collapsarr/collapsarr.db collapsarr
+pipx install collapsarr
+collapsarr
 ```
 
-The default database path (`/config/collapsarr.db`) assumes the Docker
-image's mounted `/config` volume — on a bare-metal install `/config` usually
-doesn't exist or isn't writable, so **set `COLLAPSARR_DATABASE_PATH` to a
-location your user owns**, as above (the parent directory is created for
-you). Requires FFmpeg on `PATH` — see [Requirements](#requirements) below.
-Open `http://localhost:8282`; see [Configuration](#configuration) for the
-full list of environment variables, and
-[Running on startup](#running-on-startup) for a systemd unit.
+No flags, no config file needed — Collapsarr stores its SQLite database
+under your platform's standard per-user data directory by default (e.g.
+`~/.local/share/collapsarr/collapsarr.db` on Linux; native per-OS locations
+on macOS/Windows), creating it automatically if it doesn't exist. Set
+`COLLAPSARR_DATA_DIR` if you'd rather it live somewhere else — see
+[Configuration](#configuration). Requires FFmpeg on `PATH` — see
+[Requirements](#requirements) below. Open `http://localhost:8282`; see
+[Configuration](#configuration) for the full list of environment variables,
+and [Running on startup](#running-on-startup) for a systemd unit.
 
 ## Requirements
 
@@ -132,8 +133,9 @@ directory. See [`.env.example`](.env.example).
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `COLLAPSARR_DATABASE_PATH` | `/config/collapsarr.db` | SQLite database file path. Override this on bare-metal installs — the default assumes Docker's `/config` volume. |
-| `COLLAPSARR_DATABASE_URL` | *(derived from path)* | Full SQLAlchemy URL override. |
+| `COLLAPSARR_DATA_DIR` | *(OS user-data dir)* | Root directory for application data — the SQLite database today, logs/backups later. Defaults to `platformdirs.user_data_dir("collapsarr")` (e.g. `~/.local/share/collapsarr` on Linux). Created automatically if missing. The Docker image sets `COLLAPSARR_DATABASE_PATH` directly instead (see below), pointing at its `/config` volume. |
+| `COLLAPSARR_DATABASE_PATH` | *(derived from `COLLAPSARR_DATA_DIR`)* | SQLite database file path. Set this to override the location directly, independent of `COLLAPSARR_DATA_DIR`. |
+| `COLLAPSARR_DATABASE_URL` | *(derived from path)* | Full SQLAlchemy URL override — takes precedence over both of the above. |
 | `COLLAPSARR_HOST` | `0.0.0.0` | API server bind address. |
 | `COLLAPSARR_PORT` | `8282` | API server bind port. |
 | `COLLAPSARR_LOG_LEVEL` | `INFO` | Log level. |
