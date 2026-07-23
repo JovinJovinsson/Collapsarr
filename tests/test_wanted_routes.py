@@ -121,6 +121,8 @@ def test_wanted_excludes_fully_processed_files(
 # --- auth-required behaviour ---------------------------------------------------
 
 
-def test_wanted_endpoint_requires_the_api_key(client: TestClient) -> None:
+def test_wanted_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+
     response = client.get("/api/wanted")
     assert response.status_code == 401
