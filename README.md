@@ -75,12 +75,16 @@ on a bare-metal/PyPI install instead.
 
 ```bash
 pip install collapsarr
-collapsarr
+COLLAPSARR_DATABASE_PATH=~/.local/share/collapsarr/collapsarr.db collapsarr
 ```
 
-Requires FFmpeg on `PATH` — see [Requirements](#requirements) below. Open
-`http://localhost:8282`; see [Configuration](#configuration) to change the
-port/bind address or database path, and
+The default database path (`/config/collapsarr.db`) assumes the Docker
+image's mounted `/config` volume — on a bare-metal install `/config` usually
+doesn't exist or isn't writable, so **set `COLLAPSARR_DATABASE_PATH` to a
+location your user owns**, as above (the parent directory is created for
+you). Requires FFmpeg on `PATH` — see [Requirements](#requirements) below.
+Open `http://localhost:8282`; see [Configuration](#configuration) for the
+full list of environment variables, and
 [Running on startup](#running-on-startup) for a systemd unit.
 
 ## Requirements
@@ -128,7 +132,7 @@ directory. See [`.env.example`](.env.example).
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `COLLAPSARR_DATABASE_PATH` | `/config/collapsarr.db` | SQLite database file path. |
+| `COLLAPSARR_DATABASE_PATH` | `/config/collapsarr.db` | SQLite database file path. Override this on bare-metal installs — the default assumes Docker's `/config` volume. |
 | `COLLAPSARR_DATABASE_URL` | *(derived from path)* | Full SQLAlchemy URL override. |
 | `COLLAPSARR_HOST` | `0.0.0.0` | API server bind address. |
 | `COLLAPSARR_PORT` | `8282` | API server bind port. |
