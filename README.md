@@ -133,7 +133,7 @@ directory. See [`.env.example`](.env.example).
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `COLLAPSARR_DATA_DIR` | *(OS user-data dir)* | Root directory for application data — the SQLite database today, logs/backups later. Defaults to `platformdirs.user_data_dir("collapsarr")` (e.g. `~/.local/share/collapsarr` on Linux). Created automatically if missing. The Docker image sets `COLLAPSARR_DATABASE_PATH` directly instead (see below), pointing at its `/config` volume. |
+| `COLLAPSARR_DATA_DIR` | *(OS user-data dir)* | Root directory for application data — the SQLite database today, logs/backups later. Defaults to `platformdirs.user_data_dir("collapsarr")` (e.g. `~/.local/share/collapsarr` on Linux). Created automatically if missing. The Docker image sets this to `/config` (its mounted volume) — see [Quick start](#quick-start). |
 | `COLLAPSARR_DATABASE_PATH` | *(derived from `COLLAPSARR_DATA_DIR`)* | SQLite database file path. Set this to override the location directly, independent of `COLLAPSARR_DATA_DIR`. |
 | `COLLAPSARR_DATABASE_URL` | *(derived from path)* | Full SQLAlchemy URL override — takes precedence over both of the above. |
 | `COLLAPSARR_HOST` | `0.0.0.0` | API server bind address. |

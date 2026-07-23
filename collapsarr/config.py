@@ -23,10 +23,11 @@ Environment variable                Default                    Description
 ``data_dir`` defaults to ``platformdirs.user_data_dir("collapsarr")`` — e.g.
 ``~/.local/share/collapsarr`` on Linux, native per-OS locations elsewhere —
 so a bare-metal/PyPI install has a writable location with no configuration.
-The Docker image continues to set
-``COLLAPSARR_DATABASE_PATH=/config/collapsarr.db`` explicitly (see
-``Dockerfile``), which — being a higher-precedence override — is unaffected
-by this default.
+The Docker image sets ``COLLAPSARR_DATA_DIR=/config`` explicitly (see
+``Dockerfile``), pointing this default at its ``/config`` volume; an existing
+``/config`` volume from before this variable existed still resolves its DB to
+``/config/collapsarr.db`` via the derivation below, so upgrades need no data
+migration.
 """
 
 from __future__ import annotations
