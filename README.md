@@ -130,6 +130,26 @@ Collapsarr behind a reverse proxy, set the Login requirement to "Always
 required" (`auth_required=enabled`)** until a future release adds
 trusted-proxy support (a stubbed-out capability today).
 
+**Headless deploys — seeding a credential without the setup page:** a
+declarative/automated deploy (Docker Compose, Ansible, etc.) has no human
+available to click through `/setup`. Set `COLLAPSARR_AUTH_USERNAME` and
+`COLLAPSARR_AUTH_PASSWORD` (together — see
+[Configuration](#configuration)) and a fresh install seeds that credential on
+first boot instead — hashed before it's persisted, never stored or logged in
+plaintext — and comes up already past the setup gate. `COLLAPSARR_AUTH_METHOD`
+and `COLLAPSARR_AUTH_REQUIRED` are honoured at the same time if set, otherwise
+the seeded credential gets the same defaults `/setup` would (`forms`,
+`local_bypass`).
+
+This doubles as the supported password-recovery/lockout escape hatch, but
+**only for a fresh or already-locked-out install with no credential
+configured yet** — seeding runs once and never overwrites a credential that
+already exists, even if the environment variables are still set on a later
+boot. It does **not** help recover a *forgotten* password once a credential
+is already set; that requires clearing the existing `auth_username`/
+`auth_password_hash` first (e.g. directly in the database) so the instance
+has no credential again, at which point re-seeding (or `/setup`) applies.
+
 ## Development
 
 ```bash
@@ -164,6 +184,10 @@ directory. See [`.env.example`](.env.example).
 | `COLLAPSARR_HOST` | `0.0.0.0` | API server bind address. |
 | `COLLAPSARR_PORT` | `8282` | API server bind port. |
 | `COLLAPSARR_LOG_LEVEL` | `INFO` | Log level. |
+| `COLLAPSARR_AUTH_USERNAME` | *(unset)* | First-boot credential seed: UI username. Set together with `COLLAPSARR_AUTH_PASSWORD` — see [Authentication](#authentication). |
+| `COLLAPSARR_AUTH_PASSWORD` | *(unset)* | First-boot credential seed: UI password. Hashed before being persisted; never stored or logged in plaintext. |
+| `COLLAPSARR_AUTH_METHOD` | *(unset — `forms`)* | Optional, only applied when the seed credential above is actually seeded: `forms` or `basic`. |
+| `COLLAPSARR_AUTH_REQUIRED` | *(unset — `local_bypass`)* | Optional, only applied when the seed credential above is actually seeded: `enabled` or `local_bypass`. |
 
 ## Running on startup
 

@@ -16,6 +16,7 @@ This module is imported for its side effect of registering
 
 from __future__ import annotations
 
+from .env_seed import seed_auth_from_env
 from .models import SETTINGS_ID, GlobalSettings, generate_api_key, generate_session_secret
 from .passwords import hash_password, verify_password
 from .service import (
@@ -33,6 +34,7 @@ __all__ = [
     "generate_session_secret",
     "get_global_settings",
     "hash_password",
+    "seed_auth_from_env",
     "update_global_settings",
     "verify_auth_password",
     "verify_password",

@@ -18,7 +18,20 @@ Environment variable                Default                    Description
 ``COLLAPSARR_LOG_LEVEL``             ``INFO``                   Log level (passed to uvicorn).
 ``COLLAPSARR_JOB_MAX_CONCURRENCY``   ``1``                      Max concurrent downmix jobs.
 ``COLLAPSARR_SCAN_INTERVAL_HOURS``   ``6.0``                    Hours between periodic scans.
+``COLLAPSARR_AUTH_USERNAME``         *(unset)*                  First-boot seed: UI username.
+``COLLAPSARR_AUTH_PASSWORD``         *(unset)*                  First-boot seed: UI password.
+``COLLAPSARR_AUTH_METHOD``           *(unset)*                  Seed only: forms or basic.
+``COLLAPSARR_AUTH_REQUIRED``         *(unset)*                  Seed only: enabled or local_bypass.
 ==================================  =========================  =======================
+
+``COLLAPSARR_AUTH_USERNAME``/``COLLAPSARR_AUTH_PASSWORD`` (COL-53) are a
+headless-deploy escape hatch: set together and a fresh install seeds that
+credential on first boot -- hashed before it's persisted, never stored or
+logged in plaintext -- and skips the interactive ``/setup`` gate entirely.
+See :func:`collapsarr.settings.env_seed.seed_auth_from_env` for the seeding
+logic (one-shot: it never overwrites a credential that already exists, even
+if these variables are still set on a later boot) and the README's
+Authentication section for the password-recovery/lockout use case.
 
 ``data_dir`` defaults to ``platformdirs.user_data_dir("collapsarr")`` — e.g.
 ``~/.local/share/collapsarr`` on Linux, native per-OS locations elsewhere —
@@ -34,6 +47,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 import platformdirs as platformdirs
 from pydantic import Field, model_validator
@@ -101,6 +115,64 @@ class Settings(BaseSettings):
             "double-enqueue it."
         ),
     )
+
+    auth_username: str | None = Field(
+        default=None,
+        description=(
+            "First-boot credential seed (COL-53): UI username. Set together "
+            "with auth_password to skip the interactive /setup gate on a "
+            "fresh, declarative deploy (Docker, automation). One-shot: "
+            "ignored once a credential already exists, even if this stays "
+            "set on a later boot -- not a way to recover a forgotten "
+            "password once one is configured, only to bring up a fresh or "
+            "locked-out install with a known credential."
+        ),
+    )
+    auth_password: str | None = Field(
+        default=None,
+        description=(
+            "First-boot credential seed (COL-53): UI password, paired with "
+            "auth_username. Held here as plaintext only as long as any other "
+            "environment variable is -- it is hashed (PBKDF2) before being "
+            "persisted, and the plaintext is never stored or logged."
+        ),
+    )
+    auth_method: Literal["forms", "basic"] | None = Field(
+        default=None,
+        description=(
+            "First-boot credential seed (COL-53): auth presentation method "
+            "for the seeded credential. Only applied when a credential is "
+            "actually seeded (see auth_username/auth_password); falls back "
+            "to GlobalSettings' own default (forms) when unset."
+        ),
+    )
+    auth_required: Literal["enabled", "local_bypass"] | None = Field(
+        default=None,
+        description=(
+            "First-boot credential seed (COL-53): required mode for the "
+            "seeded credential. Only applied when a credential is actually "
+            "seeded (see auth_username/auth_password); falls back to "
+            "GlobalSettings' own default (local_bypass) when unset."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_auth_seed_pair(self) -> Settings:
+        """Fail fast if only one of the seed username/password is set.
+
+        Both must be provided together to seed a credential (see
+        ``collapsarr.settings.env_seed``); a lone
+        ``COLLAPSARR_AUTH_USERNAME`` or ``COLLAPSARR_AUTH_PASSWORD`` is
+        almost certainly a typo/misconfiguration on a headless deploy, so
+        this raises at startup rather than silently seeding nothing.
+        """
+        if bool(self.auth_username) != bool(self.auth_password):
+            raise ValueError(
+                "COLLAPSARR_AUTH_USERNAME and COLLAPSARR_AUTH_PASSWORD must "
+                "both be set (or both left unset) to seed a first-boot "
+                "credential."
+            )
+        return self
 
     @model_validator(mode="after")
     def _derive_database_path(self) -> Settings:

@@ -41,6 +41,7 @@ from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .media.routes import router as wanted_router
 from .notify.routes import router as notifiers_router
+from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,15 @@ def create_app(
         session_factory = create_session_factory(engine)
         app.state.session_factory = session_factory
         init_db(engine)
+
+        # Environment-seeded UI credential for headless deploys (COL-53): if
+        # COLLAPSARR_AUTH_USERNAME/PASSWORD are set and no credential exists
+        # yet, persist one (hashed) now, before the first request, so the
+        # instance comes up already past the /setup gate. No-op on every
+        # later boot once a credential exists, even if the variables are
+        # still set (see collapsarr.settings.env_seed).
+        with session_factory() as seed_session:
+            seed_auth_from_env(seed_session, resolved_settings)
 
         # FFmpeg presence check (COL-38): run once at startup rather than let
         # a missing binary surface as a cryptic mid-job failure. The result is
