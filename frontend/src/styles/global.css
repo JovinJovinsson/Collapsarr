@@ -237,6 +237,45 @@ a {
   flex-shrink: 0;
 }
 
+/* ---- Onboarding panel (COL-54) ---------------------------------------- */
+
+.onboarding-panel {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  background: var(--c-accent-tint);
+  border: 1px solid var(--c-accent-tint-strong);
+  border-radius: var(--radius-md);
+  padding: var(--sp-4);
+  margin-bottom: var(--sp-5);
+  max-width: 1100px;
+}
+
+.onboarding-panel__title {
+  font-size: var(--fs-base);
+  font-weight: 650;
+  margin-bottom: var(--sp-1);
+}
+
+.onboarding-panel__message {
+  color: var(--c-text-muted);
+  font-size: var(--fs-sm);
+}
+
+.onboarding-panel__message code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--sp-1);
+}
+
+.onboarding-panel__dismiss {
+  flex-shrink: 0;
+}
+
 /* ---- Views ----------------------------------------------------------- */
 
 .view {

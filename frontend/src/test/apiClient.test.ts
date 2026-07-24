@@ -52,6 +52,73 @@ describe("apiFetch / stored API key", () => {
   });
 });
 
+describe("apiFetch / 401 redirect (COL-54)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("redirects to /login on a 401 response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: () => Promise.resolve({ detail: "Invalid or missing API key." }),
+      }),
+    );
+    const assign = vi.fn();
+    vi.stubGlobal("location", { pathname: "/wanted", assign });
+
+    await apiFetch("/api/wanted");
+
+    expect(assign).toHaveBeenCalledWith("/login");
+  });
+
+  it("does not redirect on a 401 from the auth flow itself (e.g. a failed login attempt)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: () => Promise.resolve({ detail: "Invalid username or password." }),
+      }),
+    );
+    const assign = vi.fn();
+    vi.stubGlobal("location", { pathname: "/wanted", assign });
+
+    await apiFetch("/api/auth/login", { method: "POST" });
+
+    expect(assign).not.toHaveBeenCalled();
+  });
+
+  it("does not redirect on a non-401 error response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: false, status: 500, json: () => Promise.resolve({}) }),
+    );
+    const assign = vi.fn();
+    vi.stubGlobal("location", { pathname: "/wanted", assign });
+
+    await apiFetch("/api/wanted");
+
+    expect(assign).not.toHaveBeenCalled();
+  });
+
+  it("does not redirect on a successful response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve([]) }),
+    );
+    const assign = vi.fn();
+    vi.stubGlobal("location", { pathname: "/wanted", assign });
+
+    await apiFetch("/api/wanted");
+
+    expect(assign).not.toHaveBeenCalled();
+  });
+});
+
 describe("apiErrorMessage", () => {
   it("extracts a string `detail` field", async () => {
     const response = new Response(JSON.stringify({ detail: "No arr instance with id=1" }), { status: 404 });
