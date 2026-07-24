@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { getStoredApiKey, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
+import type { AuthRequiredMode } from "../../types/settings";
 
 type LoadState =
   | { status: "loading" }
@@ -11,6 +12,7 @@ type LoadState =
 interface GeneralFormValues {
   concurrencyLimit: string;
   uiAuthEnabled: boolean;
+  authRequired: AuthRequiredMode;
   stereoCodec: string;
   stereoBitrateKbps: string;
   surroundCodec: string;
@@ -52,6 +54,7 @@ export function GeneralSection() {
   const [form, setForm] = useState<GeneralFormValues>({
     concurrencyLimit: "1",
     uiAuthEnabled: false,
+    authRequired: "local_bypass",
     stereoCodec: "aac",
     stereoBitrateKbps: "",
     surroundCodec: "ac3",
@@ -72,6 +75,7 @@ export function GeneralSection() {
         setForm({
           concurrencyLimit: String(settings.concurrency_limit),
           uiAuthEnabled: settings.ui_auth_enabled,
+          authRequired: settings.auth_required,
           stereoCodec: settings.stereo_codec,
           stereoBitrateKbps: settings.stereo_bitrate_kbps === null ? "" : String(settings.stereo_bitrate_kbps),
           surroundCodec: settings.surround_codec,
@@ -98,6 +102,7 @@ export function GeneralSection() {
       const updated = await updateSettings({
         concurrency_limit: Number(form.concurrencyLimit),
         ui_auth_enabled: form.uiAuthEnabled,
+        auth_required: form.authRequired,
         stereo_codec: form.stereoCodec.trim(),
         stereo_bitrate_kbps: form.stereoBitrateKbps.trim() === "" ? null : Number(form.stereoBitrateKbps),
         surround_codec: form.surroundCodec.trim(),
@@ -108,6 +113,7 @@ export function GeneralSection() {
       setForm({
         concurrencyLimit: String(updated.concurrency_limit),
         uiAuthEnabled: updated.ui_auth_enabled,
+        authRequired: updated.auth_required,
         stereoCodec: updated.stereo_codec,
         stereoBitrateKbps: updated.stereo_bitrate_kbps === null ? "" : String(updated.stereo_bitrate_kbps),
         surroundCodec: updated.surround_codec,
@@ -193,6 +199,29 @@ export function GeneralSection() {
 
           <div className="panel settings-form">
             <h3 className="settings-form__subtitle">Authentication &amp; concurrency</h3>
+
+            <div className="form-field form-field--narrow">
+              <label htmlFor="auth-required">Login requirement</label>
+              <select
+                id="auth-required"
+                value={form.authRequired}
+                onChange={(event) =>
+                  setForm({ ...form, authRequired: event.target.value as typeof form.authRequired })
+                }
+              >
+                <option value="local_bypass">Disabled for local addresses</option>
+                <option value="enabled">Always required</option>
+              </select>
+              <p className="form-hint">
+                <strong>Disabled for local addresses</strong> (default): a browser connecting from
+                localhost or your LAN reaches the app without logging in; anyone connecting from
+                outside your network still has to sign in. This is based on the direct connection
+                address only, never an <code>X-Forwarded-For</code> header — if Collapsarr sits
+                behind a reverse proxy, every client looks like the proxy&apos;s own address, so
+                pick <strong>Always required</strong> instead until trusted-proxy support ships.
+              </p>
+            </div>
+
             <label className="checkbox-row">
               <input
                 type="checkbox"

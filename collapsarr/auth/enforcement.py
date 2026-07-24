@@ -26,19 +26,38 @@ Routing decision, per request:
       redirect a logged-in user back into the app, and pre-credential ``/login``
       redirects to ``/setup``).
 
-Required-mode is fixed to ``enabled`` here. The ``local_bypass`` mode (COL-51)
-and the Basic auth method (COL-52) slot in at the marked seam below without
-disturbing this happy path.
+Required-mode (COL-51): the routing table above is what ``auth_required=
+"enabled"`` gets. When ``auth_required="local_bypass"`` (the default -- see
+:class:`collapsarr.settings.models.GlobalSettings`) *and* the caller's direct
+peer address is loopback or a private range, every check above is skipped --
+the request passes straight through, same as ``/health``. A caller whose peer
+address is routable/public is challenged exactly per the table, regardless of
+mode. This makes a LAN/localhost self-hoster's install frictionless (no
+setup, no login, no API key) while any routable-address client -- including
+one pretending to be local -- must still authenticate.
+
+Classification (:func:`_client_is_local`) reads only the literal peer address
+the ASGI server accepted the connection from (``request.client``) -- it never
+parses ``X-Forwarded-For`` or any other client-suppliable header, which any
+caller could forge. The consequence: behind a reverse proxy, the proxy's own
+address is what gets classified, not its upstream client's -- an install
+behind a reverse proxy should set ``auth_required="enabled"`` until a later
+ticket adds trusted-proxy support (see the README's Authentication section).
+
+The Basic auth method (COL-52) slots in at ``is_authenticated`` without
+disturbing this routing.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import secrets
 from collections.abc import Awaitable, Callable
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from ..settings.models import AUTH_REQUIRED_LOCAL_BYPASS
 from ..settings.service import get_global_settings
 from .session import is_authenticated
 
@@ -69,6 +88,30 @@ def _extract_key(request: Request) -> str | None:
     return request.query_params.get(API_KEY_QUERY) or None
 
 
+def _client_is_local(request: Request) -> bool:
+    """Whether the request's direct TCP peer is loopback or a private-range address.
+
+    Reads ``request.client`` -- the literal address the ASGI server accepted
+    the connection from -- and nothing else. In particular this deliberately
+    does **not** consult ``X-Forwarded-For`` (or any other header): those are
+    supplied by the client and trivially spoofable, so trusting them here
+    would let any external caller claim to be local and bypass auth entirely.
+    The tradeoff (documented in the module docstring and the README) is that
+    an install behind a reverse proxy sees the proxy's own peer address, not
+    its upstream client's -- trusted-proxy support is a later stub.
+    """
+    client = request.client
+    if client is None:
+        return False
+    try:
+        address = ipaddress.ip_address(client.host)
+    except ValueError:
+        # Not a literal IP address (seen in some non-network test harnesses) --
+        # treat conservatively as not local.
+        return False
+    return address.is_loopback or address.is_private
+
+
 def _is_static_asset(path: str) -> bool:
     """Whether ``path`` names a bundled static file (has a file extension).
 
@@ -95,10 +138,14 @@ async def enforce_auth_middleware(
         settings = get_global_settings(session)
         credential_set = settings.auth_username is not None
         expected_key = settings.api_key
+        auth_required = settings.auth_required
 
-    # Seam for COL-51 (local_bypass): required-mode is fixed to ``enabled`` in
-    # this slice, so a session is always required. A later ticket decides here
-    # whether a local-network caller may skip the session check below.
+    if auth_required == AUTH_REQUIRED_LOCAL_BYPASS and _client_is_local(request):
+        # local_bypass + a loopback/private-range peer: trust the network,
+        # skip every check below (first-run gate, session, API key) same as
+        # /health. A non-local peer falls through to the normal routing.
+        return await call_next(request)
+
     authed = is_authenticated(request)
 
     if path.startswith(API_PREFIX):

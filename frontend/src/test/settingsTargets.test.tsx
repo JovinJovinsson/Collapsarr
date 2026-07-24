@@ -17,6 +17,7 @@ const baseSettings: GlobalSettings = {
   surround_bitrate_kbps: 448,
   concurrency_limit: 1,
   ui_auth_enabled: false,
+  auth_required: "local_bypass",
   api_key: "server-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",

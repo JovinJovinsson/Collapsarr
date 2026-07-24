@@ -109,6 +109,16 @@ class GlobalSettings(Base):
     row creation, mirroring ``api_key``; it is nullable at the DB level so the
     schema-ensure can add it to an existing row, which
     :func:`collapsarr.settings.service.get_global_settings` then backfills.
+
+    ``auth_required`` defaults to ``local_bypass`` (COL-51), not ``enabled``: a
+    fresh install stays frictionless for a caller connecting from a
+    loopback/private-network address (see
+    :func:`collapsarr.auth.enforcement.enforce_auth_middleware`), while any
+    routable address must still authenticate -- closing the "wide open on
+    0.0.0.0" gap without any pre-launch configuration. An install sitting
+    behind a reverse proxy should switch this to ``enabled``, since
+    classification only ever looks at the direct TCP peer (see that module's
+    docstring).
     """
 
     __tablename__ = "global_settings"
@@ -144,8 +154,8 @@ class GlobalSettings(Base):
     auth_required: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
-        default=AUTH_REQUIRED_ENABLED,
-        server_default=text(f"'{AUTH_REQUIRED_ENABLED}'"),
+        default=AUTH_REQUIRED_LOCAL_BYPASS,
+        server_default=text(f"'{AUTH_REQUIRED_LOCAL_BYPASS}'"),
     )
     session_secret: Mapped[str | None] = mapped_column(
         String(128), nullable=True, default=generate_session_secret

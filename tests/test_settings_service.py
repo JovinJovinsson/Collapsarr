@@ -168,9 +168,11 @@ def test_auth_credential_defaults(session: Session) -> None:
     # No credential set on a fresh install.
     assert settings.auth_username is None
     assert settings.auth_password_hash is None
-    # Sensible, secure defaults for the enum-like columns.
+    # Sensible, secure defaults for the enum-like columns. auth_required
+    # defaults to local_bypass, not enabled (COL-51): a fresh install stays
+    # frictionless for a local caller.
     assert settings.auth_method == AUTH_METHOD_FORMS
-    assert settings.auth_required == AUTH_REQUIRED_ENABLED
+    assert settings.auth_required == AUTH_REQUIRED_LOCAL_BYPASS
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +246,17 @@ def test_update_auth_method_and_required(session: Session) -> None:
 
     assert updated.auth_method == AUTH_METHOD_BASIC
     assert updated.auth_required == AUTH_REQUIRED_LOCAL_BYPASS
+
+
+def test_auth_required_is_switchable_back_to_enabled(session: Session) -> None:
+    """COL-51: the mode must be switchable both ways, not just away from the
+    default -- e.g. an install behind a reverse proxy opting back into
+    ``enabled`` (see the README's Authentication section)."""
+    update_global_settings(session, auth_required=AUTH_REQUIRED_LOCAL_BYPASS)
+
+    updated = update_global_settings(session, auth_required=AUTH_REQUIRED_ENABLED)
+
+    assert updated.auth_required == AUTH_REQUIRED_ENABLED
 
 
 def test_update_omitting_password_leaves_credential_untouched(session: Session) -> None:

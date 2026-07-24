@@ -13,9 +13,11 @@ session):
 * ``POST /api/auth/logout`` -- clear the session.
 
 ``status``/``setup``/``login`` are reachable without a session (the enforcement
-middleware opens them); ``logout`` requires one. Only the Forms method and the
-``enabled`` required-mode are wired here -- Basic auth (COL-52) and
-``local_bypass`` (COL-51) are separate tickets.
+middleware opens them); ``logout`` requires one. Only the Forms method is
+wired here -- Basic auth (COL-52) is a separate ticket. ``setup`` leaves
+``auth_required`` untouched (it does not force ``enabled``), so the
+required-mode the row already carries -- ``local_bypass`` by default (COL-51)
+-- survives completing first-run setup; switch it from Settings.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..database import get_session
-from ..settings.models import AUTH_METHOD_FORMS, AUTH_REQUIRED_ENABLED
+from ..settings.models import AUTH_METHOD_FORMS
 from ..settings.service import (
     get_global_settings,
     update_global_settings,
@@ -81,7 +83,10 @@ def setup(
     """Create the single credential on first run and log the operator in.
 
     Rejected with ``409`` once a credential already exists, so the first-run
-    gate can only ever be closed once.
+    gate can only ever be closed once. Deliberately does not pass
+    ``auth_required``: whatever required-mode the row already carries
+    (``local_bypass`` by default, COL-51) is left as-is, so completing setup
+    never silently promotes a fresh install to ``enabled``.
     """
     settings = get_global_settings(session)
     if settings.auth_username is not None:
@@ -92,7 +97,6 @@ def setup(
         auth_username=body.username,
         password=body.password,
         auth_method=AUTH_METHOD_FORMS,
-        auth_required=AUTH_REQUIRED_ENABLED,
     )
     log_in(request, body.username, remember=False)
     return AuthStatus(needs_setup=False, authenticated=True)

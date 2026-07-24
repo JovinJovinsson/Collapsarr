@@ -204,7 +204,8 @@ def test_init_db_adds_col49_auth_columns_to_an_older_global_settings(settings: S
     assert row.auth_username is None
     assert row.auth_password_hash is None
     assert row.auth_method == "forms"
-    assert row.auth_required == "enabled"
+    # COL-51 default: local_bypass, not enabled.
+    assert row.auth_required == "local_bypass"
     assert row.session_secret is None
 
     engine.dispose()
