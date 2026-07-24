@@ -65,10 +65,12 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 # Runtime configuration. COLLAPSARR_* mirror the app defaults (collapsarr/config.py);
-# PUID/PGID are consumed by the entrypoint.
+# PUID/PGID are consumed by the entrypoint. COLLAPSARR_DATA_DIR points at the
+# /config volume; database_path derives to /config/collapsarr.db (COL-46), so
+# existing /config volumes keep landing the DB at the same path on upgrade.
 ENV COLLAPSARR_HOST=0.0.0.0 \
     COLLAPSARR_PORT=8282 \
-    COLLAPSARR_DATABASE_PATH=/config/collapsarr.db \
+    COLLAPSARR_DATA_DIR=/config \
     PUID=1000 \
     PGID=1000
 
