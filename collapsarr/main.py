@@ -26,7 +26,7 @@ from .arr.webhooks import (
     parse_webhook_payload,
     resolve_webhook_file,
 )
-from .auth import api_key_middleware
+from .auth import SessionMiddleware, auth_router, enforce_auth_middleware
 from .config import Settings, get_settings
 from .database import (
     create_engine_from_settings,
@@ -124,8 +124,16 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.on_file_ready = on_file_ready or default_on_file_ready_hook
 
-    # Enforce the auto-generated API key on every /api route (COL-26).
-    app.middleware("http")(api_key_middleware)
+    # Auth (COL-50): first-run setup + Forms login gate the whole UI behind a
+    # signed-cookie session; /api still accepts the API key. The enforcement
+    # middleware is added first (inner) and the session middleware last (outer)
+    # so the session is decoded onto the request scope *before* enforcement
+    # reads it. Both supersede the old opt-in api_key_middleware (COL-26).
+    app.middleware("http")(enforce_auth_middleware)
+    app.add_middleware(SessionMiddleware)
+
+    # Forms auth endpoints: /api/auth/{status,setup,login,logout} (COL-50).
+    app.include_router(auth_router)
 
     # Instance config & path-mapping CRUD endpoints (COL-27), under /api.
     app.include_router(arr_router)

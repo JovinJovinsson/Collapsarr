@@ -96,8 +96,8 @@ class GlobalSettings(Base):
     :attr:`~collapsarr.downmix.targets.DownmixSettings.language_allow_list`.
 
     ``api_key`` is auto-generated (via :func:`generate_api_key`) the first time
-    the row is created and enforced on every ``/api`` request by
-    :func:`collapsarr.auth.api_key_middleware`.
+    the row is created and accepted on every ``/api`` request by
+    :func:`collapsarr.auth.enforcement.enforce_auth_middleware`.
 
     The auth-credential columns (COL-49) hold the single UI operator credential
     -- Radarr-style, no multi-user. ``auth_username``/``auth_password_hash`` are

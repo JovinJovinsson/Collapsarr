@@ -135,15 +135,79 @@ a {
 }
 
 .sidebar__footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
   padding: var(--sp-3) var(--sp-3) var(--sp-1);
   border-top: 1px solid var(--c-border);
   margin-top: var(--sp-3);
+}
+
+.sidebar__logout {
+  width: 100%;
 }
 
 .sidebar__version {
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   color: var(--c-text-faint);
+}
+
+/* ---- Auth screens (COL-50): setup + login ------------------------------ */
+
+.auth-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: var(--sp-6);
+}
+
+.auth-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  width: 100%;
+  max-width: 380px;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-6);
+}
+
+.auth-card__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--c-text);
+}
+
+.auth-card__brand-mark {
+  display: inline-flex;
+  color: var(--c-accent);
+}
+
+.auth-card__brand-name {
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.auth-card__title {
+  font-size: var(--fs-xl);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.auth-card__subtitle {
+  margin: calc(var(--sp-2) * -1) 0 0;
+  color: var(--c-text-muted);
+  font-size: var(--fs-sm);
+}
+
+.auth-card__submit {
+  margin-top: var(--sp-1);
 }
 
 /* ---- Health banner (COL-38) -------------------------------------------- */
