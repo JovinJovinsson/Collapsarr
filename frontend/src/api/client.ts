@@ -53,8 +53,14 @@ export function setStoredApiKey(key: string): void {
   }
 }
 
-/** Sends the browser to `/login`, best-effort (some test harnesses stub or omit `location`). */
-function redirectToLogin(): void {
+/**
+ * Sends the browser to `/login`, best-effort (some test harnesses stub or
+ * omit `location`). Exported so callers that invalidate the *current*
+ * session as a deliberate action rather than an error response -- e.g.
+ * "log out everywhere" (COL-55) -- can reuse the same navigation instead of
+ * duplicating it.
+ */
+export function redirectToLogin(): void {
   try {
     globalThis.location?.assign(LOGIN_PATH);
   } catch {

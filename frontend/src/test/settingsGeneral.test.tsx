@@ -189,3 +189,103 @@ describe("GeneralSection", () => {
     expect(await screen.findByText(/couldn't load settings: network down/i)).toBeInTheDocument();
   });
 });
+
+describe("GeneralSection credential controls (COL-55)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("rejects a password change with the wrong current password", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/auth/change-password") {
+        return Promise.resolve(jsonResponse({ detail: "Current password is incorrect." }, 401));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<GeneralSection />);
+    fireEvent.change(await screen.findByLabelText(/current password/i), {
+      target: { value: "wrong password" },
+    });
+    fireEvent.change(screen.getByLabelText(/^new password$/i), { target: { value: "a new password" } });
+    fireEvent.change(screen.getByLabelText(/confirm new password/i), {
+      target: { value: "a new password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /change password/i }));
+
+    expect(await screen.findByText(/current password is incorrect/i)).toBeInTheDocument();
+  });
+
+  it("changes the password with the correct current password", async () => {
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<ReturnType<typeof jsonResponse>>>(
+      (url) => {
+        if (url === "/api/auth/change-password") {
+          return Promise.resolve(
+            jsonResponse({ needs_setup: false, authenticated: true, auth_method: "forms" }),
+          );
+        }
+        return Promise.resolve(jsonResponse(baseSettings));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<GeneralSection />);
+    fireEvent.change(await screen.findByLabelText(/current password/i), {
+      target: { value: "correct horse battery staple" },
+    });
+    fireEvent.change(screen.getByLabelText(/^new password$/i), { target: { value: "a new password" } });
+    fireEvent.change(screen.getByLabelText(/confirm new password/i), {
+      target: { value: "a new password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /change password/i }));
+
+    expect(await screen.findByText(/password changed\./i)).toBeInTheDocument();
+    const call = fetchMock.mock.calls.find(([url]) => url === "/api/auth/change-password");
+    const body = JSON.parse(String((call?.[1] as RequestInit).body));
+    expect(body).toEqual({ current_password: "correct horse battery staple", new_password: "a new password" });
+  });
+
+  it("requires the new password and confirmation to match before submitting", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    render(<GeneralSection />);
+
+    fireEvent.change(await screen.findByLabelText(/current password/i), {
+      target: { value: "correct horse battery staple" },
+    });
+    fireEvent.change(screen.getByLabelText(/^new password$/i), { target: { value: "one" } });
+    fireEvent.change(screen.getByLabelText(/confirm new password/i), { target: { value: "two" } });
+    fireEvent.click(screen.getByRole("button", { name: /change password/i }));
+
+    expect(await screen.findByText(/do not match/i)).toBeInTheDocument();
+  });
+
+  it("logs out everywhere and redirects to /login", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/auth/logout-everywhere") {
+        return Promise.resolve(
+          jsonResponse({ needs_setup: false, authenticated: false, auth_method: "forms" }),
+        );
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const assign = vi.fn();
+    vi.stubGlobal("location", { pathname: "/settings", assign });
+
+    render(<GeneralSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /log out everywhere/i }));
+
+    await screen.findByRole("button", { name: /log out everywhere/i });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/auth/logout-everywhere",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(assign).toHaveBeenCalledWith("/login");
+  });
+});

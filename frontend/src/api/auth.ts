@@ -73,3 +73,36 @@ export async function logout(): Promise<void> {
     throw new Error(await apiErrorMessage(response, `Logout failed (${response.status})`));
   }
 }
+
+/**
+ * Rotates the operator's password from Settings (COL-55,
+ * `POST /api/auth/change-password`). Requires the current password to
+ * verify server-side; rejects with a `401`-derived message on a mismatch.
+ * This browser's session stays valid -- only `logoutEverywhere` below
+ * invalidates sessions.
+ */
+export async function changePassword(currentPassword: string, newPassword: string): Promise<AuthStatus> {
+  const response = await apiFetch("/api/auth/change-password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Password change failed (${response.status})`));
+  }
+  return (await response.json()) as AuthStatus;
+}
+
+/**
+ * Rotates `session_secret` (COL-55, `POST /api/auth/logout-everywhere`),
+ * invalidating every signed-cookie session -- this browser and any other --
+ * and clearing this browser's own cookie. The caller is responsible for
+ * navigating away (e.g. to `/login`) afterwards, same as `logout` above.
+ */
+export async function logoutEverywhere(): Promise<AuthStatus> {
+  const response = await apiFetch("/api/auth/logout-everywhere", { method: "POST" });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Log out everywhere failed (${response.status})`));
+  }
+  return (await response.json()) as AuthStatus;
+}

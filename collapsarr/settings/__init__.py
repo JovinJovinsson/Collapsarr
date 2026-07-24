@@ -22,6 +22,7 @@ from .passwords import hash_password, verify_password
 from .service import (
     as_downmix_settings,
     get_global_settings,
+    rotate_session_secret,
     update_global_settings,
     verify_auth_password,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "generate_session_secret",
     "get_global_settings",
     "hash_password",
+    "rotate_session_secret",
     "seed_auth_from_env",
     "update_global_settings",
     "verify_auth_password",

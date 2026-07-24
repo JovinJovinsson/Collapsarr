@@ -167,6 +167,27 @@ def update_global_settings(
     return settings
 
 
+def rotate_session_secret(session: Session) -> GlobalSettings:
+    """Mint a fresh session-signing secret and persist it (COL-55).
+
+    Uses the same generator (:func:`~collapsarr.settings.models.
+    generate_session_secret`) COL-49 used for the initial mint. Every
+    signed-cookie session issued under the *previous* secret fails to unsign
+    against the new one, so this is the persistence half of "log out
+    everywhere" -- the caller (:mod:`collapsarr.auth.routes`) still has to
+    push the fresh value into the running process's cached secret (see
+    :func:`collapsarr.auth.session.sync_cached_secret`), since
+    :class:`~collapsarr.auth.session.SessionMiddleware` caches it on
+    ``app.state`` for the life of the process rather than re-reading the DB
+    on every request.
+    """
+    settings = get_global_settings(session)
+    settings.session_secret = generate_session_secret()
+    session.commit()
+    session.refresh(settings)
+    return settings
+
+
 def verify_auth_password(session: Session, password: str) -> bool:
     """Return whether ``password`` matches the stored UI credential.
 

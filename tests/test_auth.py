@@ -466,3 +466,142 @@ def test_auth_status_reports_the_active_method(client: TestClient, session: Sess
 
     assert response.status_code == 200
     assert response.json()["auth_method"] == "basic"
+
+
+# --- change password / log out everywhere (COL-55) ---------------------------
+
+
+NEW_PASSWORD = "a whole new battery staple"
+
+
+def test_change_password_rejects_the_wrong_current_password(
+    client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+    client.post("/api/auth/login", json={"username": USERNAME, "password": PASSWORD})
+
+    response = client.post(
+        "/api/auth/change-password",
+        json={"current_password": "not the password", "new_password": NEW_PASSWORD},
+    )
+
+    assert response.status_code == 401
+    # The stored credential is untouched: the original password still works.
+    assert get_global_settings(session).auth_password_hash is not None
+    login = client.post("/api/auth/login", json={"username": USERNAME, "password": PASSWORD})
+    assert login.status_code == 200
+
+
+def test_change_password_with_the_correct_current_password_rotates_which_password_authenticates(
+    client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+    client.post("/api/auth/login", json={"username": USERNAME, "password": PASSWORD})
+
+    response = client.post(
+        "/api/auth/change-password",
+        json={"current_password": PASSWORD, "new_password": NEW_PASSWORD},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["authenticated"] is True
+
+    # Old password no longer authenticates...
+    old_login = client.post("/api/auth/login", json={"username": USERNAME, "password": PASSWORD})
+    assert old_login.status_code == 401
+
+    # ...the new one does.
+    new_login = client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": NEW_PASSWORD}
+    )
+    assert new_login.status_code == 200
+
+
+def test_change_password_before_a_credential_exists_is_conflict(
+    client: TestClient, session: Session
+) -> None:
+    key = get_global_settings(session).api_key  # auto-generated on row creation
+
+    response = client.post(
+        "/api/auth/change-password",
+        json={"current_password": "x", "new_password": "y"},
+        headers={"X-Api-Key": key},
+    )
+
+    assert response.status_code == 409
+
+
+def test_change_password_requires_a_session_or_api_key(
+    client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+
+    response = client.post(
+        "/api/auth/change-password",
+        json={"current_password": PASSWORD, "new_password": NEW_PASSWORD},
+    )
+
+    assert response.status_code == 401
+
+
+def test_logout_everywhere_rotates_the_secret_and_invalidates_existing_sessions(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+    original_secret = get_global_settings(session).session_secret
+
+    login = noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+    assert login.status_code == 200
+    old_cookie = noredirect_client.cookies.get("collapsarr_session")
+    assert old_cookie is not None
+    # Logged in: UI route passes through.
+    assert noredirect_client.get(UI_ROUTE).status_code == 404
+
+    response = noredirect_client.post("/api/auth/logout-everywhere")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "needs_setup": False,
+        "authenticated": False,
+        "auth_method": "forms",
+    }
+    # The secret changed in the DB...
+    assert get_global_settings(session).session_secret != original_secret
+    # ...the current browser's cookie is discarded in the same response...
+    assert "expires=Thu, 01 Jan 1970" in response.headers["set-cookie"]
+    # ...and this request's own UI access is already gone.
+    assert noredirect_client.get(UI_ROUTE).status_code == 303
+
+    # A different browser replaying the OLD (pre-rotation) cookie is rejected
+    # too -- it fails to unsign against the rotated secret, not merely absent.
+    noredirect_client.cookies.set("collapsarr_session", old_cookie)
+    redirect = noredirect_client.get(UI_ROUTE)
+    assert redirect.status_code == 303
+    assert redirect.headers["location"] == "/login"
+
+
+def test_logout_everywhere_requires_a_session_or_api_key(
+    client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+
+    assert client.post("/api/auth/logout-everywhere").status_code == 401
+
+
+def test_logout_everywhere_leaves_the_credential_itself_unchanged(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    """Rotating the secret is orthogonal to the password -- it stays valid."""
+    _set_credential(session)
+    noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+
+    noredirect_client.post("/api/auth/logout-everywhere")
+
+    relogin = noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+    assert relogin.status_code == 200

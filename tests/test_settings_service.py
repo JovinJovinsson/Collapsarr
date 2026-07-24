@@ -25,6 +25,7 @@ from collapsarr.settings.models import (
 from collapsarr.settings.service import (
     as_downmix_settings,
     get_global_settings,
+    rotate_session_secret,
     update_global_settings,
     verify_auth_password,
 )
@@ -155,6 +156,37 @@ def test_session_secret_is_unique_per_database(settings: Settings, tmp_path: Pat
     second = get_global_settings(session=_fresh_session(other_settings)).session_secret
 
     assert first != second
+
+
+# ---------------------------------------------------------------------------
+# Rotating the session secret (COL-55, "log out everywhere").
+# ---------------------------------------------------------------------------
+
+
+def test_rotate_session_secret_mints_a_new_value(session: Session) -> None:
+    original = get_global_settings(session).session_secret
+
+    rotated = rotate_session_secret(session)
+
+    assert rotated.session_secret is not None
+    assert rotated.session_secret != original
+    assert len(rotated.session_secret) == 64
+    assert all(char in "0123456789abcdef" for char in rotated.session_secret)
+
+
+def test_rotate_session_secret_persists_across_reads(session: Session) -> None:
+    rotated = rotate_session_secret(session)
+
+    assert get_global_settings(session).session_secret == rotated.session_secret
+
+
+def test_rotate_session_secret_leaves_the_credential_untouched(session: Session) -> None:
+    update_global_settings(session, auth_username="operator", password="hunter2000")
+    original_hash = get_global_settings(session).auth_password_hash
+
+    rotate_session_secret(session)
+
+    assert get_global_settings(session).auth_password_hash == original_hash
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
-import { getStoredApiKey, setStoredApiKey } from "../../api/client";
+import { changePassword, logoutEverywhere } from "../../api/auth";
+import { getStoredApiKey, redirectToLogin, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
 import type { AuthMethod, AuthRequiredMode } from "../../types/settings";
 
@@ -69,6 +70,16 @@ export function GeneralSection() {
 
   const [browserApiKey, setBrowserApiKey] = useState(() => getStoredApiKey());
   const [browserKeySavedAt, setBrowserKeySavedAt] = useState<number | null>(null);
+
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [changingPassword, setChangingPassword] = useState(false);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [passwordChangedAt, setPasswordChangedAt] = useState<number | null>(null);
+
+  const [loggingOutEverywhere, setLoggingOutEverywhere] = useState(false);
+  const [logoutEverywhereError, setLogoutEverywhereError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchSettings()
@@ -142,6 +153,58 @@ export function GeneralSection() {
     setBrowserApiKey(serverApiKey);
     setStoredApiKey(serverApiKey);
     setBrowserKeySavedAt(Date.now());
+  }
+
+  /**
+   * Changes the operator's password (COL-55): verifies `currentPassword`
+   * server-side before applying `newPassword`. This browser's session stays
+   * valid -- only "log out everywhere" below invalidates sessions.
+   */
+  async function handleChangePassword() {
+    setPasswordError(null);
+    setPasswordChangedAt(null);
+    if (!currentPassword) {
+      setPasswordError("Current password is required.");
+      return;
+    }
+    if (!newPassword) {
+      setPasswordError("New password is required.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError("New password and confirmation do not match.");
+      return;
+    }
+    setChangingPassword(true);
+    try {
+      await changePassword(currentPassword, newPassword);
+      setPasswordChangedAt(Date.now());
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (err: unknown) {
+      setPasswordError(err instanceof Error ? err.message : "Unknown error.");
+    } finally {
+      setChangingPassword(false);
+    }
+  }
+
+  /**
+   * Rotates `session_secret` (COL-55), invalidating every signed-cookie
+   * session -- including this browser's -- then sends this browser to
+   * `/login`, since its own session is gone too.
+   */
+  async function handleLogoutEverywhere() {
+    setLogoutEverywhereError(null);
+    setLoggingOutEverywhere(true);
+    try {
+      await logoutEverywhere();
+      redirectToLogin();
+    } catch (err: unknown) {
+      setLogoutEverywhereError(err instanceof Error ? err.message : "Unknown error.");
+    } finally {
+      setLoggingOutEverywhere(false);
+    }
   }
 
   return (
@@ -267,6 +330,77 @@ export function GeneralSection() {
                 onChange={(event) => setForm({ ...form, concurrencyLimit: event.target.value })}
               />
               <p className="form-hint">Maximum downmix jobs running at once.</p>
+            </div>
+          </div>
+
+          <div className="panel settings-form">
+            <h3 className="settings-form__subtitle">Credential</h3>
+            <p className="settings-section__summary">
+              Rotate the operator password or sign every browser out, without editing the
+              database directly.
+            </p>
+
+            <div className="form-field">
+              <label htmlFor="current-password">Current password</label>
+              <input
+                id="current-password"
+                type="password"
+                autoComplete="current-password"
+                value={currentPassword}
+                onChange={(event) => setCurrentPassword(event.target.value)}
+              />
+            </div>
+            <div className="form-field">
+              <label htmlFor="new-password">New password</label>
+              <input
+                id="new-password"
+                type="password"
+                autoComplete="new-password"
+                value={newPassword}
+                onChange={(event) => setNewPassword(event.target.value)}
+              />
+            </div>
+            <div className="form-field">
+              <label htmlFor="confirm-new-password">Confirm new password</label>
+              <input
+                id="confirm-new-password"
+                type="password"
+                autoComplete="new-password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+              />
+            </div>
+            <div className="form-actions">
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={handleChangePassword}
+                disabled={changingPassword}
+              >
+                {changingPassword ? "Changing…" : "Change password"}
+              </button>
+              {passwordChangedAt !== null && !passwordError && (
+                <span className="form-success">Password changed.</span>
+              )}
+            </div>
+            {passwordError && <p className="form-error">{passwordError}</p>}
+
+            <div className="form-field">
+              <p className="form-hint">
+                Rotates the session-signing secret, immediately signing this browser and every
+                other signed-in browser out. Everyone -- including you -- has to log in again.
+              </p>
+              <div className="form-actions">
+                <button
+                  type="button"
+                  className="btn btn--secondary"
+                  onClick={handleLogoutEverywhere}
+                  disabled={loggingOutEverywhere}
+                >
+                  {loggingOutEverywhere ? "Signing out everywhere…" : "Log out everywhere"}
+                </button>
+              </div>
+              {logoutEverywhereError && <p className="form-error">{logoutEverywhereError}</p>}
             </div>
           </div>
 

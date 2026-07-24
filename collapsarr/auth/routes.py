@@ -23,6 +23,16 @@ which method is active so the frontend (the Login page) can adapt --
 ``auth_method`` untouched (it does not force either), so the modes the row
 already carries -- ``local_bypass``/``forms`` by default (COL-51/COL-52) --
 survive completing first-run setup; switch them from Settings.
+
+``change-password`` and ``logout-everywhere`` (COL-55) let the Settings page
+manage the credential in-app, without editing the database directly: the
+former verifies the current password before re-hashing a new one over the
+same PBKDF2 core (COL-49); the latter rotates ``session_secret``, which
+invalidates every signed-cookie session -- on this browser and any other --
+since :class:`~collapsarr.auth.session.SessionMiddleware` signs and verifies
+cookies against that value. Neither is in the enforcement middleware's
+``OPEN_API_PATHS`` (unlike ``setup``/``login``/``status``), so both require an
+existing session or the API key, same as ``logout``.
 """
 
 from __future__ import annotations
@@ -36,10 +46,11 @@ from ..settings.models import AUTH_METHOD_FORMS
 from ..settings.routes import AuthMethodMode
 from ..settings.service import (
     get_global_settings,
+    rotate_session_secret,
     update_global_settings,
     verify_auth_password,
 )
-from .session import is_authenticated, log_in, log_out
+from .session import is_authenticated, log_in, log_out, sync_cached_secret
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -69,6 +80,14 @@ class LoginRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
     remember: bool = False
+
+
+class ChangePasswordRequest(BaseModel):
+    """A password-change attempt (COL-55): the current password (verified
+    before the change is applied) and the new one to set."""
+
+    current_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=1)
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -144,3 +163,58 @@ def logout(request: Request, session: Session = Depends(get_session)) -> AuthSta
         authenticated=False,
         auth_method=settings.auth_method,
     )
+
+
+@router.post("/change-password", response_model=AuthStatus)
+def change_password(
+    body: ChangePasswordRequest, request: Request, session: Session = Depends(get_session)
+) -> AuthStatus:
+    """Rotate the operator's password from Settings (COL-55).
+
+    Requires the *current* password to verify (via
+    :func:`~collapsarr.settings.service.verify_auth_password`) before applying
+    the change -- ``401`` on a mismatch, so knowing a session or the API key
+    alone isn't enough to take over the credential. ``409`` before any
+    credential exists (mirrors ``login``/``setup``: there is nothing to
+    change yet). The new password is re-hashed through the same PBKDF2 core
+    (:func:`~collapsarr.settings.service.update_global_settings`'s
+    ``password`` kwarg); the plaintext is never persisted. Does not touch
+    ``session_secret`` -- this browser's (and any other open) session stays
+    valid; only ``logout-everywhere`` below invalidates sessions.
+    """
+    settings = get_global_settings(session)
+    if settings.auth_username is None:
+        raise HTTPException(
+            status_code=409, detail="No credential configured; complete setup first."
+        )
+    if not verify_auth_password(session, body.current_password):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+
+    update_global_settings(session, password=body.new_password)
+    return AuthStatus(
+        needs_setup=False,
+        authenticated=is_authenticated(request),
+        auth_method=settings.auth_method,
+    )
+
+
+@router.post("/logout-everywhere", response_model=AuthStatus)
+def logout_everywhere(request: Request, session: Session = Depends(get_session)) -> AuthStatus:
+    """Rotate ``session_secret``, invalidating every signed-cookie session --
+    including this one (COL-55).
+
+    :func:`~collapsarr.settings.service.rotate_session_secret` mints and
+    persists a fresh secret; :func:`~collapsarr.auth.session.sync_cached_secret`
+    then pushes it into this process's ``app.state`` cache so the invalidation
+    takes effect immediately rather than after a restart (see that function's
+    docstring). Every cookie signed under the old secret -- on this browser
+    and any other -- fails to unsign on its next request and is treated as
+    logged out; this response also proactively clears the current browser's
+    cookie via :func:`~collapsarr.auth.session.log_out` rather than leaving it
+    to fail lazily on the next request.
+    """
+    settings = rotate_session_secret(session)
+    assert settings.session_secret is not None  # rotate_session_secret always sets one
+    sync_cached_secret(request.app, settings.session_secret)
+    log_out(request)
+    return AuthStatus(needs_setup=False, authenticated=False, auth_method=settings.auth_method)

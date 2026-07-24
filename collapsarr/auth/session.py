@@ -96,6 +96,23 @@ def _is_secure(connection: HTTPConnection) -> bool:
     return forwarded.split(",")[0].strip().lower() == "https"
 
 
+def sync_cached_secret(app: object, secret: str) -> None:
+    """Push a freshly rotated ``session_secret`` into the ``app.state`` cache.
+
+    :func:`_get_signer` caches the secret it reads from the DB on ``app.state``
+    for the life of the process, so writing a new value to the DB alone (see
+    :func:`collapsarr.settings.service.rotate_session_secret`) would not affect
+    an already-running process's signing/verification until it restarted --
+    every cookie already-issued *and* every cookie the still-running process
+    would go on to mint would keep using the stale cached secret. "Log out
+    everywhere" (COL-55) needs the invalidation to take effect immediately, so
+    the route handler that rotates the secret calls this in the same request
+    to update the cache the next request's :class:`SessionMiddleware` pass
+    will read.
+    """
+    setattr(app.state, _SESSION_SECRET_STATE, secret)  # type: ignore[attr-defined]
+
+
 def _get_signer(app: object) -> itsdangerous.TimestampSigner:
     """Build (and cache) the cookie signer keyed on the install's session secret.
 
