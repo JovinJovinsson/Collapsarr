@@ -16,14 +16,28 @@ This module is imported for its side effect of registering
 
 from __future__ import annotations
 
-from .models import SETTINGS_ID, GlobalSettings, generate_api_key
-from .service import as_downmix_settings, get_global_settings, update_global_settings
+from .env_seed import seed_auth_from_env
+from .models import SETTINGS_ID, GlobalSettings, generate_api_key, generate_session_secret
+from .passwords import hash_password, verify_password
+from .service import (
+    as_downmix_settings,
+    get_global_settings,
+    rotate_session_secret,
+    update_global_settings,
+    verify_auth_password,
+)
 
 __all__ = [
     "SETTINGS_ID",
     "GlobalSettings",
     "as_downmix_settings",
     "generate_api_key",
+    "generate_session_secret",
     "get_global_settings",
+    "hash_password",
+    "rotate_session_secret",
+    "seed_auth_from_env",
     "update_global_settings",
+    "verify_auth_password",
+    "verify_password",
 ]

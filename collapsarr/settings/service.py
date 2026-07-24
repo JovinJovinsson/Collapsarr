@@ -34,7 +34,8 @@ from sqlalchemy.orm import Session
 
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 
-from .models import SETTINGS_ID, GlobalSettings
+from .models import SETTINGS_ID, GlobalSettings, generate_session_secret
+from .passwords import hash_password, verify_password
 
 
 class _Unset:
@@ -90,6 +91,14 @@ def get_global_settings(session: Session) -> GlobalSettings:
         session.add(settings)
         session.commit()
         session.refresh(settings)
+    elif settings.session_secret is None:
+        # An install that predates the ``session_secret`` column (added to the
+        # existing row NULL by the schema-ensure step) gets its secret minted
+        # once here, then it is stable for every subsequent read -- matching the
+        # "generated once on row creation" guarantee for fresh installs.
+        settings.session_secret = generate_session_secret()
+        session.commit()
+        session.refresh(settings)
     return settings
 
 
@@ -104,17 +113,27 @@ def update_global_settings(
     surround_bitrate_kbps: int | None | _Unset = _UNSET,
     concurrency_limit: int | None = None,
     ui_auth_enabled: bool | None = None,
+    auth_username: str | None | _Unset = _UNSET,
+    password: str | None | _Unset = _UNSET,
+    auth_method: str | None = None,
+    auth_required: str | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
     Only fields passed explicitly are changed, matching the convention
     :func:`collapsarr.arr.service.update_instance` already uses. For the
-    three fields whose valid domain includes ``None`` as a meaningful value
+    fields whose valid domain includes ``None`` as a meaningful value
     (``language_allow_list``, ``stereo_bitrate_kbps``,
-    ``surround_bitrate_kbps``), passing ``None`` explicitly *clears* the
-    stored value (e.g. removes a bitrate override) -- omitting the argument
-    (the default) leaves it untouched. Creates the row with defaults first
-    if it doesn't exist yet, same as :func:`get_global_settings`.
+    ``surround_bitrate_kbps``, ``auth_username``, and ``password``), passing
+    ``None`` explicitly *clears* the stored value (e.g. removes a bitrate
+    override, or unsets the credential) -- omitting the argument (the default)
+    leaves it untouched. Creates the row with defaults first if it doesn't
+    exist yet, same as :func:`get_global_settings`.
+
+    ``password`` takes the **plaintext** credential and is stored as a PBKDF2
+    hash (:func:`collapsarr.settings.passwords.hash_password`); the plaintext
+    itself is never persisted. Verify a candidate later with
+    :func:`verify_auth_password`.
     """
     settings = get_global_settings(session)
 
@@ -134,10 +153,54 @@ def update_global_settings(
         settings.concurrency_limit = concurrency_limit
     if ui_auth_enabled is not None:
         settings.ui_auth_enabled = ui_auth_enabled
+    if not isinstance(auth_username, _Unset):
+        settings.auth_username = auth_username
+    if not isinstance(password, _Unset):
+        settings.auth_password_hash = None if password is None else hash_password(password)
+    if auth_method is not None:
+        settings.auth_method = auth_method
+    if auth_required is not None:
+        settings.auth_required = auth_required
 
     session.commit()
     session.refresh(settings)
     return settings
+
+
+def rotate_session_secret(session: Session) -> GlobalSettings:
+    """Mint a fresh session-signing secret and persist it (COL-55).
+
+    Uses the same generator (:func:`~collapsarr.settings.models.
+    generate_session_secret`) COL-49 used for the initial mint. Every
+    signed-cookie session issued under the *previous* secret fails to unsign
+    against the new one, so this is the persistence half of "log out
+    everywhere" -- the caller (:mod:`collapsarr.auth.routes`) still has to
+    push the fresh value into the running process's cached secret (see
+    :func:`collapsarr.auth.session.sync_cached_secret`), since
+    :class:`~collapsarr.auth.session.SessionMiddleware` caches it on
+    ``app.state`` for the life of the process rather than re-reading the DB
+    on every request.
+    """
+    settings = get_global_settings(session)
+    settings.session_secret = generate_session_secret()
+    session.commit()
+    session.refresh(settings)
+    return settings
+
+
+def verify_auth_password(session: Session, password: str) -> bool:
+    """Return whether ``password`` matches the stored UI credential.
+
+    Reads the singleton row's ``auth_password_hash`` and checks the candidate
+    against it in constant time
+    (:func:`collapsarr.settings.passwords.verify_password`). Returns ``False``
+    when no credential has been set yet (``auth_password_hash`` is ``None``), so
+    an unconfigured install never accepts a login.
+    """
+    settings = get_global_settings(session)
+    if settings.auth_password_hash is None:
+        return False
+    return verify_password(password, settings.auth_password_hash)
 
 
 def as_downmix_settings(settings: GlobalSettings) -> DownmixSettings:

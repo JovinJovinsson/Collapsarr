@@ -12,8 +12,9 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from fastapi import Request
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.schema import CreateColumn
 
 from .config import Settings
 
@@ -74,6 +75,48 @@ def init_db(engine: Engine) -> None:
     from . import arr, jobs, media, notify, settings  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    ensure_schema(engine)
+
+
+def ensure_schema(engine: Engine) -> None:
+    """Add any model columns missing from an already-created database (COL-48).
+
+    ``create_all`` (see :func:`init_db`) only creates whole tables that don't
+    exist yet -- it never alters an existing table to add a column a model
+    has gained since that table was first created. This closes that gap: for
+    every table already present in the database, it diffs the model's
+    columns against the database's actual columns and issues
+    ``ALTER TABLE ... ADD COLUMN`` for each one the model has that the
+    database doesn't, preserving all existing rows and data.
+
+    Strictly additive -- it never drops, renames, or retypes a column, and a
+    column already present is left untouched, so re-running is a no-op. This
+    is a deliberate, minimal stopgap; every column added here must be
+    nullable or declare a DB-side ``server_default`` (not just an ORM-side
+    ``default=``), since SQLite (and most databases) reject adding a
+    ``NOT NULL`` column with no default to a table that may already hold
+    rows. It will be superseded by the Alembic migration framework (a later
+    ticket) once schema changes outgrow "add a column".
+    """
+    with engine.begin() as connection:
+        inspector = inspect(connection)
+        existing_tables = set(inspector.get_table_names())
+        preparer = connection.dialect.identifier_preparer
+
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                # create_all() above should already have created it; skip
+                # rather than risk altering a table that isn't there.
+                continue
+
+            existing_columns = {col["name"] for col in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing_columns:
+                    continue
+
+                column_ddl = str(CreateColumn(column).compile(dialect=connection.dialect))
+                quoted_table = preparer.quote(table.name)
+                connection.execute(text(f"ALTER TABLE {quoted_table} ADD COLUMN {column_ddl}"))
 
 
 def get_session(request: Request) -> Iterator[Session]:

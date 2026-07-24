@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from collapsarr import config
 from collapsarr.config import Settings
@@ -83,6 +84,58 @@ def test_database_path_derives_from_data_dir(tmp_path: Path) -> None:
 
     assert settings.database_path == str(data_dir / "collapsarr.db")
     assert settings.sqlalchemy_url == f"sqlite:///{data_dir / 'collapsarr.db'}"
+
+
+def test_auth_seed_env_vars_are_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No COLLAPSARR_AUTH_* set -- the seed fields stay unset (COL-53)."""
+    for var in (
+        "COLLAPSARR_AUTH_USERNAME",
+        "COLLAPSARR_AUTH_PASSWORD",
+        "COLLAPSARR_AUTH_METHOD",
+        "COLLAPSARR_AUTH_REQUIRED",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.auth_username is None
+    assert settings.auth_password is None
+    assert settings.auth_method is None
+    assert settings.auth_required is None
+
+
+def test_auth_seed_env_vars_are_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """COLLAPSARR_AUTH_* populate the seed fields (COL-53)."""
+    monkeypatch.setenv("COLLAPSARR_AUTH_USERNAME", "admin")
+    monkeypatch.setenv("COLLAPSARR_AUTH_PASSWORD", "hunter2")
+    monkeypatch.setenv("COLLAPSARR_AUTH_METHOD", "basic")
+    monkeypatch.setenv("COLLAPSARR_AUTH_REQUIRED", "enabled")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.auth_username == "admin"
+    assert settings.auth_password == "hunter2"
+    assert settings.auth_method == "basic"
+    assert settings.auth_required == "enabled"
+
+
+def test_auth_seed_requires_username_and_password_together() -> None:
+    """A lone COLLAPSARR_AUTH_USERNAME (no password) fails fast at startup."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, auth_username="admin")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, auth_password="hunter2")
+
+
+def test_auth_seed_method_rejects_an_invalid_value() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            auth_username="admin",
+            auth_password="hunter2",
+            auth_method="not-a-real-method",
+        )
 
 
 def test_database_path_override_takes_precedence_over_data_dir(
