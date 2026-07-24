@@ -5,8 +5,9 @@ database. These build the runtime Alembic ``Config`` the same way production
 will (from ``Settings``, no ``alembic.ini``) and run ``upgrade head`` against a
 throwaway SQLite file, asserting all seven mapped tables appear.
 
-Boot-path note: this slice does not wire migrations into app startup (still
-``init_db``); these tests exercise the migration machinery directly.
+These exercise the migration machinery directly. The boot-path wiring (the app
+lifespan calling :func:`~collapsarr.migrations.upgrade_to_head`) and the
+fresh-install / drift-check coverage live in ``test_database.py`` (COL-58).
 """
 
 from __future__ import annotations

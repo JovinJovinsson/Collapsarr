@@ -19,8 +19,9 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
-from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
+from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.main import create_app
+from collapsarr.migrations import upgrade_to_head
 from collapsarr.settings.env_seed import seed_auth_from_env
 from collapsarr.settings.models import AUTH_METHOD_BASIC, AUTH_REQUIRED_ENABLED
 from collapsarr.settings.service import (
@@ -60,7 +61,7 @@ def _seeded_settings(tmp_path: Path, **overrides: object) -> Settings:
 
 def _session_for(settings: Settings) -> Session:
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     return create_session_factory(engine)()
 
 

@@ -16,12 +16,13 @@ import httpx
 from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
-from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
+from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.remux import RemuxResult
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs.failure_notify import make_failure_notifier, notify_job_failure
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
+from collapsarr.migrations import upgrade_to_head
 from collapsarr.notify.service import update_notifier_config
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
@@ -191,7 +192,7 @@ def test_run_pending_automatically_dispatches_a_notification_when_wired_via_make
     settings: Settings,
 ) -> None:
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
 
     with session_factory() as setup_session:
@@ -218,7 +219,7 @@ def test_run_pending_does_not_dispatch_a_notification_for_a_succeeded_job(
     settings: Settings,
 ) -> None:
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
 
     with session_factory() as setup_session:

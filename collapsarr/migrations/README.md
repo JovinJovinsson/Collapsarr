@@ -22,10 +22,13 @@ autogenerate notices column type / server-default drift against
   and a throwaway scratch DB (`./.alembic-scratch.db`, gitignored). It is used
   *solely* for `alembic revision --autogenerate` and `alembic history`.
 
-> Boot-path note: as of COL-57 the production boot path is unchanged — the app
-> still creates its schema via `init_db` (`Base.metadata.create_all` +
-> `ensure_schema`). Wiring `upgrade head` into boot and switching fixtures over
-> to migrations is the next slice (COL-58).
+> Boot-path note: as of COL-58 Alembic is the single source of truth for
+> schema. The application lifespan calls
+> `collapsarr.migrations.upgrade_to_head(settings)` before serving its first
+> request, and the test fixtures build their schema the same way. The retired
+> `init_db` / `Base.metadata.create_all` / `ensure_schema` no longer exist. A
+> failed migration aborts startup (non-zero exit) rather than serve against a
+> half-migrated schema.
 
 ## Authoring workflow
 

@@ -18,8 +18,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
-from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
+from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.main import create_app
+from collapsarr.migrations import upgrade_to_head
 
 
 @pytest.fixture
@@ -39,9 +40,14 @@ def client(settings: Settings) -> Iterator[TestClient]:
 
 @pytest.fixture
 def session(settings: Settings) -> Iterator[Session]:
-    """A schema-initialised DB session for service-layer tests (no HTTP app)."""
+    """A schema-initialised DB session for service-layer tests (no HTTP app).
+
+    Schema is built by running the Alembic migration chain to head (COL-58) --
+    the same mechanism the app boots with -- so tests exercise the real
+    migration-built schema, not a ``create_all`` shortcut.
+    """
+    upgrade_to_head(settings)
     engine = create_engine_from_settings(settings)
-    init_db(engine)
     session_factory = create_session_factory(engine)
     with session_factory() as db_session:
         yield db_session

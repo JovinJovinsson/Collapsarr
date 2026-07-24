@@ -24,7 +24,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
-from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
+from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.remux import RemuxResult
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
@@ -36,6 +36,7 @@ from collapsarr.jobs.history import (
 )
 from collapsarr.jobs.models import JobHistory
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
+from collapsarr.migrations import upgrade_to_head
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
 _REMUX_FAILURE = PipelineResult(
@@ -272,7 +273,7 @@ def test_run_pending_automatically_persists_history_when_a_recorder_is_configure
 ) -> None:
     """Every job run is persisted by run_pending() itself -- no manual call."""
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
 
     queue = JobQueue(
@@ -297,7 +298,7 @@ def test_run_pending_automatically_persists_history_when_a_recorder_is_configure
 
 def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> None:
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
 
     queue = JobQueue(
@@ -319,7 +320,7 @@ def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> 
 def test_run_pending_with_no_history_recorder_persists_nothing(settings: Settings) -> None:
     """No history_recorder configured -> run_pending works, nothing persisted."""
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
 
     queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))  # no history_recorder
@@ -343,7 +344,7 @@ def test_run_pending_persists_history_for_every_concurrently_run_job(
     writes or cross-thread session sharing errors.
     """
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
 
     queue = JobQueue(
@@ -365,7 +366,7 @@ def test_run_pending_persists_history_for_every_concurrently_run_job(
 
 def test_from_settings_threads_history_recorder_through(settings: Settings) -> None:
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
 
     queue = JobQueue.from_settings(

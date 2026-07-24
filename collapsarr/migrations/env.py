@@ -24,7 +24,7 @@ from sqlalchemy import engine_from_config, pool
 from collapsarr.database import Base
 
 # Import every feature package for its side effect of registering models with
-# Base.metadata (the same pattern as collapsarr.database.init_db), so
+# Base.metadata (the pattern the retired collapsarr.database.init_db used), so
 # autogenerate and upgrade see the full current schema.
 import collapsarr.arr  # noqa: F401,E402  isort:skip
 import collapsarr.jobs  # noqa: F401,E402  isort:skip
