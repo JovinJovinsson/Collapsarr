@@ -9,12 +9,16 @@
  * they still route through `apiFetch` only to reuse its error parsing.
  */
 
+import type { AuthMethod } from "../types/settings";
 import { apiErrorMessage, apiFetch } from "./client";
 
 /** Mirrors `collapsarr.auth.routes.AuthStatus`. */
 export interface AuthStatus {
   needs_setup: boolean;
   authenticated: boolean;
+  /** Which method (COL-52) is active -- the Login page uses this to hide
+   * "remember me" under Basic, a Forms-only concept. */
+  auth_method: AuthMethod;
 }
 
 /** Reads first-run / session state (`GET /api/auth/status`). */

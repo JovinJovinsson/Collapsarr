@@ -18,6 +18,7 @@ const baseSettings: GlobalSettings = {
   concurrency_limit: 1,
   ui_auth_enabled: false,
   auth_required: "local_bypass",
+  auth_method: "forms",
   api_key: "server-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",

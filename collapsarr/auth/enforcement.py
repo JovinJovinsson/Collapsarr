@@ -44,12 +44,20 @@ address is what gets classified, not its upstream client's -- an install
 behind a reverse proxy should set ``auth_required="enabled"`` until a later
 ticket adds trusted-proxy support (see the README's Authentication section).
 
-The Basic auth method (COL-52) slots in at ``is_authenticated`` without
-disturbing this routing.
+The Basic auth method (COL-52) slots in at the browser-route branch below:
+when ``auth_method="basic"``, an unauthenticated browser request gets a ``401``
++ ``WWW-Authenticate: Basic`` challenge instead of a redirect to ``/login``; a
+valid ``Authorization: Basic`` header verified against the same credential
+(:func:`collapsarr.settings.service.verify_auth_password` -- COL-49's single
+operator credential, shared with Forms) mints a normal session
+(:func:`collapsarr.auth.session.log_in`), so every check *after* that --
+including ``/api``'s session-or-key rule -- is untouched. Only the initial UI
+challenge's transport differs between the two methods.
 """
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import secrets
 from collections.abc import Awaitable, Callable
@@ -57,15 +65,20 @@ from collections.abc import Awaitable, Callable
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from ..settings.models import AUTH_REQUIRED_LOCAL_BYPASS
-from ..settings.service import get_global_settings
-from .session import is_authenticated
+from ..settings.models import AUTH_METHOD_BASIC, AUTH_REQUIRED_LOCAL_BYPASS
+from ..settings.service import get_global_settings, verify_auth_password
+from .session import is_authenticated, log_in
 
 API_KEY_HEADER = "X-Api-Key"
 """Request header carrying the API key (Sonarr/Radarr convention)."""
 
 API_KEY_QUERY = "apikey"
 """Query-parameter fallback for callers that cannot set a custom header."""
+
+AUTHORIZATION_HEADER = "authorization"
+BASIC_SCHEME_PREFIX = "basic "
+BASIC_REALM = "Collapsarr"
+"""``WWW-Authenticate`` realm presented in the Basic auth challenge."""
 
 HEALTH_PATH = "/health"
 SETUP_PATH = "/setup"
@@ -86,6 +99,32 @@ def _extract_key(request: Request) -> str | None:
     if header:
         return header
     return request.query_params.get(API_KEY_QUERY) or None
+
+
+def _parse_basic_credentials(request: Request) -> tuple[str, str] | None:
+    """Decode an ``Authorization: Basic <base64>`` header into
+    ``(username, password)``, or ``None`` if it is absent or malformed."""
+    header = request.headers.get(AUTHORIZATION_HEADER)
+    if header is None or not header.lower().startswith(BASIC_SCHEME_PREFIX):
+        return None
+    try:
+        decoded = base64.b64decode(header[len(BASIC_SCHEME_PREFIX) :].strip()).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    username, separator, password = decoded.partition(":")
+    if not separator:
+        return None
+    return username, password
+
+
+def _basic_challenge() -> Response:
+    """The ``401`` + ``WWW-Authenticate: Basic`` response for an
+    unauthenticated request under the Basic auth method (COL-52)."""
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Basic authentication required."},
+        headers={"WWW-Authenticate": f'Basic realm="{BASIC_REALM}"'},
+    )
 
 
 def _client_is_local(request: Request) -> bool:
@@ -139,6 +178,8 @@ async def enforce_auth_middleware(
         credential_set = settings.auth_username is not None
         expected_key = settings.api_key
         auth_required = settings.auth_required
+        auth_method = settings.auth_method
+        auth_username = settings.auth_username
 
     if auth_required == AUTH_REQUIRED_LOCAL_BYPASS and _client_is_local(request):
         # local_bypass + a loopback/private-range peer: trust the network,
@@ -165,11 +206,34 @@ async def enforce_auth_middleware(
         if path == SETUP_PATH:
             return await call_next(request)
         return RedirectResponse(url=SETUP_PATH, status_code=_REDIRECT_STATUS)
+    assert auth_username is not None  # credential_set is True past this point
 
     if path == SETUP_PATH:
         # Credential already exists -- setup is done.
-        target = APP_ROOT if authed else LOGIN_PATH
-        return RedirectResponse(url=target, status_code=_REDIRECT_STATUS)
+        if authed:
+            return RedirectResponse(url=APP_ROOT, status_code=_REDIRECT_STATUS)
+        if auth_method == AUTH_METHOD_BASIC:
+            return _basic_challenge()
+        return RedirectResponse(url=LOGIN_PATH, status_code=_REDIRECT_STATUS)
+
+    if auth_method == AUTH_METHOD_BASIC:
+        # No Forms /login page under this method -- every other browser route
+        # (including /login itself, if visited directly) is challenged or
+        # passed the same way.
+        if authed:
+            return await call_next(request)
+        creds = _parse_basic_credentials(request)
+        if creds is not None and creds[0] == auth_username:
+            with session_factory() as session:
+                password_ok = verify_auth_password(session, creds[1])
+            if password_ok:
+                # Same credential core as Forms (COL-49) -- mint a session so
+                # this browser's subsequent /api calls keep working the
+                # unchanged session-or-key way; only the initial UI challenge
+                # differs.
+                log_in(request, auth_username, remember=False)
+                return await call_next(request)
+        return _basic_challenge()
 
     if path == LOGIN_PATH:
         if authed:

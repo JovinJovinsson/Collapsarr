@@ -1,7 +1,7 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { login } from "../api/auth";
+import { fetchAuthStatus, login } from "../api/auth";
 import { BrandMark } from "../components/icons";
 
 /**
@@ -10,6 +10,13 @@ import { BrandMark } from "../components/icons";
  * credential exists but no session is present. "Remember me" selects a
  * long-lived cookie over a browser-session one; on success we navigate into
  * the app, where the session cookie authenticates `/api` requests.
+ *
+ * Under the Basic auth method (COL-52) this page is normally unreachable --
+ * the enforcement middleware challenges with `WWW-Authenticate: Basic`
+ * instead of redirecting here -- but if it is ever reached directly (e.g. a
+ * stale bookmark before a method switch takes effect in this browser),
+ * "remember me" is hidden: it's a Forms-only concept, since Basic re-sends
+ * credentials on every request rather than persisting a session choice.
  */
 export function LoginPage() {
   const navigate = useNavigate();
@@ -18,6 +25,16 @@ export function LoginPage() {
   const [remember, setRemember] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [authMethod, setAuthMethod] = useState<"forms" | "basic">("forms");
+
+  useEffect(() => {
+    fetchAuthStatus()
+      .then((status) => setAuthMethod(status.auth_method))
+      .catch(() => {
+        // Best-effort: keep the default ("forms", remember-me shown) if the
+        // status fetch fails -- the login form itself still works either way.
+      });
+  }, []);
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -75,14 +92,16 @@ export function LoginPage() {
           />
         </div>
 
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={remember}
-            onChange={(event) => setRemember(event.target.checked)}
-          />
-          Remember me on this device
-        </label>
+        {authMethod !== "basic" && (
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(event) => setRemember(event.target.checked)}
+            />
+            Remember me on this device
+          </label>
+        )}
 
         {error && <p className="form-error">{error}</p>}
 

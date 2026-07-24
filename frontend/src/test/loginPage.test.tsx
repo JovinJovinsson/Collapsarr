@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -45,9 +45,13 @@ describe("LoginPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     expect(await screen.findByText("Home view")).toBeInTheDocument();
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("/api/auth/login");
-    expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+    // The mount effect also fetches /api/auth/status (to learn the active
+    // auth method), so find the login call specifically rather than
+    // assuming it is the first one.
+    const loginCall = fetchMock.mock.calls.find(([callUrl]) => callUrl === "/api/auth/login");
+    expect(loginCall).toBeDefined();
+    const [, init] = loginCall as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({
       username: "operator",
       password: "secret-pass",
       remember: true,
@@ -68,14 +72,36 @@ describe("LoginPage", () => {
     expect(await screen.findByText(/invalid username or password/i)).toBeInTheDocument();
   });
 
-  it("validates that both fields are filled before calling the API", () => {
-    const fetchMock = vi.fn();
+  it("validates that both fields are filled before calling the login API", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({ needs_setup: false, authenticated: false, auth_method: "forms" }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     renderLogin();
+    // Let the mount effect's /api/auth/status fetch settle before asserting,
+    // so the state update it triggers doesn't leak into the next test.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     fireEvent.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     expect(screen.getByText(/enter your username and password/i)).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalled();
+    // The mount effect's /api/auth/status fetch is expected; only the login
+    // submission itself must not have fired.
+    expect(fetchMock.mock.calls.some(([callUrl]) => callUrl === "/api/auth/login")).toBe(false);
+  });
+
+  it("hides the remember-me option once the server reports the Basic auth method (COL-52)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse({ needs_setup: false, authenticated: false, auth_method: "basic" }),
+      ),
+    );
+    renderLogin();
+
+    expect(screen.getByLabelText(/^username$/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("checkbox", { name: /remember me/i })).not.toBeInTheDocument(),
+    );
   });
 });

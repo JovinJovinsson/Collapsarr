@@ -13,11 +13,16 @@ session):
 * ``POST /api/auth/logout`` -- clear the session.
 
 ``status``/``setup``/``login`` are reachable without a session (the enforcement
-middleware opens them); ``logout`` requires one. Only the Forms method is
-wired here -- Basic auth (COL-52) is a separate ticket. ``setup`` leaves
-``auth_required`` untouched (it does not force ``enabled``), so the
-required-mode the row already carries -- ``local_bypass`` by default (COL-51)
--- survives completing first-run setup; switch it from Settings.
+middleware opens them); ``logout`` requires one. Only the Forms flow is wired
+as an ``/api/auth`` endpoint here -- Basic auth (COL-52) doesn't need one: it
+authenticates directly in :mod:`collapsarr.auth.enforcement` against the same
+credential this module manages, challenging with ``WWW-Authenticate`` instead
+of a JSON login call. ``AuthStatus.auth_method`` (added by COL-52) reports
+which method is active so the frontend (the Login page) can adapt --
+"remember me" is a Forms-only concept. ``setup`` leaves ``auth_required`` and
+``auth_method`` untouched (it does not force either), so the modes the row
+already carries -- ``local_bypass``/``forms`` by default (COL-51/COL-52) --
+survive completing first-run setup; switch them from Settings.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_session
 from ..settings.models import AUTH_METHOD_FORMS
+from ..settings.routes import AuthMethodMode
 from ..settings.service import (
     get_global_settings,
     update_global_settings,
@@ -42,10 +48,12 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 class AuthStatus(BaseModel):
-    """Whether the install still needs setup, and whether this caller is in."""
+    """Whether the install still needs setup, whether this caller is in, and
+    which auth method (``forms``|``basic``, COL-52) is active."""
 
     needs_setup: bool
     authenticated: bool
+    auth_method: AuthMethodMode
 
 
 class SetupRequest(BaseModel):
@@ -73,6 +81,7 @@ def auth_status(request: Request, session: Session = Depends(get_session)) -> Au
     return AuthStatus(
         needs_setup=settings.auth_username is None,
         authenticated=is_authenticated(request),
+        auth_method=settings.auth_method,
     )
 
 
@@ -99,7 +108,7 @@ def setup(
         auth_method=AUTH_METHOD_FORMS,
     )
     log_in(request, body.username, remember=False)
-    return AuthStatus(needs_setup=False, authenticated=True)
+    return AuthStatus(needs_setup=False, authenticated=True, auth_method=AUTH_METHOD_FORMS)
 
 
 @router.post("/login", response_model=AuthStatus)
@@ -122,7 +131,7 @@ def login(
         raise HTTPException(status_code=401, detail="Invalid username or password.")
 
     log_in(request, body.username, remember=body.remember)
-    return AuthStatus(needs_setup=False, authenticated=True)
+    return AuthStatus(needs_setup=False, authenticated=True, auth_method=settings.auth_method)
 
 
 @router.post("/logout", response_model=AuthStatus)
@@ -130,4 +139,8 @@ def logout(request: Request, session: Session = Depends(get_session)) -> AuthSta
     """Clear the session; the response discards the cookie."""
     log_out(request)
     settings = get_global_settings(session)
-    return AuthStatus(needs_setup=settings.auth_username is None, authenticated=False)
+    return AuthStatus(
+        needs_setup=settings.auth_username is None,
+        authenticated=False,
+        auth_method=settings.auth_method,
+    )

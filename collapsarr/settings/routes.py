@@ -26,6 +26,11 @@ collapse together.
 ``auth_required`` (COL-51) is also read/write here -- ``"local_bypass"``
 (default) vs. ``"enabled"`` -- so Settings can flip an install's required-mode;
 see :mod:`collapsarr.auth.enforcement` for what each mode does.
+
+``auth_method`` (COL-52) is read/write the same way -- ``"forms"`` (default,
+the sign-in page) vs. ``"basic"`` (a browser's native HTTP Basic prompt) --
+so Settings can switch how the same credential (COL-49) is presented; see
+:mod:`collapsarr.auth.enforcement` for how each method challenges a request.
 """
 
 from __future__ import annotations
@@ -47,8 +52,13 @@ AuthRequiredMode = Literal["enabled", "local_bypass"]
 :data:`collapsarr.settings.models.AUTH_REQUIRED_ENABLED` /
 :data:`~collapsarr.settings.models.AUTH_REQUIRED_LOCAL_BYPASS` -- spelled out
 as literals (not the constants themselves) so mypy accepts them in a
-``Literal[...]``. ``basic`` vs. ``forms`` (``auth_method``) is not exposed
-here yet -- that's COL-52."""
+``Literal[...]``."""
+
+AuthMethodMode = Literal["forms", "basic"]
+"""The two auth methods settable from Settings (COL-52), matching
+:data:`collapsarr.settings.models.AUTH_METHOD_FORMS` /
+:data:`~collapsarr.settings.models.AUTH_METHOD_BASIC` -- spelled out as
+literals for the same reason as :data:`AuthRequiredMode`."""
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -72,6 +82,7 @@ class SettingsRead(BaseModel):
     concurrency_limit: int
     ui_auth_enabled: bool
     auth_required: AuthRequiredMode
+    auth_method: AuthMethodMode
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -97,6 +108,7 @@ class SettingsUpdate(BaseModel):
     concurrency_limit: int | None = None
     ui_auth_enabled: bool | None = None
     auth_required: AuthRequiredMode | None = None
+    auth_method: AuthMethodMode | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -121,6 +133,7 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         concurrency_limit=settings.concurrency_limit,
         ui_auth_enabled=settings.ui_auth_enabled,
         auth_required=settings.auth_required,
+        auth_method=settings.auth_method,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -171,5 +184,7 @@ def update_settings_endpoint(
         kwargs["ui_auth_enabled"] = body.ui_auth_enabled
     if "auth_required" in provided:
         kwargs["auth_required"] = body.auth_required
+    if "auth_method" in provided:
+        kwargs["auth_method"] = body.auth_method
 
     return _to_read(update_global_settings(session, **kwargs))  # type: ignore[arg-type]

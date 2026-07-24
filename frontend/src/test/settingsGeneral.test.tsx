@@ -19,6 +19,7 @@ const baseSettings: GlobalSettings = {
   concurrency_limit: 2,
   ui_auth_enabled: false,
   auth_required: "local_bypass",
+  auth_method: "forms",
   api_key: "server-generated-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
@@ -44,6 +45,28 @@ describe("GeneralSection", () => {
     expect(screen.getByLabelText(/surround bitrate/i)).toHaveValue(448);
     expect(screen.getByRole("checkbox", { name: /require the api key/i })).not.toBeChecked();
     expect(screen.getByLabelText(/login requirement/i)).toHaveValue("local_bypass");
+    expect(screen.getByLabelText(/sign-in method/i)).toHaveValue("forms");
+  });
+
+  it("saves the auth_method via PUT when switched to HTTP Basic", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<GeneralSection />);
+    const authMethodSelect = await screen.findByLabelText(/sign-in method/i);
+    fireEvent.change(authMethodSelect, { target: { value: "basic" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.auth_method).toBe("basic");
   });
 
   it("saves the auth_required mode via PUT when switched to always-required", async () => {

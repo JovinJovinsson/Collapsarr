@@ -20,6 +20,7 @@ COL-26/COL-45): enforcement is unconditional once a credential is set.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -30,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
 from collapsarr.main import create_app
-from collapsarr.settings.models import AUTH_REQUIRED_ENABLED
+from collapsarr.settings.models import AUTH_METHOD_BASIC, AUTH_REQUIRED_ENABLED
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
 WEBHOOK_ROUTE = "/api/webhook/arr/1"
@@ -51,6 +52,12 @@ def noredirect_client(settings: Settings) -> Iterator[TestClient]:
     app = create_app(settings=settings)
     with TestClient(app, follow_redirects=False) as test_client:
         yield test_client
+
+
+def _basic_header(username: str, password: str) -> dict[str, str]:
+    """Build an ``Authorization: Basic`` header value for test requests."""
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
 
 
 def _set_credential(session: Session) -> str:
@@ -105,7 +112,11 @@ def test_setup_persists_a_hashed_credential_and_logs_in(
     )
 
     assert response.status_code == 200
-    assert response.json() == {"needs_setup": False, "authenticated": True}
+    assert response.json() == {
+        "needs_setup": False,
+        "authenticated": True,
+        "auth_method": "forms",
+    }
 
     settings = get_global_settings(session)
     assert settings.auth_username == USERNAME
@@ -341,3 +352,117 @@ def test_local_bypass_classification_ignores_x_forwarded_for_spoofing(
         redirect = test_client.get(UI_ROUTE, headers={"X-Forwarded-For": LOOPBACK_HOST})
         assert redirect.status_code == 303
         assert redirect.headers["location"] == "/login"
+
+
+# --- Basic auth method (COL-52) ------------------------------------------------
+#
+# Same credential core as Forms (verified via ``verify_auth_password``), a
+# different transport: a browser-native ``WWW-Authenticate: Basic`` challenge
+# instead of a redirect to ``/login``. These use the plain ``client``/
+# ``noredirect_client`` fixtures (non-local peer, per the comment above) so
+# local_bypass never masks the method's own behaviour.
+
+
+def test_basic_method_challenges_an_unauthenticated_ui_request(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+    update_global_settings(session, auth_method=AUTH_METHOD_BASIC)
+
+    response = noredirect_client.get(UI_ROUTE)
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"].lower().startswith("basic")
+
+
+def test_basic_method_grants_access_with_correct_credentials(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+    update_global_settings(session, auth_method=AUTH_METHOD_BASIC)
+
+    response = noredirect_client.get(UI_ROUTE, headers=_basic_header(USERNAME, PASSWORD))
+
+    assert response.status_code == 404  # auth passed; no SPA mounted
+
+
+def test_basic_method_rejects_incorrect_credentials(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+    update_global_settings(session, auth_method=AUTH_METHOD_BASIC)
+
+    response = noredirect_client.get(UI_ROUTE, headers=_basic_header(USERNAME, "wrong"))
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"].lower().startswith("basic")
+
+
+def test_basic_method_rejects_an_unknown_username(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+    update_global_settings(session, auth_method=AUTH_METHOD_BASIC)
+
+    response = noredirect_client.get(UI_ROUTE, headers=_basic_header("someone-else", PASSWORD))
+
+    assert response.status_code == 401
+
+
+def test_basic_method_mints_a_session_so_later_requests_need_no_header(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    _set_credential(session)
+    update_global_settings(session, auth_method=AUTH_METHOD_BASIC)
+
+    challenged = noredirect_client.get(UI_ROUTE, headers=_basic_header(USERNAME, PASSWORD))
+    assert challenged.status_code == 404
+    assert "collapsarr_session" in noredirect_client.cookies
+
+    # The client's cookie jar now carries the session, so a follow-up request
+    # with no Authorization header at all still passes.
+    followup = noredirect_client.get(UI_ROUTE)
+    assert followup.status_code == 404
+
+
+def test_basic_method_leaves_api_session_or_key_behaviour_unchanged(
+    client: TestClient, session: Session
+) -> None:
+    key = _set_credential(session)
+    update_global_settings(session, auth_method=AUTH_METHOD_BASIC)
+
+    # No session, no key: rejected exactly like under Forms.
+    assert client.post(WEBHOOK_ROUTE, json={}).status_code == 401
+    # A valid API key still passes, unaffected by the method choice.
+    assert client.post(WEBHOOK_ROUTE, json={}, headers={"X-Api-Key": key}).status_code == 404
+
+
+def test_basic_method_leaves_health_open(client: TestClient, session: Session) -> None:
+    _set_credential(session)
+    update_global_settings(session, auth_method=AUTH_METHOD_BASIC)
+
+    assert client.get("/health").status_code == 200
+
+
+def test_auth_method_is_switchable_via_the_settings_api(
+    client: TestClient, session: Session
+) -> None:
+    key = _set_credential(session)
+
+    response = client.put(
+        "/api/settings", json={"auth_method": "basic"}, headers={"X-Api-Key": key}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["auth_method"] == "basic"
+    assert get_global_settings(session).auth_method == AUTH_METHOD_BASIC
+
+
+def test_auth_status_reports_the_active_method(client: TestClient, session: Session) -> None:
+    _set_credential(session)
+    update_global_settings(session, auth_method=AUTH_METHOD_BASIC)
+
+    response = client.get("/api/auth/status")
+
+    assert response.status_code == 200
+    assert response.json()["auth_method"] == "basic"

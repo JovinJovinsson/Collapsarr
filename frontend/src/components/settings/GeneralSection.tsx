@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 import { getStoredApiKey, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
-import type { AuthRequiredMode } from "../../types/settings";
+import type { AuthMethod, AuthRequiredMode } from "../../types/settings";
 
 type LoadState =
   | { status: "loading" }
@@ -13,6 +13,7 @@ interface GeneralFormValues {
   concurrencyLimit: string;
   uiAuthEnabled: boolean;
   authRequired: AuthRequiredMode;
+  authMethod: AuthMethod;
   stereoCodec: string;
   stereoBitrateKbps: string;
   surroundCodec: string;
@@ -55,6 +56,7 @@ export function GeneralSection() {
     concurrencyLimit: "1",
     uiAuthEnabled: false,
     authRequired: "local_bypass",
+    authMethod: "forms",
     stereoCodec: "aac",
     stereoBitrateKbps: "",
     surroundCodec: "ac3",
@@ -76,6 +78,7 @@ export function GeneralSection() {
           concurrencyLimit: String(settings.concurrency_limit),
           uiAuthEnabled: settings.ui_auth_enabled,
           authRequired: settings.auth_required,
+          authMethod: settings.auth_method,
           stereoCodec: settings.stereo_codec,
           stereoBitrateKbps: settings.stereo_bitrate_kbps === null ? "" : String(settings.stereo_bitrate_kbps),
           surroundCodec: settings.surround_codec,
@@ -103,6 +106,7 @@ export function GeneralSection() {
         concurrency_limit: Number(form.concurrencyLimit),
         ui_auth_enabled: form.uiAuthEnabled,
         auth_required: form.authRequired,
+        auth_method: form.authMethod,
         stereo_codec: form.stereoCodec.trim(),
         stereo_bitrate_kbps: form.stereoBitrateKbps.trim() === "" ? null : Number(form.stereoBitrateKbps),
         surround_codec: form.surroundCodec.trim(),
@@ -114,6 +118,7 @@ export function GeneralSection() {
         concurrencyLimit: String(updated.concurrency_limit),
         uiAuthEnabled: updated.ui_auth_enabled,
         authRequired: updated.auth_required,
+        authMethod: updated.auth_method,
         stereoCodec: updated.stereo_codec,
         stereoBitrateKbps: updated.stereo_bitrate_kbps === null ? "" : String(updated.stereo_bitrate_kbps),
         surroundCodec: updated.surround_codec,
@@ -219,6 +224,27 @@ export function GeneralSection() {
                 address only, never an <code>X-Forwarded-For</code> header — if Collapsarr sits
                 behind a reverse proxy, every client looks like the proxy&apos;s own address, so
                 pick <strong>Always required</strong> instead until trusted-proxy support ships.
+              </p>
+            </div>
+
+            <div className="form-field form-field--narrow">
+              <label htmlFor="auth-method">Sign-in method</label>
+              <select
+                id="auth-method"
+                value={form.authMethod}
+                onChange={(event) =>
+                  setForm({ ...form, authMethod: event.target.value as typeof form.authMethod })
+                }
+              >
+                <option value="forms">Sign-in page</option>
+                <option value="basic">HTTP Basic (browser prompt)</option>
+              </select>
+              <p className="form-hint">
+                <strong>Sign-in page</strong> (default) shows Collapsarr&apos;s own login form,
+                with an optional &quot;remember me&quot;. <strong>HTTP Basic</strong> uses your
+                browser&apos;s native credential prompt instead -- no remember-me option, since
+                Basic re-sends credentials with every request. Both verify the same username and
+                password.
               </p>
             </div>
 
