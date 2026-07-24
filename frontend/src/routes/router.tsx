@@ -2,9 +2,17 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 
 import { AppShell } from "../components/AppShell";
 import { FileDetailPage } from "../pages/FileDetailPage";
+import { LoginPage } from "../pages/LoginPage";
+import { SetupPage } from "../pages/SetupPage";
 import { navItems } from "./nav";
 
 export const router = createBrowserRouter([
+  // Auth screens (COL-50) live outside the AppShell layout: no sidebar, no
+  // session required. The server's enforcement middleware redirects UI routes
+  // to /setup (first run) or /login (no session) so these are reachable before
+  // a session exists; they render standalone here.
+  { path: "/setup", element: <SetupPage /> },
+  { path: "/login", element: <LoginPage /> },
   {
     path: "/",
     element: <AppShell />,

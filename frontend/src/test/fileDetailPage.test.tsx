@@ -45,6 +45,8 @@ const settingsResponse: GlobalSettings = {
   surround_bitrate_kbps: 640,
   concurrency_limit: 1,
   ui_auth_enabled: false,
+  auth_required: "local_bypass",
+  auth_method: "forms",
   api_key: "test-key",
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",

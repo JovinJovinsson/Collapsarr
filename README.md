@@ -65,27 +65,30 @@ services:
     restart: unless-stopped
 ```
 
-Then open `http://localhost:8282`. `restart: unless-stopped` above means the
-container comes back automatically whenever it stops unexpectedly or the
-Docker daemon restarts (e.g. after a host reboot) — see
-[Running on startup](#running-on-startup) if you need it to survive a reboot
-on a bare-metal/PyPI install instead.
+Then open `http://localhost:8282` — you'll land on a one-time credential setup
+page (see [Authentication](#authentication) for how login is enforced,
+including the caveat if you're putting Collapsarr behind a reverse proxy).
+`restart: unless-stopped` above means the container comes back automatically
+whenever it stops unexpectedly or the Docker daemon restarts (e.g. after a
+host reboot) — see [Running on startup](#running-on-startup) if you need it
+to survive a reboot on a bare-metal/PyPI install instead.
 
 **PyPI (bare-metal):**
 
 ```bash
-pip install collapsarr
-COLLAPSARR_DATABASE_PATH=~/.local/share/collapsarr/collapsarr.db collapsarr
+pipx install collapsarr
+collapsarr
 ```
 
-The default database path (`/config/collapsarr.db`) assumes the Docker
-image's mounted `/config` volume — on a bare-metal install `/config` usually
-doesn't exist or isn't writable, so **set `COLLAPSARR_DATABASE_PATH` to a
-location your user owns**, as above (the parent directory is created for
-you). Requires FFmpeg on `PATH` — see [Requirements](#requirements) below.
-Open `http://localhost:8282`; see [Configuration](#configuration) for the
-full list of environment variables, and
-[Running on startup](#running-on-startup) for a systemd unit.
+No flags, no config file needed — Collapsarr stores its SQLite database
+under your platform's standard per-user data directory by default (e.g.
+`~/.local/share/collapsarr/collapsarr.db` on Linux; native per-OS locations
+on macOS/Windows), creating it automatically if it doesn't exist. Set
+`COLLAPSARR_DATA_DIR` if you'd rather it live somewhere else — see
+[Configuration](#configuration). Requires FFmpeg on `PATH` — see
+[Requirements](#requirements) below. Open `http://localhost:8282`; see
+[Configuration](#configuration) for the full list of environment variables,
+and [Running on startup](#running-on-startup) for a systemd unit.
 
 ## Requirements
 
@@ -103,6 +106,49 @@ full list of environment variables, and
   | Windows (winget) | `winget install ffmpeg` |
 
   Verify with `ffmpeg -version`. Official builds/source: [ffmpeg.org/download.html](https://ffmpeg.org/download.html).
+
+## Authentication
+
+Collapsarr requires a one-time credential setup (`/setup`, first run) and,
+after that, logging in (`/login`) before the UI/API is usable — *except* from
+a caller Collapsarr considers "local". The **Login requirement** setting
+(Settings → General, `auth_required` in the API) controls this:
+
+| Mode | Behaviour |
+| --- | --- |
+| **Disabled for local addresses** (`local_bypass`, default) | A caller connecting from a loopback (`127.0.0.1`/`::1`) or private-range (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, etc.) address reaches the UI and API with no setup and no login. Anyone connecting from a routable/public address still has to authenticate normally. |
+| **Always required** (`enabled`) | Every caller is challenged, regardless of address. |
+
+**Reverse-proxy limitation:** local-address classification looks only at the
+*direct* TCP connection Collapsarr accepted — never an `X-Forwarded-For` (or
+similar) header, since that's supplied by the client and trivially spoofable.
+If Collapsarr sits behind a reverse proxy (nginx, Traefik, Cloudflare Tunnel,
+etc.), every request's direct peer is the proxy itself, which usually *is*
+local — meaning **every** client, including ones out on the internet, would
+be classified as local and skip authentication entirely. **If you run
+Collapsarr behind a reverse proxy, set the Login requirement to "Always
+required" (`auth_required=enabled`)** until a future release adds
+trusted-proxy support (a stubbed-out capability today).
+
+**Headless deploys — seeding a credential without the setup page:** a
+declarative/automated deploy (Docker Compose, Ansible, etc.) has no human
+available to click through `/setup`. Set `COLLAPSARR_AUTH_USERNAME` and
+`COLLAPSARR_AUTH_PASSWORD` (together — see
+[Configuration](#configuration)) and a fresh install seeds that credential on
+first boot instead — hashed before it's persisted, never stored or logged in
+plaintext — and comes up already past the setup gate. `COLLAPSARR_AUTH_METHOD`
+and `COLLAPSARR_AUTH_REQUIRED` are honoured at the same time if set, otherwise
+the seeded credential gets the same defaults `/setup` would (`forms`,
+`local_bypass`).
+
+This doubles as the supported password-recovery/lockout escape hatch, but
+**only for a fresh or already-locked-out install with no credential
+configured yet** — seeding runs once and never overwrites a credential that
+already exists, even if the environment variables are still set on a later
+boot. It does **not** help recover a *forgotten* password once a credential
+is already set; that requires clearing the existing `auth_username`/
+`auth_password_hash` first (e.g. directly in the database) so the instance
+has no credential again, at which point re-seeding (or `/setup`) applies.
 
 ## Development
 
@@ -132,11 +178,16 @@ directory. See [`.env.example`](.env.example).
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `COLLAPSARR_DATABASE_PATH` | `/config/collapsarr.db` | SQLite database file path. Override this on bare-metal installs — the default assumes Docker's `/config` volume. |
-| `COLLAPSARR_DATABASE_URL` | *(derived from path)* | Full SQLAlchemy URL override. |
+| `COLLAPSARR_DATA_DIR` | *(OS user-data dir)* | Root directory for application data — the SQLite database today, logs/backups later. Defaults to `platformdirs.user_data_dir("collapsarr")` (e.g. `~/.local/share/collapsarr` on Linux). Created automatically if missing. The Docker image sets this to `/config` (its mounted volume) — see [Quick start](#quick-start). |
+| `COLLAPSARR_DATABASE_PATH` | *(derived from `COLLAPSARR_DATA_DIR`)* | SQLite database file path. Set this to override the location directly, independent of `COLLAPSARR_DATA_DIR`. |
+| `COLLAPSARR_DATABASE_URL` | *(derived from path)* | Full SQLAlchemy URL override — takes precedence over both of the above. |
 | `COLLAPSARR_HOST` | `0.0.0.0` | API server bind address. |
 | `COLLAPSARR_PORT` | `8282` | API server bind port. |
 | `COLLAPSARR_LOG_LEVEL` | `INFO` | Log level. |
+| `COLLAPSARR_AUTH_USERNAME` | *(unset)* | First-boot credential seed: UI username. Set together with `COLLAPSARR_AUTH_PASSWORD` — see [Authentication](#authentication). |
+| `COLLAPSARR_AUTH_PASSWORD` | *(unset)* | First-boot credential seed: UI password. Hashed before being persisted; never stored or logged in plaintext. |
+| `COLLAPSARR_AUTH_METHOD` | *(unset — `forms`)* | Optional, only applied when the seed credential above is actually seeded: `forms` or `basic`. |
+| `COLLAPSARR_AUTH_REQUIRED` | *(unset — `local_bypass`)* | Optional, only applied when the seed credential above is actually seeded: `enabled` or `local_bypass`. |
 
 ## Running on startup
 
