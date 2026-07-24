@@ -137,6 +137,11 @@ def _prune_old_backups(backups_dir: Path, db_file_name: str) -> None:
         key=lambda path: path.stat().st_mtime,
     )
     stale_count = len(backups) - BACKUP_RETENTION_COUNT
+    if stale_count <= 0:
+        # At or under the retention limit: nothing to prune. Guarded explicitly
+        # because a negative ``stale_count`` would make ``backups[:stale_count]``
+        # slice from the *front*, deleting the oldest backups we must keep.
+        return
     for stale in backups[:stale_count]:
         stale.unlink(missing_ok=True)
 

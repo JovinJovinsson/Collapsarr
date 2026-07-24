@@ -27,6 +27,7 @@ from collapsarr.migrations import (
     BACKUP_RETENTION_COUNT,
     BASELINE_REVISION,
     _backup_before_migration,
+    _prune_old_backups,
     _sqlite_file_path,
     build_alembic_config,
     upgrade_to_head,
@@ -153,6 +154,46 @@ def test_retention_keeps_only_last_five_backups(settings: Settings) -> None:
     for name in stale_names[2:]:
         assert name in remaining
     assert any("unversioned" in name for name in remaining)
+
+
+def test_retention_grows_to_five_then_caps_on_incremental_accrual(
+    settings: Settings,
+) -> None:
+    """Backups accrued one at a time grow 1..5 then cap at 5 (oldest pruned).
+
+    This models the realistic path -- one backup added per pending migration --
+    where each prune sees ``len(backups) <= BACKUP_RETENTION_COUNT`` until the
+    sixth. It is the regression guard for the negative-slice bug: with the
+    buggy ``backups[:len-5]`` pruning, retention would cap at 2 (each prune
+    below the limit sliced from the front and deleted a backup that should be
+    kept) instead of growing to 5.
+    """
+    backups_dir = _backups_dir(settings)
+    backups_dir.mkdir(parents=True)
+    db_name = _db_file_name(settings)
+    base_epoch = 1_700_000_000  # a fixed point well in the past
+
+    expected_counts = [1, 2, 3, 4, 5, 5, 5]  # 7 accruals: grows to 5, then caps
+    for i, expected in enumerate(expected_counts):
+        # One new backup with a strictly-increasing mtime, then prune -- exactly
+        # what _backup_before_migration does per pending migration.
+        new_backup = backups_dir / f"{db_name}.pre-rev{i}-{i:020d}.bak"
+        new_backup.write_bytes(b"x")
+        os.utime(new_backup, (base_epoch + i, base_epoch + i))
+
+        _prune_old_backups(backups_dir, db_name)
+
+        remaining = sorted(
+            backups_dir.glob(f"{db_name}.pre-*.bak"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        assert len(remaining) == expected, f"after accrual #{i + 1}"
+        # Retention keeps the *newest*: the just-written backup is always present.
+        assert new_backup.name in {p.name for p in remaining}
+
+    # After capping, the survivors are the five most-recent accruals (rev2..rev6).
+    survivors = {p.name for p in backups_dir.glob(f"{db_name}.pre-*.bak")}
+    assert survivors == {f"{db_name}.pre-rev{i}-{i:020d}.bak" for i in range(2, 7)}
 
 
 # --------------------------------------------------------------------------- #
