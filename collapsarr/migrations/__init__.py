@@ -22,6 +22,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from sqlalchemy import inspect
 
 from collapsarr.config import Settings
 
@@ -31,6 +32,17 @@ logger = logging.getLogger(__name__)
 #: ``script_location`` at runtime — resolved from ``__file__`` so it points at
 #: the *installed* location inside the wheel, not a repo-relative path.
 MIGRATIONS_DIR = Path(__file__).resolve().parent
+
+#: Baseline revision (the schema a ``create_all``-era database already has). An
+#: unversioned-but-populated DB is stamped here to adopt its existing schema
+#: without rebuilding it; see :func:`upgrade_to_head`.
+BASELINE_REVISION = "afde30c41b7b"
+
+#: Sentinel table proving an unversioned database is a real, populated Collapsarr
+#: install (not an empty file). Its presence is what distinguishes "adopt this
+#: existing schema" from "build from base". ``global_settings`` is the singleton
+#: settings row every install has.
+SENTINEL_TABLE = "global_settings"
 
 
 def build_alembic_config(settings: Settings) -> Config:
@@ -68,13 +80,37 @@ def _current_revision(settings: Settings) -> str | None:
         engine.dispose()
 
 
+def _has_sentinel_table(settings: Settings) -> bool:
+    """Return whether the sentinel table (:data:`SENTINEL_TABLE`) exists.
+
+    Used only when the DB is unversioned (no ``alembic_version``): a populated
+    install has this table (adopt at baseline), a truly empty file does not
+    (build from base).
+    """
+    from collapsarr.database import create_engine_from_settings
+
+    engine = create_engine_from_settings(settings)
+    try:
+        return inspect(engine).has_table(SENTINEL_TABLE)
+    finally:
+        engine.dispose()
+
+
 def upgrade_to_head(settings: Settings) -> None:
     """Apply any pending Alembic migrations, bringing the schema up to head.
 
     This is the single schema-construction routine on the boot path (it replaced
-    the retired ``init_db``/``create_all``/``ensure_schema``). On a fresh, empty
-    database it runs the full migration chain from base; on an already-current
-    database it is a no-op.
+    the retired ``init_db``/``create_all``/``ensure_schema``). Three cases:
+
+    * **Fresh, empty database** — no ``alembic_version`` and no sentinel table:
+      run the full migration chain from base.
+    * **Unversioned but populated** (a ``create_all``-era install: no
+      ``alembic_version`` but the sentinel :data:`SENTINEL_TABLE` exists):
+      *stamp* the baseline revision to adopt the existing schema without
+      rebuilding it, then upgrade to head so any post-baseline deltas (e.g. the
+      reconcile-indexes heal) apply. This is COL-59's existing-DB adoption.
+    * **Already versioned** — has ``alembic_version``: run only pending deltas
+      (a no-op when already at head).
 
     Logging: emits the from→to revisions when a migration actually runs, and
     "schema is current" when there is nothing to do.
@@ -88,6 +124,18 @@ def upgrade_to_head(settings: Settings) -> None:
     head_revision = ScriptDirectory.from_config(config).get_current_head()
     current_revision = _current_revision(settings)
 
+    # Adopt an unversioned-but-populated (create_all-era) database: stamp the
+    # baseline it already matches, then let the normal upgrade apply new deltas.
+    # Guarded on current_revision being None, so it never re-stamps a versioned
+    # DB — the stamp is idempotent by construction.
+    if current_revision is None and _has_sentinel_table(settings):
+        logger.info(
+            "Adopting unversioned populated database: stamping baseline %s",
+            BASELINE_REVISION,
+        )
+        command.stamp(config, BASELINE_REVISION)
+        current_revision = BASELINE_REVISION
+
     if current_revision == head_revision:
         logger.info("Database schema is current (revision %s)", head_revision)
         return
@@ -100,4 +148,10 @@ def upgrade_to_head(settings: Settings) -> None:
     command.upgrade(config, "head")
 
 
-__all__ = ["MIGRATIONS_DIR", "build_alembic_config", "upgrade_to_head"]
+__all__ = [
+    "BASELINE_REVISION",
+    "MIGRATIONS_DIR",
+    "SENTINEL_TABLE",
+    "build_alembic_config",
+    "upgrade_to_head",
+]
