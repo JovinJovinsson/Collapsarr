@@ -25,9 +25,17 @@ from collapsarr.migrations import upgrade_to_head
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    """Settings backed by a throwaway SQLite file under a temp directory."""
+    """Settings backed by a throwaway SQLite file under a temp directory.
+
+    ``data_dir`` is pinned alongside ``database_path`` (COL-60) so the
+    pre-migration backups directory (``data_dir/backups``) also lands under
+    ``tmp_path`` -- without this, every test that runs a pending migration
+    would write real backup files into the host's actual per-user data
+    directory (``platformdirs.user_data_dir``), since ``data_dir`` otherwise
+    keeps its process-wide default.
+    """
     db_path = tmp_path / "collapsarr.db"
-    return Settings(database_path=str(db_path))
+    return Settings(database_path=str(db_path), data_dir=str(tmp_path))
 
 
 @pytest.fixture
