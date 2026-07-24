@@ -9,17 +9,24 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
-from collapsarr.settings.models import GlobalSettings
+from collapsarr.settings.models import (
+    AUTH_METHOD_BASIC,
+    AUTH_METHOD_FORMS,
+    AUTH_REQUIRED_ENABLED,
+    AUTH_REQUIRED_LOCAL_BYPASS,
+    GlobalSettings,
+)
 from collapsarr.settings.service import (
     as_downmix_settings,
     get_global_settings,
     update_global_settings,
+    verify_auth_password,
 )
 
 
@@ -92,6 +99,159 @@ def test_api_key_is_unique_per_database(settings: Settings, tmp_path: Path) -> N
     second = get_global_settings(session=_fresh_session(other_settings)).api_key
 
     assert first != second
+
+
+# ---------------------------------------------------------------------------
+# Auto-generated session secret (COL-49).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_generates_a_session_secret_on_first_run(session: Session) -> None:
+    settings = get_global_settings(session)
+
+    # 64-char lowercase hex (secrets.token_hex(32)).
+    assert settings.session_secret is not None
+    assert len(settings.session_secret) == 64
+    assert all(char in "0123456789abcdef" for char in settings.session_secret)
+
+
+def test_session_secret_is_stable_across_reads(session: Session) -> None:
+    first = get_global_settings(session).session_secret
+
+    assert get_global_settings(session).session_secret == first
+
+
+def test_session_secret_survives_an_unrelated_update(session: Session) -> None:
+    original = get_global_settings(session).session_secret
+
+    updated = update_global_settings(session, concurrency_limit=4)
+
+    assert updated.session_secret == original
+
+
+def test_session_secret_is_backfilled_for_a_row_that_predates_the_column(
+    session: Session,
+) -> None:
+    """A pre-existing row left NULL by schema-ensure gets a secret minted once."""
+    get_global_settings(session)
+    # Simulate the state right after schema-ensure adds the nullable column to
+    # an existing install: the row exists but has no secret yet.
+    session.execute(
+        text("UPDATE global_settings SET session_secret = NULL WHERE id = 1")
+    )
+    session.commit()
+
+    backfilled = get_global_settings(session).session_secret
+    assert backfilled is not None
+    assert len(backfilled) == 64
+    # Stable thereafter -- not regenerated on the next read.
+    assert get_global_settings(session).session_secret == backfilled
+
+
+def test_session_secret_is_unique_per_database(settings: Settings, tmp_path: Path) -> None:
+    first = get_global_settings(session=_fresh_session(settings)).session_secret
+
+    other_settings = Settings(database_path=str(tmp_path / "other.db"))
+    second = get_global_settings(session=_fresh_session(other_settings)).session_secret
+
+    assert first != second
+
+
+# ---------------------------------------------------------------------------
+# Auth credential defaults (COL-49).
+# ---------------------------------------------------------------------------
+
+
+def test_auth_credential_defaults(session: Session) -> None:
+    settings = get_global_settings(session)
+
+    # No credential set on a fresh install.
+    assert settings.auth_username is None
+    assert settings.auth_password_hash is None
+    # Sensible, secure defaults for the enum-like columns.
+    assert settings.auth_method == AUTH_METHOD_FORMS
+    assert settings.auth_required == AUTH_REQUIRED_ENABLED
+
+
+# ---------------------------------------------------------------------------
+# Password set / verify (COL-49).
+# ---------------------------------------------------------------------------
+
+
+def test_set_password_hashes_and_verifies(session: Session) -> None:
+    update_global_settings(session, auth_username="operator", password="s3cr3t-pw")
+
+    settings = get_global_settings(session)
+    assert settings.auth_username == "operator"
+    # Never the plaintext; the stored form carries scheme, iterations, salt.
+    assert settings.auth_password_hash is not None
+    assert "s3cr3t-pw" not in settings.auth_password_hash
+    scheme, iterations, salt_hex, digest_hex = settings.auth_password_hash.split("$")
+    assert scheme == "pbkdf2_sha512"
+    assert int(iterations) >= 1
+    assert salt_hex and digest_hex
+
+    assert verify_auth_password(session, "s3cr3t-pw") is True
+
+
+def test_verify_rejects_a_wrong_password(session: Session) -> None:
+    update_global_settings(session, password="correct-horse")
+
+    assert verify_auth_password(session, "battery-staple") is False
+
+
+def test_verify_returns_false_when_no_credential_is_set(session: Session) -> None:
+    get_global_settings(session)  # seed defaults, no password
+
+    assert verify_auth_password(session, "anything") is False
+
+
+def test_password_hash_uses_a_random_salt_per_set(session: Session) -> None:
+    update_global_settings(session, password="same-password")
+    first_hash = get_global_settings(session).auth_password_hash
+
+    update_global_settings(session, password="same-password")
+    second_hash = get_global_settings(session).auth_password_hash
+
+    # Different salts -> different encodings, yet both verify.
+    assert first_hash != second_hash
+    assert verify_auth_password(session, "same-password") is True
+
+
+def test_setting_a_new_password_replaces_the_old_one(session: Session) -> None:
+    update_global_settings(session, password="old-password")
+    update_global_settings(session, password="new-password")
+
+    assert verify_auth_password(session, "new-password") is True
+    assert verify_auth_password(session, "old-password") is False
+
+
+def test_password_none_clears_the_credential(session: Session) -> None:
+    update_global_settings(session, password="temp-pw")
+
+    cleared = update_global_settings(session, password=None)
+
+    assert cleared.auth_password_hash is None
+    assert verify_auth_password(session, "temp-pw") is False
+
+
+def test_update_auth_method_and_required(session: Session) -> None:
+    updated = update_global_settings(
+        session,
+        auth_method=AUTH_METHOD_BASIC,
+        auth_required=AUTH_REQUIRED_LOCAL_BYPASS,
+    )
+
+    assert updated.auth_method == AUTH_METHOD_BASIC
+    assert updated.auth_required == AUTH_REQUIRED_LOCAL_BYPASS
+
+
+def test_update_omitting_password_leaves_credential_untouched(session: Session) -> None:
+    update_global_settings(session, password="keep-me")
+
+    update_global_settings(session, concurrency_limit=2)
+
+    assert verify_auth_password(session, "keep-me") is True
 
 
 # ---------------------------------------------------------------------------

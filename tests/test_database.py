@@ -128,6 +128,88 @@ def test_init_db_rerun_is_idempotent(settings: Settings) -> None:
     engine.dispose()
 
 
+def _create_older_global_settings_schema(settings: Settings) -> None:
+    """Create ``global_settings`` as it looked before the COL-49 auth columns.
+
+    Raw DDL/DML so the table is exactly the pre-auth shape (no ``auth_username``,
+    ``auth_password_hash``, ``auth_method``, ``auth_required``, or
+    ``session_secret``), with one populated row -- the state an upgrading
+    install's database is in before ``ensure_schema`` runs.
+    """
+    engine = create_engine_from_settings(settings)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE global_settings (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    api_key VARCHAR(64) NOT NULL,
+                    enabled_targets VARCHAR(50) NOT NULL,
+                    language_allow_list VARCHAR(500),
+                    stereo_codec VARCHAR(50) NOT NULL,
+                    stereo_bitrate_kbps INTEGER,
+                    surround_codec VARCHAR(50) NOT NULL,
+                    surround_bitrate_kbps INTEGER,
+                    concurrency_limit INTEGER NOT NULL,
+                    ui_auth_enabled BOOLEAN NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO global_settings
+                    (id, api_key, enabled_targets, stereo_codec, surround_codec,
+                     concurrency_limit, ui_auth_enabled, created_at, updated_at)
+                VALUES
+                    (1, 'existingkey', 'stereo', 'aac', 'ac3', 1, 0,
+                     '2026-01-01T00:00:00', '2026-01-01T00:00:00')
+                """
+            )
+        )
+    engine.dispose()
+
+
+def test_init_db_adds_col49_auth_columns_to_an_older_global_settings(settings: Settings) -> None:
+    """The COL-49 credential columns land on an existing install via schema-ensure."""
+    _create_older_global_settings_schema(settings)
+
+    engine = create_engine_from_settings(settings)
+    init_db(engine)
+
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("global_settings")}
+    for added in (
+        "auth_username",
+        "auth_password_hash",
+        "auth_method",
+        "auth_required",
+        "session_secret",
+    ):
+        assert added in columns
+
+    # The NOT NULL enum columns backfill the pre-existing row from their
+    # server_default; the credential/secret columns are nullable (empty here).
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT api_key, auth_username, auth_password_hash, auth_method, "
+                "auth_required, session_secret FROM global_settings WHERE id = 1"
+            )
+        ).one()
+    assert row.api_key == "existingkey"  # existing data preserved
+    assert row.auth_username is None
+    assert row.auth_password_hash is None
+    assert row.auth_method == "forms"
+    assert row.auth_required == "enabled"
+    assert row.session_secret is None
+
+    engine.dispose()
+
+
 def test_init_db_boots_cleanly_against_a_fresh_database(settings: Settings) -> None:
     """A brand-new database (no tables at all) is unaffected by ensure_schema."""
     engine = create_engine_from_settings(settings)
