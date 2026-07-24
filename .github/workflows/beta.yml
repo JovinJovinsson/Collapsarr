@@ -1,20 +1,28 @@
-# Beta release track (UAT branch) — build & publish a testable image before
+# Beta release track (UAT branch) — build & publish testable artifacts before
 # anything is cut on main.
 #
 # Fires on every push to `uat`, then:
-#   1. test-*  — same backend (pytest/ruff/mypy) + frontend (vitest/tsc/eslint)
-#                gate as the tagged release pipeline (release.yml); any failure
-#                stops the image from being published.
-#   2. docker  — multi-arch (amd64+arm64) image build & push to Docker Hub,
-#                tagged `beta` (rolling, always the latest uat push) and
-#                `beta-<short-sha>` (immutable, for pinning a specific build).
+#   1. test-*       — same backend (pytest/ruff/mypy) + frontend (vitest/tsc/
+#                     eslint) gate as the tagged release pipeline (release.yml);
+#                     any failure stops artifacts from being published.
+#   2. docker       — multi-arch (amd64+arm64) image build & push to Docker
+#                     Hub, tagged `beta` (rolling, always the latest uat push)
+#                     and `beta-<short-sha>` (immutable, for pinning a build).
+#   3. build-wheel  — same frontend-then-wheel build as release.yml, but
+#                     stamped with a `+beta.<short-sha>` local version segment
+#                     so it's never mistaken for a real PyPI release.
+#   4. github-release — publishes a GitHub Release marked "Pre-release" (tag
+#                     `beta-<short-sha>`) with the wheel/sdist attached, so
+#                     bare-metal/pipx users have somewhere to get a beta build
+#                     from (`pipx install <downloaded .whl>`).
 #
-# No PyPI publish and no GitHub Release here — those stay tied to a semver tag
-# landing on main (release.yml). This track exists purely so a `beta` image can
-# be pulled onto a test server ahead of that.
+# No PyPI publish here — that stays tied to a semver tag landing on main
+# (release.yml). This track exists purely so a beta build (Docker image or
+# wheel) can be pulled/downloaded ahead of that.
 #
 # Credentials: reuses the same Docker Hub secrets as release.yml
-# (secrets.DOCKERHUB_USERNAME + secrets.DOCKERHUB_TOKEN).
+# (secrets.DOCKERHUB_USERNAME + secrets.DOCKERHUB_TOKEN). The GitHub Release
+# uses the auto-provided secrets.GITHUB_TOKEN, same as release.yml.
 
 name: beta
 
@@ -74,15 +82,21 @@ jobs:
       - name: Test
         run: npm run test
 
+  meta:
+    name: Derive short SHA
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+    steps:
+      - id: sha
+        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
   docker:
     name: Build & push beta image
-    needs: [test-backend, test-frontend]
+    needs: [test-backend, test-frontend, meta]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Derive short SHA
-        id: meta
-        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Buildx
@@ -100,5 +114,81 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:beta
-            ${{ env.IMAGE_NAME }}:beta-${{ steps.meta.outputs.short_sha }}
+            ${{ env.IMAGE_NAME }}:beta-${{ needs.meta.outputs.short_sha }}
           provenance: false
+
+  # ---- Build the wheel + sdist (for bare-metal/pipx users) --------------------
+  # Mirrors release.yml's build-wheel job: frontend first, so frontend/dist
+  # exists when `python -m build` bundles it into collapsarr/static (COL-40).
+  build-wheel:
+    name: Build wheel + sdist
+    needs: [test-backend, test-frontend, meta]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend (produces frontend/dist)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Stamp a beta local-version segment
+        run: |
+          BASE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          VERSION="${BASE_VERSION}+beta.${{ needs.meta.outputs.short_sha }}"
+          echo "Building beta version ${VERSION}"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - name: Verify the frontend was bundled into the wheel
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          wheels = glob.glob("dist/*.whl")
+          if not wheels:
+              sys.exit("no wheel produced")
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          if not any(n.startswith("collapsarr/static/") for n in names):
+              sys.exit("frontend assets missing from wheel (collapsarr/static/ not found)")
+          print("OK: frontend bundled into", wheels[0])
+          PY
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # ---- Cut a GitHub Pre-release with the wheel/sdist attached -----------------
+  github-release:
+    name: Create GitHub Pre-release
+    needs: [build-wheel, meta]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub Pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta-${{ needs.meta.outputs.short_sha }}
+          name: Beta build ${{ needs.meta.outputs.short_sha }}
+          prerelease: true
+          make_latest: 'false'
+          generate_release_notes: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
