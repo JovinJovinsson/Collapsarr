@@ -26,6 +26,7 @@ from .service import (
     ensure_backup_dirs,
     is_backup_supported,
     list_backups,
+    resolve_backup_path,
     resolve_sqlite_path,
 )
 
@@ -42,5 +43,6 @@ __all__ = [
     "ensure_backup_dirs",
     "is_backup_supported",
     "list_backups",
+    "resolve_backup_path",
     "resolve_sqlite_path",
 ]

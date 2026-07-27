@@ -31,6 +31,7 @@ Safety contract (mirrors the pre-migration backup in
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
 import sqlite3
@@ -173,6 +174,34 @@ def list_backups(settings: Settings) -> list[BackupInfo]:
     return infos
 
 
+def resolve_backup_path(settings: Settings, backup_id: str) -> Path | None:
+    """Resolve a :attr:`BackupInfo.id` (``<type>/<filename>``) back to its archive path.
+
+    ``None`` (never an exception) covers every way an ``id`` can fail to name a
+    real archive: it doesn't split into exactly ``type/filename``, the type
+    isn't one of :data:`BACKUP_TYPES`, the filename isn't a bare backup-archive
+    name (rejecting empty/``.``/``..``/embedded separators rules out path
+    traversal such as ``manual/../../etc/passwd``), it doesn't match
+    :data:`BACKUP_FILENAME_GLOB`, or no file exists at the resolved path. The
+    download route maps every ``None`` uniformly to a ``404`` so a probing
+    client can't distinguish "wrong type" from "file doesn't exist".
+    """
+    parts = backup_id.split("/")
+    if len(parts) != 2:
+        return None
+    backup_type, filename = parts
+    if backup_type not in BACKUP_TYPES:
+        return None
+    if filename in ("", ".", "..") or "/" in filename or "\\" in filename:
+        return None
+    if not fnmatch.fnmatch(filename, BACKUP_FILENAME_GLOB):
+        return None
+    candidate = backup_type_dir(settings, backup_type) / filename
+    if candidate.name != filename or not candidate.is_file():
+        return None
+    return candidate
+
+
 def _snapshot_database(db_file: Path, destination: Path) -> None:
     """Write a consistent snapshot of ``db_file`` to ``destination`` via ``VACUUM INTO``.
 
@@ -249,5 +278,6 @@ __all__ = [
     "ensure_backup_dirs",
     "is_backup_supported",
     "list_backups",
+    "resolve_backup_path",
     "resolve_sqlite_path",
 ]

@@ -1074,6 +1074,13 @@ a {
   border-top: 1px solid var(--c-border);
 }
 
+.data-table__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition-duration: 0.01ms !important;

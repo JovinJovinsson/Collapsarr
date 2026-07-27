@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { createBackup, fetchBackups } from "../api/backups";
+import { createBackup, downloadBackup, fetchBackups } from "../api/backups";
 import { fetchSettings, updateSettings } from "../api/settings";
 import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
@@ -71,11 +71,15 @@ function validateScheduleForm(form: ScheduleFormValues): string | null {
  * endpoint). The values are inert here -- COL-67's scheduler reads the
  * interval and COL-68's pruning reads the retention; this page only persists
  * the knobs.
+ *
+ * COL-64 adds a per-row "Download" action, streaming the archive off disk via
+ * `GET /api/system/backup/{id}/download` (`downloadBackup`, `api/backups.ts`).
  */
 export function BackupsPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
   const [scheduleState, setScheduleState] = useState<ScheduleLoadState>({ status: "loading" });
   const [scheduleForm, setScheduleForm] = useState<ScheduleFormValues>({
@@ -178,6 +182,18 @@ export function BackupsPage() {
       setActionError(error instanceof Error ? error.message : "Failed to create backup.");
     } finally {
       setCreating(false);
+    }
+  }
+
+  async function handleDownload(backup: Backup) {
+    setDownloadingId(backup.id);
+    setActionError(null);
+    try {
+      await downloadBackup(backup);
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : "Failed to download backup.");
+    } finally {
+      setDownloadingId(null);
     }
   }
 
@@ -312,6 +328,7 @@ export function BackupsPage() {
                 <th scope="col">Type</th>
                 <th scope="col">Size</th>
                 <th scope="col">Created</th>
+                <th scope="col">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -321,6 +338,16 @@ export function BackupsPage() {
                   <td>{TYPE_LABEL[backup.type] ?? backup.type}</td>
                   <td>{formatSize(backup.size)}</td>
                   <td>{formatTimestamp(backup.created_at)}</td>
+                  <td className="data-table__actions">
+                    <button
+                      type="button"
+                      className="btn btn--secondary btn--sm"
+                      onClick={() => handleDownload(backup)}
+                      disabled={downloadingId === backup.id}
+                    >
+                      {downloadingId === backup.id ? "Downloading…" : "Download"}
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>

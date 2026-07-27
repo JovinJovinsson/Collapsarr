@@ -21,13 +21,16 @@ from collapsarr.backup.service import (
     ARCHIVE_MEMBER_NAME,
     BACKUP_FILENAME_GLOB,
     BACKUP_MANUAL,
+    BACKUP_SCHEDULED,
     BACKUP_TYPES,
     BackupUnavailableError,
+    backup_type_dir,
     backups_root,
     create_backup,
     ensure_backup_dirs,
     is_backup_supported,
     list_backups,
+    resolve_backup_path,
     resolve_sqlite_path,
 )
 from collapsarr.config import Settings
@@ -212,3 +215,64 @@ def test_create_backup_rejects_unknown_type(settings: Settings) -> None:
     _populate_db(settings)
     with pytest.raises(ValueError, match="Unknown backup type"):
         create_backup(settings, "bogus")
+
+
+# --------------------------------------------------------------------------- #
+# resolve_backup_path (COL-64)
+# --------------------------------------------------------------------------- #
+def test_resolve_backup_path_finds_a_real_archive(settings: Settings) -> None:
+    _populate_db(settings)
+    info = create_backup(settings)
+
+    resolved = resolve_backup_path(settings, info.id)
+
+    assert resolved == _manual_dir(settings) / info.name
+    assert resolved.is_file()
+
+
+def test_resolve_backup_path_none_for_unknown_type(settings: Settings) -> None:
+    _populate_db(settings)
+    info = create_backup(settings)
+    assert resolve_backup_path(settings, f"bogus/{info.name}") is None
+
+
+def test_resolve_backup_path_none_for_nonexistent_filename(settings: Settings) -> None:
+    ensure_backup_dirs(settings)
+    assert resolve_backup_path(settings, f"{BACKUP_MANUAL}/does_not_exist.zip") is None
+
+
+def test_resolve_backup_path_none_when_filename_does_not_match_glob(settings: Settings) -> None:
+    """A real file that just doesn't look like a backup archive is rejected too."""
+    manual_dir = backup_type_dir(settings, BACKUP_MANUAL)
+    manual_dir.mkdir(parents=True, exist_ok=True)
+    stray = manual_dir / "not_a_backup.txt"
+    stray.write_text("hello")
+    assert resolve_backup_path(settings, f"{BACKUP_MANUAL}/not_a_backup.txt") is None
+
+
+@pytest.mark.parametrize(
+    "backup_id",
+    [
+        "manual",  # missing filename segment
+        "manual/",  # empty filename
+        "manual/.",
+        "manual/..",
+        "manual/../../etc/passwd",
+        "manual/sub/collapsarr_backup_v1_2026.01.01_00.00.00.zip",  # embedded slash
+        "manual/collapsarr_backup_v1_2026.01.01_00.00.00.zip/../../secret",
+        "manual\\collapsarr_backup_v1_2026.01.01_00.00.00.zip",  # no split at all
+    ],
+)
+def test_resolve_backup_path_rejects_malformed_or_traversal_ids(
+    settings: Settings, backup_id: str
+) -> None:
+    ensure_backup_dirs(settings)
+    assert resolve_backup_path(settings, backup_id) is None
+
+
+def test_resolve_backup_path_does_not_cross_backup_type_boundaries(settings: Settings) -> None:
+    """A filename that exists under one type is not found by asking for another."""
+    _populate_db(settings)
+    info = create_backup(settings, BACKUP_MANUAL)
+    ensure_backup_dirs(settings)
+    assert resolve_backup_path(settings, f"{BACKUP_SCHEDULED}/{info.name}") is None

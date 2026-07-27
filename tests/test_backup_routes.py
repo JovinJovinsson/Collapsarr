@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.routing import Mount
 
 from collapsarr.backup.service import BACKUP_MANUAL, backups_root
 from collapsarr.config import Settings
@@ -100,3 +101,92 @@ def test_non_file_database_reports_unsupported_and_409_on_create(tmp_path: Path)
         created = client.post("/api/system/backup", headers=headers)
         assert created.status_code == 409
         assert "unavailable" in created.json()["detail"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Download (COL-64)
+# --------------------------------------------------------------------------- #
+def test_download_requires_authentication(client: TestClient) -> None:
+    # No API key / session: the /api gate rejects the download route too.
+    response = client.get(f"/api/system/backup/{BACKUP_MANUAL}/whatever.zip/download")
+    assert response.status_code == 401
+
+
+def test_download_streams_the_correct_archive(client: TestClient, settings: Settings) -> None:
+    headers = _auth_headers(client)
+    created = client.post("/api/system/backup", headers=headers).json()
+
+    response = client.get(f"/api/system/backup/{created['id']}/download", headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    disposition = response.headers["content-disposition"]
+    assert "attachment" in disposition
+    assert created["name"] in disposition
+
+    archive_path = backups_root(settings) / BACKUP_MANUAL / created["name"]
+    assert response.content == archive_path.read_bytes()
+    assert int(response.headers["content-length"]) == archive_path.stat().st_size
+
+    # The streamed bytes really are the same valid zip written to disk.
+    with zipfile.ZipFile(Path(archive_path)) as archive:
+        assert archive.namelist() == ["collapsarr.db"]
+
+
+def test_download_unknown_type_returns_404(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    response = client.get("/api/system/backup/bogus/whatever.zip/download", headers=headers)
+    assert response.status_code == 404
+
+
+def test_download_nonexistent_filename_returns_404(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    response = client.get(
+        f"/api/system/backup/{BACKUP_MANUAL}/collapsarr_backup_v9.9.9_2020.01.01_00.00.00.zip/download",
+        headers=headers,
+    )
+    assert response.status_code == 404
+
+
+def test_download_path_traversal_id_returns_404(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    response = client.get(
+        "/api/system/backup/manual/../../etc/passwd/download",
+        headers=headers,
+    )
+    assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# No static exposure of backups/ (COL-64)
+# --------------------------------------------------------------------------- #
+def test_backups_directory_has_no_static_mount(client: TestClient, settings: Settings) -> None:
+    """The authenticated download route is the *only* way to fetch a backup.
+
+    Confirmed two ways: (1) no ``Mount`` registered on the app serves the
+    backups directory (or an ancestor of it) as static files, and (2) probing
+    a plausible "raw" filesystem-shaped path for a real archive does not
+    return the file (200 with the zip bytes) the way a static mount would.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
+    backups_dir = backups_root(settings).resolve()
+
+    for route in app.router.routes:
+        if isinstance(route, Mount):
+            mount_dir = getattr(route.app, "directory", None)
+            if mount_dir is None:
+                continue
+            mount_dir = Path(mount_dir).resolve()
+            assert mount_dir != backups_dir
+            assert backups_dir not in mount_dir.parents
+            assert mount_dir not in backups_dir.parents
+
+    headers = _auth_headers(client)
+    created = client.post("/api/system/backup", headers=headers).json()
+
+    # No credential exists yet in this fresh test app, so unauthenticated
+    # browser-route probes hit the first-run redirect rather than any static
+    # file -- either way, never the zip.
+    probe = client.get(f"/backups/{created['id']}", follow_redirects=False)
+    assert probe.status_code != 200

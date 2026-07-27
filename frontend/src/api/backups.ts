@@ -26,3 +26,35 @@ export async function createBackup(): Promise<Backup> {
   }
   return (await response.json()) as Backup;
 }
+
+/**
+ * Downloads a backup archive (`GET /api/system/backup/{id}/download`, COL-64)
+ * and saves it to disk via the browser's download flow.
+ *
+ * `backup.id` is already the `<type>/<filename>` path segment the server
+ * expects (see `types/backups.ts`), so it's interpolated directly rather than
+ * `encodeURIComponent`-ed -- encoding its embedded `/` would break the route.
+ * A plain `<a href="...">` can't carry the stored API key / session, so this
+ * routes the request through `apiFetch` (same auth as every other call),
+ * reads the response as a `Blob`, and "clicks" a transient object-URL anchor
+ * with `download` set -- the standard way to trigger a save dialog for a
+ * fetched (rather than directly linked) resource.
+ */
+export async function downloadBackup(backup: Pick<Backup, "id" | "name">): Promise<void> {
+  const response = await apiFetch(`/api/system/backup/${backup.id}/download`);
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to download backup (${response.status})`));
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = backup.name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
