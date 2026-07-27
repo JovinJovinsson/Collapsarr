@@ -31,6 +31,16 @@ see :mod:`collapsarr.auth.enforcement` for what each mode does.
 the sign-in page) vs. ``"basic"`` (a browser's native HTTP Basic prompt) --
 so Settings can switch how the same credential (COL-49) is presented; see
 :mod:`collapsarr.auth.enforcement` for how each method challenges a request.
+
+``backup_interval_days``/``backup_retention_days`` (COL-66) are also
+read/write here -- the two knobs the Backups page's inline controls persist.
+Both are constrained to positive integers (``Field(gt=0)``, matching the
+"sensible validation" acceptance criterion): a non-positive value is rejected
+with a ``422`` before it ever reaches the service layer. Neither has a
+dedicated endpoint -- they round-trip through the same ``GET``/``PUT
+/api/settings`` as every other setting. The values are inert here: COL-67's
+scheduler is what reads the interval to decide when to run, and COL-68's
+pruning is what reads the retention to decide what to delete.
 """
 
 from __future__ import annotations
@@ -39,7 +49,7 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from ..database import get_session
@@ -83,6 +93,8 @@ class SettingsRead(BaseModel):
     ui_auth_enabled: bool
     auth_required: AuthRequiredMode
     auth_method: AuthMethodMode
+    backup_interval_days: int
+    backup_retention_days: int
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -109,6 +121,8 @@ class SettingsUpdate(BaseModel):
     ui_auth_enabled: bool | None = None
     auth_required: AuthRequiredMode | None = None
     auth_method: AuthMethodMode | None = None
+    backup_interval_days: int | None = Field(default=None, gt=0)
+    backup_retention_days: int | None = Field(default=None, gt=0)
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -134,6 +148,8 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         ui_auth_enabled=settings.ui_auth_enabled,
         auth_required=settings.auth_required,
         auth_method=settings.auth_method,
+        backup_interval_days=settings.backup_interval_days,
+        backup_retention_days=settings.backup_retention_days,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -186,5 +202,9 @@ def update_settings_endpoint(
         kwargs["auth_required"] = body.auth_required
     if "auth_method" in provided:
         kwargs["auth_method"] = body.auth_method
+    if "backup_interval_days" in provided:
+        kwargs["backup_interval_days"] = body.backup_interval_days
+    if "backup_retention_days" in provided:
+        kwargs["backup_retention_days"] = body.backup_retention_days
 
     return _to_read(update_global_settings(session, **kwargs))  # type: ignore[arg-type]

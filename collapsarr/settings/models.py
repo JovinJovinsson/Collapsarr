@@ -52,6 +52,14 @@ AUTH_REQUIRED_ENABLED = "enabled"
 AUTH_REQUIRED_LOCAL_BYPASS = "local_bypass"
 """Whether auth is always required, or bypassed for local-network callers."""
 
+DEFAULT_BACKUP_INTERVAL_DAYS = 7
+"""Default days between scheduled backups (COL-66). Consumed by the
+scheduler landing in COL-67 -- this ticket only persists the knob."""
+
+DEFAULT_BACKUP_RETENTION_DAYS = 28
+"""Default days a backup is kept before pruning (COL-66). Consumed by the
+retention pruning landing in COL-68 -- this ticket only persists the knob."""
+
 
 def generate_api_key() -> str:
     """Return a fresh, cryptographically-random API key.
@@ -119,6 +127,14 @@ class GlobalSettings(Base):
     behind a reverse proxy should switch this to ``enabled``, since
     classification only ever looks at the direct TCP peer (see that module's
     docstring).
+
+    ``backup_interval_days``/``backup_retention_days`` (COL-66) are the two
+    knobs later slices consume: COL-67's scheduler reads the interval to decide
+    when to take the next scheduled backup, and COL-68's pruning reads the
+    retention to decide how long a backup is kept before deletion. Both carry
+    DB-side ``server_default``\\ s (matching ``auth_method``/``auth_required``
+    above) so the additive migration backfills existing installs with the
+    documented defaults (7 / 28 days) rather than leaving them ``NULL``.
     """
 
     __tablename__ = "global_settings"
@@ -159,6 +175,19 @@ class GlobalSettings(Base):
     )
     session_secret: Mapped[str | None] = mapped_column(
         String(128), nullable=True, default=generate_session_secret
+    )
+
+    backup_interval_days: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_BACKUP_INTERVAL_DAYS,
+        server_default=text(str(DEFAULT_BACKUP_INTERVAL_DAYS)),
+    )
+    backup_retention_days: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_BACKUP_RETENTION_DAYS,
+        server_default=text(str(DEFAULT_BACKUP_RETENTION_DAYS)),
     )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)

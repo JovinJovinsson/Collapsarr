@@ -1011,6 +1011,84 @@ a {
   }
 }
 
+/* ---- System nav section + Backups page (COL-63) ------------------------ */
+
+.sidebar__section {
+  margin-top: var(--sp-4);
+  padding: var(--sp-1) var(--sp-3);
+  color: var(--c-text-faint);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Header variant that seats page-level actions beside the title block. */
+.view__header--row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--sp-4);
+}
+
+.view__actions {
+  display: flex;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+}
+
+.view__error {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-md);
+  background: var(--c-danger-tint);
+  border: 1px solid var(--c-danger);
+  color: var(--c-danger);
+  font-size: var(--fs-sm);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.data-table th,
+.data-table td {
+  padding: var(--sp-3) var(--sp-4);
+  text-align: left;
+  vertical-align: top;
+}
+
+.data-table thead th {
+  color: var(--c-text-muted);
+  font-weight: 600;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--c-border);
+  white-space: nowrap;
+}
+
+.data-table tbody tr + tr td {
+  border-top: 1px solid var(--c-border);
+}
+
+.data-table__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+/* Inline "Delete this backup?" prompt shown between the Confirm/Cancel buttons
+   while a per-row delete is being confirmed (COL-65). */
+.data-table__confirm {
+  color: var(--c-danger);
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition-duration: 0.01ms !important;

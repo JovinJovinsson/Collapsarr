@@ -66,6 +66,14 @@ def test_get_global_settings_defaults_match_the_prd(session: Session) -> None:
     assert settings.ui_auth_enabled is False
 
 
+def test_get_global_settings_backup_schedule_defaults(session: Session) -> None:
+    """COL-66: a fresh row defaults to a 7-day interval and 28-day retention."""
+    settings = get_global_settings(session)
+
+    assert settings.backup_interval_days == 7
+    assert settings.backup_retention_days == 28
+
+
 def test_get_global_settings_does_not_duplicate_the_row_across_calls(session: Session) -> None:
     first = get_global_settings(session)
     second = get_global_settings(session)
@@ -390,6 +398,42 @@ def test_update_global_settings_explicit_none_clears_bitrate_overrides(session: 
     cleared = update_global_settings(session, surround_bitrate_kbps=None)
 
     assert cleared.surround_bitrate_kbps is None
+
+
+# ---------------------------------------------------------------------------
+# Backup schedule (COL-66): interval + retention days.
+# ---------------------------------------------------------------------------
+
+
+def test_update_global_settings_updates_backup_interval_and_retention(session: Session) -> None:
+    updated = update_global_settings(
+        session, backup_interval_days=3, backup_retention_days=14
+    )
+
+    assert updated.backup_interval_days == 3
+    assert updated.backup_retention_days == 14
+
+
+def test_update_global_settings_omitting_backup_schedule_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, backup_interval_days=10, backup_retention_days=40)
+
+    unchanged = update_global_settings(session, concurrency_limit=2)
+
+    assert unchanged.backup_interval_days == 10
+    assert unchanged.backup_retention_days == 40
+
+
+def test_update_global_settings_backup_schedule_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, backup_interval_days=1, backup_retention_days=7)
+
+    reread = get_global_settings(session)
+
+    assert reread.backup_interval_days == 1
+    assert reread.backup_retention_days == 7
 
 
 # ---------------------------------------------------------------------------

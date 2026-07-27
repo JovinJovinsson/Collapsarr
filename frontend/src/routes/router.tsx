@@ -4,7 +4,7 @@ import { AppShell } from "../components/AppShell";
 import { FileDetailPage } from "../pages/FileDetailPage";
 import { LoginPage } from "../pages/LoginPage";
 import { SetupPage } from "../pages/SetupPage";
-import { navItems } from "./nav";
+import { navItems, systemNavItems } from "./nav";
 
 export const router = createBrowserRouter([
   // Auth screens (COL-50) live outside the AppShell layout: no sidebar, no
@@ -19,6 +19,10 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <Navigate to="/wanted" replace /> },
       ...navItems.map(({ to, element }) => ({ path: to, element })),
+      // System area (COL-63): its pages, plus a bare /system that lands on the
+      // first System view (Backups).
+      { path: "/system", element: <Navigate to="/system/backups" replace /> },
+      ...systemNavItems.map(({ to, element }) => ({ path: to, element })),
       // Per-file detail (COL-34): not a primary nav destination, so it's
       // wired directly here rather than through `navItems` (the sidebar's
       // source of truth) -- it's reached from a file row, not the sidebar.

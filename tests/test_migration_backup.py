@@ -1,45 +1,87 @@
-"""Backup-before-migrate with retention (COL-60).
+"""Pre-migration backup, folded into the unified backup scheme (COL-60 -> COL-69).
 
-Covers the pre-migration safety net added to ``upgrade_to_head``: a plain
-SQLite file copy taken before any pending migration mutates the database,
-retained up to :data:`~collapsarr.migrations.BACKUP_RETENTION_COUNT` copies,
-skipped entirely when nothing is pending or when the configured backend isn't
-a file-based SQLite database, and exercised end-to-end by a forced-failure
-test asserting the fail-fast contract (backup exists, DB left at the last
-good revision, boot never reaches serving).
+Covers the pre-migration safety net in ``upgrade_to_head``: instead of the old
+standalone flat ``.bak`` copy with a private count-based retention, it now emits
+a unified ``update``-type backup zip through the shared backup service -- landing
+under ``<data_dir>/backups/update/``, listable alongside manual/scheduled
+backups, and pruned by the one unified retention model (age-based window + the
+``update`` guaranteed-minimum floor, COL-68).
+
+The contract this suite guards is unchanged: the backup is taken before anything
+mutates the database (covering the pre-stamp state), skipped entirely when
+nothing is pending or the backend isn't a file-based SQLite database, and the
+forced-failure test still asserts the fail-fast contract (backup exists, DB left
+at the last good revision, boot never reaches serving). The one property the
+pre-migration path keeps is that it runs *before the engine connects*, so the
+artifact is a byte-for-byte raw copy of the source file (the exact rollback
+point) rather than a live ``VACUUM INTO``.
 """
 
 from __future__ import annotations
 
 import os
+import zipfile
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.runtime.migration import MigrationContext
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 import collapsarr.migrations as migrations_module
+from collapsarr.backup.service import (
+    ARCHIVE_MEMBER_NAME,
+    BACKUP_UPDATE,
+    UPDATE_BACKUP_MIN_KEEP,
+    BackupInfo,
+    backup_type_dir,
+    list_backups,
+)
 from collapsarr.config import Settings
 from collapsarr.database import Base, create_engine_from_settings
 from collapsarr.main import create_app
 from collapsarr.migrations import (
-    BACKUP_RETENTION_COUNT,
     BASELINE_REVISION,
     _backup_before_migration,
-    _prune_old_backups,
     _sqlite_file_path,
     build_alembic_config,
     upgrade_to_head,
 )
 
+#: Columns a post-baseline migration adds (currently just COL-66's backup
+#: schedule knobs) -- dropped after ``create_all`` below by
+#: :func:`_create_unversioned_db`, mirroring the same de-evolving idiom in
+#: ``test_migration_adoption.py``. Without this, ``create_all`` (which always
+#: builds from the *current* ``Base.metadata``) leaves these columns already
+#: present, so the migration that's supposed to add them fails.
+_POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("global_settings", "backup_interval_days"),
+    ("global_settings", "backup_retention_days"),
+)
 
-def _backups_dir(settings: Settings) -> Path:
-    return Path(settings.data_dir).expanduser() / "backups"
+
+def _update_backups(settings: Settings) -> list[BackupInfo]:
+    """Every finished ``update``-type backup, newest first (via the unified list)."""
+    return [info for info in list_backups(settings) if info.type == BACKUP_UPDATE]
 
 
-def _db_file_name(settings: Settings) -> str:
-    return Path(settings.database_path).name
+def _update_dir(settings: Settings) -> Path:
+    return backup_type_dir(settings, BACKUP_UPDATE)
+
+
+def _create_unversioned_db(settings: Settings) -> None:
+    """Build a create_all-era, unversioned database (populated schema, no
+    ``alembic_version``), de-evolved past any post-baseline column so the
+    normal migration chain -- not ``create_all`` -- is what adds them."""
+    engine = create_engine_from_settings(settings)
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        for table_name, column_name in _POST_BASELINE_COLUMNS:
+            connection.execute(
+                text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
+            )
+    engine.dispose()
 
 
 # --------------------------------------------------------------------------- #
@@ -49,12 +91,13 @@ def test_no_backup_on_fresh_install(settings: Settings) -> None:
     """A brand-new install (no pre-existing file) writes no backup.
 
     Migrations are technically "pending" from an empty database, but there is
-    no prior data on disk to protect, so this must not create
-    ``data_dir/backups`` at all.
+    no prior data on disk to protect, so this must not write an ``update``
+    backup -- and must not even create the ``update/`` directory (no churn).
     """
     upgrade_to_head(settings)
 
-    assert not _backups_dir(settings).exists()
+    assert _update_backups(settings) == []
+    assert not _update_dir(settings).exists()
 
 
 def test_no_backup_on_up_to_date_boot(settings: Settings) -> None:
@@ -62,138 +105,122 @@ def test_no_backup_on_up_to_date_boot(settings: Settings) -> None:
     upgrade_to_head(settings)  # fresh install -> head, no backup (see above)
     upgrade_to_head(settings)  # already current -> no-op, still no backup
 
-    assert not _backups_dir(settings).exists()
+    assert _update_backups(settings) == []
+    assert not _update_dir(settings).exists()
 
 
 def test_backup_written_when_adopting_existing_unversioned_db(settings: Settings) -> None:
-    """An adopted (unversioned, populated) DB is backed up before the stamp.
+    """An adopted (unversioned, populated) DB gets a unified ``update`` zip
+    before the stamp.
 
     Covers the COL-59 interaction: the backup must cover the pre-stamp state,
-    so it's taken before the baseline stamp mutates the database at all.
+    so it's taken before the baseline stamp mutates the database at all. The
+    artifact is the unified ``update``-type zip (COL-69), not a flat ``.bak``.
     """
-    engine = create_engine_from_settings(settings)
-    Base.metadata.create_all(engine)  # create_all-era install: populated, unversioned
-    engine.dispose()
+    _create_unversioned_db(settings)  # create_all-era install: populated, unversioned
 
     upgrade_to_head(settings)
 
-    backups = list(_backups_dir(settings).glob(f"{_db_file_name(settings)}.pre-*.bak"))
+    backups = _update_backups(settings)
     assert len(backups) == 1
-    # Unversioned pre-migration state has no revision string -- labelled explicitly.
-    assert "unversioned" in backups[0].name
-    assert backups[0].stat().st_size > 0
+    info = backups[0]
+    assert info.type == BACKUP_UPDATE
+    assert info.size > 0
+    # Lives under <data_dir>/backups/update/ and is the unified archive name.
+    assert (_update_dir(settings) / info.name).is_file()
+    assert info.name.startswith("collapsarr_backup_v")
+    assert info.name.endswith(".zip")
 
 
-def test_backup_filename_encodes_revision_and_timestamp(settings: Settings) -> None:
-    """An incremental migration (already-versioned DB) names the backup after
-    the pre-migration revision, plus a timestamp suffix."""
-    # Stamp+build the DB at the baseline only (a versioned, but not-yet-head,
-    # install) so upgrading to head is a plain incremental migration.
+def test_backup_is_unified_update_zip_containing_the_database(settings: Settings) -> None:
+    """The pre-migration artifact is a real zip holding the database member.
+
+    A versioned-but-not-head install (stamped at baseline) makes upgrading a
+    plain incremental migration; the snapshot must be a byte-for-byte raw copy
+    of the source file, packed as the unified archive member name so a restore
+    step can find it deterministically.
+    """
     config = build_alembic_config(settings)
     command.upgrade(config, BASELINE_REVISION)
 
     upgrade_to_head(settings)
 
-    backups = list(_backups_dir(settings).glob(f"{_db_file_name(settings)}.pre-*.bak"))
+    backups = _update_backups(settings)
     assert len(backups) == 1
-    name = backups[0].name
-    prefix = f"{_db_file_name(settings)}.pre-{BASELINE_REVISION}-"
-    assert name.startswith(prefix)
-    timestamp = name.removeprefix(prefix).removesuffix(".bak")
-    assert timestamp.isdigit()
-    assert len(timestamp) == 20  # %Y%m%d%H%M%S%f
+    archive_path = _update_dir(settings) / backups[0].name
+    with zipfile.ZipFile(archive_path) as archive:
+        assert archive.namelist() == [ARCHIVE_MEMBER_NAME]
+        # The member is the raw source database (SQLite file header magic).
+        assert archive.read(ARCHIVE_MEMBER_NAME).startswith(b"SQLite format 3\x00")
+
+
+def test_backup_is_listable_alongside_other_backup_types(settings: Settings) -> None:
+    """The pre-migration ``update`` backup shows up in the unified listing."""
+    _create_unversioned_db(settings)
+
+    upgrade_to_head(settings)
+
+    all_backups = list_backups(settings)
+    assert len(all_backups) == 1
+    assert all_backups[0].type == BACKUP_UPDATE
+    assert all_backups[0].id.startswith(f"{BACKUP_UPDATE}/")
 
 
 def test_backup_path_is_logged(
     settings: Settings, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The backup path is logged when a backup is actually taken."""
-    engine = create_engine_from_settings(settings)
-    Base.metadata.create_all(engine)
-    engine.dispose()
+    """The backup path is logged (by the shared service) when one is taken."""
+    _create_unversioned_db(settings)
 
     with caplog.at_level("INFO"):
         upgrade_to_head(settings)
 
-    backups = list(_backups_dir(settings).glob(f"{_db_file_name(settings)}.pre-*.bak"))
+    backups = _update_backups(settings)
     assert len(backups) == 1
-    assert str(backups[0]) in caplog.text
+    archive_path = _update_dir(settings) / backups[0].name
+    assert str(archive_path) in caplog.text
+    assert "update backup" in caplog.text
 
 
 # --------------------------------------------------------------------------- #
-# Retention
+# Retention (unified model: age-based + update guaranteed-minimum, COL-68)
 # --------------------------------------------------------------------------- #
-def test_retention_keeps_only_last_five_backups(settings: Settings) -> None:
-    """Pruning keeps only the most recent :data:`BACKUP_RETENTION_COUNT`."""
-    backups_dir = _backups_dir(settings)
-    backups_dir.mkdir(parents=True)
-    db_name = _db_file_name(settings)
+def test_update_retention_prunes_stale_but_keeps_guaranteed_minimum(
+    settings: Settings,
+) -> None:
+    """A pre-migration backup prunes ancient ``update`` archives past the window
+    while keeping the :data:`UPDATE_BACKUP_MIN_KEEP` newest regardless of age.
 
-    # Six pre-existing "stale" backups with strictly increasing, deliberately
-    # old mtimes, so a new real backup should push the oldest two out.
+    Retirement of COL-60's private count-based retention: pruning is now the
+    shared, age-based :func:`~collapsarr.backup.service.prune_backups` with the
+    ``update`` guaranteed-minimum floor. Several ancient ``update`` zips (far
+    older than any retention window) are pre-seeded; taking one real
+    pre-migration backup must prune all of them except the floor-count newest.
+    """
+    update_dir = _update_dir(settings)
+    update_dir.mkdir(parents=True)
+
+    # Ancient stale archives (well beyond the retention window), strictly
+    # increasing mtimes so "newest" is unambiguous.
     base_epoch = 1_700_000_000  # a fixed point well in the past
     stale_names = []
-    for i in range(6):
-        stale = backups_dir / f"{db_name}.pre-stale{i}-{i:020d}.bak"
+    for i in range(4):
+        stale = update_dir / f"collapsarr_backup_v0.0.0_stale_{i:02d}.zip"
         stale.write_bytes(b"x")
         os.utime(stale, (base_epoch + i, base_epoch + i))
         stale_names.append(stale.name)
 
-    # Trigger one real backup (adoption path).
-    engine = create_engine_from_settings(settings)
-    Base.metadata.create_all(engine)
-    engine.dispose()
+    # Trigger one real pre-migration backup (adoption path).
+    _create_unversioned_db(settings)
     upgrade_to_head(settings)
 
-    remaining = {p.name for p in backups_dir.glob(f"{db_name}.pre-*.bak")}
-    assert len(remaining) == BACKUP_RETENTION_COUNT
-    # The two oldest stale backups were pruned.
-    assert stale_names[0] not in remaining
-    assert stale_names[1] not in remaining
-    # The four newest stale backups plus the just-written real one remain.
-    for name in stale_names[2:]:
-        assert name in remaining
-    assert any("unversioned" in name for name in remaining)
-
-
-def test_retention_grows_to_five_then_caps_on_incremental_accrual(
-    settings: Settings,
-) -> None:
-    """Backups accrued one at a time grow 1..5 then cap at 5 (oldest pruned).
-
-    This models the realistic path -- one backup added per pending migration --
-    where each prune sees ``len(backups) <= BACKUP_RETENTION_COUNT`` until the
-    sixth. It is the regression guard for the negative-slice bug: with the
-    buggy ``backups[:len-5]`` pruning, retention would cap at 2 (each prune
-    below the limit sliced from the front and deleted a backup that should be
-    kept) instead of growing to 5.
-    """
-    backups_dir = _backups_dir(settings)
-    backups_dir.mkdir(parents=True)
-    db_name = _db_file_name(settings)
-    base_epoch = 1_700_000_000  # a fixed point well in the past
-
-    expected_counts = [1, 2, 3, 4, 5, 5, 5]  # 7 accruals: grows to 5, then caps
-    for i, expected in enumerate(expected_counts):
-        # One new backup with a strictly-increasing mtime, then prune -- exactly
-        # what _backup_before_migration does per pending migration.
-        new_backup = backups_dir / f"{db_name}.pre-rev{i}-{i:020d}.bak"
-        new_backup.write_bytes(b"x")
-        os.utime(new_backup, (base_epoch + i, base_epoch + i))
-
-        _prune_old_backups(backups_dir, db_name)
-
-        remaining = sorted(
-            backups_dir.glob(f"{db_name}.pre-*.bak"),
-            key=lambda p: p.stat().st_mtime,
-        )
-        assert len(remaining) == expected, f"after accrual #{i + 1}"
-        # Retention keeps the *newest*: the just-written backup is always present.
-        assert new_backup.name in {p.name for p in remaining}
-
-    # After capping, the survivors are the five most-recent accruals (rev2..rev6).
-    survivors = {p.name for p in backups_dir.glob(f"{db_name}.pre-*.bak")}
-    assert survivors == {f"{db_name}.pre-rev{i}-{i:020d}.bak" for i in range(2, 7)}
+    remaining = {info.name for info in _update_backups(settings)}
+    # Floor keeps exactly UPDATE_BACKUP_MIN_KEEP: the just-written real backup
+    # plus the single newest stale one; the rest were pruned by age.
+    assert len(remaining) == UPDATE_BACKUP_MIN_KEEP
+    assert stale_names[-1] in remaining  # newest stale survives (floor slot)
+    for name in stale_names[:-1]:
+        assert name not in remaining  # older stale ones pruned by age
 
 
 # --------------------------------------------------------------------------- #
@@ -223,10 +250,10 @@ def test_non_file_database_url_skips_backup_and_logs(
     )
 
     with caplog.at_level("INFO"):
-        _backup_before_migration(non_file_settings, None, False, None)
+        _backup_before_migration(non_file_settings, None, False)
 
     assert "database_url does not point at a file-based SQLite database" in caplog.text
-    assert not _backups_dir(non_file_settings).exists()
+    assert _update_backups(non_file_settings) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -322,8 +349,8 @@ def test_fail_fast_backs_up_keeps_last_good_revision_and_never_serves(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Forced migration failure: backup exists, DB at last-good revision, and
-    the app never proceeds to serving (COL-60 fail-fast assertion test).
+    """Forced migration failure: a unified ``update`` backup exists, DB at
+    last-good revision, and the app never proceeds to serving (fail-fast).
 
     Uses a throwaway two-revision chain (good -> bad) swapped in for
     ``MIGRATIONS_DIR`` so the failure is a *real* Alembic/SQLite transaction
@@ -353,11 +380,15 @@ def test_fail_fast_backs_up_keeps_last_good_revision_and_never_serves(
         with pytest.raises(RuntimeError, match="simulated migration failure"):
             upgrade_to_head(settings)
 
-    # (a) the pre-migration backup exists, labelled with the last-good revision.
-    backups = list(_backups_dir(settings).glob(f"{_db_file_name(settings)}.pre-*.bak"))
+    # (a) the pre-migration backup exists as a unified ``update`` zip holding a
+    # byte-for-byte copy of the last-good database (its raw SQLite bytes).
+    backups = _update_backups(settings)
     assert len(backups) == 1
-    assert _GOOD_REVISION in backups[0].name
-    assert "Wrote pre-migration backup to" in caplog.text
+    archive_path = _update_dir(settings) / backups[0].name
+    with zipfile.ZipFile(archive_path) as archive:
+        assert archive.namelist() == [ARCHIVE_MEMBER_NAME]
+        assert archive.read(ARCHIVE_MEMBER_NAME).startswith(b"SQLite format 3\x00")
+    assert "update backup" in caplog.text
 
     # (b) the DB is left at the last good revision (transactional rollback of
     # Alembic's version bookkeeping).

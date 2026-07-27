@@ -38,6 +38,10 @@ export interface GlobalSettings {
   ui_auth_enabled: boolean;
   auth_required: AuthRequiredMode;
   auth_method: AuthMethod;
+  /** Days between scheduled backups (COL-66). Default 7; positive integer. */
+  backup_interval_days: number;
+  /** Days a backup is kept before pruning (COL-66). Default 28; positive integer. */
+  backup_retention_days: number;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -62,4 +66,6 @@ export interface GlobalSettingsUpdateInput {
   ui_auth_enabled?: boolean;
   auth_required?: AuthRequiredMode;
   auth_method?: AuthMethod;
+  backup_interval_days?: number;
+  backup_retention_days?: number;
 }
