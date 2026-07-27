@@ -22,10 +22,14 @@ Sequence when a valid restore is pending:
 #. **Clear the marker**, then let the normal ``upgrade_to_head`` run -- which
    forward-migrates an older restored database up to head before serving.
 
-Defensive path: if the staged file is missing or is not a valid SQLite database
-(or the configured database is not a file-based SQLite one at all), the swap is
+Defensive path: if the staged file is missing or is not a valid SQLite database,
+is stamped at an Alembic revision this build doesn't know (a backup from a
+*newer* Collapsarr -- the boot-time half of the COL-72 version guard, sharing
+:func:`collapsarr.migrations.check_restore_revision` with the stage-time gate),
+or the configured database is not a file-based SQLite one at all, the swap is
 **aborted** -- the current database is left untouched, the failure is logged
-loudly, the marker is cleared, and the app boots normally.
+loudly, the marker is cleared, and the app boots normally. The pre-swap safety
+backup is the backstop if a swap ever does apply against expectations.
 
 Marker-clearing semantics distinguish three outcomes deliberately:
 
@@ -58,6 +62,7 @@ from collapsarr.backup.service import (
     resolve_sqlite_path,
 )
 from collapsarr.config import Settings
+from collapsarr.migrations import IncompatibleRevisionError, check_restore_revision
 from collapsarr.restore.marker import (
     clear_restore_marker,
     read_restore_marker,
@@ -95,7 +100,7 @@ class RestoreOutcome:
     safety_backup: BackupInfo | None = None
 
 
-def _is_sqlite_file(path: Path) -> bool:
+def is_sqlite_file(path: Path) -> bool:
     """Return whether ``path`` exists and looks like a SQLite database file."""
     try:
         with path.open("rb") as handle:
@@ -133,7 +138,7 @@ def apply_pending_restore(settings: Settings) -> RestoreOutcome | None:
         return RestoreOutcome(applied=False, reason="malformed restore marker")
 
     staged = marker.staged_path
-    if not _is_sqlite_file(staged):
+    if not is_sqlite_file(staged):
         logger.error(
             "RESTORE ABORTED: staged database %s is missing or is not a valid "
             "SQLite file. The current database is left untouched; booting normally.",
@@ -141,6 +146,25 @@ def apply_pending_restore(settings: Settings) -> RestoreOutcome | None:
         )
         clear_restore_marker(settings)
         return RestoreOutcome(applied=False, reason="staged file missing or not a SQLite database")
+
+    # Defensive re-check of the version guard (COL-72). The stage-time gate
+    # already rejects a newer-than-supported backup before writing the marker, so
+    # this normally never fires -- but if a staged file somehow reaches boot at an
+    # unknown revision (a hand-planted marker, a downgrade between staging and
+    # reboot), abort rather than swap in a database this build can't migrate. The
+    # same shared helper the stage gate uses, so the two paths can't disagree.
+    try:
+        check_restore_revision(settings, staged)
+    except IncompatibleRevisionError as exc:
+        logger.error(
+            "RESTORE ABORTED: %s The current database is left untouched; booting normally.",
+            exc,
+        )
+        clear_restore_marker(settings)
+        return RestoreOutcome(
+            applied=False,
+            reason="staged database revision is newer than this build supports",
+        )
 
     current_db = resolve_sqlite_path(settings)
     if current_db is None:
@@ -224,4 +248,5 @@ def _swap_in(staged: Path, current_db: Path) -> None:
 __all__ = [
     "RestoreOutcome",
     "apply_pending_restore",
+    "is_sqlite_file",
 ]

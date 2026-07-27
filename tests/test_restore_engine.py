@@ -34,7 +34,9 @@ from collapsarr.config import Settings
 from collapsarr.main import create_app
 from collapsarr.migrations import (
     BASELINE_REVISION,
+    IncompatibleRevisionError,
     build_alembic_config,
+    check_restore_revision,
     upgrade_to_head,
 )
 from collapsarr.restore.engine import apply_pending_restore
@@ -114,6 +116,72 @@ def _current_db_with(settings: Settings, name: str) -> None:
     """Materialise the app's current database at head with a sentinel row."""
     upgrade_to_head(settings)
     _insert_instance(Path(settings.database_path), name)
+
+
+#: A fabricated revision no packaged migration defines -- stands in for a schema
+#: written by a *newer* Collapsarr build than the one running.
+_UNKNOWN_REVISION = "ffffffffffff"
+
+
+def _stamp_revision(db_path: Path, revision: str) -> None:
+    """Overwrite a database's ``alembic_version`` to an arbitrary revision.
+
+    Used to forge a "newer than this build" database from a real head-schema DB:
+    the file still passes the SQLite + sentinel-table gates, but its revision is
+    unknown to the packaged script directory.
+    """
+    connection = sqlite3.connect(str(db_path))
+    try:
+        connection.execute("UPDATE alembic_version SET version_num = ?", (revision,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _build_newer_revision_staged_db(
+    staged_path: Path, build_data_dir: Path, *, name: str
+) -> None:
+    """Build a staged DB stamped at an unknown (newer-than-supported) revision."""
+    _build_staged_db(staged_path, build_data_dir, name=name)
+    _stamp_revision(staged_path, _UNKNOWN_REVISION)
+
+
+# --------------------------------------------------------------------------- #
+# Shared version-compatibility guard (COL-72)
+# --------------------------------------------------------------------------- #
+def test_check_restore_revision_allows_known_and_unversioned(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The shared guard passes an older/known revision and an unversioned DB."""
+    head_db = tmp_path / "head.db"
+    _build_staged_db(head_db, tmp_path / "head_build", name="HEAD")
+    assert check_restore_revision(settings, head_db) == _head_revision(settings)
+
+    baseline_db = tmp_path / "baseline.db"
+    _build_staged_db(
+        baseline_db, tmp_path / "baseline_build", name="OLD", revision=BASELINE_REVISION
+    )
+    assert check_restore_revision(settings, baseline_db) == BASELINE_REVISION
+
+    # An unversioned (create_all-era) file with no alembic_version passes as None.
+    unversioned = tmp_path / "unversioned.db"
+    connection = sqlite3.connect(str(unversioned))
+    connection.execute("CREATE TABLE global_settings (id INTEGER PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    assert check_restore_revision(settings, unversioned) is None
+
+
+def test_check_restore_revision_rejects_newer_revision(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A revision absent from the packaged script dir raises the guard error."""
+    newer = tmp_path / "newer.db"
+    _build_newer_revision_staged_db(newer, tmp_path / "newer_build", name="FUTURE")
+    with pytest.raises(IncompatibleRevisionError) as excinfo:
+        check_restore_revision(settings, newer)
+    assert excinfo.value.revision == _UNKNOWN_REVISION
+    assert "newer version" in str(excinfo.value).lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +317,33 @@ def test_non_sqlite_staged_file_aborts(
     assert "RESTORE ABORTED" in caplog.text
     assert not restore_marker_path(settings).exists()
     assert staged.exists()  # a rejected staged file is not consumed
+    assert list_backups(settings) == []
+
+
+def test_newer_revision_staged_file_aborts_and_leaves_current_untouched(
+    settings: Settings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Boot-time version guard (COL-72): a staged file at an unknown (newer)
+    revision is defensively aborted -- current DB untouched, marker cleared,
+    startup proceeds normally, and no swap or safety backup happens.
+    """
+    _current_db_with(settings, "CURRENT")
+    staged = tmp_path / "staged" / "staged.db"
+    _build_newer_revision_staged_db(staged, tmp_path / "staged_build", name="FUTURE")
+    write_restore_marker(settings, staged)
+
+    app = create_app(settings=settings)
+    with caplog.at_level("ERROR"):
+        with TestClient(app) as client:
+            assert client.get("/health").status_code == 200
+            # The live database still serves CURRENT -- the newer DB was never swapped in.
+            assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
+
+    assert "RESTORE ABORTED" in caplog.text
+    assert "newer version" in caplog.text.lower()
+    assert not restore_marker_path(settings).exists()
+    assert staged.exists()  # a rejected staged file is not consumed
+    # Nothing was swapped, so no safety backup was taken.
     assert list_backups(settings) == []
 
 

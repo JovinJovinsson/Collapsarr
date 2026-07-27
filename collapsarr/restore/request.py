@@ -9,20 +9,27 @@ the next boot's swap engine consumes.
 
 The gate exists so a corrupt or foreign zip can never brick the next boot: a
 marker is only ever written for a file already proven to be a real,
-identifiable Collapsarr database. Three checks, in order:
+identifiable Collapsarr database this build can actually migrate. Four checks,
+in order:
 
 #. **Valid zip containing the expected DB entry** -- ``backup_id`` resolves to
    a real archive on disk (see :func:`~collapsarr.backup.service.resolve_backup_path`)
    and it opens as a zip carrying :data:`~collapsarr.backup.service.ARCHIVE_MEMBER_NAME`.
 #. **Extracted file opens as valid SQLite** -- the member's bytes, once
    written to a temp file, both look like a SQLite file (the same header check
-   :func:`collapsarr.restore.engine._is_sqlite_file` uses at swap time) and
+   :func:`collapsarr.restore.engine.is_sqlite_file` uses at swap time) and
    actually open via ``sqlite3``.
 #. **Carries the ``global_settings`` sentinel table** -- reuses
    :data:`collapsarr.migrations.SENTINEL_TABLE`, the same "is this really a
    populated Collapsarr database" signal ``upgrade_to_head`` uses to decide
    whether an unversioned database is adoptable. A file that opens as SQLite
    but isn't a Collapsarr database at all (or is truly empty) fails here.
+#. **Not stamped at a newer-than-supported revision** (COL-72) -- reuses the
+   shared :func:`collapsarr.migrations.check_restore_revision` guard to reject a
+   backup taken by a *newer* Collapsarr, whose Alembic revision this build has no
+   migration path for. Older/known and unversioned databases pass (the boot
+   swap forward-migrates them); the same helper is re-run defensively at boot in
+   :func:`collapsarr.restore.engine.apply_pending_restore`.
 
 Any gate failure raises :class:`RestoreGateError` with a message safe to
 surface directly to the operator; the temp file is cleaned up and neither the
@@ -32,14 +39,14 @@ raises :class:`~collapsarr.backup.service.BackupNotFoundError` unchanged when
 id" and "gate failure" as the two distinct outcomes the REST layer maps to
 404 and 422 respectively.
 
-**Stage-gate seam**: the version-compatibility guard (COL-72, a separate
-later ticket) slots in as a fourth check inside this same gate -- after
+**Stage-gate shape**: the version-compatibility guard (COL-72) is the fourth
+check, wired in exactly where the seam was reserved for it -- after
 :func:`_open_and_check_sentinel` confirms the file is a real Collapsarr
-database, a revision check can read its ``alembic_version`` and reject a
-newer-than-supported schema before the temp file is ever promoted to the
-staging path. Nothing about this function's shape needs to change for that;
-it is deliberately one gate function with checks run in sequence, each raising
-the same :class:`RestoreGateError` on failure.
+database, :func:`~collapsarr.migrations.check_restore_revision` reads its
+``alembic_version`` and rejects a newer-than-supported schema before the temp
+file is ever promoted to the staging path. It is deliberately one gate function
+with checks run in sequence, each raising the same :class:`RestoreGateError` on
+failure.
 """
 
 from __future__ import annotations
@@ -56,8 +63,12 @@ from collapsarr.backup.service import (
     resolve_backup_path,
 )
 from collapsarr.config import Settings
-from collapsarr.migrations import SENTINEL_TABLE
-from collapsarr.restore.engine import _is_sqlite_file
+from collapsarr.migrations import (
+    SENTINEL_TABLE,
+    IncompatibleRevisionError,
+    check_restore_revision,
+)
+from collapsarr.restore.engine import is_sqlite_file
 from collapsarr.restore.marker import write_restore_marker
 
 logger = logging.getLogger(__name__)
@@ -74,12 +85,13 @@ RESTORE_STAGED_FILENAME = ".restore_staged.db"
 class RestoreGateError(RuntimeError):
     """The validate-before-stage gate rejected a restore request.
 
-    Raised by :func:`stage_restore` for any of the three gate failures (not a
+    Raised by :func:`stage_restore` for any of the four gate failures (not a
     valid zip / missing DB entry, not a valid SQLite file, missing the
-    ``global_settings`` sentinel table). The message is written to be shown to
-    the operator as-is. The REST layer (:mod:`collapsarr.restore.routes`) maps
-    this to a ``422``. No marker is ever written and the running instance's
-    database is never touched on this path.
+    ``global_settings`` sentinel table, or stamped at a newer-than-supported
+    Alembic revision). The message is written to be shown to the operator as-is.
+    The REST layer (:mod:`collapsarr.restore.routes`) maps this to a ``422``. No
+    marker is ever written and the running instance's database is never touched
+    on this path.
     """
 
 
@@ -120,7 +132,7 @@ def _open_and_check_sentinel(path: Path) -> None:
     "opens as valid SQLite" proof and the vehicle for the sentinel-table
     query, so a single open serves both checks.
     """
-    if not _is_sqlite_file(path):
+    if not is_sqlite_file(path):
         raise RestoreGateError(
             "The backup's database file is not a valid SQLite database."
         )
@@ -180,6 +192,15 @@ def stage_restore(settings: Settings, backup_id: str) -> Path:
     try:
         tmp_path.write_bytes(data)
         _open_and_check_sentinel(tmp_path)
+        # Fourth check (COL-72): reject a backup from a newer Collapsarr whose
+        # revision this build can't migrate. Shared with the boot swap engine so
+        # the two paths agree on "too new to restore". Re-raised as the gate's
+        # own error type so the REST layer maps it to 422 like every other
+        # rejection -- no marker written, running database untouched.
+        try:
+            check_restore_revision(settings, tmp_path)
+        except IncompatibleRevisionError as exc:
+            raise RestoreGateError(str(exc)) from exc
         # Only reached once the gate has fully passed: atomically promote the
         # validated temp file to the staging path so a reader never observes
         # a partially-written or not-yet-validated staged database.

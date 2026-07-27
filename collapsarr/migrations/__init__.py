@@ -16,12 +16,14 @@ directory for the migration-authoring workflow.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from alembic.util.exc import CommandError
 from sqlalchemy import inspect
 
 from collapsarr.config import Settings
@@ -45,6 +47,26 @@ BASELINE_REVISION = "afde30c41b7b"
 SENTINEL_TABLE = "global_settings"
 
 
+class IncompatibleRevisionError(RuntimeError):
+    """A to-be-restored database is stamped at a revision this build can't handle.
+
+    Raised by :func:`check_restore_revision` when the database carries an Alembic
+    revision that is **not** present in this build's packaged migration script
+    directory -- the signature of a backup taken by a *newer* version of
+    Collapsarr, whose schema this build has no migration path for. The message is
+    written to be surfaced to the operator as-is; the offending ``revision`` is
+    kept as an attribute for logging.
+    """
+
+    def __init__(self, revision: str) -> None:
+        self.revision = revision
+        super().__init__(
+            "This backup was created by a newer version of Collapsarr "
+            f"(database revision {revision!r} is not known to this build); "
+            "upgrade Collapsarr before restoring it."
+        )
+
+
 def build_alembic_config(settings: Settings) -> Config:
     """Build a runtime Alembic :class:`~alembic.config.Config` from ``settings``.
 
@@ -57,6 +79,68 @@ def build_alembic_config(settings: Settings) -> Config:
     config.set_main_option("script_location", str(MIGRATIONS_DIR))
     config.set_main_option("sqlalchemy.url", settings.sqlalchemy_url)
     return config
+
+
+def read_stamped_revision(db_path: Path) -> str | None:
+    """Return the Alembic revision a standalone SQLite file is stamped at.
+
+    Reads ``alembic_version`` directly from ``db_path`` with ``sqlite3``: the
+    file is a *to-be-restored* database, not the live one, so it must not be
+    opened through the app's engine. ``None`` when the file has no
+    ``alembic_version`` table or no row -- an unversioned (``create_all``-era)
+    backup -- which callers treat the same as a known older revision:
+    :func:`upgrade_to_head` adopts and forward-migrates it after the swap.
+    """
+    connection = sqlite3.connect(str(db_path))
+    try:
+        try:
+            row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        except sqlite3.OperationalError:
+            # No ``alembic_version`` table at all: an unversioned backup.
+            return None
+    finally:
+        connection.close()
+    return None if row is None else str(row[0])
+
+
+def is_known_revision(settings: Settings, revision: str) -> bool:
+    """Return whether ``revision`` exists in the packaged migration script dir.
+
+    A revision is "known" when this build's packaged ``versions/`` directory
+    ships the script that defines it -- i.e. Alembic can migrate a database at
+    that revision forward to head. An *unknown* revision is the signature of a
+    backup produced by a newer Collapsarr build than the one running.
+    """
+    script = ScriptDirectory.from_config(build_alembic_config(settings))
+    try:
+        script.get_revision(revision)
+    except CommandError:
+        return False
+    return True
+
+
+def check_restore_revision(settings: Settings, db_path: Path) -> str | None:
+    """Reject a to-be-restored database stamped at a newer/unknown revision.
+
+    The single shared version-compatibility guard (COL-72), used by **both** the
+    stage-time restore gate (:func:`collapsarr.restore.request.stage_restore`)
+    and the boot-time swap engine
+    (:func:`collapsarr.restore.engine.apply_pending_restore`), so the two paths
+    can never disagree on what "too new to restore" means. Reads the revision
+    ``db_path`` is stamped at and:
+
+    * ``None`` (unversioned) or a **known** revision -> returns it unchanged; the
+      boot swap's ``upgrade_to_head`` forward-migrates an older database.
+    * a revision **not** in the packaged script directory -> raises
+      :class:`IncompatibleRevisionError` (a newer-than-supported backup).
+
+    Returns the revision (or ``None``) for logging; raising is the only rejection
+    signal. Reads only -- never writes to ``db_path``.
+    """
+    revision = read_stamped_revision(db_path)
+    if revision is not None and not is_known_revision(settings, revision):
+        raise IncompatibleRevisionError(revision)
+    return revision
 
 
 def _current_revision(settings: Settings) -> str | None:
@@ -261,6 +345,10 @@ __all__ = [
     "BASELINE_REVISION",
     "MIGRATIONS_DIR",
     "SENTINEL_TABLE",
+    "IncompatibleRevisionError",
     "build_alembic_config",
+    "check_restore_revision",
+    "is_known_revision",
+    "read_stamped_revision",
     "upgrade_to_head",
 ]

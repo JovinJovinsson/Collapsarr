@@ -116,6 +116,30 @@ def _write_old_revision_backup(settings: Settings, tmp_path: Path, *, name: str)
     return _write_bogus_archive(settings, filename, zip_bytes)
 
 
+def _write_newer_revision_backup(settings: Settings, tmp_path: Path, *, name: str) -> str:
+    """Build a real backup archive whose DB is stamped at a revision no packaged
+    migration defines -- the signature of a backup taken by a *newer* Collapsarr.
+
+    Built from a head-schema DB whose ``alembic_version`` is then overwritten to
+    a bogus revision, so the file still passes the SQLite + sentinel-table gates
+    and is only rejected by the COL-72 version guard.
+    """
+    newer_db = tmp_path / "newer_revision.db"
+    newer_settings = Settings(database_path=str(newer_db), data_dir=str(tmp_path))
+    command.upgrade(build_alembic_config(newer_settings), "head")
+    _insert_instance(newer_db, name)
+    connection = sqlite3.connect(str(newer_db))
+    try:
+        connection.execute("UPDATE alembic_version SET version_num = 'ffffffffffff'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    zip_bytes = _zip_with_member(ARCHIVE_MEMBER_NAME, newer_db.read_bytes())
+    filename = "collapsarr_backup_v9.9.9_2099.01.01_00.00.00.zip"
+    return _write_bogus_archive(settings, filename, zip_bytes)
+
+
 # --------------------------------------------------------------------------- #
 # Auth gate + unknown id
 # --------------------------------------------------------------------------- #
@@ -237,6 +261,33 @@ def test_restore_rejects_a_sqlite_db_missing_the_sentinel_table(
     assert "global_settings" in response.json()["detail"]
     assert not restore_marker_path(settings).exists()
     assert not restore_staging_path(settings).exists()
+
+
+def test_restore_rejects_a_newer_version_backup(
+    client: TestClient, settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Version guard (COL-72): a backup stamped at a revision this build doesn't
+    know is rejected at stage time with a clear "newer version" 422 -- no marker,
+    no staged file, and shutdown is never triggered.
+    """
+    shutdown_calls: list[None] = []
+    monkeypatch.setattr(
+        "collapsarr.restore.routes.trigger_shutdown", lambda: shutdown_calls.append(None)
+    )
+    headers = _auth_headers(client)
+
+    _insert_instance(Path(settings.database_path), "CURRENT")
+    backup_id = _write_newer_revision_backup(settings, tmp_path, name="FUTURE")
+
+    response = client.post(f"/api/system/backup/restore/{backup_id}", headers=headers)
+
+    assert response.status_code == 422
+    assert "newer version" in response.json()["detail"].lower()
+    # Nothing was armed and the running instance is completely untouched.
+    assert not restore_marker_path(settings).exists()
+    assert not restore_staging_path(settings).exists()
+    assert shutdown_calls == []
+    assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
 
 
 # --------------------------------------------------------------------------- #
