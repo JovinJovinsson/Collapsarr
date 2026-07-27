@@ -13,9 +13,10 @@ from fastapi.testclient import TestClient
 
 from collapsarr import __version__
 from collapsarr.config import Settings
-from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
+from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.health import FfmpegCheckResult
 from collapsarr.main import create_app
+from collapsarr.migrations import upgrade_to_head
 from collapsarr.notify.service import update_notifier_config
 
 
@@ -130,7 +131,7 @@ def test_app_startup_dispatches_a_notification_when_ffmpeg_is_missing_and_a_noti
     # Pre-seed an enabled webhook notifier before the app (re-)opens this same
     # SQLite file in its own lifespan-owned engine/session.
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
     with session_factory() as setup_session:
         update_notifier_config(
@@ -189,7 +190,7 @@ def test_app_startup_makes_no_network_call_when_ffmpeg_is_present_even_with_a_no
     settings: Settings,
 ) -> None:
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
     with session_factory() as setup_session:
         update_notifier_config(

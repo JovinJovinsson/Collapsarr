@@ -13,8 +13,9 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
-from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
+from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
+from collapsarr.migrations import upgrade_to_head
 from collapsarr.settings.models import (
     AUTH_METHOD_BASIC,
     AUTH_METHOD_FORMS,
@@ -34,7 +35,7 @@ from collapsarr.settings.service import (
 def _fresh_session(settings: Settings) -> Session:
     """Build a schema-initialised session for a standalone Settings/database."""
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     return create_session_factory(engine)()
 
 # ---------------------------------------------------------------------------

@@ -210,8 +210,9 @@ class JobQueue:
         make_history_recorder` and ``failure_notifier`` via
         :func:`collapsarr.jobs.failure_notify.make_failure_notifier`, both
         bound to the same session factory for ``resolved``'s database
-        (schema created via :func:`~collapsarr.database.init_db` if not
-        already present) -- rather than staying ``None``. This mirrors how
+        (schema brought up to head via
+        :func:`~collapsarr.migrations.upgrade_to_head` if not already
+        current) -- rather than staying ``None``. This mirrors how
         ``pipeline_runner`` already defaults to the real
         :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline` in the raw
         ``__init__``: a bare ``JobQueue.from_settings()`` call, with no extra
@@ -234,9 +235,9 @@ class JobQueue:
         The imports of :mod:`collapsarr.jobs.history` and
         :mod:`collapsarr.jobs.failure_notify` below are deferred (inside this
         method, not at module scope) because those modules import *this* one
-        (for :class:`Job`/:class:`JobStatus`) -- the same defer-to-break-a-
-        cycle trick :func:`collapsarr.database.init_db` already uses for its
-        own model-registration imports.
+        (for :class:`Job`/:class:`JobStatus`) -- a deferred import to break the
+        module cycle, the same reason the schema/engine helpers above are
+        imported inside this method rather than at module scope.
         """
         resolved = settings or get_settings()
 
@@ -246,11 +247,11 @@ class JobQueue:
             from collapsarr.database import (
                 create_engine_from_settings,
                 create_session_factory,
-                init_db,
             )
+            from collapsarr.migrations import upgrade_to_head
 
+            upgrade_to_head(resolved)
             engine = create_engine_from_settings(resolved)
-            init_db(engine)
             session_factory = create_session_factory(engine)
 
             if resolved_history_recorder is None:

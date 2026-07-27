@@ -11,7 +11,7 @@ concern and is not part of this module.
 This module is imported for its side effect of registering
 :class:`~collapsarr.settings.models.GlobalSettings` with
 :data:`collapsarr.database.Base.metadata` -- see
-:func:`collapsarr.database.init_db`.
+the Alembic migration environment (:mod:`collapsarr.migrations`).
 """
 
 from __future__ import annotations

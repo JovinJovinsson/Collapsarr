@@ -32,7 +32,6 @@ from .database import (
     create_engine_from_settings,
     create_session_factory,
     get_session,
-    init_db,
 )
 from .frontend import mount_frontend
 from .health import FfmpegCheckResult, check_ffmpeg, notify_ffmpeg_missing
@@ -40,6 +39,7 @@ from .jobs.queue import JobQueue
 from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .media.routes import router as wanted_router
+from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
@@ -83,11 +83,18 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Bring the schema up to head via Alembic before serving the first
+        # request (COL-58). Alembic is the single source of truth for schema:
+        # on a fresh install this runs the full migration chain from base; on an
+        # already-current install it is a no-op. Any migration error propagates
+        # out of the lifespan, so startup aborts (non-zero exit) rather than
+        # serve against a half-migrated schema.
+        upgrade_to_head(resolved_settings)
+
         engine = create_engine_from_settings(resolved_settings)
         app.state.engine = engine
         session_factory = create_session_factory(engine)
         app.state.session_factory = session_factory
-        init_db(engine)
 
         # Environment-seeded UI credential for headless deploys (COL-53): if
         # COLLAPSARR_AUTH_USERNAME/PASSWORD are set and no credential exists

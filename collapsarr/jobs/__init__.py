@@ -8,7 +8,7 @@ concurrency cap (COL-20), periodic full-library scans, and job history
 This module is imported for its side effect of registering
 :class:`~collapsarr.jobs.models.JobHistory` with
 :data:`collapsarr.database.Base.metadata` -- see
-:func:`collapsarr.database.init_db`.
+the Alembic migration environment (:mod:`collapsarr.migrations`).
 """
 
 from __future__ import annotations
