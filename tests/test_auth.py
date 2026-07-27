@@ -241,6 +241,23 @@ def test_api_without_session_or_key_is_rejected(client: TestClient, session: Ses
     assert client.get("/api/settings").status_code == 401
 
 
+def test_api_path_with_a_file_extension_still_requires_auth(
+    client: TestClient, session: Session
+) -> None:
+    """The static-asset bypass must not open an ``/api`` route (COL-65).
+
+    A backup id ends in ``.zip``, so ``DELETE /api/system/backup/{type}/{file}.zip``
+    has a dotted final segment. Without the ``/api`` guard on the static-asset
+    check, the extension heuristic would misclassify it as a public bundle asset
+    and skip the session/key gate -- silently un-authing the delete endpoint.
+    """
+    _set_credential(session)
+
+    assert (
+        client.delete("/api/system/backup/manual/whatever.zip").status_code == 401
+    )
+
+
 def test_health_stays_open_once_a_credential_exists(
     client: TestClient, session: Session
 ) -> None:

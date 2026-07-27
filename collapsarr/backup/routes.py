@@ -7,7 +7,7 @@ by the auth middleware (session cookie or API key; see
 :mod:`collapsarr.auth.enforcement`), both routes here inherit that gate -- no
 per-route auth wiring is needed.
 
-Three endpoints:
+Four endpoints:
 
 * ``GET /api/system/backup`` -- returns ``{supported, backups}``. ``supported``
   is ``false`` when the database isn't file-based SQLite, which is how the UI
@@ -25,6 +25,13 @@ Three endpoints:
   An unknown/invalid ``id`` -- wrong type, a filename that doesn't match a real
   archive, or a path-traversal attempt -- is rejected with ``404`` rather than
   distinguishing why (see :func:`~collapsarr.backup.service.resolve_backup_path`).
+* ``DELETE /api/system/backup/{id}`` (COL-65) -- removes one backup and its file
+  from disk, returning ``204``. An unknown/invalid ``id`` is a ``404`` (same
+  resolution as download); a delete that would drop below the minimum-keep floor
+  (:data:`~collapsarr.backup.service.MINIMUM_BACKUP_KEEP`) is refused with a
+  ``409`` and a clear message, without touching any file. Full age-based
+  retention is a separate slice (COL-68); this endpoint only enforces the floor
+  as the manual-deletion guardrail.
 
 The JSON uses the codebase's snake_case convention (``created_at``), matching
 every other endpoint (settings, jobs history).
@@ -42,8 +49,11 @@ from ..config import Settings
 from .service import (
     BACKUP_MANUAL,
     BackupInfo,
+    BackupNotFoundError,
+    BackupRetentionFloorError,
     BackupUnavailableError,
     create_backup,
+    delete_backup,
     is_backup_supported,
     list_backups,
     resolve_backup_path,
@@ -131,3 +141,29 @@ def download_backup_endpoint(backup_id: str, request: Request) -> FileResponse:
     if path is None:
         raise HTTPException(status_code=404, detail=f"No backup archive with id={backup_id!r}")
     return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+@router.delete("/backup/{backup_id:path}", status_code=204)
+def delete_backup_endpoint(backup_id: str, request: Request) -> None:
+    """Delete one backup and its file from disk (COL-65).
+
+    ``backup_id`` is the ``<type>/<filename>`` id from :func:`list_backups`
+    (the ``:path`` converter lets it carry its embedded ``/``). Maps the
+    service's two refusal modes to distinct HTTP statuses:
+
+    * an unknown/invalid id (unknown type, malformed/traversal filename, or no
+      file on disk) -> ``404`` -- indistinguishable from a missing file, same
+      as the download route;
+    * a delete that would breach the minimum-keep floor
+      (:data:`~collapsarr.backup.service.MINIMUM_BACKUP_KEEP`) -> ``409`` with
+      the guardrail message, *without* touching any file.
+
+    On success returns ``204`` with no body.
+    """
+    settings = _settings(request)
+    try:
+        delete_backup(settings, backup_id)
+    except BackupNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except BackupRetentionFloorError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

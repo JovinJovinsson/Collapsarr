@@ -158,6 +158,75 @@ def test_download_path_traversal_id_returns_404(client: TestClient) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Delete (COL-65)
+# --------------------------------------------------------------------------- #
+def test_delete_requires_authentication(client: TestClient) -> None:
+    # No API key / session: the /api gate rejects the delete route too.
+    response = client.delete(f"/api/system/backup/{BACKUP_MANUAL}/whatever.zip")
+    assert response.status_code == 401
+
+
+def test_delete_removes_the_backup_when_above_the_floor(
+    client: TestClient, settings: Settings
+) -> None:
+    headers = _auth_headers(client)
+    created = client.post("/api/system/backup", headers=headers).json()
+
+    # A second on-disk archive keeps the total above the minimum-keep floor so
+    # the delete is permitted (two real backups would collide on filename).
+    manual_dir = backups_root(settings) / BACKUP_MANUAL
+    (manual_dir / "collapsarr_backup_v0.0.1_2020.01.01_00.00.00.zip").write_bytes(b"stand-in")
+
+    response = client.delete(f"/api/system/backup/{created['id']}", headers=headers)
+    assert response.status_code == 204
+
+    # The file is gone from disk and no longer listed.
+    assert not (manual_dir / created["name"]).exists()
+    listed = client.get("/api/system/backup", headers=headers).json()
+    assert [b["name"] for b in listed["backups"]] == [
+        "collapsarr_backup_v0.0.1_2020.01.01_00.00.00.zip"
+    ]
+
+
+def test_delete_below_floor_is_refused_with_409_and_keeps_the_file(
+    client: TestClient, settings: Settings
+) -> None:
+    headers = _auth_headers(client)
+    created = client.post("/api/system/backup", headers=headers).json()
+
+    # Only one backup exists: deleting it would breach the minimum-keep floor.
+    response = client.delete(f"/api/system/backup/{created['id']}", headers=headers)
+    assert response.status_code == 409
+    assert "kept" in response.json()["detail"].lower()
+
+    # Refused without touching disk: still on disk and still listed.
+    assert (backups_root(settings) / BACKUP_MANUAL / created["name"]).exists()
+    listed = client.get("/api/system/backup", headers=headers).json()
+    assert [b["name"] for b in listed["backups"]] == [created["name"]]
+
+
+def test_delete_unknown_type_returns_404(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    response = client.delete("/api/system/backup/bogus/whatever.zip", headers=headers)
+    assert response.status_code == 404
+
+
+def test_delete_nonexistent_filename_returns_404(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    response = client.delete(
+        f"/api/system/backup/{BACKUP_MANUAL}/collapsarr_backup_v9.9.9_2020.01.01_00.00.00.zip",
+        headers=headers,
+    )
+    assert response.status_code == 404
+
+
+def test_delete_path_traversal_id_returns_404(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    response = client.delete("/api/system/backup/manual/../../etc/passwd", headers=headers)
+    assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
 # No static exposure of backups/ (COL-64)
 # --------------------------------------------------------------------------- #
 def test_backups_directory_has_no_static_mount(client: TestClient, settings: Settings) -> None:

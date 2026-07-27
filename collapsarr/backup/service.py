@@ -72,6 +72,13 @@ BACKUP_FILENAME_GLOB = "collapsarr_backup_v*.zip"
 #: filename) so a restore step can find the database member deterministically.
 ARCHIVE_MEMBER_NAME = "collapsarr.db"
 
+#: Minimum number of backups that must always remain on disk. A manual delete
+#: (COL-65) refuses when it would drop the total below this floor, so an
+#: operator can never delete their way to zero recovery points. The age-based
+#: retention prune (COL-68) reuses this as a hard floor -- backups are never
+#: pruned below this count regardless of age.
+MINIMUM_BACKUP_KEEP = 1
+
 #: Serialises the whole create-backup critical section so concurrent requests
 #: never interleave temp files or race the atomic rename.
 _BACKUP_LOCK = Lock()
@@ -84,6 +91,24 @@ class BackupUnavailableError(RuntimeError):
     ``None`` (a non-SQLite ``database_url`` override or an in-memory database).
     The REST layer maps this to a ``409`` and the UI shows its "unavailable for
     this database configuration" state instead of the controls.
+    """
+
+
+class BackupNotFoundError(RuntimeError):
+    """The named backup id doesn't resolve to a real archive on disk.
+
+    Raised by :func:`delete_backup` when
+    :func:`resolve_backup_path` returns ``None`` (unknown type, malformed or
+    traversal id, or no file present). The REST layer maps this to a ``404``.
+    """
+
+
+class BackupRetentionFloorError(RuntimeError):
+    """Deleting the backup would drop below :data:`MINIMUM_BACKUP_KEEP`.
+
+    Raised by :func:`delete_backup` instead of executing the deletion, so an
+    operator can't manually delete their last recovery point. The REST layer
+    maps this to a ``409`` and surfaces the message to the UI.
     """
 
 
@@ -263,6 +288,37 @@ def create_backup(settings: Settings, backup_type: str = BACKUP_MANUAL) -> Backu
         return _info_from_path(final_path, backup_type)
 
 
+def delete_backup(settings: Settings, backup_id: str) -> None:
+    """Delete one backup archive and its file from disk (COL-65).
+
+    The whole resolve -> floor-check -> unlink runs under :data:`_BACKUP_LOCK`
+    (the same lock :func:`create_backup` holds) so the count can't shift under
+    us between the guardrail check and the deletion.
+
+    Raises:
+        BackupNotFoundError: ``backup_id`` doesn't resolve to a real archive
+            (unknown type, malformed/traversal id, or no file) -- the REST
+            layer maps this to ``404``.
+        BackupRetentionFloorError: the deletion would leave fewer than
+            :data:`MINIMUM_BACKUP_KEEP` backups. Enforced *before* any file is
+            touched, so a refused delete never removes anything.
+    """
+    with _BACKUP_LOCK:
+        path = resolve_backup_path(settings, backup_id)
+        if path is None:
+            raise BackupNotFoundError(f"No backup archive with id={backup_id!r}")
+
+        remaining = len(list_backups(settings)) - 1
+        if remaining < MINIMUM_BACKUP_KEEP:
+            raise BackupRetentionFloorError(
+                f"Refusing to delete this backup: at least {MINIMUM_BACKUP_KEEP} "
+                "backup must be kept so a recovery point always remains."
+            )
+
+        path.unlink()
+        logger.info("Deleted backup %s", backup_id)
+
+
 __all__ = [
     "ARCHIVE_MEMBER_NAME",
     "BACKUP_FILENAME_GLOB",
@@ -270,11 +326,15 @@ __all__ = [
     "BACKUP_SCHEDULED",
     "BACKUP_TYPES",
     "BACKUP_UPDATE",
+    "MINIMUM_BACKUP_KEEP",
     "BackupInfo",
+    "BackupNotFoundError",
+    "BackupRetentionFloorError",
     "BackupUnavailableError",
     "backup_type_dir",
     "backups_root",
     "create_backup",
+    "delete_backup",
     "ensure_backup_dirs",
     "is_backup_supported",
     "list_backups",

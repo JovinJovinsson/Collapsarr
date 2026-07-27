@@ -1081,6 +1081,14 @@ a {
   align-items: center;
 }
 
+/* Inline "Delete this backup?" prompt shown between the Confirm/Cancel buttons
+   while a per-row delete is being confirmed (COL-65). */
+.data-table__confirm {
+  color: var(--c-danger);
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition-duration: 0.01ms !important;

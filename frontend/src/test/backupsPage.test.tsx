@@ -287,4 +287,79 @@ describe("BackupsPage", () => {
 
     expect(await screen.findByText("backup not found")).toBeInTheDocument();
   });
+
+  // --- Delete action (COL-65) --------------------------------------------------
+
+  it("deletes a backup only after confirming, then refreshes the list", async () => {
+    let deleted = false;
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (url === `/api/system/backup/${sampleBackup.id}` && method === "DELETE") {
+        deleted = true;
+        return Promise.resolve({ ok: true, status: 204, json: () => Promise.resolve(null) });
+      }
+      if (url === "/api/system/backup") {
+        return Promise.resolve(jsonResponse(deleted ? emptyList : listWithOne));
+      }
+      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
+      return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<BackupsPage />);
+
+    // Clicking Delete asks for confirmation first -- it must not call DELETE yet.
+    fireEvent.click(await screen.findByRole("button", { name: /^delete$/i }));
+    expect(screen.getByText(/delete this backup\?/i)).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, i]) => (i as RequestInit | undefined)?.method === "DELETE"),
+    ).toBe(false);
+
+    // Confirming performs the DELETE and the row drops out on the refreshed list.
+    fireEvent.click(screen.getByRole("button", { name: /confirm delete/i }));
+
+    expect(await screen.findByText(/no backups yet/i)).toBeInTheDocument();
+    const deleteCall = fetchMock.mock.calls.find(
+      ([, i]) => (i as RequestInit | undefined)?.method === "DELETE",
+    );
+    expect(deleteCall?.[0]).toBe(`/api/system/backup/${sampleBackup.id}`);
+  });
+
+  it("cancels a pending delete without calling DELETE", async () => {
+    const fetchMock = stubFetch({ backups: listWithOne });
+    render(<BackupsPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^delete$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+
+    // Back to the plain Delete button, no confirmation prompt, no DELETE call.
+    expect(screen.queryByText(/delete this backup\?/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^delete$/i })).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, i]) => (i as RequestInit | undefined)?.method === "DELETE"),
+    ).toBe(false);
+  });
+
+  it("surfaces the minimum-keep floor refusal (409) when a delete is rejected", async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (url === `/api/system/backup/${sampleBackup.id}` && method === "DELETE") {
+        return Promise.resolve(
+          jsonResponse({ detail: "Refusing to delete this backup: at least 1 backup must be kept." }, 409),
+        );
+      }
+      if (url === "/api/system/backup") return Promise.resolve(jsonResponse(listWithOne));
+      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
+      return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<BackupsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /^delete$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /confirm delete/i }));
+
+    expect(await screen.findByText(/at least 1 backup must be kept/i)).toBeInTheDocument();
+    // The backup is still listed -- the refusal didn't remove it.
+    expect(screen.getByText(sampleBackup.name)).toBeInTheDocument();
+  });
 });

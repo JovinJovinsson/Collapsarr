@@ -23,10 +23,14 @@ from collapsarr.backup.service import (
     BACKUP_MANUAL,
     BACKUP_SCHEDULED,
     BACKUP_TYPES,
+    MINIMUM_BACKUP_KEEP,
+    BackupNotFoundError,
+    BackupRetentionFloorError,
     BackupUnavailableError,
     backup_type_dir,
     backups_root,
     create_backup,
+    delete_backup,
     ensure_backup_dirs,
     is_backup_supported,
     list_backups,
@@ -276,3 +280,70 @@ def test_resolve_backup_path_does_not_cross_backup_type_boundaries(settings: Set
     info = create_backup(settings, BACKUP_MANUAL)
     ensure_backup_dirs(settings)
     assert resolve_backup_path(settings, f"{BACKUP_SCHEDULED}/{info.name}") is None
+
+
+# --------------------------------------------------------------------------- #
+# delete_backup (COL-65)
+# --------------------------------------------------------------------------- #
+def _fabricate_archive(settings: Settings, name: str) -> Path:
+    """Drop a well-named (glob-matching) file under ``manual`` so it's listable."""
+    manual_dir = backup_type_dir(settings, BACKUP_MANUAL)
+    manual_dir.mkdir(parents=True, exist_ok=True)
+    archive = manual_dir / name
+    archive.write_bytes(b"stand-in archive, only its presence matters")
+    return archive
+
+
+def test_floor_is_one_so_the_last_backup_is_protected() -> None:
+    """Guard the assumed floor: this slice keeps at least one recovery point."""
+    assert MINIMUM_BACKUP_KEEP == 1
+
+
+def test_delete_backup_removes_the_file_when_above_the_floor(settings: Settings) -> None:
+    _populate_db(settings)
+    info = create_backup(settings)
+    # A second archive keeps the total above the floor, so the delete proceeds.
+    _fabricate_archive(settings, "collapsarr_backup_v0.0.1_2020.01.01_00.00.00.zip")
+    assert len(list_backups(settings)) == 2
+
+    delete_backup(settings, info.id)
+
+    assert not (_manual_dir(settings) / info.name).exists()
+    assert [b.name for b in list_backups(settings)] == [
+        "collapsarr_backup_v0.0.1_2020.01.01_00.00.00.zip"
+    ]
+
+
+def test_delete_backup_refuses_below_floor_and_leaves_file_intact(settings: Settings) -> None:
+    _populate_db(settings)
+    info = create_backup(settings)
+    assert len(list_backups(settings)) == 1
+
+    with pytest.raises(BackupRetentionFloorError, match="at least"):
+        delete_backup(settings, info.id)
+
+    # Refused before touching disk: the sole backup is still present + listable.
+    assert (_manual_dir(settings) / info.name).exists()
+    assert [b.name for b in list_backups(settings)] == [info.name]
+
+
+def test_delete_backup_unknown_id_raises_not_found(settings: Settings) -> None:
+    ensure_backup_dirs(settings)
+    with pytest.raises(BackupNotFoundError):
+        delete_backup(settings, f"{BACKUP_MANUAL}/does_not_exist.zip")
+
+
+@pytest.mark.parametrize(
+    "backup_id",
+    [
+        "bogus/collapsarr_backup_v1_2026.01.01_00.00.00.zip",  # unknown type
+        "manual/../../etc/passwd",  # traversal
+        "manual/not_a_backup.txt",  # non-matching filename
+    ],
+)
+def test_delete_backup_rejects_malformed_or_traversal_ids(
+    settings: Settings, backup_id: str
+) -> None:
+    ensure_backup_dirs(settings)
+    with pytest.raises(BackupNotFoundError):
+        delete_backup(settings, backup_id)

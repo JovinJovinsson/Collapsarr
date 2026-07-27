@@ -58,3 +58,19 @@ export async function downloadBackup(backup: Pick<Backup, "id" | "name">): Promi
     URL.revokeObjectURL(url);
   }
 }
+
+/**
+ * Deletes a backup archive (`DELETE /api/system/backup/{id}`, COL-65).
+ *
+ * `backup.id` is the `<type>/<filename>` path segment, interpolated directly
+ * (not `encodeURIComponent`-ed) so its embedded `/` survives -- same as
+ * `downloadBackup`. The server refuses with a `409` (surfaced via
+ * `apiErrorMessage`) when the delete would drop below the minimum-keep floor,
+ * and `404`s an unknown id.
+ */
+export async function deleteBackup(backup: Pick<Backup, "id">): Promise<void> {
+  const response = await apiFetch(`/api/system/backup/${backup.id}`, { method: "DELETE" });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to delete backup (${response.status})`));
+  }
+}

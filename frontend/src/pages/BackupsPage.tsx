@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { createBackup, downloadBackup, fetchBackups } from "../api/backups";
+import { createBackup, deleteBackup, downloadBackup, fetchBackups } from "../api/backups";
 import { fetchSettings, updateSettings } from "../api/settings";
 import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
@@ -74,12 +74,20 @@ function validateScheduleForm(form: ScheduleFormValues): string | null {
  *
  * COL-64 adds a per-row "Download" action, streaming the archive off disk via
  * `GET /api/system/backup/{id}/download` (`downloadBackup`, `api/backups.ts`).
+ *
+ * COL-65 adds a per-row "Delete" action with an inline confirmation step
+ * (Confirm delete / Cancel), calling `DELETE /api/system/backup/{id}`
+ * (`deleteBackup`). The server enforces a minimum-keep floor: a delete that
+ * would remove the last recovery point is refused with a `409`, whose message
+ * is surfaced in the same `actionError` banner as the other row actions.
  */
 export function BackupsPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const [scheduleState, setScheduleState] = useState<ScheduleLoadState>({ status: "loading" });
   const [scheduleForm, setScheduleForm] = useState<ScheduleFormValues>({
@@ -194,6 +202,20 @@ export function BackupsPage() {
       setActionError(error instanceof Error ? error.message : "Failed to download backup.");
     } finally {
       setDownloadingId(null);
+    }
+  }
+
+  async function handleConfirmDelete(backup: Backup) {
+    setDeletingId(backup.id);
+    setActionError(null);
+    try {
+      await deleteBackup(backup);
+      setConfirmingDeleteId(null);
+      await load();
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : "Failed to delete backup.");
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -347,6 +369,37 @@ export function BackupsPage() {
                     >
                       {downloadingId === backup.id ? "Downloading…" : "Download"}
                     </button>
+                    {confirmingDeleteId === backup.id ? (
+                      <>
+                        <span className="data-table__confirm" role="status">
+                          Delete this backup?
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn--danger btn--sm"
+                          onClick={() => handleConfirmDelete(backup)}
+                          disabled={deletingId === backup.id}
+                        >
+                          {deletingId === backup.id ? "Deleting…" : "Confirm delete"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn--ghost btn--sm"
+                          onClick={() => setConfirmingDeleteId(null)}
+                          disabled={deletingId === backup.id}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn btn--danger btn--sm"
+                        onClick={() => setConfirmingDeleteId(backup.id)}
+                      >
+                        Delete
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}
