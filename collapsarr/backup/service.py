@@ -34,8 +34,10 @@ from __future__ import annotations
 import fnmatch
 import logging
 import os
+import shutil
 import sqlite3
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -252,6 +254,22 @@ def _snapshot_database(db_file: Path, destination: Path) -> None:
         connection.close()
 
 
+def _raw_copy_snapshot(db_file: Path, destination: Path) -> None:
+    """Byte-for-byte copy of ``db_file`` to ``destination`` (pre-migration use).
+
+    The snapshot strategy the pre-migration ``update`` backup passes to
+    :func:`create_backup` (COL-69). It runs on the boot path *before the app's
+    engine connects*, so there is no concurrent writer and a plain file copy is
+    already consistent -- no ``VACUUM INTO`` connection is needed. A raw copy
+    also preserves the exact pre-migration bytes rather than a vacuum-normalised
+    equivalent: the archive is the rollback point for a schema upgrade, so it
+    must be the database *as it was*, and it must not depend on the file being an
+    openable/valid SQLite database at snapshot time.
+    """
+    destination.unlink(missing_ok=True)
+    shutil.copy2(db_file, destination)
+
+
 def _min_keep_for(backup_type: str) -> int:
     """Minimum backups of ``backup_type`` the prune keeps regardless of age.
 
@@ -332,21 +350,30 @@ def create_backup(
     backup_type: str = BACKUP_MANUAL,
     *,
     retention_days: int | None = None,
+    snapshot: Callable[[Path, Path], None] | None = None,
 ) -> BackupInfo:
     """Create one backup archive and return its :class:`BackupInfo`.
 
-    Snapshots the live SQLite database (:func:`_snapshot_database`), zips the
-    snapshot, and atomically renames it into
-    ``<data_dir>/backups/<backup_type>/``. The whole critical section holds
-    :data:`_BACKUP_LOCK`; temp files are cleaned up in a ``finally`` so a
-    failure leaves no partial or listable archive.
+    Snapshots the live SQLite database, zips the snapshot, and atomically
+    renames it into ``<data_dir>/backups/<backup_type>/``. The whole critical
+    section holds :data:`_BACKUP_LOCK`; temp files are cleaned up in a
+    ``finally`` so a failure leaves no partial or listable archive.
+
+    ``snapshot`` selects how the source database is captured to the temp file.
+    It defaults to :func:`_snapshot_database` (``VACUUM INTO`` -- a consistent
+    copy of the *live* database, for the manual/scheduled paths). The
+    pre-migration ``update`` path (COL-69) passes :func:`_raw_copy_snapshot`
+    instead: it runs before the engine connects, so a byte-for-byte copy is both
+    safe and the exact rollback artifact a schema upgrade needs.
 
     When ``retention_days`` is given (the scheduler and "Backup Now" paths pass
-    the live ``backup_retention_days`` setting), :func:`prune_backups` runs
-    after the archive is published -- deleting older backups of *this type* past
-    the window while honouring the per-type minimum-keep floor and never
-    touching the archive just written. A prune failure is logged but never fails
-    the create: the backup already succeeded and must not be lost.
+    the live ``backup_retention_days`` setting; the pre-migration path passes the
+    schema default), :func:`prune_backups` runs after the archive is published --
+    deleting older backups of *this type* past the window while honouring the
+    per-type minimum-keep floor (raised to :data:`UPDATE_BACKUP_MIN_KEEP` for
+    ``update``) and never touching the archive just written. A prune failure is
+    logged but never fails the create: the backup already succeeded and must not
+    be lost.
 
     Raises :class:`BackupUnavailableError` when the database isn't a file-based
     SQLite one (see :func:`resolve_sqlite_path`).
@@ -369,8 +396,9 @@ def create_backup(
         tmp_db = target_dir / f".{filename}.db.part"
         tmp_zip = target_dir / f".{filename}.part"
 
+        snapshot_fn = snapshot or _snapshot_database
         try:
-            _snapshot_database(db_file, tmp_db)
+            snapshot_fn(db_file, tmp_db)
             with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as archive:
                 archive.write(tmp_db, arcname=ARCHIVE_MEMBER_NAME)
             # Atomic publish: nothing matching BACKUP_FILENAME_GLOB exists until

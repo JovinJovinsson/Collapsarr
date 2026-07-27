@@ -16,8 +16,6 @@ directory for the migration-authoring workflow.
 from __future__ import annotations
 
 import logging
-import shutil
-from datetime import UTC, datetime
 from pathlib import Path
 
 from alembic import command
@@ -45,11 +43,6 @@ BASELINE_REVISION = "afde30c41b7b"
 #: existing schema" from "build from base". ``global_settings`` is the singleton
 #: settings row every install has.
 SENTINEL_TABLE = "global_settings"
-
-#: Number of pre-migration backups retained under ``data_dir/backups`` (COL-60).
-#: Hardcoded, not configurable -- the oldest backups beyond this count are
-#: pruned every time a new one is written. See :func:`upgrade_to_head`.
-BACKUP_RETENTION_COUNT = 5
 
 
 def build_alembic_config(settings: Settings) -> Config:
@@ -126,38 +119,30 @@ def _sqlite_file_path(settings: Settings) -> Path | None:
     return Path(path_part).expanduser()
 
 
-def _prune_old_backups(backups_dir: Path, db_file_name: str) -> None:
-    """Keep only the most recent :data:`BACKUP_RETENTION_COUNT` backups.
-
-    Ordered by file modification time (not filename) so pruning stays correct
-    regardless of how the revision label sorts lexicographically.
-    """
-    backups = sorted(
-        backups_dir.glob(f"{db_file_name}.pre-*.bak"),
-        key=lambda path: path.stat().st_mtime,
-    )
-    stale_count = len(backups) - BACKUP_RETENTION_COUNT
-    if stale_count <= 0:
-        # At or under the retention limit: nothing to prune. Guarded explicitly
-        # because a negative ``stale_count`` would make ``backups[:stale_count]``
-        # slice from the *front*, deleting the oldest backups we must keep.
-        return
-    for stale in backups[:stale_count]:
-        stale.unlink(missing_ok=True)
-
-
 def _backup_before_migration(
     settings: Settings,
     db_file: Path | None,
     db_file_existed: bool,
-    pre_migration_revision: str | None,
 ) -> None:
-    """Snapshot the SQLite file before a pending migration mutates it (COL-60).
+    """Snapshot the SQLite file before a pending migration mutates it (COL-69).
 
     Called from :func:`upgrade_to_head` only once migrations are known to be
     pending (and before the adoption stamp or the upgrade itself runs, so it
-    covers the pre-stamp state too). A plain file copy is safe here because
-    startup runs before any session/connection writer opens.
+    covers the pre-stamp state too).
+
+    Emits a **unified ``update``-type backup** through the shared backup service
+    (:func:`collapsarr.backup.service.create_backup`): a zip under
+    ``<data_dir>/backups/update/``, listable alongside the manual and scheduled
+    backups and pruned by the one unified retention model -- an age-based window
+    plus the ``update`` guaranteed-minimum floor (:data:`UPDATE_BACKUP_MIN_KEEP`,
+    COL-68) -- not a private count-based scheme. This is COL-69's fold of the
+    former standalone ``.bak`` backup into the single backup story.
+
+    The one property the pre-migration path keeps that the manual/scheduled
+    paths don't: it runs *before the app's engine connects*, so the service is
+    handed :func:`~collapsarr.backup.service._raw_copy_snapshot` -- a
+    byte-for-byte copy of the source file (the exact rollback artifact for a
+    schema upgrade) instead of the live-database ``VACUUM INTO``.
 
     No-ops (with a log line) for a non-file ``database_url``. Also no-ops,
     silently, when the file doesn't exist yet -- a brand-new install has no
@@ -173,16 +158,27 @@ def _backup_before_migration(
     if not db_file_existed:
         return
 
-    backups_dir = Path(settings.data_dir).expanduser() / "backups"
-    backups_dir.mkdir(parents=True, exist_ok=True)
+    # Imported lazily: the backup service imports this module at import time
+    # (for ``_sqlite_file_path``), so a module-level import here would be a
+    # circular import.
+    from collapsarr.backup.service import (
+        BACKUP_UPDATE,
+        _raw_copy_snapshot,
+        create_backup,
+    )
+    from collapsarr.settings.models import DEFAULT_BACKUP_RETENTION_DAYS
 
-    timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
-    revision_label = pre_migration_revision or "unversioned"
-    backup_path = backups_dir / f"{db_file.name}.pre-{revision_label}-{timestamp}.bak"
-    shutil.copy2(db_file, backup_path)
-    logger.info("Wrote pre-migration backup to %s", backup_path)
-
-    _prune_old_backups(backups_dir, db_file.name)
+    # Retention window is the schema default rather than the live
+    # ``global_settings`` value: this runs before migrations apply, so that
+    # column may not exist yet and reading it would create/commit the settings
+    # row (a write) against a not-yet-migrated schema. The ``update``
+    # guaranteed-minimum floor is what actually protects rollback points.
+    create_backup(
+        settings,
+        BACKUP_UPDATE,
+        retention_days=DEFAULT_BACKUP_RETENTION_DAYS,
+        snapshot=_raw_copy_snapshot,
+    )
 
 
 def upgrade_to_head(settings: Settings) -> None:
@@ -201,13 +197,13 @@ def upgrade_to_head(settings: Settings) -> None:
     * **Already versioned** — has ``alembic_version``: run only pending deltas
       (a no-op when already at head).
 
-    Backup-before-migrate (COL-60): once *anything* is determined to be
-    pending -- a stamp, an upgrade, or both -- the SQLite file is copied to
-    ``data_dir/backups/<db file>.pre-<revision>-<timestamp>.bak`` before either
-    mutates it (so the adoption stamp is covered too), and backups beyond the
-    last :data:`BACKUP_RETENTION_COUNT` are pruned. Skipped for a non-file
-    ``database_url`` (logged) and for a boot with nothing pending (no backup
-    churn on a normal boot).
+    Backup-before-migrate (COL-60, folded into the unified backup scheme by
+    COL-69): once *anything* is determined to be pending -- a stamp, an upgrade,
+    or both -- a unified ``update``-type backup zip is written under
+    ``data_dir/backups/update/`` before either mutates the database (so the
+    adoption stamp is covered too), and the unified retention model prunes it.
+    Skipped for a non-file ``database_url`` (logged) and for a boot with nothing
+    pending (no backup churn on a normal boot).
 
     Logging: emits the from→to revisions when a migration actually runs, and
     "schema is current" when there is nothing to do.
@@ -231,7 +227,6 @@ def upgrade_to_head(settings: Settings) -> None:
     db_file_existed = db_file is not None and db_file.exists()
 
     current_revision = _current_revision(settings)
-    pre_migration_revision = current_revision
 
     # Adopt an unversioned-but-populated (create_all-era) database: stamp the
     # baseline it already matches, then let the normal upgrade apply new deltas.
@@ -240,7 +235,7 @@ def upgrade_to_head(settings: Settings) -> None:
     adopting = current_revision is None and _has_sentinel_table(settings)
 
     if current_revision != head_revision:
-        _backup_before_migration(settings, db_file, db_file_existed, pre_migration_revision)
+        _backup_before_migration(settings, db_file, db_file_existed)
 
     if adopting:
         logger.info(
@@ -263,7 +258,6 @@ def upgrade_to_head(settings: Settings) -> None:
 
 
 __all__ = [
-    "BACKUP_RETENTION_COUNT",
     "BASELINE_REVISION",
     "MIGRATIONS_DIR",
     "SENTINEL_TABLE",
