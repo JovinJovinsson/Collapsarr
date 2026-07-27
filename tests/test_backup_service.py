@@ -9,13 +9,14 @@ and the non-file-database no-op.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-import collapsarr.backup.service as backup_service
 from collapsarr import __version__
 from collapsarr.backup.service import (
     ARCHIVE_MEMBER_NAME,
@@ -23,7 +24,9 @@ from collapsarr.backup.service import (
     BACKUP_MANUAL,
     BACKUP_SCHEDULED,
     BACKUP_TYPES,
+    BACKUP_UPDATE,
     MINIMUM_BACKUP_KEEP,
+    UPDATE_BACKUP_MIN_KEEP,
     BackupNotFoundError,
     BackupRetentionFloorError,
     BackupUnavailableError,
@@ -34,6 +37,7 @@ from collapsarr.backup.service import (
     ensure_backup_dirs,
     is_backup_supported,
     list_backups,
+    prune_backups,
     resolve_backup_path,
     resolve_sqlite_path,
 )
@@ -147,7 +151,7 @@ def test_mid_write_failure_leaves_no_listable_backup_and_no_partial_file(
 
     # Fail at the final atomic publish, after the snapshot + zip already exist
     # as temp files -- the strongest test of the cleanup/rename contract.
-    monkeypatch.setattr(backup_service.os, "replace", _boom)
+    monkeypatch.setattr("collapsarr.backup.service.os.replace", _boom)
 
     with pytest.raises(RuntimeError, match="simulated mid-write failure"):
         create_backup(settings)
@@ -347,3 +351,279 @@ def test_delete_backup_rejects_malformed_or_traversal_ids(
     ensure_backup_dirs(settings)
     with pytest.raises(BackupNotFoundError):
         delete_backup(settings, backup_id)
+
+
+# --------------------------------------------------------------------------- #
+# Age-based retention pruning (COL-68)
+# --------------------------------------------------------------------------- #
+#: Fixed "now" so age math is deterministic without touching the wall clock.
+_NOW = datetime(2026, 7, 27, 12, 0, 0, tzinfo=UTC)
+_RETENTION_DAYS = 28
+
+
+def _archive_name(index: int) -> str:
+    """A distinct, glob-matching archive filename (names must differ per file)."""
+    return f"collapsarr_backup_v0.0.1_2020.01.{index:02d}_00.00.00.zip"
+
+
+def _fabricate_typed_archive(
+    settings: Settings, backup_type: str, name: str, *, days_ago: float
+) -> Path:
+    """Drop a glob-matching archive under ``<type>/`` with an aged mtime.
+
+    ``list_backups`` derives ``created_at`` from the file mtime, so setting the
+    mtime relative to :data:`_NOW` is how these tests place a backup inside or
+    outside the retention window.
+    """
+    type_dir = backup_type_dir(settings, backup_type)
+    type_dir.mkdir(parents=True, exist_ok=True)
+    archive = type_dir / name
+    archive.write_bytes(b"stand-in archive, only its listing/mtime matter")
+    epoch = (_NOW - timedelta(days=days_ago)).timestamp()
+    os.utime(archive, (epoch, epoch))
+    return archive
+
+
+def _names_of(settings: Settings, backup_type: str) -> set[str]:
+    return {
+        info.name for info in list_backups(settings) if info.type == backup_type
+    }
+
+
+def test_update_guaranteed_minimum_constant_exceeds_global_floor() -> None:
+    """Guard the assumed knobs: update keeps strictly more than the global floor."""
+    assert MINIMUM_BACKUP_KEEP == 1
+    assert UPDATE_BACKUP_MIN_KEEP == 2
+    assert UPDATE_BACKUP_MIN_KEEP > MINIMUM_BACKUP_KEEP
+
+
+def test_prune_deletes_backups_older_than_window(settings: Settings) -> None:
+    """Backups past the retention window are deleted; in-window ones are kept."""
+    # Newest is 10 days old (inside the 28-day window); three others are past it.
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(1), days_ago=40)
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(2), days_ago=35)
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(3), days_ago=30)
+    keep = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(4), days_ago=10
+    )
+
+    deleted = prune_backups(
+        settings, BACKUP_MANUAL, retention_days=_RETENTION_DAYS, now=_NOW
+    )
+
+    assert {info.name for info in deleted} == {
+        _archive_name(1),
+        _archive_name(2),
+        _archive_name(3),
+    }
+    assert _names_of(settings, BACKUP_MANUAL) == {keep.name}
+
+
+def test_prune_keeps_in_window_backups_untouched(settings: Settings) -> None:
+    """Every backup inside the window survives, regardless of count."""
+    for i in range(1, 6):
+        _fabricate_typed_archive(
+            settings, BACKUP_MANUAL, _archive_name(i), days_ago=i
+        )
+
+    deleted = prune_backups(
+        settings, BACKUP_MANUAL, retention_days=_RETENTION_DAYS, now=_NOW
+    )
+
+    assert deleted == []
+    assert len(_names_of(settings, BACKUP_MANUAL)) == 5
+
+
+def test_prune_floor_survives_when_every_backup_is_past_the_window(
+    settings: Settings,
+) -> None:
+    """The minimum-keep floor is honoured even when all backups are expired."""
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(1), days_ago=60)
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(2), days_ago=50)
+    newest = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(3), days_ago=40
+    )
+
+    prune_backups(settings, BACKUP_MANUAL, retention_days=_RETENTION_DAYS, now=_NOW)
+
+    # Exactly the floor survives, and it is the newest of the expired backups.
+    survivors = _names_of(settings, BACKUP_MANUAL)
+    assert survivors == {newest.name}
+    assert len(survivors) == MINIMUM_BACKUP_KEEP
+
+
+def test_prune_noop_at_exactly_floor_count(settings: Settings) -> None:
+    """A single expired backup (== floor) is never pruned (empty candidate slice)."""
+    only = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(1), days_ago=99
+    )
+
+    deleted = prune_backups(
+        settings, BACKUP_MANUAL, retention_days=_RETENTION_DAYS, now=_NOW
+    )
+
+    assert deleted == []
+    assert _names_of(settings, BACKUP_MANUAL) == {only.name}
+
+
+def test_prune_at_floor_plus_one_deletes_exactly_one(settings: Settings) -> None:
+    """floor+1 expired backups: only the single over-floor one is pruned.
+
+    Regression guard for COL-60's negative-slice bug -- a ``[:len - keep]``
+    slice here would have deleted the newest (kept) backup instead of the
+    oldest over-floor one.
+    """
+    older = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(1), days_ago=50
+    )
+    newest = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(2), days_ago=40
+    )
+
+    deleted = prune_backups(
+        settings, BACKUP_MANUAL, retention_days=_RETENTION_DAYS, now=_NOW
+    )
+
+    assert {info.name for info in deleted} == {older.name}
+    assert _names_of(settings, BACKUP_MANUAL) == {newest.name}
+
+
+def test_prune_update_type_keeps_guaranteed_minimum_regardless_of_age(
+    settings: Settings,
+) -> None:
+    """``update`` backups keep UPDATE_BACKUP_MIN_KEEP even when all are expired."""
+    _fabricate_typed_archive(settings, BACKUP_UPDATE, _archive_name(1), days_ago=90)
+    _fabricate_typed_archive(settings, BACKUP_UPDATE, _archive_name(2), days_ago=80)
+    keep_a = _fabricate_typed_archive(
+        settings, BACKUP_UPDATE, _archive_name(3), days_ago=70
+    )
+    keep_b = _fabricate_typed_archive(
+        settings, BACKUP_UPDATE, _archive_name(4), days_ago=60
+    )
+
+    prune_backups(settings, BACKUP_UPDATE, retention_days=_RETENTION_DAYS, now=_NOW)
+
+    # The two most-recent update backups survive despite being far past the window.
+    survivors = _names_of(settings, BACKUP_UPDATE)
+    assert survivors == {keep_a.name, keep_b.name}
+    assert len(survivors) == UPDATE_BACKUP_MIN_KEEP
+
+
+def test_prune_update_type_still_deletes_beyond_the_guaranteed_minimum(
+    settings: Settings,
+) -> None:
+    """Past the guaranteed-minimum, ``update`` backups still prune by age."""
+    # Two inside the window (kept by the floor), one inside, one expired.
+    keep_1 = _fabricate_typed_archive(
+        settings, BACKUP_UPDATE, _archive_name(1), days_ago=5
+    )
+    keep_2 = _fabricate_typed_archive(
+        settings, BACKUP_UPDATE, _archive_name(2), days_ago=10
+    )
+    keep_3 = _fabricate_typed_archive(
+        settings, BACKUP_UPDATE, _archive_name(3), days_ago=20
+    )
+    expired = _fabricate_typed_archive(
+        settings, BACKUP_UPDATE, _archive_name(4), days_ago=40
+    )
+
+    deleted = prune_backups(
+        settings, BACKUP_UPDATE, retention_days=_RETENTION_DAYS, now=_NOW
+    )
+
+    assert {info.name for info in deleted} == {expired.name}
+    assert _names_of(settings, BACKUP_UPDATE) == {
+        keep_1.name,
+        keep_2.name,
+        keep_3.name,
+    }
+
+
+def test_prune_never_removes_the_protected_backup(settings: Settings) -> None:
+    """``protect`` shields a backup that would otherwise be pruned by age."""
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(1), days_ago=10)
+    doomed = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(2), days_ago=40
+    )
+    protected = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(3), days_ago=50
+    )
+
+    deleted = prune_backups(
+        settings,
+        BACKUP_MANUAL,
+        retention_days=_RETENTION_DAYS,
+        now=_NOW,
+        protect=protected,
+    )
+
+    # The 40-day archive is pruned; the protected 50-day one is spared.
+    assert {info.name for info in deleted} == {doomed.name}
+    assert protected.name in _names_of(settings, BACKUP_MANUAL)
+
+
+def test_prune_operates_per_type_only(settings: Settings) -> None:
+    """Pruning one type never touches archives of another type."""
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(1), days_ago=40)
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(2), days_ago=10)
+    sched_old = _fabricate_typed_archive(
+        settings, BACKUP_SCHEDULED, _archive_name(3), days_ago=90
+    )
+    sched_new = _fabricate_typed_archive(
+        settings, BACKUP_SCHEDULED, _archive_name(4), days_ago=80
+    )
+
+    prune_backups(settings, BACKUP_MANUAL, retention_days=_RETENTION_DAYS, now=_NOW)
+
+    # scheduled/ is fully intact even though both its archives are expired.
+    assert _names_of(settings, BACKUP_SCHEDULED) == {sched_old.name, sched_new.name}
+
+
+def test_prune_disabled_for_non_positive_retention(settings: Settings) -> None:
+    """A non-positive window disables age pruning (defensive guard)."""
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(1), days_ago=99)
+    _fabricate_typed_archive(settings, BACKUP_MANUAL, _archive_name(2), days_ago=88)
+
+    assert prune_backups(settings, BACKUP_MANUAL, retention_days=0, now=_NOW) == []
+    assert len(_names_of(settings, BACKUP_MANUAL)) == 2
+
+
+def test_prune_rejects_unknown_type(settings: Settings) -> None:
+    with pytest.raises(ValueError, match="Unknown backup type"):
+        prune_backups(settings, "bogus", retention_days=_RETENTION_DAYS)
+
+
+# --------------------------------------------------------------------------- #
+# create_backup wires pruning into the create path (COL-68)
+# --------------------------------------------------------------------------- #
+def test_create_backup_prunes_stale_and_never_the_just_created_one(
+    settings: Settings,
+) -> None:
+    """A create with ``retention_days`` prunes expired archives, keeps the new one."""
+    _populate_db(settings)
+    # A pre-existing expired manual archive that the prune should remove.
+    stale = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(1), days_ago=99
+    )
+
+    info = create_backup(settings, BACKUP_MANUAL, retention_days=_RETENTION_DAYS)
+
+    survivors = _names_of(settings, BACKUP_MANUAL)
+    assert stale.name not in survivors  # expired archive pruned
+    assert info.name in survivors  # the just-created backup is protected
+
+
+def test_create_backup_without_retention_days_does_not_prune(
+    settings: Settings,
+) -> None:
+    """Omitting ``retention_days`` leaves existing backups untouched (compat)."""
+    _populate_db(settings)
+    stale = _fabricate_typed_archive(
+        settings, BACKUP_MANUAL, _archive_name(1), days_ago=99
+    )
+
+    info = create_backup(settings, BACKUP_MANUAL)
+
+    survivors = _names_of(settings, BACKUP_MANUAL)
+    assert stale.name in survivors  # no prune requested -> old archive stays
+    assert info.name in survivors

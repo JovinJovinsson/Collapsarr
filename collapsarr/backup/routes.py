@@ -46,6 +46,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..config import Settings
+from ..settings.service import get_global_settings
 from .service import (
     BACKUP_MANUAL,
     BackupInfo,
@@ -98,6 +99,17 @@ def _settings(request: Request) -> Settings:
     return settings
 
 
+def _retention_days(request: Request) -> int:
+    """Read the live ``backup_retention_days`` from ``global_settings`` (COL-66).
+
+    Passed to :func:`~collapsarr.backup.service.create_backup` so a manual
+    "Backup Now" prunes stale ``manual`` archives past the window (COL-68),
+    mirroring the scheduler's post-backup prune.
+    """
+    with request.app.state.session_factory() as session:
+        return get_global_settings(session).backup_retention_days
+
+
 # --- endpoints ---------------------------------------------------------------
 
 
@@ -120,7 +132,9 @@ def create_backup_endpoint(request: Request) -> BackupRead:
     """
     settings = _settings(request)
     try:
-        info = create_backup(settings, BACKUP_MANUAL)
+        info = create_backup(
+            settings, BACKUP_MANUAL, retention_days=_retention_days(request)
+        )
     except BackupUnavailableError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _to_read(info)

@@ -19,6 +19,7 @@ from .service import (
     BACKUP_TYPES,
     BACKUP_UPDATE,
     MINIMUM_BACKUP_KEEP,
+    UPDATE_BACKUP_MIN_KEEP,
     BackupInfo,
     BackupNotFoundError,
     BackupRetentionFloorError,
@@ -30,6 +31,7 @@ from .service import (
     ensure_backup_dirs,
     is_backup_supported,
     list_backups,
+    prune_backups,
     resolve_backup_path,
     resolve_sqlite_path,
 )
@@ -40,6 +42,7 @@ __all__ = [
     "BACKUP_TYPES",
     "BACKUP_UPDATE",
     "MINIMUM_BACKUP_KEEP",
+    "UPDATE_BACKUP_MIN_KEEP",
     "BackupInfo",
     "BackupNotFoundError",
     "BackupRetentionFloorError",
@@ -51,6 +54,7 @@ __all__ = [
     "ensure_backup_dirs",
     "is_backup_supported",
     "list_backups",
+    "prune_backups",
     "resolve_backup_path",
     "resolve_sqlite_path",
 ]

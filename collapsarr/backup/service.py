@@ -37,7 +37,7 @@ import os
 import sqlite3
 import zipfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 
@@ -78,6 +78,15 @@ ARCHIVE_MEMBER_NAME = "collapsarr.db"
 #: retention prune (COL-68) reuses this as a hard floor -- backups are never
 #: pruned below this count regardless of age.
 MINIMUM_BACKUP_KEEP = 1
+
+#: Guaranteed-minimum count of ``update`` (pre-migration) backups the age-based
+#: prune keeps *regardless of age* (COL-68). An ``update`` backup is the
+#: rollback point for a schema migration, so an upgrade must remain reversible
+#: even long after the retention window has lapsed. This floor is applied only
+#: to the ``update`` type, on top of the global :data:`MINIMUM_BACKUP_KEEP`
+#: floor every type honours -- keeping the two most recent lets an operator roll
+#: back the last upgrade even when a newer upgrade has since run.
+UPDATE_BACKUP_MIN_KEEP = 2
 
 #: Serialises the whole create-backup critical section so concurrent requests
 #: never interleave temp files or race the atomic rename.
@@ -243,7 +252,87 @@ def _snapshot_database(db_file: Path, destination: Path) -> None:
         connection.close()
 
 
-def create_backup(settings: Settings, backup_type: str = BACKUP_MANUAL) -> BackupInfo:
+def _min_keep_for(backup_type: str) -> int:
+    """Minimum backups of ``backup_type`` the prune keeps regardless of age.
+
+    Every type honours the global :data:`MINIMUM_BACKUP_KEEP` floor. The
+    ``update`` type additionally guarantees :data:`UPDATE_BACKUP_MIN_KEEP` (a
+    rollback point for a schema migration must survive even past the retention
+    window), so its effective floor is the larger of the two.
+    """
+    if backup_type == BACKUP_UPDATE:
+        return max(MINIMUM_BACKUP_KEEP, UPDATE_BACKUP_MIN_KEEP)
+    return MINIMUM_BACKUP_KEEP
+
+
+def prune_backups(
+    settings: Settings,
+    backup_type: str,
+    *,
+    retention_days: int,
+    now: datetime | None = None,
+    protect: Path | None = None,
+) -> list[BackupInfo]:
+    """Delete backups of ``backup_type`` older than the retention window (COL-68).
+
+    Age-based retention with a hard, count-based floor per type:
+
+    * Backups are considered newest-first. The newest :func:`_min_keep_for`
+      count are **never** pruned regardless of age -- this is the minimum-keep
+      floor (:data:`MINIMUM_BACKUP_KEEP` for every type, raised to
+      :data:`UPDATE_BACKUP_MIN_KEEP` for ``update``), so a long-idle instance is
+      never pruned to zero and an upgrade stays rollback-able.
+    * Of the remainder, only those strictly older than ``now - retention_days``
+      are deleted; anything inside the window is kept.
+    * ``protect`` (a just-created archive's path) is never deleted, so the
+      backup that triggered the prune always survives even under clock skew.
+
+    The floor is applied by slicing ``[keep:]`` from a newest-first list --
+    which is empty (never a negative-index slice) when there are ``<= keep``
+    backups -- deliberately avoiding COL-60's negative-slice bug where a
+    ``[:len - keep]`` slice pruned from the *front* and deleted backups it
+    should have kept.
+
+    ``retention_days <= 0`` disables age pruning (returns ``[]``); the settings
+    layer constrains the value to ``> 0`` so this is only a defensive guard.
+    Returns the :class:`BackupInfo` of every archive deleted (for logging/tests).
+    """
+    _validate_type(backup_type)
+    if retention_days <= 0:
+        return []
+
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=retention_days)
+    keep = _min_keep_for(backup_type)
+    protected_name = protect.name if protect is not None else None
+
+    # list_backups is already newest-first; keep the top `keep` unconditionally.
+    of_type = [info for info in list_backups(settings) if info.type == backup_type]
+    type_dir = backup_type_dir(settings, backup_type)
+
+    deleted: list[BackupInfo] = []
+    for info in of_type[keep:]:
+        if info.name == protected_name:
+            continue
+        if info.created_at < cutoff:
+            (type_dir / info.name).unlink(missing_ok=True)
+            deleted.append(info)
+    if deleted:
+        logger.info(
+            "Pruned %d stale %s backup(s) older than %d day(s)",
+            len(deleted),
+            backup_type,
+            retention_days,
+        )
+    return deleted
+
+
+def create_backup(
+    settings: Settings,
+    backup_type: str = BACKUP_MANUAL,
+    *,
+    retention_days: int | None = None,
+) -> BackupInfo:
     """Create one backup archive and return its :class:`BackupInfo`.
 
     Snapshots the live SQLite database (:func:`_snapshot_database`), zips the
@@ -251,6 +340,13 @@ def create_backup(settings: Settings, backup_type: str = BACKUP_MANUAL) -> Backu
     ``<data_dir>/backups/<backup_type>/``. The whole critical section holds
     :data:`_BACKUP_LOCK`; temp files are cleaned up in a ``finally`` so a
     failure leaves no partial or listable archive.
+
+    When ``retention_days`` is given (the scheduler and "Backup Now" paths pass
+    the live ``backup_retention_days`` setting), :func:`prune_backups` runs
+    after the archive is published -- deleting older backups of *this type* past
+    the window while honouring the per-type minimum-keep floor and never
+    touching the archive just written. A prune failure is logged but never fails
+    the create: the backup already succeeded and must not be lost.
 
     Raises :class:`BackupUnavailableError` when the database isn't a file-based
     SQLite one (see :func:`resolve_sqlite_path`).
@@ -285,7 +381,20 @@ def create_backup(settings: Settings, backup_type: str = BACKUP_MANUAL) -> Backu
             tmp_zip.unlink(missing_ok=True)
 
         logger.info("Wrote %s backup to %s", backup_type, final_path)
-        return _info_from_path(final_path, backup_type)
+        info = _info_from_path(final_path, backup_type)
+
+        if retention_days is not None:
+            try:
+                prune_backups(
+                    settings,
+                    backup_type,
+                    retention_days=retention_days,
+                    protect=final_path,
+                )
+            except Exception:  # noqa: BLE001 - a prune failure must not lose the backup
+                logger.exception("post-backup retention prune failed for %s", backup_type)
+
+        return info
 
 
 def delete_backup(settings: Settings, backup_id: str) -> None:
@@ -327,6 +436,7 @@ __all__ = [
     "BACKUP_TYPES",
     "BACKUP_UPDATE",
     "MINIMUM_BACKUP_KEEP",
+    "UPDATE_BACKUP_MIN_KEEP",
     "BackupInfo",
     "BackupNotFoundError",
     "BackupRetentionFloorError",
@@ -338,6 +448,7 @@ __all__ = [
     "ensure_backup_dirs",
     "is_backup_supported",
     "list_backups",
+    "prune_backups",
     "resolve_backup_path",
     "resolve_sqlite_path",
 ]

@@ -113,6 +113,17 @@ class BackupScheduler:
             days = get_global_settings(session).backup_interval_days
         return timedelta(days=days)
 
+    def _retention_days(self) -> int:
+        """Read the live backup retention window from ``global_settings`` (COL-66).
+
+        Passed to :func:`~collapsarr.backup.service.create_backup` so the
+        post-backup prune (COL-68) deletes ``scheduled`` archives past the
+        configured window. Read live on each backup so an operator's Settings
+        change is honoured without a restart.
+        """
+        with self._session_factory() as session:
+            return get_global_settings(session).backup_retention_days
+
     def _newest_scheduled_at(self) -> datetime | None:
         """Modification time (UTC) of the newest ``scheduled/`` archive, or ``None``.
 
@@ -153,7 +164,11 @@ class BackupScheduler:
         if not self.is_due():
             return None
         try:
-            info = create_backup(self._settings, BACKUP_SCHEDULED)
+            info = create_backup(
+                self._settings,
+                BACKUP_SCHEDULED,
+                retention_days=self._retention_days(),
+            )
         except BackupUnavailableError:
             # The database stopped being file-based between the support check
             # and the snapshot (a configuration race). Treat as a no-op.
