@@ -25,9 +25,21 @@ Sequence when a valid restore is pending:
 Defensive path: if the staged file is missing or is not a valid SQLite database
 (or the configured database is not a file-based SQLite one at all), the swap is
 **aborted** -- the current database is left untouched, the failure is logged
-loudly, the marker is cleared, and the app boots normally. The marker is always
-consumed exactly once (cleared on success and on every abort), so a restore can
-never loop across reboots.
+loudly, the marker is cleared, and the app boots normally.
+
+Marker-clearing semantics distinguish three outcomes deliberately:
+
+* **Reached a decision** -- a clean no-op, a validated abort (unreadable marker,
+  missing/non-SQLite staged file, non-file database), or a successful apply. In
+  every one of these the marker is **cleared**, so the restore is consumed
+  exactly once and can never loop across reboots.
+* **Crashed mid-attempt** -- a *transient* failure in the destructive section
+  (e.g. the safety backup or the swap raising ``OSError`` because the disk is
+  full). The current database has not been swapped, so nothing was applied, and
+  the marker is deliberately **left in place**. The exception propagates and
+  aborts boot; the restore is retried on the next boot once the transient
+  condition clears, rather than being silently lost. This mirrors how a failed
+  ``upgrade_to_head`` aborts boot rather than serving a half-migrated schema.
 """
 
 from __future__ import annotations
@@ -105,62 +117,73 @@ def apply_pending_restore(settings: Settings) -> RestoreOutcome | None:
         # No restore pending: clean no-op, no filesystem writes.
         return None
 
-    try:
-        marker = read_restore_marker(settings)
-        if marker is None:
-            # read_restore_marker already logged the specifics of the corruption.
-            logger.error(
-                "RESTORE ABORTED: the restore marker at %s is unreadable; booting "
-                "on the current database.",
-                marker_path,
-            )
-            return RestoreOutcome(applied=False, reason="malformed restore marker")
-
-        staged = marker.staged_path
-        if not _is_sqlite_file(staged):
-            logger.error(
-                "RESTORE ABORTED: staged database %s is missing or is not a valid "
-                "SQLite file. The current database is left untouched; booting normally.",
-                staged,
-            )
-            return RestoreOutcome(
-                applied=False, reason="staged file missing or not a SQLite database"
-            )
-
-        current_db = resolve_sqlite_path(settings)
-        if current_db is None:
-            logger.error(
-                "RESTORE ABORTED: the configured database is not a file-based SQLite "
-                "database, so a staged-file swap cannot be applied. The current "
-                "database is left untouched; booting normally."
-            )
-            return RestoreOutcome(
-                applied=False, reason="configured database is not file-based SQLite"
-            )
-
-        safety_backup = _safety_backup_current_db(settings, current_db)
-        _swap_in(staged, current_db)
-        logger.warning(
-            "RESTORE APPLIED: swapped staged database %s into %s. The schema upgrade "
-            "will now migrate it forward to head if it is an older revision.",
-            staged,
-            current_db,
+    # --- Decision phase: validate the request. Every branch here reaches a
+    # decision (abort or proceed), so on an abort we clear the marker: the
+    # request was inspected and found wanting, and retrying it would fail the
+    # same way forever. ---
+    marker = read_restore_marker(settings)
+    if marker is None:
+        # read_restore_marker already logged the specifics of the corruption.
+        logger.error(
+            "RESTORE ABORTED: the restore marker at %s is unreadable; booting "
+            "on the current database.",
+            marker_path,
         )
-        return RestoreOutcome(applied=True, safety_backup=safety_backup)
-    finally:
-        # A marker is consumed exactly once -- cleared on success, on a defensive
-        # abort, and even on an unexpected error -- so a restore never loops.
         clear_restore_marker(settings)
+        return RestoreOutcome(applied=False, reason="malformed restore marker")
+
+    staged = marker.staged_path
+    if not _is_sqlite_file(staged):
+        logger.error(
+            "RESTORE ABORTED: staged database %s is missing or is not a valid "
+            "SQLite file. The current database is left untouched; booting normally.",
+            staged,
+        )
+        clear_restore_marker(settings)
+        return RestoreOutcome(applied=False, reason="staged file missing or not a SQLite database")
+
+    current_db = resolve_sqlite_path(settings)
+    if current_db is None:
+        logger.error(
+            "RESTORE ABORTED: the configured database is not a file-based SQLite "
+            "database, so a staged-file swap cannot be applied. The current "
+            "database is left untouched; booting normally."
+        )
+        clear_restore_marker(settings)
+        return RestoreOutcome(applied=False, reason="configured database is not file-based SQLite")
+
+    # --- Destructive phase. A *transient* failure here -- the safety backup or
+    # the swap raising OSError (e.g. a full disk) -- must NOT clear the marker:
+    # nothing has been swapped, so the requested restore is still pending. We
+    # deliberately let the exception propagate to abort boot (rather than swallow
+    # it and silently boot on the un-restored database), leaving the marker in
+    # place so the restore is retried on the next boot. Only a *fully applied*
+    # swap clears the marker, below. ---
+    safety_backup = _safety_backup_current_db(settings, current_db)
+    _swap_in(staged, current_db)
+    clear_restore_marker(settings)
+    logger.warning(
+        "RESTORE APPLIED: swapped staged database %s into %s. The schema upgrade "
+        "will now migrate it forward to head if it is an older revision.",
+        staged,
+        current_db,
+    )
+    return RestoreOutcome(applied=True, safety_backup=safety_backup)
 
 
 def _safety_backup_current_db(settings: Settings, current_db: Path) -> BackupInfo | None:
     """Snapshot the current database before it is overwritten by the swap.
 
-    Emitted through the Phase 1 backup service as a unified ``update``-type
-    backup (listable alongside manual/scheduled/pre-migration backups). Runs
-    before the engine connects, so -- like the pre-migration backup -- a
-    byte-for-byte raw copy is both safe and the exact pre-restore rollback
-    artifact.
+    Emitted through the Phase 1 backup service as a dedicated ``restore``-type
+    backup (listable alongside manual/scheduled/pre-migration backups). The
+    dedicated type is not cosmetic: a restore of an older database forward-
+    migrates on the same boot, which takes an ``update`` pre-migration backup
+    moments later. Both use a same-second timestamp filename, so sharing the
+    ``update`` subdirectory would let one overwrite the other; the ``restore``
+    type keeps this pre-restore rollback point in its own subdirectory where it
+    can't collide. Runs before the engine connects, so -- like the pre-migration
+    backup -- a byte-for-byte raw copy is both safe and the exact pre-restore
+    rollback artifact.
 
     No-op when the current database file doesn't exist yet: a fresh install has
     no prior data to protect, so there is nothing to back up.

@@ -181,9 +181,7 @@ def test_older_restored_db_is_migrated_forward(settings: Settings, tmp_path: Pat
     """A staged DB at an older revision is migrated up to head after the swap."""
     _current_db_with(settings, "CURRENT")
     staged = tmp_path / "staged" / "staged.db"
-    _build_staged_db(
-        staged, tmp_path / "staged_build", name="STAGED", revision=BASELINE_REVISION
-    )
+    _build_staged_db(staged, tmp_path / "staged_build", name="STAGED", revision=BASELINE_REVISION)
     write_restore_marker(settings, staged)
     assert _db_revision(staged) == BASELINE_REVISION  # older than head before boot
 
@@ -287,6 +285,44 @@ def test_non_file_database_aborts(settings: Settings, tmp_path: Path) -> None:
     assert outcome.reason is not None and "file-based" in outcome.reason
     assert not restore_marker_path(non_file).exists()
     assert staged.exists()  # untouched
+
+
+# --------------------------------------------------------------------------- #
+# Transient failure -> marker + staged file survive, retry on next boot
+# --------------------------------------------------------------------------- #
+def test_transient_safety_backup_failure_preserves_marker_and_staged_file(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient safety-backup failure must not consume the restore.
+
+    If the pre-swap safety backup raises (e.g. a full disk building the zip),
+    nothing has been swapped yet. The marker and staged file must both survive so
+    the restore is retried on the next boot rather than silently lost, and the
+    current database must be left untouched.
+    """
+    _current_db_with(settings, "CURRENT")
+    staged = tmp_path / "staged" / "staged.db"
+    _build_staged_db(staged, tmp_path / "staged_build", name="STAGED")
+    write_restore_marker(settings, staged)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("No space left on device")
+
+    # Fail the safety backup transiently at the point it builds the archive.
+    monkeypatch.setattr("collapsarr.restore.engine.create_backup", _boom)
+
+    with pytest.raises(OSError, match="No space left on device"):
+        apply_pending_restore(settings)
+
+    # Marker survives -> the restore is still pending and retries next boot.
+    marker = read_restore_marker(settings)
+    assert marker is not None
+    assert marker.staged_path == staged.resolve()
+    # Staged file survives (not consumed) and the current DB is untouched.
+    assert staged.exists()
+    assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
+    # No safety backup landed (the create failed), so nothing to list.
+    assert list_backups(settings) == []
 
 
 # --------------------------------------------------------------------------- #
