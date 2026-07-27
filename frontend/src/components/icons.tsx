@@ -45,6 +45,17 @@ export function SettingsIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Backups: stacked database cylinders — a saved snapshot of the store.
+export function BackupIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <ellipse cx="12" cy="5" rx="7" ry="2.5" />
+      <path d="M5 5v6c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V5" />
+      <path d="M5 11v6c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-6" />
+    </svg>
+  );
+}
+
 // Warning: an alert triangle, used by the app-health banner (COL-38).
 export function WarningIcon(props: SVGProps<SVGSVGElement>) {
   return (

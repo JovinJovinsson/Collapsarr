@@ -27,6 +27,7 @@ from .arr.webhooks import (
     resolve_webhook_file,
 )
 from .auth import SessionMiddleware, auth_router, enforce_auth_middleware
+from .backup.routes import router as backup_router
 from .config import Settings, get_settings
 from .database import (
     create_engine_from_settings,
@@ -164,6 +165,9 @@ def create_app(
 
     # Notifier config GET/PUT (COL-36), under /api.
     app.include_router(notifiers_router)
+
+    # Database backup list/create (COL-63), under /api/system.
+    app.include_router(backup_router)
 
     @app.get("/health", tags=["system"])
     def health(request: Request) -> dict[str, object]:
