@@ -117,6 +117,8 @@ def update_global_settings(
     password: str | None | _Unset = _UNSET,
     auth_method: str | None = None,
     auth_required: str | None = None,
+    backup_interval_days: int | None = None,
+    backup_retention_days: int | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -134,6 +136,12 @@ def update_global_settings(
     hash (:func:`collapsarr.settings.passwords.hash_password`); the plaintext
     itself is never persisted. Verify a candidate later with
     :func:`verify_auth_password`.
+
+    ``backup_interval_days``/``backup_retention_days`` (COL-66) follow the
+    same "only change what's passed" rule as every other non-nullable field
+    here -- there is no clear-to-default sentinel since both always hold a
+    positive integer (the DB-side ``server_default`` only matters for
+    pre-existing rows predating the columns, not for updates).
     """
     settings = get_global_settings(session)
 
@@ -161,6 +169,10 @@ def update_global_settings(
         settings.auth_method = auth_method
     if auth_required is not None:
         settings.auth_required = auth_required
+    if backup_interval_days is not None:
+        settings.backup_interval_days = backup_interval_days
+    if backup_retention_days is not None:
+        settings.backup_retention_days = backup_retention_days
 
     session.commit()
     session.refresh(settings)

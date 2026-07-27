@@ -24,6 +24,7 @@ import json
 import re
 from pathlib import Path
 
+from alembic import command
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
@@ -38,6 +39,18 @@ from collapsarr.migrations import (
 )
 
 GOLDEN_SNAPSHOT = Path(__file__).parent / "fixtures" / "golden_schema_snapshot.json"
+
+#: The chain revision the golden snapshot was captured at -- COL-59's
+#: reconcile-indexes revision, the last one before any *real* schema-adding
+#: migration shipped (COL-66 onward). Pinned rather than "head" so the
+#: fidelity test below keeps meaning what it always meant as the chain grows:
+#: the snapshot is a frozen stand-in for a real pre-Alembic release's disk
+#: schema, which by definition can never gain columns a later migration adds
+#: (those installs adopt them via the normal upgrade path instead -- see
+#: ``test_startup_adopts_unversioned_db_and_heals_indexes`` below). Comparing
+#: against a moving "head" would make this test fail on every future
+#: schema-adding migration, which is not the drift it exists to catch.
+GOLDEN_SNAPSHOT_REVISION = "2bd1b849232b"
 
 # The nine SQLAlchemy-declared indexes the baseline creates (name, unique?).
 BASELINE_INDEXES = {
@@ -121,13 +134,20 @@ def _live_schema(settings: Settings) -> dict[tuple[str, str], str]:
 # Golden-snapshot fidelity
 # --------------------------------------------------------------------------- #
 def test_upgrade_head_reproduces_golden_release_snapshot(settings: Settings) -> None:
-    """`upgrade head` on an empty DB matches the committed real-release schema."""
+    """`upgrade` to :data:`GOLDEN_SNAPSHOT_REVISION` on an empty DB matches the
+    committed real-release schema.
+
+    Deliberately upgrades to the pinned revision, not "head": see
+    :data:`GOLDEN_SNAPSHOT_REVISION` for why comparing against a moving head
+    would make this fail on every later schema-adding migration.
+    """
     golden = json.loads(GOLDEN_SNAPSHOT.read_text())
     expected = {
         (obj["type"], obj["name"]): _normalize(obj["sql"]) for obj in golden["objects"]
     }
 
-    upgrade_to_head(settings)
+    config = build_alembic_config(settings)
+    command.upgrade(config, GOLDEN_SNAPSHOT_REVISION)
     actual = _live_schema(settings)
 
     assert actual == expected
@@ -184,15 +204,30 @@ def test_already_versioned_database_runs_only_pending_deltas(settings: Settings)
 # --------------------------------------------------------------------------- #
 # Stamp adoption + index heal
 # --------------------------------------------------------------------------- #
+#: Columns a *post-baseline* migration adds (currently just COL-66's backup
+#: schedule knobs). ``create_all`` below always builds the table from the
+#: live ``Base.metadata`` -- i.e. with these columns already present -- so
+#: they are dropped by raw DDL afterwards to de-evolve the stand-in back to
+#: what a real pre-COL-66 create_all-era release actually had on disk. This
+#: mirrors the ``DROP INDEX`` idiom just below for the same reason: the
+#: unversioned DB this function fabricates predates every post-baseline
+#: delta, not just the index-reconcile one.
+POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("global_settings", "backup_interval_days"),
+    ("global_settings", "backup_retention_days"),
+)
+
+
 def _build_populated_unversioned_db(settings: Settings) -> None:
     """Construct a create_all-era database: full schema, no ``alembic_version``,
     populated rows, and (raw DDL) the SQLAlchemy indexes dropped to simulate the
     retired ``ensure_schema`` gap (it could add columns but never indexes).
 
     ``create_all`` is the real pre-COL-56 build path, so this is a faithful
-    stand-in for a database in the wild; the raw ``DROP INDEX`` / ``INSERT``
-    shape the specific "populated but missing indexes, unversioned" precondition
-    independently of the code under test.
+    stand-in for a database in the wild; the raw ``DROP INDEX`` / ``DROP
+    COLUMN`` / ``INSERT`` shape the specific "populated but missing indexes
+    and post-baseline columns, unversioned" precondition independently of the
+    code under test.
     """
     engine = create_engine_from_settings(settings)
     Base.metadata.create_all(engine)
@@ -200,6 +235,13 @@ def _build_populated_unversioned_db(settings: Settings) -> None:
         # Drop every SQLAlchemy-declared index (older create_all-era DB).
         for index_name in BASELINE_INDEXES:
             connection.execute(text(f'DROP INDEX IF EXISTS "{index_name}"'))
+        # Drop columns a post-baseline migration owns, so the adoption delta
+        # (not create_all) is what adds them back -- same reasoning as the
+        # dropped indexes above.
+        for table_name, column_name in POST_BASELINE_COLUMNS:
+            connection.execute(
+                text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
+            )
         # Populate the sentinel + a couple of indexed tables via raw DML.
         connection.execute(
             text(

@@ -40,6 +40,8 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["concurrency_limit"] == 1
     assert body["ui_auth_enabled"] is False
     assert body["auth_required"] == "local_bypass"  # COL-51 default
+    assert body["backup_interval_days"] == 7  # COL-66 default
+    assert body["backup_retention_days"] == 28  # COL-66 default
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -143,6 +145,64 @@ def test_put_settings_rejects_an_unknown_auth_required_value(client: TestClient)
     response = client.put(
         "/api/settings",
         json={"auth_required": "disabled"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+# --- backup schedule (COL-66) ---------------------------------------------------
+
+
+def test_put_settings_updates_backup_interval_and_retention(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"backup_interval_days": 3, "backup_retention_days": 14},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["backup_interval_days"] == 3
+    assert body["backup_retention_days"] == 14
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["backup_interval_days"] == 3
+    assert follow_up.json()["backup_retention_days"] == 14
+
+
+def test_put_settings_leaves_backup_schedule_untouched_when_omitted(client: TestClient) -> None:
+    client.put(
+        "/api/settings",
+        json={"backup_interval_days": 5, "backup_retention_days": 20},
+        headers=_auth_headers(client),
+    )
+
+    client.put(
+        "/api/settings",
+        json={"concurrency_limit": 3},
+        headers=_auth_headers(client),
+    )
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["backup_interval_days"] == 5
+    assert body["backup_retention_days"] == 20
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_rejects_a_zero_backup_interval(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"backup_interval_days": 0},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+def test_put_settings_rejects_a_negative_backup_retention(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"backup_retention_days": -1},
         headers=_auth_headers(client),
     )
     assert response.status_code == 422

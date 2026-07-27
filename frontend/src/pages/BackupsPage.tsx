@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { createBackup, fetchBackups } from "../api/backups";
+import { fetchSettings, updateSettings } from "../api/settings";
 import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
 
@@ -35,6 +36,26 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ready"; supported: boolean; backups: Backup[] };
 
+type ScheduleLoadState = { status: "loading" } | { status: "error"; message: string } | { status: "ready" };
+
+interface ScheduleFormValues {
+  intervalDays: string;
+  retentionDays: string;
+}
+
+/** Validates the backup-schedule form; returns an error message, or `null` when valid. */
+function validateScheduleForm(form: ScheduleFormValues): string | null {
+  const interval = Number(form.intervalDays);
+  if (form.intervalDays.trim() === "" || !Number.isInteger(interval) || interval < 1) {
+    return "Backup interval must be a whole number of 1 or more.";
+  }
+  const retention = Number(form.retentionDays);
+  if (form.retentionDays.trim() === "" || !Number.isInteger(retention) || retention < 1) {
+    return "Backup retention must be a whole number of 1 or more.";
+  }
+  return null;
+}
+
 /**
  * The System → Backups view (COL-63): lists the database backups on disk and
  * drives the manual "Backup now" action (`POST /api/system/backup`).
@@ -43,11 +64,76 @@ type LoadState =
  * `supported: false`; the page then shows an "unavailable for this database
  * configuration" state instead of the controls. Timestamps render in local
  * time.
+ *
+ * COL-66 adds the inline "Backup schedule" panel: interval/retention days,
+ * backed by the same `GET`/`PUT /api/settings` the Settings page's
+ * `GeneralSection` uses (Radarr-style -- no dedicated backup-settings
+ * endpoint). The values are inert here -- COL-67's scheduler reads the
+ * interval and COL-68's pruning reads the retention; this page only persists
+ * the knobs.
  */
 export function BackupsPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  const [scheduleState, setScheduleState] = useState<ScheduleLoadState>({ status: "loading" });
+  const [scheduleForm, setScheduleForm] = useState<ScheduleFormValues>({
+    intervalDays: "7",
+    retentionDays: "28",
+  });
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
+  const [scheduleSavedAt, setScheduleSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchSettings()
+      .then((settings) => {
+        if (cancelled) return;
+        setScheduleForm({
+          intervalDays: String(settings.backup_interval_days),
+          retentionDays: String(settings.backup_retention_days),
+        });
+        setScheduleState({ status: "ready" });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setScheduleState({
+          status: "error",
+          message: error instanceof Error ? error.message : "Unknown error.",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleSaveSchedule() {
+    const validationError = validateScheduleForm(scheduleForm);
+    if (validationError) {
+      setScheduleError(validationError);
+      return;
+    }
+    setScheduleSaving(true);
+    setScheduleError(null);
+    setScheduleSavedAt(null);
+    try {
+      const updated = await updateSettings({
+        backup_interval_days: Number(scheduleForm.intervalDays),
+        backup_retention_days: Number(scheduleForm.retentionDays),
+      });
+      setScheduleForm({
+        intervalDays: String(updated.backup_interval_days),
+        retentionDays: String(updated.backup_retention_days),
+      });
+      setScheduleSavedAt(Date.now());
+    } catch (error: unknown) {
+      setScheduleError(error instanceof Error ? error.message : "Failed to save the backup schedule.");
+    } finally {
+      setScheduleSaving(false);
+    }
+  }
 
   async function load() {
     try {
@@ -121,6 +207,63 @@ export function BackupsPage() {
       </header>
 
       {actionError && <p className="view__error">{actionError}</p>}
+
+      <div className="panel settings-form">
+        <h3 className="settings-form__subtitle">Backup schedule</h3>
+
+        {scheduleState.status === "loading" && (
+          <p className="panel__message">Loading schedule…</p>
+        )}
+
+        {scheduleState.status === "error" && (
+          <p className="form-error">Couldn&apos;t load the backup schedule: {scheduleState.message}</p>
+        )}
+
+        {scheduleState.status === "ready" && (
+          <>
+            <div className="form-grid">
+              <div className="form-field form-field--narrow">
+                <label htmlFor="backup-interval-days">Backup interval (days)</label>
+                <input
+                  id="backup-interval-days"
+                  type="number"
+                  min={1}
+                  value={scheduleForm.intervalDays}
+                  onChange={(event) =>
+                    setScheduleForm({ ...scheduleForm, intervalDays: event.target.value })
+                  }
+                />
+                <p className="form-hint">How often a scheduled backup runs.</p>
+              </div>
+              <div className="form-field form-field--narrow">
+                <label htmlFor="backup-retention-days">Backup retention (days)</label>
+                <input
+                  id="backup-retention-days"
+                  type="number"
+                  min={1}
+                  value={scheduleForm.retentionDays}
+                  onChange={(event) =>
+                    setScheduleForm({ ...scheduleForm, retentionDays: event.target.value })
+                  }
+                />
+                <p className="form-hint">How long a backup is kept before it&apos;s pruned.</p>
+              </div>
+            </div>
+            <div className="form-actions">
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={handleSaveSchedule}
+                disabled={scheduleSaving}
+              >
+                {scheduleSaving ? "Saving…" : "Save schedule"}
+              </button>
+              {scheduleSavedAt !== null && !scheduleError && <span className="form-success">Saved.</span>}
+            </div>
+            {scheduleError && <p className="form-error">{scheduleError}</p>}
+          </>
+        )}
+      </div>
 
       {state.status === "loading" && (
         <div className="panel panel--empty">

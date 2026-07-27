@@ -18,6 +18,7 @@ import pytest
 from alembic import command
 from alembic.runtime.migration import MigrationContext
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 import collapsarr.migrations as migrations_module
 from collapsarr.config import Settings
@@ -33,6 +34,17 @@ from collapsarr.migrations import (
     upgrade_to_head,
 )
 
+#: Columns a post-baseline migration adds (currently just COL-66's backup
+#: schedule knobs) -- dropped after ``create_all`` below by
+#: :func:`_create_unversioned_db`, mirroring the same de-evolving idiom in
+#: ``test_migration_adoption.py``. Without this, ``create_all`` (which always
+#: builds from the *current* ``Base.metadata``) leaves these columns already
+#: present, so the migration that's supposed to add them fails.
+_POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("global_settings", "backup_interval_days"),
+    ("global_settings", "backup_retention_days"),
+)
+
 
 def _backups_dir(settings: Settings) -> Path:
     return Path(settings.data_dir).expanduser() / "backups"
@@ -40,6 +52,20 @@ def _backups_dir(settings: Settings) -> Path:
 
 def _db_file_name(settings: Settings) -> str:
     return Path(settings.database_path).name
+
+
+def _create_unversioned_db(settings: Settings) -> None:
+    """Build a create_all-era, unversioned database (populated schema, no
+    ``alembic_version``), de-evolved past any post-baseline column so the
+    normal migration chain -- not ``create_all`` -- is what adds them."""
+    engine = create_engine_from_settings(settings)
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        for table_name, column_name in _POST_BASELINE_COLUMNS:
+            connection.execute(
+                text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
+            )
+    engine.dispose()
 
 
 # --------------------------------------------------------------------------- #
@@ -71,9 +97,7 @@ def test_backup_written_when_adopting_existing_unversioned_db(settings: Settings
     Covers the COL-59 interaction: the backup must cover the pre-stamp state,
     so it's taken before the baseline stamp mutates the database at all.
     """
-    engine = create_engine_from_settings(settings)
-    Base.metadata.create_all(engine)  # create_all-era install: populated, unversioned
-    engine.dispose()
+    _create_unversioned_db(settings)  # create_all-era install: populated, unversioned
 
     upgrade_to_head(settings)
 
@@ -108,9 +132,7 @@ def test_backup_path_is_logged(
     settings: Settings, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The backup path is logged when a backup is actually taken."""
-    engine = create_engine_from_settings(settings)
-    Base.metadata.create_all(engine)
-    engine.dispose()
+    _create_unversioned_db(settings)
 
     with caplog.at_level("INFO"):
         upgrade_to_head(settings)
@@ -140,9 +162,7 @@ def test_retention_keeps_only_last_five_backups(settings: Settings) -> None:
         stale_names.append(stale.name)
 
     # Trigger one real backup (adoption path).
-    engine = create_engine_from_settings(settings)
-    Base.metadata.create_all(engine)
-    engine.dispose()
+    _create_unversioned_db(settings)
     upgrade_to_head(settings)
 
     remaining = {p.name for p in backups_dir.glob(f"{db_name}.pre-*.bak")}

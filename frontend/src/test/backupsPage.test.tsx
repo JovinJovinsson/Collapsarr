@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { BackupsPage } from "../pages/BackupsPage";
 import type { Backup, BackupList } from "../types/backups";
+import type { GlobalSettings } from "../types/settings";
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
@@ -19,13 +20,66 @@ const sampleBackup: Backup = {
 const emptyList: BackupList = { supported: true, backups: [] };
 const listWithOne: BackupList = { supported: true, backups: [sampleBackup] };
 
+const sampleSettings: GlobalSettings = {
+  enabled_targets: ["stereo"],
+  language_allow_list: null,
+  stereo_codec: "aac",
+  stereo_bitrate_kbps: null,
+  surround_codec: "ac3",
+  surround_bitrate_kbps: 448,
+  concurrency_limit: 1,
+  ui_auth_enabled: false,
+  auth_required: "local_bypass",
+  auth_method: "forms",
+  backup_interval_days: 7,
+  backup_retention_days: 28,
+  api_key: "abc123",
+  created_at: "2026-07-27T00:00:00Z",
+  updated_at: "2026-07-27T00:00:00Z",
+};
+
+/** Routes a mocked `fetch` by URL/method: `/api/system/backup` vs. `/api/settings`. */
+function stubFetch(options: {
+  backups?: BackupList;
+  settings?: GlobalSettings;
+  onBackupPost?: () => { ok: boolean; status: number; json: () => Promise<unknown> };
+  onSettingsPut?: (body: unknown) => { ok: boolean; status: number; json: () => Promise<unknown> };
+}) {
+  const {
+    backups = emptyList,
+    settings = sampleSettings,
+    onBackupPost,
+    onSettingsPut,
+  } = options;
+
+  const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    const method = init?.method ?? "GET";
+    if (url === "/api/system/backup" && method === "POST") {
+      return Promise.resolve(onBackupPost ? onBackupPost() : jsonResponse(sampleBackup, 202));
+    }
+    if (url === "/api/system/backup") {
+      return Promise.resolve(jsonResponse(backups));
+    }
+    if (url === "/api/settings" && method === "PUT") {
+      const body: unknown = init?.body ? JSON.parse(init.body as string) : {};
+      return Promise.resolve(onSettingsPut ? onSettingsPut(body) : jsonResponse({ ...settings, ...(body as object) }));
+    }
+    if (url === "/api/settings") {
+      return Promise.resolve(jsonResponse(settings));
+    }
+    return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("BackupsPage", () => {
   it("renders the heading and existing backups from a mocked GET", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(listWithOne)));
+    stubFetch({ backups: listWithOne });
     render(<BackupsPage />);
 
     expect(await screen.findByRole("heading", { name: "Backups" })).toBeInTheDocument();
@@ -36,7 +90,7 @@ describe("BackupsPage", () => {
   });
 
   it("shows an empty state and a Backup now button when there are no backups", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(emptyList)));
+    stubFetch({ backups: emptyList });
     render(<BackupsPage />);
 
     expect(await screen.findByText(/no backups yet/i)).toBeInTheDocument();
@@ -44,13 +98,20 @@ describe("BackupsPage", () => {
   });
 
   it("creates a backup via POST and shows it in the refreshed list", async () => {
-    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
-      if ((init?.method ?? "GET") === "POST") {
+    let backupCreated = false;
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (url === "/api/system/backup" && method === "POST") {
+        backupCreated = true;
         return Promise.resolve(jsonResponse(sampleBackup, 202));
       }
-      // First GET: empty. After the POST, the reload GET returns the new backup.
-      const call = fetchMock.mock.calls.filter(([, i]) => (i as RequestInit | undefined)?.method !== "POST").length;
-      return Promise.resolve(jsonResponse(call <= 1 ? emptyList : listWithOne));
+      if (url === "/api/system/backup") {
+        return Promise.resolve(jsonResponse(backupCreated ? listWithOne : emptyList));
+      }
+      if (url === "/api/settings") {
+        return Promise.resolve(jsonResponse(sampleSettings));
+      }
+      return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
 
@@ -63,13 +124,10 @@ describe("BackupsPage", () => {
   });
 
   it("surfaces an error when creating a backup fails", async () => {
-    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
-      if ((init?.method ?? "GET") === "POST") {
-        return Promise.resolve(jsonResponse({ detail: "disk full" }, 500));
-      }
-      return Promise.resolve(jsonResponse(emptyList));
+    stubFetch({
+      backups: emptyList,
+      onBackupPost: () => jsonResponse({ detail: "disk full" }, 500),
     });
-    vi.stubGlobal("fetch", fetchMock);
 
     render(<BackupsPage />);
     fireEvent.click(await screen.findByRole("button", { name: /backup now/i }));
@@ -78,10 +136,7 @@ describe("BackupsPage", () => {
   });
 
   it("shows the unavailable state (no controls) when the DB isn't file-based SQLite", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(jsonResponse({ supported: false, backups: [] } satisfies BackupList)),
-    );
+    stubFetch({ backups: { supported: false, backups: [] } });
     render(<BackupsPage />);
 
     expect(await screen.findByText(/unavailable for this database configuration/i)).toBeInTheDocument();
@@ -89,19 +144,80 @@ describe("BackupsPage", () => {
   });
 
   it("renders an error state when the initial load fails", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/system/backup") return Promise.reject(new Error("network down"));
+      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
+      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
     render(<BackupsPage />);
 
     expect(await screen.findByText(/couldn't load backups: network down/i)).toBeInTheDocument();
   });
 
   it("displays the created timestamp in local time", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(listWithOne)));
+    stubFetch({ backups: listWithOne });
     render(<BackupsPage />);
 
     const row = (await screen.findByText(sampleBackup.name)).closest("tr");
     expect(row).not.toBeNull();
     const expected = new Date(sampleBackup.created_at).toLocaleString();
     expect(within(row as HTMLElement).getByText(expected)).toBeInTheDocument();
+  });
+
+  // --- Backup schedule (COL-66) ------------------------------------------------
+
+  it("renders the persisted interval/retention values from a mocked GET", async () => {
+    stubFetch({ settings: { ...sampleSettings, backup_interval_days: 3, backup_retention_days: 14 } });
+    render(<BackupsPage />);
+
+    expect(await screen.findByLabelText(/backup interval/i)).toHaveValue(3);
+    expect(screen.getByLabelText(/backup retention/i)).toHaveValue(14);
+  });
+
+  it("saves edited interval/retention via PUT and persists across reload", async () => {
+    const fetchMock = stubFetch({});
+    render(<BackupsPage />);
+
+    const intervalInput = await screen.findByLabelText(/backup interval/i);
+    const retentionInput = screen.getByLabelText(/backup retention/i);
+    fireEvent.change(intervalInput, { target: { value: "10" } });
+    fireEvent.change(retentionInput, { target: { value: "30" } });
+    fireEvent.click(screen.getByRole("button", { name: /save schedule/i }));
+
+    expect(await screen.findByText("Saved.")).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(
+      ([url, init]) => url === "/api/settings" && (init as RequestInit | undefined)?.method === "PUT",
+    );
+    expect(putCall).toBeDefined();
+    const body: unknown = JSON.parse((putCall?.[1] as RequestInit).body as string);
+    expect(body).toEqual({ backup_interval_days: 10, backup_retention_days: 30 });
+    expect(intervalInput).toHaveValue(10);
+    expect(retentionInput).toHaveValue(30);
+  });
+
+  it("rejects a non-positive interval before saving, without calling PUT", async () => {
+    const fetchMock = stubFetch({});
+    render(<BackupsPage />);
+
+    const intervalInput = await screen.findByLabelText(/backup interval/i);
+    fireEvent.change(intervalInput, { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /save schedule/i }));
+
+    expect(await screen.findByText(/must be a whole number of 1 or more/i)).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) => url === "/api/settings" && (init as RequestInit | undefined)?.method === "PUT",
+      ),
+    ).toBe(false);
+  });
+
+  it("surfaces an error when saving the schedule fails", async () => {
+    stubFetch({ onSettingsPut: () => jsonResponse({ detail: "invalid retention" }, 422) });
+    render(<BackupsPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /save schedule/i }));
+
+    expect(await screen.findByText("invalid retention")).toBeInTheDocument();
   });
 });

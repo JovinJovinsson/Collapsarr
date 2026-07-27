@@ -47,6 +47,8 @@ const settingsResponse: GlobalSettings = {
   ui_auth_enabled: false,
   auth_required: "local_bypass",
   auth_method: "forms",
+  backup_interval_days: 7,
+  backup_retention_days: 28,
   api_key: "test-key",
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
