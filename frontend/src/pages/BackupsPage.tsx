@@ -1,6 +1,14 @@
+import type { ChangeEvent } from "react";
 import { useEffect, useState } from "react";
 
-import { createBackup, deleteBackup, downloadBackup, fetchBackups, restoreBackup } from "../api/backups";
+import {
+  createBackup,
+  deleteBackup,
+  downloadBackup,
+  fetchBackups,
+  restoreBackup,
+  restoreFromUpload,
+} from "../api/backups";
 import { fetchSettings, updateSettings } from "../api/settings";
 import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
@@ -103,6 +111,8 @@ export function BackupsPage() {
   const [confirmingRestoreId, setConfirmingRestoreId] = useState<string | null>(null);
   const [restoringId, setRestoringId] = useState<string | null>(null);
   const [restoreStarted, setRestoreStarted] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
 
   const [scheduleState, setScheduleState] = useState<ScheduleLoadState>({ status: "loading" });
   const [scheduleForm, setScheduleForm] = useState<ScheduleFormValues>({
@@ -251,6 +261,37 @@ export function BackupsPage() {
     }
   }
 
+  function handleUploadFileSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    // Reset the input so re-selecting the same file still fires onChange.
+    event.target.value = "";
+    if (!file) return;
+    setActionError(null);
+    setUploadFile(file);
+  }
+
+  function handleCancelUpload() {
+    setUploadFile(null);
+  }
+
+  async function handleConfirmUpload() {
+    if (!uploadFile) return;
+    setUploading(true);
+    setActionError(null);
+    try {
+      await restoreFromUpload(uploadFile);
+      setUploadFile(null);
+      // Same as a per-row restore: the server has staged the upload and is
+      // shutting down, so show the persistent restarting notice rather than
+      // refreshing the list.
+      setRestoreStarted(true);
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : "Failed to restore from upload.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
   const supported = state.status === "ready" ? state.supported : true;
 
   return (
@@ -272,6 +313,17 @@ export function BackupsPage() {
             >
               {creating ? "Backing up…" : "Backup now"}
             </button>
+            <label className="btn btn--secondary" htmlFor="restore-upload-input">
+              Upload &amp; Restore
+            </label>
+            <input
+              id="restore-upload-input"
+              type="file"
+              accept=".zip,application/zip"
+              className="visually-hidden"
+              onChange={handleUploadFileSelected}
+              disabled={uploading || restoreStarted}
+            />
           </div>
         )}
       </header>
@@ -284,6 +336,35 @@ export function BackupsPage() {
           seconds. If this install isn&apos;t running under a supervisor (Docker or systemd) that
           restarts it automatically, you&apos;ll need to start it again manually.
         </p>
+      )}
+
+      {uploadFile && !restoreStarted && (
+        <div className="panel view__confirm" role="status">
+          <p>
+            Restore from the uploaded archive <strong>{uploadFile.name}</strong>? This will log out
+            active sessions and may change the API key (both revert to the backup&apos;s values).
+            Collapsarr will restart to apply it — if this install isn&apos;t supervised
+            (Docker/systemd), restart it yourself afterwards.
+          </p>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="btn btn--danger"
+              onClick={handleConfirmUpload}
+              disabled={uploading}
+            >
+              {uploading ? "Restoring…" : "Confirm upload & restore"}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={handleCancelUpload}
+              disabled={uploading}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
 
       <div className="panel settings-form">

@@ -27,12 +27,14 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from ..backup.service import BackupNotFoundError
 from ..config import Settings
+from . import upload
 from .request import RestoreGateError, stage_restore
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,17 @@ class RestoreAccepted(BaseModel):
 
     status: str
     backup_id: str
+
+
+class RestoreUploadAccepted(BaseModel):
+    """Response body for a successfully staged restore from an uploaded archive.
+
+    No ``backup_id`` -- an uploaded archive isn't a listed backup on disk, so
+    there is no id to echo back; ``status`` alone mirrors the listed-restore
+    ``202`` shape enough for the UI's "restarting" transition.
+    """
+
+    status: str
 
 
 # --- shutdown trigger ----------------------------------------------------------
@@ -98,6 +111,80 @@ def _settings(request: Request) -> Settings:
 
 # --- endpoints -----------------------------------------------------------------
 
+#: Temp filename the streaming upload is spooled to under ``<data_dir>``,
+#: dot-prefixed like the codebase's other internal artifacts. Removed in a
+#: ``finally`` on every path, so a failed/oversized upload leaves nothing behind.
+UPLOAD_TMP_FILENAME = ".restore_upload.zip.part"
+
+
+@router.post(
+    "/backup/restore/upload",
+    status_code=202,
+    response_model=RestoreUploadAccepted,
+)
+async def restore_upload_endpoint(request: Request) -> RestoreUploadAccepted:
+    """Stage a restore from an *uploaded* archive and shut down to apply it.
+
+    The request body is the raw ``.zip`` bytes (the frontend POSTs the chosen
+    file directly). They are streamed to a temp file, aborting the moment the
+    running total exceeds :data:`~collapsarr.restore.upload.MAX_UPLOAD_ARCHIVE_BYTES`
+    so an oversized upload can never be spooled unbounded to disk, then handed to
+    :func:`~collapsarr.restore.upload.stage_restore_from_upload` for hardened
+    extraction and the *same* validate -> stage -> marker gate as the
+    listed-backup restore (SQLite + ``global_settings`` sentinel +
+    version-compatibility guard).
+
+    This route is declared **before** ``POST /backup/restore/{backup_id:path}``
+    so the literal ``upload`` segment matches here rather than being captured as
+    a backup id.
+
+    * ``413`` -- the upload exceeded the max archive size. No marker written.
+    * ``422`` -- the archive failed hardened extraction (bad zip, zip-slip,
+      missing/oversize DB entry) or the validate gate (not SQLite, missing
+      sentinel table, or a newer-than-supported revision). No marker written and
+      the running database is untouched.
+    * ``202`` -- the database was staged and the marker armed; this process is
+      now shutting down so the supervisor restarts it and the swap applies on
+      next boot.
+
+    Auth is inherited from the ``/api`` middleware, same as every other route
+    under this prefix.
+    """
+    settings = _settings(request)
+    upload_tmp = Path(settings.data_dir).expanduser() / UPLOAD_TMP_FILENAME
+    try:
+        upload_tmp.parent.mkdir(parents=True, exist_ok=True)
+        max_bytes = upload.MAX_UPLOAD_ARCHIVE_BYTES
+        received = 0
+        try:
+            with upload_tmp.open("wb") as dst:
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if received > max_bytes:
+                        raise upload.UploadTooLargeError(
+                            "The uploaded archive exceeds the maximum allowed "
+                            f"size of {max_bytes} bytes."
+                        )
+                    dst.write(chunk)
+            if received == 0:
+                raise RestoreGateError(
+                    "No uploaded archive was received in the request body."
+                )
+            upload.stage_restore_from_upload(settings, upload_tmp)
+        except upload.UploadTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except RestoreGateError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        upload_tmp.unlink(missing_ok=True)
+
+    logger.warning(
+        "Restore staged from an uploaded archive; shutting down so the "
+        "supervisor restarts this instance and the swap applies on next boot.",
+    )
+    trigger_shutdown()
+    return RestoreUploadAccepted(status="restoring")
+
 
 @router.post(
     "/backup/restore/{backup_id:path}",
@@ -137,4 +224,4 @@ def restore_backup_endpoint(backup_id: str, request: Request) -> RestoreAccepted
     return RestoreAccepted(status="restoring", backup_id=backup_id)
 
 
-__all__ = ["router", "trigger_shutdown"]
+__all__ = ["UPLOAD_TMP_FILENAME", "router", "trigger_shutdown"]

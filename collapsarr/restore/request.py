@@ -161,6 +161,34 @@ def _open_and_check_sentinel(path: Path) -> None:
         )
 
 
+def validate_staged_db(settings: Settings, path: Path) -> None:
+    """Run the post-extraction half of the gate against a staged DB file.
+
+    The checks that are identical regardless of *where* the database bytes came
+    from -- a listed archive (:func:`stage_restore`) or an untrusted uploaded
+    archive (:func:`collapsarr.restore.upload.stage_restore_from_upload`):
+
+    #. It opens as valid SQLite and carries the ``global_settings`` sentinel
+       table (:func:`_open_and_check_sentinel`, gate checks #2 and #3).
+    #. It is not stamped at a newer-than-supported Alembic revision (COL-72),
+       reusing the shared :func:`~collapsarr.migrations.check_restore_revision`
+       guard -- re-raised as :class:`RestoreGateError` so every rejection maps to
+       the same ``422``.
+
+    Raises :class:`RestoreGateError` on any failure; the caller keeps ownership
+    of the temp file and never promotes it or writes a marker on a raise.
+    """
+    _open_and_check_sentinel(path)
+    # Fourth check (COL-72): reject a backup from a newer Collapsarr whose
+    # revision this build can't migrate. Shared with the boot swap engine so the
+    # two paths agree on "too new to restore". Re-raised as the gate's own error
+    # type so the REST layer maps it to 422 like every other rejection.
+    try:
+        check_restore_revision(settings, path)
+    except IncompatibleRevisionError as exc:
+        raise RestoreGateError(str(exc)) from exc
+
+
 def stage_restore(settings: Settings, backup_id: str) -> Path:
     """Stage a restore from the listed backup ``backup_id`` and arm the marker.
 
@@ -191,16 +219,7 @@ def stage_restore(settings: Settings, backup_id: str) -> Path:
     tmp_path = staged_path.with_name(f".{staged_path.name}.part")
     try:
         tmp_path.write_bytes(data)
-        _open_and_check_sentinel(tmp_path)
-        # Fourth check (COL-72): reject a backup from a newer Collapsarr whose
-        # revision this build can't migrate. Shared with the boot swap engine so
-        # the two paths agree on "too new to restore". Re-raised as the gate's
-        # own error type so the REST layer maps it to 422 like every other
-        # rejection -- no marker written, running database untouched.
-        try:
-            check_restore_revision(settings, tmp_path)
-        except IncompatibleRevisionError as exc:
-            raise RestoreGateError(str(exc)) from exc
+        validate_staged_db(settings, tmp_path)
         # Only reached once the gate has fully passed: atomically promote the
         # validated temp file to the staging path so a reader never observes
         # a partially-written or not-yet-validated staged database.
@@ -222,4 +241,5 @@ __all__ = [
     "RestoreGateError",
     "restore_staging_path",
     "stage_restore",
+    "validate_staged_db",
 ]
