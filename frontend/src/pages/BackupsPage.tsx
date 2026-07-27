@@ -29,6 +29,7 @@ const TYPE_LABEL: Record<Backup["type"], string> = {
   manual: "Manual",
   scheduled: "Scheduled",
   update: "Update",
+  restore: "Restore",
 };
 
 type LoadState =

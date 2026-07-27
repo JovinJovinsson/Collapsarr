@@ -1,5 +1,10 @@
-/** Backup type partition on disk (COL-63). Only `manual` is produced today. */
-export type BackupType = "manual" | "scheduled" | "update";
+/**
+ * Backup type partition on disk. `manual` (COL-63) is the "Backup Now" type,
+ * `scheduled` (COL-67) the scheduler's, `update` (COL-69) the pre-migration
+ * safety copy, and `restore` (COL-70) the pre-restore safety copy the boot-time
+ * swap engine takes before applying a restore.
+ */
+export type BackupType = "manual" | "scheduled" | "update" | "restore";
 
 /** One backup archive, as returned by `GET /api/system/backup`. */
 export interface Backup {

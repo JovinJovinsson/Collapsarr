@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from .service import (
     BACKUP_MANUAL,
+    BACKUP_RESTORE,
     BACKUP_SCHEDULED,
     BACKUP_TYPES,
     BACKUP_UPDATE,
@@ -38,6 +39,7 @@ from .service import (
 
 __all__ = [
     "BACKUP_MANUAL",
+    "BACKUP_RESTORE",
     "BACKUP_SCHEDULED",
     "BACKUP_TYPES",
     "BACKUP_UPDATE",

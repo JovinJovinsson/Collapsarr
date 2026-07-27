@@ -43,6 +43,7 @@ from .jobs.scheduler import JobScheduler
 from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
+from .restore.engine import apply_pending_restore
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
 
@@ -85,6 +86,16 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Boot-time staged swap (COL-70): before the engine connects and before
+        # the schema upgrade below, apply a pending database restore if one is
+        # marked -- take a safety backup of the current DB, swap the staged file
+        # into place, and clear the marker. A missing/invalid staged file (or a
+        # non-file database) aborts the swap and boots normally; no marker is a
+        # clean no-op. This is the one window a raw file swap is safe: nothing has
+        # opened the database yet, and the swapped-in (possibly older) DB is then
+        # forward-migrated by upgrade_to_head.
+        apply_pending_restore(resolved_settings)
+
         # Bring the schema up to head via Alembic before serving the first
         # request (COL-58). Alembic is the single source of truth for schema:
         # on a fresh install this runs the full migration chain from base; on an
