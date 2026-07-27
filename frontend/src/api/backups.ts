@@ -74,3 +74,23 @@ export async function deleteBackup(backup: Pick<Backup, "id">): Promise<void> {
     throw new Error(await apiErrorMessage(response, `Failed to delete backup (${response.status})`));
   }
 }
+
+/**
+ * Restores the database from a listed backup
+ * (`POST /api/system/backup/restore/{id}`, COL-71).
+ *
+ * `backup.id` is interpolated directly, same as `downloadBackup`/`deleteBackup`.
+ * On success (`202`) the server has already staged the database and armed the
+ * restore marker, then triggered its own shutdown -- the supervisor
+ * (Docker/systemd) restarts the process and the swap applies on next boot, so
+ * this call resolving is the caller's cue to show a "restarting" state rather
+ * than refresh the list (the current process may already be on its way down).
+ * A gate failure (`422`) or unknown id (`404`) is surfaced via
+ * `apiErrorMessage`, same as the other row actions.
+ */
+export async function restoreBackup(backup: Pick<Backup, "id">): Promise<void> {
+  const response = await apiFetch(`/api/system/backup/restore/${backup.id}`, { method: "POST" });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to restore backup (${response.status})`));
+  }
+}

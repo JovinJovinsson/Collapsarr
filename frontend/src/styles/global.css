@@ -1037,6 +1037,18 @@ a {
   flex-shrink: 0;
 }
 
+/* Non-error, positive-confirmation banner (e.g. "restore started") -- same
+   shape as .view__error but in the success palette (COL-71). */
+.view__notice {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-md);
+  background: var(--c-success-tint);
+  border: 1px solid var(--c-success);
+  color: var(--c-success);
+  font-size: var(--fs-sm);
+}
+
 .view__error {
   margin: 0 0 var(--sp-4);
   padding: var(--sp-3) var(--sp-4);

@@ -362,4 +362,98 @@ describe("BackupsPage", () => {
     // The backup is still listed -- the refusal didn't remove it.
     expect(screen.getByText(sampleBackup.name)).toBeInTheDocument();
   });
+
+  // --- Restore action (COL-71) -------------------------------------------------
+
+  it("shows a Restore action per row that asks for confirmation before calling the API", async () => {
+    const fetchMock = stubFetch({ backups: listWithOne });
+    render(<BackupsPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^restore$/i }));
+
+    // The confirm copy warns about session logout + API-key change, both
+    // reverting to the backup's values, and about the restart.
+    expect(screen.getByText(/log out active sessions/i)).toBeInTheDocument();
+    expect(screen.getByText(/api key/i)).toBeInTheDocument();
+    expect(screen.getByText(/revert to the backup/i)).toBeInTheDocument();
+    expect(screen.getByText(/restart/i)).toBeInTheDocument();
+    // Unsupervised-install guidance is spelled out, per the acceptance criteria.
+    expect(screen.getByText(/restart it yourself/i)).toBeInTheDocument();
+
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          url === `/api/system/backup/restore/${sampleBackup.id}` &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  it("restores a backup only after confirming, then shows a restarting notice", async () => {
+    let restored = false;
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (url === `/api/system/backup/restore/${sampleBackup.id}` && method === "POST") {
+        restored = true;
+        return Promise.resolve(jsonResponse({ status: "restoring", backup_id: sampleBackup.id }, 202));
+      }
+      if (url === "/api/system/backup") return Promise.resolve(jsonResponse(listWithOne));
+      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
+      return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<BackupsPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^restore$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /confirm restore/i }));
+
+    expect(await screen.findByText(/restarting to apply it/i)).toBeInTheDocument();
+    expect(restored).toBe(true);
+    const restoreCall = fetchMock.mock.calls.find(
+      ([, i]) => (i as RequestInit | undefined)?.method === "POST",
+    );
+    expect(restoreCall?.[0]).toBe(`/api/system/backup/restore/${sampleBackup.id}`);
+  });
+
+  it("cancels a pending restore without calling the restore endpoint", async () => {
+    const fetchMock = stubFetch({ backups: listWithOne });
+    render(<BackupsPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^restore$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+
+    expect(screen.queryByText(/log out active sessions/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^restore$/i })).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          url === `/api/system/backup/restore/${sampleBackup.id}` &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  it("surfaces a gate rejection (422) when a restore is refused", async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (url === `/api/system/backup/restore/${sampleBackup.id}` && method === "POST") {
+        return Promise.resolve(
+          jsonResponse({ detail: "The backup's database is missing the 'global_settings' table." }, 422),
+        );
+      }
+      if (url === "/api/system/backup") return Promise.resolve(jsonResponse(listWithOne));
+      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
+      return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<BackupsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /^restore$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /confirm restore/i }));
+
+    expect(await screen.findByText(/missing the 'global_settings' table/i)).toBeInTheDocument();
+    // No restarting notice shown on a refused restore.
+    expect(screen.queryByText(/restarting to apply it/i)).not.toBeInTheDocument();
+  });
 });

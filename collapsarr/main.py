@@ -44,6 +44,7 @@ from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
 from .restore.engine import apply_pending_restore
+from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
 
@@ -193,6 +194,13 @@ def create_app(
 
     # Database backup list/create (COL-63), under /api/system.
     app.include_router(backup_router)
+
+    # Restore from a listed backup (COL-71), under /api/system. Stages the
+    # database + arms the marker consumed by the boot-time swap engine
+    # (COL-70); registered after backup_router but distinguished by the
+    # POST /backup/restore/{id} path and method, so it never shadows the
+    # GET .../download or DELETE .../{id} routes above.
+    app.include_router(restore_router)
 
     @app.get("/health", tags=["system"])
     def health(request: Request) -> dict[str, object]:

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { createBackup, deleteBackup, downloadBackup, fetchBackups } from "../api/backups";
+import { createBackup, deleteBackup, downloadBackup, fetchBackups, restoreBackup } from "../api/backups";
 import { fetchSettings, updateSettings } from "../api/settings";
 import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
@@ -81,6 +81,17 @@ function validateScheduleForm(form: ScheduleFormValues): string | null {
  * (`deleteBackup`). The server enforces a minimum-keep floor: a delete that
  * would remove the last recovery point is refused with a `409`, whose message
  * is surfaced in the same `actionError` banner as the other row actions.
+ *
+ * COL-71 adds a per-row "Restore" action, same inline-confirm shape as
+ * Delete, calling `POST /api/system/backup/restore/{id}` (`restoreBackup`).
+ * It is destructive in a different way than Delete -- it doesn't lose data,
+ * but it logs out every active session and can change the API key (both
+ * revert to the backup's values), and it restarts the app -- so the confirm
+ * step spells that out explicitly rather than reusing Delete's generic
+ * wording. A gate rejection (bad archive / not SQLite / missing sentinel
+ * table, `422`) or unknown id (`404`) surfaces in `actionError`, same as the
+ * other actions; a successful restore instead shows a persistent `view__notice`
+ * banner (the app is restarting, so refreshing the list would just fail).
  */
 export function BackupsPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
@@ -89,6 +100,9 @@ export function BackupsPage() {
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirmingRestoreId, setConfirmingRestoreId] = useState<string | null>(null);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
+  const [restoreStarted, setRestoreStarted] = useState(false);
 
   const [scheduleState, setScheduleState] = useState<ScheduleLoadState>({ status: "loading" });
   const [scheduleForm, setScheduleForm] = useState<ScheduleFormValues>({
@@ -220,6 +234,23 @@ export function BackupsPage() {
     }
   }
 
+  async function handleConfirmRestore(backup: Backup) {
+    setRestoringId(backup.id);
+    setActionError(null);
+    try {
+      await restoreBackup(backup);
+      setConfirmingRestoreId(null);
+      // The server has already staged the restore and is shutting down --
+      // don't re-fetch the list (the app may already be on its way down);
+      // show a persistent notice instead.
+      setRestoreStarted(true);
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : "Failed to restore backup.");
+    } finally {
+      setRestoringId(null);
+    }
+  }
+
   const supported = state.status === "ready" ? state.supported : true;
 
   return (
@@ -246,6 +277,14 @@ export function BackupsPage() {
       </header>
 
       {actionError && <p className="view__error">{actionError}</p>}
+
+      {restoreStarted && (
+        <p className="view__notice" role="status">
+          Restore started. Collapsarr is restarting to apply it — reload this page in a few
+          seconds. If this install isn&apos;t running under a supervisor (Docker or systemd) that
+          restarts it automatically, you&apos;ll need to start it again manually.
+        </p>
+      )}
 
       <div className="panel settings-form">
         <h3 className="settings-form__subtitle">Backup schedule</h3>
@@ -370,6 +409,41 @@ export function BackupsPage() {
                     >
                       {downloadingId === backup.id ? "Downloading…" : "Download"}
                     </button>
+                    {confirmingRestoreId === backup.id ? (
+                      <>
+                        <span className="data-table__confirm" role="status">
+                          Restoring this backup will log out active sessions and may change the
+                          API key (both revert to the backup&apos;s values). Collapsarr will
+                          restart to apply it — if this install isn&apos;t supervised
+                          (Docker/systemd), restart it yourself afterwards.
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn--danger btn--sm"
+                          onClick={() => handleConfirmRestore(backup)}
+                          disabled={restoringId === backup.id}
+                        >
+                          {restoringId === backup.id ? "Restoring…" : "Confirm restore"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn--ghost btn--sm"
+                          onClick={() => setConfirmingRestoreId(null)}
+                          disabled={restoringId === backup.id}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn btn--secondary btn--sm"
+                        onClick={() => setConfirmingRestoreId(backup.id)}
+                        disabled={restoreStarted}
+                      >
+                        Restore
+                      </button>
+                    )}
                     {confirmingDeleteId === backup.id ? (
                       <>
                         <span className="data-table__confirm" role="status">
