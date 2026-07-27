@@ -28,6 +28,7 @@ from .arr.webhooks import (
 )
 from .auth import SessionMiddleware, auth_router, enforce_auth_middleware
 from .backup.routes import router as backup_router
+from .backup.scheduler import BackupScheduler
 from .config import Settings, get_settings
 from .database import (
     create_engine_from_settings,
@@ -126,11 +127,24 @@ def create_app(
             app.state.job_scheduler = scheduler
             app.state.on_file_ready = scheduler.on_file_ready
             scheduler.start()
+
+        # Scheduled automatic database backups (COL-67): a separate daemon-thread
+        # scheduler that takes a `scheduled` backup whenever the newest one on
+        # disk is older than `backup_interval_days`. Gated on `enable_scheduler`
+        # alone (independent of the webhook hook above), and cleanly stopped in
+        # the `finally` below. No-ops for a non-file-based / `:memory:` database.
+        backup_scheduler: BackupScheduler | None = None
+        if enable_scheduler:
+            backup_scheduler = BackupScheduler(resolved_settings, session_factory)
+            app.state.backup_scheduler = backup_scheduler
+            backup_scheduler.start()
         try:
             yield
         finally:
             if scheduler is not None:
                 scheduler.stop()
+            if backup_scheduler is not None:
+                backup_scheduler.stop()
             engine.dispose()
 
     app = FastAPI(
