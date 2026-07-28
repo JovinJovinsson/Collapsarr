@@ -55,15 +55,21 @@ from collapsarr.migrations import _sqlite_file_path as resolve_sqlite_path
 logger = logging.getLogger(__name__)
 
 #: Backup type -> subdirectory name under ``<data_dir>/backups/``. ``manual`` is
-#: the only type produced by this slice; the other two are reserved for the
-#: scheduler (COL-67) and the pre-migration fold (COL-69).
+#: the "Backup Now" type; ``scheduled`` is the scheduler's (COL-67); ``update``
+#: is the pre-migration fold (COL-69); ``restore`` is the pre-restore safety
+#: backup the boot-time swap engine takes (COL-70). ``update`` and ``restore``
+#: are both automatic, pre-destructive rollback points, but they live in separate
+#: subdirectories so a restore-then-forward-migrate boot (which takes one of
+#: each, back to back) keeps both -- a same-second filename would otherwise
+#: collide within a single directory.
 BACKUP_MANUAL = "manual"
 BACKUP_SCHEDULED = "scheduled"
 BACKUP_UPDATE = "update"
+BACKUP_RESTORE = "restore"
 
 #: All valid backup types, in a stable order. The on-disk layout carves one
 #: subdirectory per entry (see :func:`ensure_backup_dirs`).
-BACKUP_TYPES: tuple[str, ...] = (BACKUP_MANUAL, BACKUP_SCHEDULED, BACKUP_UPDATE)
+BACKUP_TYPES: tuple[str, ...] = (BACKUP_MANUAL, BACKUP_SCHEDULED, BACKUP_UPDATE, BACKUP_RESTORE)
 
 #: Glob matching a *finished* backup archive. Deliberately excludes the
 #: dot-prefixed temp files an in-flight backup writes, so a partial/failed
@@ -460,6 +466,7 @@ __all__ = [
     "ARCHIVE_MEMBER_NAME",
     "BACKUP_FILENAME_GLOB",
     "BACKUP_MANUAL",
+    "BACKUP_RESTORE",
     "BACKUP_SCHEDULED",
     "BACKUP_TYPES",
     "BACKUP_UPDATE",

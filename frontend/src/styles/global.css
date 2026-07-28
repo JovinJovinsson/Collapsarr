@@ -1037,6 +1037,46 @@ a {
   flex-shrink: 0;
 }
 
+/* Destructive-action confirmation banner (e.g. the Upload & Restore confirm,
+   COL-73) -- a bordered panel carrying the warning copy and its confirm/cancel
+   actions, in the danger palette to match the destructive per-row confirms. */
+.view__confirm {
+  margin: 0 0 var(--sp-4);
+  border: 1px solid var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.view__confirm p {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-sm);
+}
+
+/* Accessible visually-hidden helper: kept in the a11y tree (unlike display:none)
+   so a label-associated control such as the hidden file input stays reachable. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Non-error, positive-confirmation banner (e.g. "restore started") -- same
+   shape as .view__error but in the success palette (COL-71). */
+.view__notice {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-md);
+  background: var(--c-success-tint);
+  border: 1px solid var(--c-success);
+  color: var(--c-success);
+  font-size: var(--fs-sm);
+}
+
 .view__error {
   margin: 0 0 var(--sp-4);
   padding: var(--sp-3) var(--sp-4);

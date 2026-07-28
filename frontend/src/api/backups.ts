@@ -74,3 +74,49 @@ export async function deleteBackup(backup: Pick<Backup, "id">): Promise<void> {
     throw new Error(await apiErrorMessage(response, `Failed to delete backup (${response.status})`));
   }
 }
+
+/**
+ * Restores the database from a listed backup
+ * (`POST /api/system/backup/restore/{id}`, COL-71).
+ *
+ * `backup.id` is interpolated directly, same as `downloadBackup`/`deleteBackup`.
+ * On success (`202`) the server has already staged the database and armed the
+ * restore marker, then triggered its own shutdown -- the supervisor
+ * (Docker/systemd) restarts the process and the swap applies on next boot, so
+ * this call resolving is the caller's cue to show a "restarting" state rather
+ * than refresh the list (the current process may already be on its way down).
+ * A gate failure (`422`) or unknown id (`404`) is surfaced via
+ * `apiErrorMessage`, same as the other row actions.
+ */
+export async function restoreBackup(backup: Pick<Backup, "id">): Promise<void> {
+  const response = await apiFetch(`/api/system/backup/restore/${backup.id}`, { method: "POST" });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to restore backup (${response.status})`));
+  }
+}
+
+/**
+ * Restores the database from an *uploaded* archive
+ * (`POST /api/system/backup/restore/upload`, COL-73).
+ *
+ * Unlike `restoreBackup` (which names a backup already on disk), this lets an
+ * operator recover on a fresh box whose `backups/` folder is gone by uploading
+ * an archive they downloaded earlier. The chosen `.zip` is sent as the raw
+ * request body -- the server streams and size-caps it, then runs it through the
+ * *same* hardened validate -> stage -> marker -> self-shutdown pipeline as the
+ * listed restore (including the version-compatibility guard). On success
+ * (`202`) the server has staged the database and is shutting down to apply it on
+ * next boot, so this resolving is the cue to show the "restarting" state rather
+ * than refresh the list. An oversize upload (`413`), a gate/extraction failure
+ * (`422`), or any other error is surfaced via `apiErrorMessage`, same as the
+ * per-row restore.
+ */
+export async function restoreFromUpload(file: File): Promise<void> {
+  const response = await apiFetch("/api/system/backup/restore/upload", {
+    method: "POST",
+    body: file,
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to restore from upload (${response.status})`));
+  }
+}
