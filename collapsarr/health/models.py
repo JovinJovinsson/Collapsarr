@@ -1,4 +1,4 @@
-"""ORM model for persisted per-check health state (COL-75).
+"""ORM models for persisted health-check state and probe data (COL-75, COL-80).
 
 One row per *Check Key* -- ``(code, instance_id)`` -- so the framework survives
 a restart: on boot the scheduler reads the same rows the previous process
@@ -11,23 +11,32 @@ code so it is already shaped for the later per-instance checks (Arr instance
 connectivity -- one row per instance): singleton checks (FFmpeg, disk space,
 database writability) simply carry ``instance_id = NULL``.
 
-This module is imported for its side effect of registering
-:class:`HealthCheckState` with :data:`collapsarr.database.Base.metadata` -- see
-:mod:`collapsarr.health` and the Alembic migration environment
-(:mod:`collapsarr.migrations`).
+Also defines :class:`HealthWriteProbe` (COL-80): a small, dedicated,
+otherwise-unused single-row table the database-unwritable check writes-and-
+commits to on every tick, isolated from ``HealthCheckState`` and every real
+config/data table so the probe never contends with genuine application
+writes.
+
+This module is imported for its side effect of registering both models with
+:data:`collapsarr.database.Base.metadata` -- see :mod:`collapsarr.health` and
+the Alembic migration environment (:mod:`collapsarr.migrations`).
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from collapsarr.database import Base
 
 CHECK_STATUS_PASSING = "passing"
 CHECK_STATUS_FAILING = "failing"
+
+#: Fixed primary key of the single :class:`HealthWriteProbe` row -- mirrors
+#: :data:`collapsarr.settings.models.SETTINGS_ID`'s singleton-row idiom.
+WRITE_PROBE_ID = 1
 
 
 def _utcnow() -> datetime:
@@ -81,3 +90,33 @@ class HealthCheckState(Base):
             f"HealthCheckState(code={self.code!r}, instance_id={self.instance_id!r}, "
             f"status={self.status!r})"
         )
+
+
+class HealthWriteProbe(Base):
+    """The single row the database-unwritable check writes-and-commits to (COL-80).
+
+    Purely a probe target -- it carries no meaning of its own beyond "was a
+    write-and-commit against the configured database backend accepted just
+    now". Singleton, mirroring :class:`~collapsarr.settings.models.
+    GlobalSettings`'s ``id = <fixed id>`` check-constraint idiom: the row is
+    created once (the check's first-ever tick) and then updated -- never
+    re-inserted -- on every subsequent tick, so a live install exercises a
+    genuine ``UPDATE`` (not just an ``INSERT``) almost every time.
+
+    Deliberately its own table, not a column bolted onto ``HealthCheckState``
+    or ``global_settings`` -- the whole point of this probe is that it is
+    otherwise-unused, so a locked/read-only database is caught by the same
+    write path any real feature table would hit, without the probe itself
+    ever competing with real application data for the same row/table.
+    """
+
+    __tablename__ = "health_write_probe"
+    __table_args__ = (
+        CheckConstraint(f"id = {WRITE_PROBE_ID}", name="ck_health_write_probe_singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=WRITE_PROBE_ID)
+    pinged_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)
+
+    def __repr__(self) -> str:
+        return f"HealthWriteProbe(id={self.id!r}, pinged_at={self.pinged_at!r})"

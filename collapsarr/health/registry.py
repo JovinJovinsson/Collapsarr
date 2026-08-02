@@ -8,11 +8,11 @@ Key(s) it owns. A check may return several results (e.g. a per-instance check
 returns one per Arr instance).
 
 :func:`default_health_checks` is the single place the app assembles the
-registry. Each later ticket in Epic COL-74 (disk space, database-writable,
-failed-jobs) adds its check here; COL-75 shipped the migrated FFmpeg presence
-check, COL-77 added the no-Arr-instances-configured check, COL-78 added the
-per-instance Arr-unreachable connectivity check, and COL-79 adds the two-tier
-disk-space-low/critical check.
+registry. Each later ticket in Epic COL-74 (failed-jobs, ...) adds its check
+here; COL-75 shipped the migrated FFmpeg presence check, COL-77 added the
+no-Arr-instances-configured check, COL-78 added the per-instance
+Arr-unreachable connectivity check, COL-79 added the two-tier
+disk-space-low/critical check, and COL-80 adds the database-unwritable check.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import httpx
 from .arr_connectivity import ARR_CONNECTIVITY_CHECK_NAME, make_arr_connectivity_check_run
 from .arr_instances import ARR_INSTANCES_CHECK_NAME, run_arr_instances_check
 from .context import HealthCheckContext
+from .database_writable import DATABASE_WRITABLE_CHECK_NAME, run_database_writable_check
 from .disk_space import DISK_SPACE_CHECK_NAME, DiskUsage, make_disk_space_check_run
 from .ffmpeg import (
     FFMPEG_CHECK_NAME,
@@ -77,5 +78,9 @@ def default_health_checks(
         HealthCheck(
             name=DISK_SPACE_CHECK_NAME,
             run=make_disk_space_check_run(disk_usage),
+        ),
+        HealthCheck(
+            name=DATABASE_WRITABLE_CHECK_NAME,
+            run=run_database_writable_check,
         ),
     ]

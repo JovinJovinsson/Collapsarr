@@ -62,11 +62,11 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "disk_space_error_percent"),
 )
 
-#: Whole tables a post-baseline migration adds (currently just COL-75's
-#: ``health_check_state``) -- dropped after ``create_all`` for the same reason
-#: as ``_POST_BASELINE_COLUMNS``, so the migration that creates them does not
-#: collide with a table ``create_all`` already built.
-_POST_BASELINE_TABLES: tuple[str, ...] = ("health_check_state",)
+#: Whole tables a post-baseline migration adds (COL-75's ``health_check_state``,
+#: COL-80's ``health_write_probe``) -- dropped after ``create_all`` for the same
+#: reason as ``_POST_BASELINE_COLUMNS``, so the migration that creates them does
+#: not collide with a table ``create_all`` already built.
+_POST_BASELINE_TABLES: tuple[str, ...] = ("health_check_state", "health_write_probe")
 
 
 def _update_backups(settings: Settings) -> list[BackupInfo]:

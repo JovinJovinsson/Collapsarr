@@ -219,13 +219,14 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "disk_space_error_percent"),
 )
 
-#: Whole tables a *post-baseline* migration adds (currently just COL-75's
-#: ``health_check_state``). ``create_all`` below builds them from the live
-#: ``Base.metadata``, so they are dropped afterwards to de-evolve the stand-in
-#: back to a real pre-COL-75 create_all-era release -- exactly as
-#: :data:`POST_BASELINE_COLUMNS` does for later-added columns -- so the adoption
-#: delta (not create_all) is what creates them.
-POST_BASELINE_TABLES: tuple[str, ...] = ("health_check_state",)
+#: Whole tables a *post-baseline* migration adds (COL-75's
+#: ``health_check_state``, COL-80's ``health_write_probe``). ``create_all``
+#: below builds them from the live ``Base.metadata``, so they are dropped
+#: afterwards to de-evolve the stand-in back to a real pre-COL-75/pre-COL-80
+#: create_all-era release -- exactly as :data:`POST_BASELINE_COLUMNS` does for
+#: later-added columns -- so the adoption delta (not create_all) is what
+#: creates them.
+POST_BASELINE_TABLES: tuple[str, ...] = ("health_check_state", "health_write_probe")
 
 
 def _build_populated_unversioned_db(settings: Settings) -> None:

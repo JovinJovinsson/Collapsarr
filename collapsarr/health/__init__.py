@@ -31,6 +31,11 @@ Public surface, by concern:
   (:mod:`~collapsarr.health.disk_space`, COL-79): a two-tier (warning/error)
   free-space-percentage check against the data directory's filesystem, with
   live-configurable thresholds.
+- **The database-unwritable check** -- :func:`run_database_writable_check`
+  (:mod:`~collapsarr.health.database_writable`, COL-80): a live
+  write-and-commit probe against the dedicated :class:`HealthWriteProbe`
+  table, catching a database that has become unwritable (locking,
+  permissions, a read-only mount) regardless of the configured backend.
 """
 
 from __future__ import annotations
@@ -48,6 +53,12 @@ from .arr_instances import (
     run_arr_instances_check,
 )
 from .context import HealthCheckContext
+from .database_writable import (
+    DATABASE_UNWRITABLE_CODE,
+    DATABASE_WRITABLE_CATEGORY,
+    DATABASE_WRITABLE_CHECK_NAME,
+    run_database_writable_check,
+)
 from .disk_space import (
     DISK_SPACE_CATEGORY,
     DISK_SPACE_CHECK_NAME,
@@ -65,7 +76,13 @@ from .ffmpeg import (
     check_ffmpeg,
     make_ffmpeg_check_run,
 )
-from .models import CHECK_STATUS_FAILING, CHECK_STATUS_PASSING, HealthCheckState
+from .models import (
+    CHECK_STATUS_FAILING,
+    CHECK_STATUS_PASSING,
+    WRITE_PROBE_ID,
+    HealthCheckState,
+    HealthWriteProbe,
+)
 from .registry import HealthCheck, default_health_checks
 from .result import (
     SEVERITY_ERROR,
@@ -90,6 +107,9 @@ __all__ = [
     "ARR_UNREACHABLE_CODE",
     "CHECK_STATUS_FAILING",
     "CHECK_STATUS_PASSING",
+    "DATABASE_UNWRITABLE_CODE",
+    "DATABASE_WRITABLE_CATEGORY",
+    "DATABASE_WRITABLE_CHECK_NAME",
     "DISK_SPACE_CATEGORY",
     "DISK_SPACE_CHECK_NAME",
     "DISK_SPACE_ERROR_CODE",
@@ -103,6 +123,7 @@ __all__ = [
     "NO_ARR_INSTANCES_CODE",
     "SEVERITY_ERROR",
     "SEVERITY_WARNING",
+    "WRITE_PROBE_ID",
     "DiskUsage",
     "FfmpegCheckResult",
     "HealthCheck",
@@ -110,6 +131,7 @@ __all__ = [
     "HealthCheckResult",
     "HealthCheckScheduler",
     "HealthCheckState",
+    "HealthWriteProbe",
     "Severity",
     "check_ffmpeg",
     "default_health_checks",
@@ -121,4 +143,5 @@ __all__ = [
     "make_ffmpeg_check_run",
     "reconcile_health_results",
     "run_arr_instances_check",
+    "run_database_writable_check",
 ]

@@ -82,14 +82,15 @@ def test_lists_every_check_with_full_detail_and_mixed_severities(client: TestCli
     response = client.get("/api/system/health-checks", headers=headers)
     assert response.status_code == 200
     body = response.json()
-    # 7, not 3: the shared `client` fixture's app already ran its own startup
+    # 8, not 3: the shared `client` fixture's app already ran its own startup
     # tick (test_health_check.py, test_health_arr_instances.py,
-    # test_health_disk_space.py), persisting a passing FFmpeg row, a failing
-    # no-Arr-instances (COL-77) row, and a passing disk-space warning/error
-    # pair (COL-79, the fixture pins disk usage to 90% free) -- 4 rows, plus
+    # test_health_disk_space.py, test_health_database_writable.py), persisting
+    # a passing FFmpeg row, a failing no-Arr-instances (COL-77) row, a passing
+    # disk-space warning/error pair (COL-79, the fixture pins disk usage to
+    # 90% free), and a passing database-writable row (COL-80) -- 5 rows, plus
     # the 3 freshly-seeded ones above -- proving the endpoint lists *every*
     # check, seeded ones alongside it.
-    assert len(body) == 7
+    assert len(body) == 8
     assert "ffmpeg_missing" in {row["code"] for row in body}
 
     # Ordered by code then instance_id (service.list_health_check_states).
@@ -123,19 +124,22 @@ def test_lists_every_check_with_full_detail_and_mixed_severities(client: TestCli
 def test_returns_the_startup_ffmpeg_check_with_no_other_checks_seeded(client: TestClient) -> None:
     # The shared `client` fixture's app runs the real startup tick: FFmpeg is
     # expected present in dev/CI (see test_health_check.py), no Arr instances
-    # are configured (a fresh settings/database fixture), and the fixture
-    # pins disk usage to 90% free (COL-79) -- so exactly four rows are
-    # persisted before any test seeds anything else: a passing FFmpeg row, a
-    # failing no-Arr-instances (COL-77) row, and a passing disk-space
-    # warning/error pair (COL-79).
+    # are configured (a fresh settings/database fixture), the fixture pins
+    # disk usage to 90% free (COL-79), and the database-writable check
+    # (COL-80) always succeeds against the fixture's real, writable temp
+    # SQLite database -- so exactly five rows are persisted before any test
+    # seeds anything else: a passing FFmpeg row, a failing no-Arr-instances
+    # (COL-77) row, a passing disk-space warning/error pair (COL-79), and a
+    # passing database-writable row (COL-80).
     headers = _auth_headers(client)
     response = client.get("/api/system/health-checks", headers=headers)
     assert response.status_code == 200
     body = response.json()
     assert isinstance(body, list)
-    assert len(body) == 4
+    assert len(body) == 5
     by_code = {row["code"]: row for row in body}
     assert by_code["ffmpeg_missing"]["status"] == "passing"
     assert by_code["WARN-ARR-001"]["status"] == "failing"
     assert by_code["WARN-DISK-001"]["status"] == "passing"
     assert by_code["ERR-DISK-001"]["status"] == "passing"
+    assert by_code["ERR-DB-001"]["status"] == "passing"
