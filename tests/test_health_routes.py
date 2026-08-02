@@ -54,6 +54,10 @@ def test_lists_every_check_with_full_detail_and_mixed_severities(client: TestCli
     # "WARN-DISK-999" (not "WARN-DISK-001") for the synthetic disk-category
     # example so it doesn't collide with the real disk-space check's own Check
     # Code (COL-79, registered by default -- see the count comment below).
+    # "WARN-JOBS-001" *does* match the real failed-jobs check's own Check Code
+    # (COL-81, also registered by default) -- deliberately, to prove seeding a
+    # passing result for an already-persisted real check's Check Key updates
+    # that same row rather than adding a second one (see the count comment).
     _seed(
         client,
         [
@@ -82,14 +86,17 @@ def test_lists_every_check_with_full_detail_and_mixed_severities(client: TestCli
     response = client.get("/api/system/health-checks", headers=headers)
     assert response.status_code == 200
     body = response.json()
-    # 8, not 3: the shared `client` fixture's app already ran its own startup
-    # tick (test_health_check.py, test_health_arr_instances.py,
+    # 8, not 6 + 3: the shared `client` fixture's app already ran its own
+    # startup tick (test_health_check.py, test_health_arr_instances.py,
     # test_health_disk_space.py, test_health_database_writable.py), persisting
     # a passing FFmpeg row, a failing no-Arr-instances (COL-77) row, a passing
     # disk-space warning/error pair (COL-79, the fixture pins disk usage to
-    # 90% free), and a passing database-writable row (COL-80) -- 5 rows, plus
-    # the 3 freshly-seeded ones above -- proving the endpoint lists *every*
-    # check, seeded ones alongside it.
+    # 90% free), a passing database-writable row (COL-80), and a passing
+    # failed-jobs row (COL-81, a fresh job-history table has zero failures) --
+    # 6 rows. Seeding above adds ERR-CONN-001 and WARN-DISK-999 (2 genuinely
+    # new rows) and re-seeds WARN-JOBS-001 (updates the existing COL-81 row in
+    # place rather than adding a 7th) -- 8 total, proving the endpoint lists
+    # every check, seeded ones alongside the real ones.
     assert len(body) == 8
     assert "ffmpeg_missing" in {row["code"] for row in body}
 
@@ -125,21 +132,24 @@ def test_returns_the_startup_ffmpeg_check_with_no_other_checks_seeded(client: Te
     # The shared `client` fixture's app runs the real startup tick: FFmpeg is
     # expected present in dev/CI (see test_health_check.py), no Arr instances
     # are configured (a fresh settings/database fixture), the fixture pins
-    # disk usage to 90% free (COL-79), and the database-writable check
-    # (COL-80) always succeeds against the fixture's real, writable temp
-    # SQLite database -- so exactly five rows are persisted before any test
-    # seeds anything else: a passing FFmpeg row, a failing no-Arr-instances
-    # (COL-77) row, a passing disk-space warning/error pair (COL-79), and a
-    # passing database-writable row (COL-80).
+    # disk usage to 90% free (COL-79), the database-writable check (COL-80)
+    # always succeeds against the fixture's real, writable temp SQLite
+    # database, and the failed-jobs check (COL-81) always finds an empty,
+    # fresh job-history table -- so exactly six rows are persisted before any
+    # test seeds anything else: a passing FFmpeg row, a failing
+    # no-Arr-instances (COL-77) row, a passing disk-space warning/error pair
+    # (COL-79), a passing database-writable row (COL-80), and a passing
+    # failed-jobs row (COL-81).
     headers = _auth_headers(client)
     response = client.get("/api/system/health-checks", headers=headers)
     assert response.status_code == 200
     body = response.json()
     assert isinstance(body, list)
-    assert len(body) == 5
+    assert len(body) == 6
     by_code = {row["code"]: row for row in body}
     assert by_code["ffmpeg_missing"]["status"] == "passing"
     assert by_code["WARN-ARR-001"]["status"] == "failing"
     assert by_code["WARN-DISK-001"]["status"] == "passing"
     assert by_code["ERR-DISK-001"]["status"] == "passing"
     assert by_code["ERR-DB-001"]["status"] == "passing"
+    assert by_code["WARN-JOBS-001"]["status"] == "passing"

@@ -8,17 +8,19 @@ Key(s) it owns. A check may return several results (e.g. a per-instance check
 returns one per Arr instance).
 
 :func:`default_health_checks` is the single place the app assembles the
-registry. Each later ticket in Epic COL-74 (failed-jobs, ...) adds its check
-here; COL-75 shipped the migrated FFmpeg presence check, COL-77 added the
+registry. Each later ticket in Epic COL-74 adds its check here; COL-75
+shipped the migrated FFmpeg presence check, COL-77 added the
 no-Arr-instances-configured check, COL-78 added the per-instance
 Arr-unreachable connectivity check, COL-79 added the two-tier
-disk-space-low/critical check, and COL-80 adds the database-unwritable check.
+disk-space-low/critical check, COL-80 added the database-unwritable check,
+and COL-81 adds the failed-jobs-backing-up check.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 import httpx
 
@@ -27,6 +29,7 @@ from .arr_instances import ARR_INSTANCES_CHECK_NAME, run_arr_instances_check
 from .context import HealthCheckContext
 from .database_writable import DATABASE_WRITABLE_CHECK_NAME, run_database_writable_check
 from .disk_space import DISK_SPACE_CHECK_NAME, DiskUsage, make_disk_space_check_run
+from .failed_jobs import FAILED_JOBS_CHECK_NAME, make_failed_jobs_check_run
 from .ffmpeg import (
     FFMPEG_CHECK_NAME,
     FfmpegCheckResult,
@@ -49,6 +52,7 @@ def default_health_checks(
     *,
     arr_transport: httpx.BaseTransport | None = None,
     disk_usage: Callable[[str], DiskUsage] | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> list[HealthCheck]:
     """Build the registry of checks the scheduler runs each tick.
 
@@ -60,7 +64,9 @@ def default_health_checks(
     production leaves it ``None`` for a real network call). ``disk_usage``
     overrides the disk-space check's :func:`shutil.disk_usage` probe (tests
     inject a fake reading; production leaves it ``None`` for the real
-    filesystem).
+    filesystem). ``now`` overrides the failed-jobs check's clock (tests
+    inject a fixed one to place job-history rows precisely inside/outside its
+    rolling 24-hour window; production leaves it ``None`` for real UTC now).
     """
     return [
         HealthCheck(
@@ -82,5 +88,9 @@ def default_health_checks(
         HealthCheck(
             name=DATABASE_WRITABLE_CHECK_NAME,
             run=run_database_writable_check,
+        ),
+        HealthCheck(
+            name=FAILED_JOBS_CHECK_NAME,
+            run=make_failed_jobs_check_run(now),
         ),
     ]

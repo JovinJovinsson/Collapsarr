@@ -36,6 +36,11 @@ Public surface, by concern:
   write-and-commit probe against the dedicated :class:`HealthWriteProbe`
   table, catching a database that has become unwritable (locking,
   permissions, a read-only mount) regardless of the configured backend.
+- **The failed-jobs-backing-up check** -- :func:`make_failed_jobs_check_run`
+  (:mod:`~collapsarr.health.failed_jobs`, COL-81): warns when 5 or more
+  downmix jobs have reached ``FAILED`` in a rolling 24-hour window, read
+  straight from the existing :class:`~collapsarr.jobs.models.JobHistory`
+  table.
 """
 
 from __future__ import annotations
@@ -67,6 +72,15 @@ from .disk_space import (
     DiskUsage,
     free_space_percent,
     make_disk_space_check_run,
+)
+from .failed_jobs import (
+    FAILED_JOBS_BACKING_UP_CODE,
+    FAILED_JOBS_CATEGORY,
+    FAILED_JOBS_CHECK_NAME,
+    FAILURE_THRESHOLD,
+    ROLLING_WINDOW,
+    count_recent_failures,
+    make_failed_jobs_check_run,
 )
 from .ffmpeg import (
     FFMPEG_CATEGORY,
@@ -116,11 +130,16 @@ __all__ = [
     "DISK_SPACE_WARNING_CODE",
     "EVENT_HEALTH_CHECK_FAILED",
     "EVENT_HEALTH_CHECK_RECOVERED",
+    "FAILED_JOBS_BACKING_UP_CODE",
+    "FAILED_JOBS_CATEGORY",
+    "FAILED_JOBS_CHECK_NAME",
+    "FAILURE_THRESHOLD",
     "FFMPEG_CATEGORY",
     "FFMPEG_CHECK_NAME",
     "FFMPEG_MISSING_CODE",
     "INTERVAL_SECONDS",
     "NO_ARR_INSTANCES_CODE",
+    "ROLLING_WINDOW",
     "SEVERITY_ERROR",
     "SEVERITY_WARNING",
     "WRITE_PROBE_ID",
@@ -134,12 +153,14 @@ __all__ = [
     "HealthWriteProbe",
     "Severity",
     "check_ffmpeg",
+    "count_recent_failures",
     "default_health_checks",
     "free_space_percent",
     "list_failing_checks",
     "list_health_check_states",
     "make_arr_connectivity_check_run",
     "make_disk_space_check_run",
+    "make_failed_jobs_check_run",
     "make_ffmpeg_check_run",
     "reconcile_health_results",
     "run_arr_instances_check",
