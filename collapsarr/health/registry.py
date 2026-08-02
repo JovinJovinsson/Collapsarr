@@ -10,8 +10,9 @@ returns one per Arr instance).
 :func:`default_health_checks` is the single place the app assembles the
 registry. Each later ticket in Epic COL-74 (disk space, database-writable,
 failed-jobs) adds its check here; COL-75 shipped the migrated FFmpeg presence
-check, COL-77 added the no-Arr-instances-configured check, and COL-78 adds the
-per-instance Arr-unreachable connectivity check.
+check, COL-77 added the no-Arr-instances-configured check, COL-78 added the
+per-instance Arr-unreachable connectivity check, and COL-79 adds the two-tier
+disk-space-low/critical check.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import httpx
 from .arr_connectivity import ARR_CONNECTIVITY_CHECK_NAME, make_arr_connectivity_check_run
 from .arr_instances import ARR_INSTANCES_CHECK_NAME, run_arr_instances_check
 from .context import HealthCheckContext
+from .disk_space import DISK_SPACE_CHECK_NAME, DiskUsage, make_disk_space_check_run
 from .ffmpeg import (
     FFMPEG_CHECK_NAME,
     FfmpegCheckResult,
@@ -45,6 +47,7 @@ def default_health_checks(
     ffmpeg_checker: Callable[[], FfmpegCheckResult] | None = None,
     *,
     arr_transport: httpx.BaseTransport | None = None,
+    disk_usage: Callable[[str], DiskUsage] | None = None,
 ) -> list[HealthCheck]:
     """Build the registry of checks the scheduler runs each tick.
 
@@ -53,7 +56,10 @@ def default_health_checks(
     simulate a present/missing FFmpeg without touching the real binary.
     ``arr_transport`` is forwarded to every Arr-connectivity probe the
     per-instance check makes (tests inject an ``httpx.MockTransport``;
-    production leaves it ``None`` for a real network call).
+    production leaves it ``None`` for a real network call). ``disk_usage``
+    overrides the disk-space check's :func:`shutil.disk_usage` probe (tests
+    inject a fake reading; production leaves it ``None`` for the real
+    filesystem).
     """
     return [
         HealthCheck(
@@ -67,5 +73,9 @@ def default_health_checks(
         HealthCheck(
             name=ARR_CONNECTIVITY_CHECK_NAME,
             run=make_arr_connectivity_check_run(arr_transport),
+        ),
+        HealthCheck(
+            name=DISK_SPACE_CHECK_NAME,
+            run=make_disk_space_check_run(disk_usage),
         ),
     ]

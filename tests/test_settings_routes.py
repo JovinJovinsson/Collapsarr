@@ -42,6 +42,8 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["auth_required"] == "local_bypass"  # COL-51 default
     assert body["backup_interval_days"] == 7  # COL-66 default
     assert body["backup_retention_days"] == 28  # COL-66 default
+    assert body["disk_space_warning_percent"] == 5.0  # COL-79 default
+    assert body["disk_space_error_percent"] == 2.0  # COL-79 default
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -203,6 +205,66 @@ def test_put_settings_rejects_a_negative_backup_retention(client: TestClient) ->
     response = client.put(
         "/api/settings",
         json={"backup_retention_days": -1},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+# --- disk-space thresholds (COL-79) --------------------------------------------
+
+
+def test_put_settings_updates_disk_space_thresholds(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"disk_space_warning_percent": 10.0, "disk_space_error_percent": 3.0},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["disk_space_warning_percent"] == 10.0
+    assert body["disk_space_error_percent"] == 3.0
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["disk_space_warning_percent"] == 10.0
+    assert follow_up.json()["disk_space_error_percent"] == 3.0
+
+
+def test_put_settings_leaves_disk_space_thresholds_untouched_when_omitted(
+    client: TestClient,
+) -> None:
+    client.put(
+        "/api/settings",
+        json={"disk_space_warning_percent": 8.0, "disk_space_error_percent": 4.0},
+        headers=_auth_headers(client),
+    )
+
+    client.put(
+        "/api/settings",
+        json={"concurrency_limit": 3},
+        headers=_auth_headers(client),
+    )
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["disk_space_warning_percent"] == 8.0
+    assert body["disk_space_error_percent"] == 4.0
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_rejects_a_zero_disk_space_warning_percent(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"disk_space_warning_percent": 0},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+def test_put_settings_rejects_a_disk_space_error_percent_above_100(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"disk_space_error_percent": 101},
         headers=_auth_headers(client),
     )
     assert response.status_code == 422

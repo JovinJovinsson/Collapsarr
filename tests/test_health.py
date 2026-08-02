@@ -10,7 +10,8 @@ fire any pass->fail notification deterministically, without a background thread.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import NamedTuple
 
 import httpx
 import pytest
@@ -22,7 +23,7 @@ from collapsarr.arr.models import InstanceType
 from collapsarr.arr.service import create_instance
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
-from collapsarr.health import FfmpegCheckResult
+from collapsarr.health import DiskUsage, FfmpegCheckResult
 from collapsarr.main import create_app
 from collapsarr.migrations import upgrade_to_head
 from collapsarr.notify.service import update_notifier_config
@@ -31,6 +32,28 @@ from collapsarr.notify.service import update_notifier_config
 def _arr_ok_transport() -> httpx.MockTransport:
     """A transport reporting any Arr instance as reachable."""
     return httpx.MockTransport(lambda request: httpx.Response(200, json={"version": "4.0.0"}))
+
+
+class _FakeUsage(NamedTuple):
+    total: int
+    used: int
+    free: int
+
+
+def _ample_free_space() -> Callable[[str], DiskUsage]:
+    """A disk-usage probe reporting 90% free -- well clear of the disk-space
+    check's (COL-79) default 5%/2% thresholds.
+
+    The disk-space check is now registered by default, so a completely fresh
+    app -- as every isolated ``settings`` fixture starts out -- would
+    otherwise reflect *this host's real, possibly near-full* disk, adding its
+    own warning/notification on top of whatever these ffmpeg-focused tests
+    are asserting (mirrors ``_seed_arr_instance``'s rationale for COL-77/78
+    above). Every ``create_app(...)`` call below passes this so their
+    assertions stay scoped to ffmpeg alone.
+    """
+    usage = _FakeUsage(total=1000, used=100, free=900)
+    return lambda _path: usage
 
 
 def _seed_arr_instance(settings: Settings) -> None:
@@ -79,7 +102,9 @@ def test_health_returns_ok(settings: Settings) -> None:
     startup tick runs.
     """
     _seed_arr_instance(settings)
-    app = create_app(settings=settings, arr_transport=_arr_ok_transport())
+    app = create_app(
+        settings=settings, arr_transport=_arr_ok_transport(), disk_usage=_ample_free_space()
+    )
     with TestClient(app) as test_client:
         response = test_client.get("/health")
 
@@ -115,7 +140,10 @@ def client_with_ffmpeg(settings: Settings) -> Iterator[TestClient]:
         available=True, ffmpeg_path="ffmpeg", detail="FFmpeg found at '/usr/bin/ffmpeg'."
     )
     app = create_app(
-        settings=settings, ffmpeg_checker=lambda: check, arr_transport=_arr_ok_transport()
+        settings=settings,
+        ffmpeg_checker=lambda: check,
+        arr_transport=_arr_ok_transport(),
+        disk_usage=_ample_free_space(),
     )
     with TestClient(app) as test_client:
         yield test_client
@@ -136,7 +164,10 @@ def client_without_ffmpeg(settings: Settings) -> Iterator[TestClient]:
         detail="FFmpeg executable 'ffmpeg' was not found on PATH.",
     )
     app = create_app(
-        settings=settings, ffmpeg_checker=lambda: check, arr_transport=_arr_ok_transport()
+        settings=settings,
+        ffmpeg_checker=lambda: check,
+        arr_transport=_arr_ok_transport(),
+        disk_usage=_ample_free_space(),
     )
     with TestClient(app) as test_client:
         yield test_client
@@ -204,6 +235,7 @@ def test_health_reflects_the_check_synchronously_at_startup_with_the_scheduler_e
         ffmpeg_checker=lambda: missing_check,
         enable_scheduler=True,
         arr_transport=_arr_ok_transport(),
+        disk_usage=_ample_free_space(),
     )
 
     with TestClient(app) as test_client:  # entering the context runs the lifespan
@@ -267,6 +299,7 @@ def test_app_startup_dispatches_a_notification_when_ffmpeg_is_missing_and_a_noti
         ffmpeg_checker=lambda: missing_check,
         notify_transport=httpx.MockTransport(handler),
         arr_transport=_arr_ok_transport(),
+        disk_usage=_ample_free_space(),
     )
 
     with TestClient(app):  # entering the context runs the lifespan/startup
@@ -326,6 +359,7 @@ def test_app_startup_makes_no_network_call_when_ffmpeg_is_present_even_with_a_no
         ffmpeg_checker=lambda: present_check,
         notify_transport=httpx.MockTransport(handler),
         arr_transport=_arr_ok_transport(),
+        disk_usage=_ample_free_space(),
     )
 
     with TestClient(app):

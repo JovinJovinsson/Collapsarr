@@ -204,17 +204,19 @@ def test_already_versioned_database_runs_only_pending_deltas(settings: Settings)
 # --------------------------------------------------------------------------- #
 # Stamp adoption + index heal
 # --------------------------------------------------------------------------- #
-#: Columns a *post-baseline* migration adds (currently just COL-66's backup
-#: schedule knobs). ``create_all`` below always builds the table from the
-#: live ``Base.metadata`` -- i.e. with these columns already present -- so
-#: they are dropped by raw DDL afterwards to de-evolve the stand-in back to
-#: what a real pre-COL-66 create_all-era release actually had on disk. This
-#: mirrors the ``DROP INDEX`` idiom just below for the same reason: the
-#: unversioned DB this function fabricates predates every post-baseline
-#: delta, not just the index-reconcile one.
+#: Columns a *post-baseline* migration adds (COL-66's backup schedule knobs,
+#: COL-79's disk-space thresholds). ``create_all`` below always builds the
+#: table from the live ``Base.metadata`` -- i.e. with these columns already
+#: present -- so they are dropped by raw DDL afterwards to de-evolve the
+#: stand-in back to what a real pre-COL-66/pre-COL-79 create_all-era release
+#: actually had on disk. This mirrors the ``DROP INDEX`` idiom just below for
+#: the same reason: the unversioned DB this function fabricates predates
+#: every post-baseline delta, not just the index-reconcile one.
 POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_interval_days"),
     ("global_settings", "backup_retention_days"),
+    ("global_settings", "disk_space_warning_percent"),
+    ("global_settings", "disk_space_error_percent"),
 )
 
 #: Whole tables a *post-baseline* migration adds (currently just COL-75's

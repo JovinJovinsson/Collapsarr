@@ -33,6 +33,8 @@ const sampleSettings: GlobalSettings = {
   auth_method: "forms",
   backup_interval_days: 7,
   backup_retention_days: 28,
+  disk_space_warning_percent: 5,
+  disk_space_error_percent: 2,
   api_key: "abc123",
   created_at: "2026-07-27T00:00:00Z",
   updated_at: "2026-07-27T00:00:00Z",

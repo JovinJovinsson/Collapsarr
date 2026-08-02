@@ -27,6 +27,10 @@ Public surface, by concern:
 - **The Arr-unreachable check** -- :func:`make_arr_connectivity_check_run`
   (:mod:`~collapsarr.health.arr_connectivity`, COL-78): a live, per-instance
   reachability probe against every configured Arr instance.
+- **The disk-space check** -- :func:`make_disk_space_check_run`
+  (:mod:`~collapsarr.health.disk_space`, COL-79): a two-tier (warning/error)
+  free-space-percentage check against the data directory's filesystem, with
+  live-configurable thresholds.
 """
 
 from __future__ import annotations
@@ -44,6 +48,15 @@ from .arr_instances import (
     run_arr_instances_check,
 )
 from .context import HealthCheckContext
+from .disk_space import (
+    DISK_SPACE_CATEGORY,
+    DISK_SPACE_CHECK_NAME,
+    DISK_SPACE_ERROR_CODE,
+    DISK_SPACE_WARNING_CODE,
+    DiskUsage,
+    free_space_percent,
+    make_disk_space_check_run,
+)
 from .ffmpeg import (
     FFMPEG_CATEGORY,
     FFMPEG_CHECK_NAME,
@@ -77,6 +90,10 @@ __all__ = [
     "ARR_UNREACHABLE_CODE",
     "CHECK_STATUS_FAILING",
     "CHECK_STATUS_PASSING",
+    "DISK_SPACE_CATEGORY",
+    "DISK_SPACE_CHECK_NAME",
+    "DISK_SPACE_ERROR_CODE",
+    "DISK_SPACE_WARNING_CODE",
     "EVENT_HEALTH_CHECK_FAILED",
     "EVENT_HEALTH_CHECK_RECOVERED",
     "FFMPEG_CATEGORY",
@@ -86,6 +103,7 @@ __all__ = [
     "NO_ARR_INSTANCES_CODE",
     "SEVERITY_ERROR",
     "SEVERITY_WARNING",
+    "DiskUsage",
     "FfmpegCheckResult",
     "HealthCheck",
     "HealthCheckContext",
@@ -95,9 +113,11 @@ __all__ = [
     "Severity",
     "check_ffmpeg",
     "default_health_checks",
+    "free_space_percent",
     "list_failing_checks",
     "list_health_check_states",
     "make_arr_connectivity_check_run",
+    "make_disk_space_check_run",
     "make_ffmpeg_check_run",
     "reconcile_health_results",
     "run_arr_instances_check",

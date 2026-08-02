@@ -119,6 +119,8 @@ def update_global_settings(
     auth_required: str | None = None,
     backup_interval_days: int | None = None,
     backup_retention_days: int | None = None,
+    disk_space_warning_percent: float | None = None,
+    disk_space_error_percent: float | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -142,6 +144,11 @@ def update_global_settings(
     here -- there is no clear-to-default sentinel since both always hold a
     positive integer (the DB-side ``server_default`` only matters for
     pre-existing rows predating the columns, not for updates).
+
+    ``disk_space_warning_percent``/``disk_space_error_percent`` (COL-79)
+    follow the same rule as the backup pair above. The health check
+    (:mod:`collapsarr.health.disk_space`) reads them straight off this row on
+    every tick, so a change here is live on the *next* tick with no restart.
     """
     settings = get_global_settings(session)
 
@@ -173,6 +180,10 @@ def update_global_settings(
         settings.backup_interval_days = backup_interval_days
     if backup_retention_days is not None:
         settings.backup_retention_days = backup_retention_days
+    if disk_space_warning_percent is not None:
+        settings.disk_space_warning_percent = disk_space_warning_percent
+    if disk_space_error_percent is not None:
+        settings.disk_space_error_percent = disk_space_error_percent
 
     session.commit()
     session.refresh(settings)

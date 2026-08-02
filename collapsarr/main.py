@@ -36,6 +36,7 @@ from .database import (
 )
 from .frontend import mount_frontend
 from .health import (
+    DiskUsage,
     FfmpegCheckResult,
     HealthCheckScheduler,
     default_health_checks,
@@ -62,6 +63,7 @@ def create_app(
     ffmpeg_checker: Callable[[], FfmpegCheckResult] | None = None,
     notify_transport: httpx.BaseTransport | None = None,
     arr_transport: httpx.BaseTransport | None = None,
+    disk_usage: Callable[[str], DiskUsage] | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -90,7 +92,11 @@ def create_app(
     per-instance unreachable check makes, letting tests simulate
     reachable/unreachable instances without a real network call; production
     leaves it ``None`` for a real connectivity check against each configured
-    instance.
+    instance. ``disk_usage`` (COL-79) overrides the disk-space check's
+    :func:`shutil.disk_usage` probe, letting tests simulate an arbitrary
+    free-space percentage without depending on the real filesystem's current
+    usage; production leaves it ``None`` for a real reading against
+    ``settings.data_dir``.
     """
     resolved_settings = settings or get_settings()
 
@@ -163,7 +169,9 @@ def create_app(
         # (run_immediately=False, so it does not redundantly re-tick right away);
         # with it disabled (tests, one-shot use) the single synchronous tick above
         # is all that runs.
-        checks = default_health_checks(ffmpeg_checker, arr_transport=arr_transport)
+        checks = default_health_checks(
+            ffmpeg_checker, arr_transport=arr_transport, disk_usage=disk_usage
+        )
         health_scheduler = HealthCheckScheduler(
             resolved_settings, session_factory, checks, transport=notify_transport
         )

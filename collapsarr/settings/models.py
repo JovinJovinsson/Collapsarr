@@ -28,7 +28,7 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, CheckConstraint, Integer, String, text
+from sqlalchemy import Boolean, CheckConstraint, Float, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from collapsarr.database import Base
@@ -59,6 +59,20 @@ scheduler landing in COL-67 -- this ticket only persists the knob."""
 DEFAULT_BACKUP_RETENTION_DAYS = 28
 """Default days a backup is kept before pruning (COL-66). Consumed by the
 retention pruning landing in COL-68 -- this ticket only persists the knob."""
+
+DEFAULT_DISK_SPACE_WARNING_PERCENT = 5.0
+"""Default free-space percentage below which the disk-space health check
+(COL-79) reports a warning (``WARN-DISK-001``). Consumed live -- on every
+check tick, not just at process start -- by
+:func:`collapsarr.health.disk_space.make_disk_space_check_run`."""
+
+DEFAULT_DISK_SPACE_ERROR_PERCENT = 2.0
+"""Default free-space percentage below which the disk-space health check
+(COL-79) escalates to an error (``ERR-DISK-001``). Deliberately lower than
+:data:`DEFAULT_DISK_SPACE_WARNING_PERCENT` so the error tier is strictly
+worse than the warning tier by default, but the two fields are validated and
+stored independently -- see
+:func:`collapsarr.settings.service.update_global_settings`."""
 
 
 def generate_api_key() -> str:
@@ -135,6 +149,18 @@ class GlobalSettings(Base):
     DB-side ``server_default``\\ s (matching ``auth_method``/``auth_required``
     above) so the additive migration backfills existing installs with the
     documented defaults (7 / 28 days) rather than leaving them ``NULL``.
+
+    ``disk_space_warning_percent``/``disk_space_error_percent`` (COL-79) are
+    the two free-space-percentage thresholds
+    :func:`collapsarr.health.disk_space.make_disk_space_check_run` reads --
+    live, from this row, on every scheduler tick, so editing them via Settings
+    takes effect on the next tick without a restart. Same
+    additive-with-``server_default`` treatment as the backup columns above.
+    The two are stored and validated independently (see
+    :func:`collapsarr.settings.service.update_global_settings`); there is no
+    DB-level constraint forcing the error threshold below the warning
+    threshold, matching how ``backup_interval_days``/``backup_retention_days``
+    also carry no cross-field constraint.
     """
 
     __tablename__ = "global_settings"
@@ -188,6 +214,19 @@ class GlobalSettings(Base):
         nullable=False,
         default=DEFAULT_BACKUP_RETENTION_DAYS,
         server_default=text(str(DEFAULT_BACKUP_RETENTION_DAYS)),
+    )
+
+    disk_space_warning_percent: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=DEFAULT_DISK_SPACE_WARNING_PERCENT,
+        server_default=text(str(DEFAULT_DISK_SPACE_WARNING_PERCENT)),
+    )
+    disk_space_error_percent: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=DEFAULT_DISK_SPACE_ERROR_PERCENT,
+        server_default=text(str(DEFAULT_DISK_SPACE_ERROR_PERCENT)),
     )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
