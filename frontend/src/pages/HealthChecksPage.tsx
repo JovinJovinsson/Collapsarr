@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 
-import { dismissHealthCheck, fetchHealthChecks, undismissHealthCheck } from "../api/health";
+import {
+  dismissHealthCheck,
+  fetchHealthChecks,
+  recheckHealthChecks,
+  undismissHealthCheck,
+} from "../api/health";
 import { ErrorIcon, HealthIcon, WarningIcon } from "../components/icons";
 import type { HealthCheckState, HealthSeverity, HealthCheckStatus } from "../types/health";
 
@@ -53,13 +58,23 @@ type LoadState =
  * app-wide banner hides a dismissed check) and reloads the list so the badge
  * reflects the server's state; "Dismiss" is only offered while a row is
  * failing (the server would otherwise refuse with `409`), and "Undismiss"
- * only once it's dismissed. A manual recheck action (COL-83) is still out of
- * scope for this page.
+ * only once it's dismissed.
+ *
+ * COL-83 adds a page-level "Recheck now" action, calling
+ * `POST /api/system/health-checks/recheck` (`recheckHealthChecks`,
+ * `api/health.ts`), which runs every registered check immediately
+ * server-side (a genuine extra tick -- it does not restart or reset the
+ * background scheduler's own periodic cadence). Unlike the per-row
+ * dismiss/undismiss actions, the recheck response already carries every
+ * check's fresh full state, so it's applied straight to this page's state
+ * instead of triggering a second `fetchHealthChecks` round-trip -- still no
+ * full page reload, updated results appear as soon as the request resolves.
  */
 export function HealthChecksPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingId, setPendingId] = useState<number | null>(null);
+  const [rechecking, setRechecking] = useState(false);
 
   async function load() {
     try {
@@ -120,14 +135,39 @@ export function HealthChecksPage() {
     }
   }
 
+  async function handleRecheck() {
+    setRechecking(true);
+    setActionError(null);
+    try {
+      const checks = await recheckHealthChecks();
+      setState({ status: "ready", checks });
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : "Failed to run a manual recheck.");
+    } finally {
+      setRechecking(false);
+    }
+  }
+
   return (
     <section className="view">
-      <header className="view__header">
-        <h1 className="view__title">Health</h1>
-        <p className="view__summary">
-          Every registered health check and its current state — FFmpeg availability, connectivity,
-          and any others the app monitors.
-        </p>
+      <header className="view__header view__header--row">
+        <div>
+          <h1 className="view__title">Health</h1>
+          <p className="view__summary">
+            Every registered health check and its current state — FFmpeg availability, connectivity,
+            and any others the app monitors.
+          </p>
+        </div>
+        <div className="view__actions">
+          <button
+            type="button"
+            className="btn btn--primary"
+            onClick={handleRecheck}
+            disabled={rechecking}
+          >
+            {rechecking ? "Rechecking…" : "Recheck now"}
+          </button>
+        </div>
       </header>
 
       {actionError && <p className="view__error">{actionError}</p>}

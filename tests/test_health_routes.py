@@ -1,4 +1,4 @@
-"""Contract tests for the health-check detail REST endpoints (COL-76, COL-82).
+"""Contract tests for the health-check detail REST endpoints (COL-76, COL-82, COL-83).
 
 Covers ``GET /api/system/health-checks``: the API-gate behaviour (401 without
 a key/session), the full per-row shape (code, category, severity, status,
@@ -11,19 +11,56 @@ actions: success shape, the auth gate, the 404 (unknown id) and 409 (not
 currently failing) refusals, and that a dismiss actually removes the row from
 the unauthenticated ``/health`` banner while it stays visible -- marked
 dismissed -- on this authenticated list endpoint.
+
+Also covers the COL-83 ``POST .../recheck`` action: the auth gate, that it
+runs every registered check immediately and returns the resulting full state,
+that a manual recheck updates persisted state and fires the same
+edge-triggered pass<->fail notification a scheduled tick would (reusing
+``reconcile_health_results``'s existing transition-detection path -- no
+separate notification mechanism), and that it never disturbs the background
+scheduler's own periodic thread/timer.
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import NamedTuple
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from collapsarr.health import SEVERITY_ERROR, SEVERITY_WARNING, HealthCheckResult
+from collapsarr.config import Settings
+from collapsarr.health import (
+    SEVERITY_ERROR,
+    SEVERITY_WARNING,
+    DiskUsage,
+    FfmpegCheckResult,
+    HealthCheckResult,
+)
 from collapsarr.health.service import reconcile_health_results
+from collapsarr.main import create_app
+from collapsarr.notify.service import update_notifier_config
 from collapsarr.settings.service import get_global_settings
+
+
+class _FakeUsage(NamedTuple):
+    total: int
+    used: int
+    free: int
+
+
+def _ample_free_space() -> Callable[[str], DiskUsage]:
+    """A disk-usage probe reporting 90% free (mirrors ``test_health.py``'s
+    helper of the same name) -- keeps the COL-83 tests below, which build
+    their own ``create_app`` to control the FFmpeg checker, from also
+    reflecting this host's real disk-space reading.
+    """
+    usage = _FakeUsage(total=1000, used=100, free=900)
+    return lambda _path: usage
 
 
 def _auth_headers(client: TestClient) -> dict[str, str]:
@@ -261,3 +298,131 @@ def test_undismiss_restores_the_check_to_the_health_banner(client: TestClient) -
     assert response.json()["dismissed_at"] is None
     health = client.get("/health").json()
     assert "ERR-DISMISS-RESTORE" in {w["code"] for w in health["warnings"]}
+
+
+# --------------------------------------------------------------------------- #
+# COL-83: manual recheck
+# --------------------------------------------------------------------------- #
+
+
+class _ToggleFfmpegChecker:
+    """A controllable ``ffmpeg_checker`` so a recheck can flip pass<->fail
+    deterministically, without touching the real ``ffmpeg`` binary."""
+
+    def __init__(self, *, available: bool) -> None:
+        self.available = available
+
+    def __call__(self) -> FfmpegCheckResult:
+        if self.available:
+            return FfmpegCheckResult(
+                available=True, ffmpeg_path="ffmpeg", detail="FFmpeg found at '/usr/bin/ffmpeg'."
+            )
+        return FfmpegCheckResult(
+            available=False,
+            ffmpeg_path="ffmpeg",
+            detail="FFmpeg executable 'ffmpeg' was not found.",
+        )
+
+
+def _capture_transport() -> tuple[httpx.MockTransport, list[httpx.Request]]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    return httpx.MockTransport(handler), seen
+
+
+def test_recheck_endpoint_requires_authentication(client: TestClient) -> None:
+    assert client.post("/api/system/health-checks/recheck").status_code == 401
+
+
+def test_recheck_runs_every_check_immediately_and_returns_the_full_state(
+    settings: Settings,
+) -> None:
+    checker = _ToggleFfmpegChecker(available=True)
+    app = create_app(settings=settings, disk_usage=_ample_free_space(), ffmpeg_checker=checker)
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+
+        response = test_client.post("/api/system/health-checks/recheck", headers=headers)
+
+        assert response.status_code == 200
+        body = response.json()
+        # Same six default-registered checks the app's own startup tick
+        # persists (see test_returns_the_startup_ffmpeg_check_with_no_other_
+        # checks_seeded above) -- proves this is a real, full tick, not a
+        # stub.
+        assert len(body) == 6
+        by_code = {row["code"]: row for row in body}
+        assert by_code["ffmpeg_missing"]["status"] == "passing"
+
+        # And it's live, not cached: GET reflects the same, freshly persisted rows.
+        listed = test_client.get("/api/system/health-checks", headers=headers).json()
+        assert {row["code"] for row in listed} == set(by_code)
+
+
+def test_recheck_updates_persisted_state_and_fires_notification_on_change(
+    settings: Settings,
+) -> None:
+    checker = _ToggleFfmpegChecker(available=True)
+    transport, seen = _capture_transport()
+    app = create_app(
+        settings=settings,
+        disk_usage=_ample_free_space(),
+        ffmpeg_checker=checker,
+        notify_transport=transport,
+    )
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+        with app.state.session_factory() as session:
+            update_notifier_config(
+                session, webhook_url="https://example.com/hook", webhook_enabled=True
+            )
+
+        # The startup tick already ran with FFmpeg "present" -> a passing row,
+        # no notification. Flip the checker so this recheck sees a genuine
+        # pass -> fail transition.
+        checker.available = False
+
+        response = test_client.post("/api/system/health-checks/recheck", headers=headers)
+
+        assert response.status_code == 200
+        row = next(r for r in response.json() if r["code"] == "ffmpeg_missing")
+        assert row["status"] == "failing"
+        assert row["first_failed_at"] is not None
+
+        # Edge-triggered: exactly one notification for the pass -> fail
+        # transition, dispatched through reconcile_health_results' existing
+        # transition-detection path (COL-75) -- no separate notification
+        # mechanism for a manual recheck.
+        assert len(seen) == 1
+        payload = json.loads(seen[0].content)
+        assert payload["event_type"] == "health_check_failed"
+        assert payload["details"]["code"] == "ffmpeg_missing"
+
+        # A second recheck with nothing changed: still failing, but no new
+        # notification (edge-, not level-triggered).
+        second = test_client.post("/api/system/health-checks/recheck", headers=headers)
+        assert second.status_code == 200
+        assert len(seen) == 1
+
+
+def test_recheck_does_not_disrupt_the_background_scheduler(settings: Settings) -> None:
+    """A manual recheck is an extra, out-of-band tick, not a scheduler restart:
+    it must not touch the periodic background thread or reset its timer."""
+    app = create_app(settings=settings, disk_usage=_ample_free_space(), enable_scheduler=True)
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+        scheduler = app.state.health_scheduler
+        thread_before = scheduler._thread
+
+        response = test_client.post("/api/system/health-checks/recheck", headers=headers)
+
+        assert response.status_code == 200
+        # Same thread object, still alive and running -- the recheck never
+        # touched the loop's `_thread` / `_stop` event.
+        assert scheduler._thread is thread_before
+        assert scheduler._thread is not None
+        assert scheduler._thread.is_alive()

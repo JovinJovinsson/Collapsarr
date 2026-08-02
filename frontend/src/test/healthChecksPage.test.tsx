@@ -211,4 +211,57 @@ describe("HealthChecksPage", () => {
       expect(screen.getByText(/not currently failing/i)).toBeInTheDocument()
     );
   });
+
+  // --------------------------------------------------------------------- //
+  // COL-83: manual recheck
+  // --------------------------------------------------------------------- //
+
+  it("shows a Recheck now button that reflects updated results without a full page reload", async () => {
+    const recheckedCheck: HealthCheckState = {
+      ...errorCheck,
+      status: "passing",
+      message: "Sonarr instance reachable.",
+      first_failed_at: null,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse([errorCheck]))
+      .mockResolvedValueOnce(jsonResponse([recheckedCheck]));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<HealthChecksPage />);
+
+    await waitFor(() => expect(screen.getByText("ERR-CONN-001")).toBeInTheDocument());
+    const row = screen.getByText("ERR-CONN-001").closest("tr") as HTMLElement;
+    expect(within(row).getByText("Failing")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Recheck now" }));
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/system/health-checks/recheck",
+      expect.objectContaining({ method: "POST" })
+    );
+    await waitFor(() =>
+      expect(within(row).getByText("Passing")).toBeInTheDocument()
+    );
+    // Exactly the recheck round-trip -- no extra GET afterwards, since the
+    // recheck response already carries the full, fresh state.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows an error banner when a recheck fails", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse([errorCheck]))
+      .mockResolvedValueOnce(jsonResponse({ detail: "scheduler unavailable" }, 503));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<HealthChecksPage />);
+
+    await waitFor(() => expect(screen.getByText("ERR-CONN-001")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Recheck now" }));
+
+    await waitFor(() => expect(screen.getByText(/scheduler unavailable/i)).toBeInTheDocument());
+    // The stale list is left in place -- a failed recheck doesn't wipe it out.
+    expect(screen.getByText("ERR-CONN-001")).toBeInTheDocument();
+  });
 });

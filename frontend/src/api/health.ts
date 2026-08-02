@@ -69,3 +69,23 @@ export async function undismissHealthCheck(
   }
   return (await response.json()) as HealthCheckState;
 }
+
+/**
+ * Runs every registered health check immediately
+ * (`POST /api/system/health-checks/recheck`, COL-83) and returns the
+ * resulting full state -- the same shape `fetchHealthChecks` returns.
+ * Triggers a real, out-of-band tick on the server (not a scheduler restart),
+ * so a check that actually changed fires the usual edge-triggered
+ * notification server-side; this call just surfaces the fresh result.
+ */
+export async function recheckHealthChecks(): Promise<HealthCheckState[]> {
+  const response = await apiFetch("/api/system/health-checks/recheck", {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to run a manual recheck (${response.status})`)
+    );
+  }
+  return (await response.json()) as HealthCheckState[];
+}
