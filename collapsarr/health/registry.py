@@ -9,8 +9,9 @@ returns one per Arr instance).
 
 :func:`default_health_checks` is the single place the app assembles the
 registry. Each later ticket in Epic COL-74 (no-instances, Arr-unreachable, disk
-space, database-writable, failed-jobs) adds its check here; this ticket ships
-just the migrated FFmpeg presence check.
+space, database-writable, failed-jobs) adds its check here; COL-75 shipped the
+migrated FFmpeg presence check and COL-77 adds the no-Arr-instances-configured
+check.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from .arr_instances import ARR_INSTANCES_CHECK_NAME, run_arr_instances_check
 from .context import HealthCheckContext
 from .ffmpeg import (
     FFMPEG_CHECK_NAME,
@@ -49,5 +51,9 @@ def default_health_checks(
         HealthCheck(
             name=FFMPEG_CHECK_NAME,
             run=make_ffmpeg_check_run(ffmpeg_checker or check_ffmpeg),
+        ),
+        HealthCheck(
+            name=ARR_INSTANCES_CHECK_NAME,
+            run=run_arr_instances_check,
         ),
     ]

@@ -18,6 +18,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from collapsarr import __version__
+from collapsarr.arr.models import InstanceType
+from collapsarr.arr.service import create_instance
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.health import FfmpegCheckResult
@@ -26,15 +28,49 @@ from collapsarr.migrations import upgrade_to_head
 from collapsarr.notify.service import update_notifier_config
 
 
-def test_health_returns_ok(client: TestClient) -> None:
+def _seed_arr_instance(settings: Settings) -> None:
+    """Pre-configure one Arr instance against ``settings``' database.
+
+    The no-Arr-instances-configured check (COL-77) is now registered by
+    default, so a completely fresh database -- as every isolated ``settings``
+    fixture starts out -- would otherwise add its own warning/notification on
+    top of whatever these ffmpeg-focused tests are asserting. Seeding one
+    instance up front keeps those assertions scoped to ffmpeg alone, matching
+    their original intent from COL-75.
+    """
+    engine = create_engine_from_settings(settings)
+    upgrade_to_head(settings)
+    session_factory = create_session_factory(engine)
+    with session_factory() as setup_session:
+        create_instance(
+            setup_session,
+            name="Seed Sonarr",
+            instance_type=InstanceType.SONARR,
+            base_url="http://sonarr.local:8989",
+            api_key="seed-api-key",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"version": "4.0.0"})
+            ),
+        )
+    engine.dispose()
+
+
+def test_health_returns_ok(settings: Settings) -> None:
     """GET /health returns 200 with a JSON status payload.
 
     The real ``ffmpeg`` binary is expected to be present in the dev/CI
     environment (the downmix pipeline's own tests already rely on this, e.g.
-    ``tests/test_downmix_remux.py``), so the default ``client`` fixture's
-    startup check should find it and report "ok" with no warnings.
+    ``tests/test_downmix_remux.py``), so a freshly built app's startup check
+    should find it and report "ok" with no warnings. One Arr instance is
+    seeded first so the no-Arr-instances check (COL-77) doesn't add its own
+    warning here -- this test builds its own app (rather than using the
+    shared ``client`` fixture) so the seed lands before the lifespan's
+    startup tick runs.
     """
-    response = client.get("/health")
+    _seed_arr_instance(settings)
+    app = create_app(settings=settings)
+    with TestClient(app) as test_client:
+        response = test_client.get("/health")
 
     assert response.status_code == 200
     body = response.json()
@@ -58,7 +94,12 @@ def test_app_wires_database_state(client: TestClient) -> None:
 
 @pytest.fixture
 def client_with_ffmpeg(settings: Settings) -> Iterator[TestClient]:
-    """A client whose startup check reports FFmpeg present (no real lookup)."""
+    """A client whose startup check reports FFmpeg present (no real lookup).
+
+    Seeds one Arr instance first so the no-Arr-instances check (COL-77) stays
+    passing here too -- these fixtures are scoped to ffmpeg alone.
+    """
+    _seed_arr_instance(settings)
     check = FfmpegCheckResult(
         available=True, ffmpeg_path="ffmpeg", detail="FFmpeg found at '/usr/bin/ffmpeg'."
     )
@@ -69,7 +110,13 @@ def client_with_ffmpeg(settings: Settings) -> Iterator[TestClient]:
 
 @pytest.fixture
 def client_without_ffmpeg(settings: Settings) -> Iterator[TestClient]:
-    """A client whose startup check reports FFmpeg missing (no real lookup)."""
+    """A client whose startup check reports FFmpeg missing (no real lookup).
+
+    Seeds one Arr instance first so the no-Arr-instances check (COL-77) stays
+    passing here, keeping the "degraded" assertions below scoped to the single
+    ffmpeg warning they're testing.
+    """
+    _seed_arr_instance(settings)
     check = FfmpegCheckResult(
         available=False,
         ffmpeg_path="ffmpeg",
@@ -131,6 +178,7 @@ def test_health_reflects_the_check_synchronously_at_startup_with_the_scheduler_e
     with the background thread. Were the first tick left to the thread (the
     regression), /health could momentarily report "ok" here.
     """
+    _seed_arr_instance(settings)
     missing_check = FfmpegCheckResult(
         available=False,
         ffmpeg_path="ffmpeg",
@@ -171,8 +219,11 @@ def test_health_route_is_unauthenticated_even_when_degraded(
 def test_app_startup_dispatches_a_notification_when_ffmpeg_is_missing_and_a_notifier_is_enabled(
     settings: Settings,
 ) -> None:
-    # Pre-seed an enabled webhook notifier before the app (re-)opens this same
-    # SQLite file in its own lifespan-owned engine/session.
+    # Pre-seed one Arr instance (so the COL-77 check stays passing and only
+    # ffmpeg's transition is under test here) and an enabled webhook notifier,
+    # before the app (re-)opens this same SQLite file in its own
+    # lifespan-owned engine/session.
+    _seed_arr_instance(settings)
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
@@ -232,6 +283,9 @@ def test_app_startup_makes_no_network_call_when_ffmpeg_is_missing_but_no_notifie
 def test_app_startup_makes_no_network_call_when_ffmpeg_is_present_even_with_a_notifier_enabled(
     settings: Settings,
 ) -> None:
+    # Seed one Arr instance too -- otherwise the COL-77 check's own first-tick
+    # failing transition would make its own (unrelated) notification call.
+    _seed_arr_instance(settings)
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)

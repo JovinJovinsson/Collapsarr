@@ -79,10 +79,11 @@ def test_lists_every_check_with_full_detail_and_mixed_severities(client: TestCli
     response = client.get("/api/system/health-checks", headers=headers)
     assert response.status_code == 200
     body = response.json()
-    # 4, not 3: the shared `client` fixture's app already ran its own startup
-    # FFmpeg tick (test_health_check.py), persisting a 4th (passing) row --
-    # proves the endpoint lists *every* check, seeded ones alongside it.
-    assert len(body) == 4
+    # 5, not 3: the shared `client` fixture's app already ran its own startup
+    # tick (test_health_check.py, test_health_arr_instances.py), persisting a
+    # passing FFmpeg row and a failing no-Arr-instances (COL-77) row -- proves
+    # the endpoint lists *every* check, seeded ones alongside it.
+    assert len(body) == 5
     assert "ffmpeg_missing" in {row["code"] for row in body}
 
     # Ordered by code then instance_id (service.list_health_check_states).
@@ -114,14 +115,17 @@ def test_lists_every_check_with_full_detail_and_mixed_severities(client: TestCli
 
 
 def test_returns_the_startup_ffmpeg_check_with_no_other_checks_seeded(client: TestClient) -> None:
-    # The shared `client` fixture's app runs the real startup tick (FFmpeg is
-    # expected present in dev/CI, see test_health_check.py), persisting exactly
-    # one passing row before any test seeds anything else.
+    # The shared `client` fixture's app runs the real startup tick: FFmpeg is
+    # expected present in dev/CI (see test_health_check.py) and no Arr
+    # instances are configured (a fresh settings/database fixture), so exactly
+    # two rows are persisted before any test seeds anything else -- a passing
+    # FFmpeg row and a failing no-Arr-instances (COL-77) row.
     headers = _auth_headers(client)
     response = client.get("/api/system/health-checks", headers=headers)
     assert response.status_code == 200
     body = response.json()
     assert isinstance(body, list)
-    assert len(body) == 1
-    assert body[0]["code"] == "ffmpeg_missing"
-    assert body[0]["status"] == "passing"
+    assert len(body) == 2
+    by_code = {row["code"]: row for row in body}
+    assert by_code["ffmpeg_missing"]["status"] == "passing"
+    assert by_code["WARN-ARR-001"]["status"] == "failing"

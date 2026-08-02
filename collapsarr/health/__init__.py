@@ -21,10 +21,19 @@ Public surface, by concern:
   (:mod:`~collapsarr.health.service`).
 - **The FFmpeg check** -- :func:`check_ffmpeg` + :class:`FfmpegCheckResult`
   (:mod:`~collapsarr.health.ffmpeg`), the probe migrated verbatim from COL-38.
+- **The no-Arr-instances check** -- :func:`run_arr_instances_check`
+  (:mod:`~collapsarr.health.arr_instances`, COL-77): warns when zero Sonarr/
+  Radarr instances are configured.
 """
 
 from __future__ import annotations
 
+from .arr_instances import (
+    ARR_INSTANCES_CATEGORY,
+    ARR_INSTANCES_CHECK_NAME,
+    NO_ARR_INSTANCES_CODE,
+    run_arr_instances_check,
+)
 from .context import HealthCheckContext
 from .ffmpeg import (
     FFMPEG_CATEGORY,
@@ -52,6 +61,8 @@ from .service import (
 )
 
 __all__ = [
+    "ARR_INSTANCES_CATEGORY",
+    "ARR_INSTANCES_CHECK_NAME",
     "CHECK_STATUS_FAILING",
     "CHECK_STATUS_PASSING",
     "EVENT_HEALTH_CHECK_FAILED",
@@ -60,6 +71,7 @@ __all__ = [
     "FFMPEG_CHECK_NAME",
     "FFMPEG_MISSING_CODE",
     "INTERVAL_SECONDS",
+    "NO_ARR_INSTANCES_CODE",
     "SEVERITY_ERROR",
     "SEVERITY_WARNING",
     "FfmpegCheckResult",
@@ -75,4 +87,5 @@ __all__ = [
     "list_health_check_states",
     "make_ffmpeg_check_run",
     "reconcile_health_results",
+    "run_arr_instances_check",
 ]
