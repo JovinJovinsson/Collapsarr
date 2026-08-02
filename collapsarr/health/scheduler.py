@@ -105,18 +105,26 @@ class HealthCheckScheduler:
             )
         return results
 
-    def start(self) -> None:
+    def start(self, *, run_immediately: bool = True) -> None:
         """Start the background loop in a daemon thread.
 
-        Runs a tick immediately (so ``/health`` is populated and any pass->fail
-        notification fires right away), then sleeps one interval between ticks.
-        Idempotency is the caller's responsibility -- calling this twice raises.
+        By default runs a tick immediately (so ``/health`` is populated and any
+        pass->fail notification fires right away), then sleeps one interval
+        between ticks. Pass ``run_immediately=False`` when the caller has already
+        run the first tick synchronously (as the app lifespan does, to guarantee
+        ``/health`` is accurate the instant the app comes up) and only wants the
+        thread for the subsequent periodic ticks -- the loop then sleeps one
+        interval before its first tick. Idempotency is the caller's
+        responsibility -- calling this twice raises.
         """
         if self._thread is not None:
             raise RuntimeError("HealthCheckScheduler is already started")
         self._stop.clear()
         self._thread = threading.Thread(
-            target=self._run, name="collapsarr-health-scheduler", daemon=True
+            target=self._run,
+            args=(run_immediately,),
+            name="collapsarr-health-scheduler",
+            daemon=True,
         )
         self._thread.start()
 
@@ -128,8 +136,14 @@ class HealthCheckScheduler:
             thread.join(timeout=timeout)
         self._thread = None
 
-    def _run(self) -> None:
-        """Sleep/wake loop: run a tick, then sleep one interval until the next."""
+    def _run(self, run_immediately: bool = True) -> None:
+        """Sleep/wake loop: run a tick, then sleep one interval until the next.
+
+        When ``run_immediately`` is ``False`` the loop sleeps one interval before
+        its first tick (the caller already ran the initial tick synchronously).
+        """
+        if not run_immediately:
+            self._stop.wait(timeout=self._interval_seconds)
         while not self._stop.is_set():
             try:
                 self.run_once()

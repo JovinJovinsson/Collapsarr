@@ -115,6 +115,41 @@ def test_health_is_degraded_with_a_warning_when_ffmpeg_is_missing(
     assert "not found on PATH" in warning["message"]
 
 
+def test_health_reflects_the_check_synchronously_at_startup_with_the_scheduler_enabled(
+    settings: Settings,
+) -> None:
+    """With the real background scheduler enabled, /health must already reflect
+    the first check result the instant the app comes up -- before any background
+    tick fires.
+
+    This guards the deterministic-at-startup guarantee (the pre-framework
+    startup check ran synchronously before serving). The lifespan runs the first
+    tick synchronously and only then starts the daemon thread for the *recurring*
+    5-minute cadence (``run_immediately=False``), so that thread will not tick
+    again for a full interval. Hence a "degraded" /health the moment the context
+    is entered can only have come from the synchronous startup tick -- not a race
+    with the background thread. Were the first tick left to the thread (the
+    regression), /health could momentarily report "ok" here.
+    """
+    missing_check = FfmpegCheckResult(
+        available=False,
+        ffmpeg_path="ffmpeg",
+        detail="FFmpeg executable 'ffmpeg' was not found on PATH.",
+    )
+    app = create_app(
+        settings=settings, ffmpeg_checker=lambda: missing_check, enable_scheduler=True
+    )
+
+    with TestClient(app) as test_client:  # entering the context runs the lifespan
+        response = test_client.get("/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert len(body["warnings"]) == 1
+    assert body["warnings"][0]["code"] == "ffmpeg_missing"
+
+
 def test_health_route_is_unauthenticated_even_when_degraded(
     client_without_ffmpeg: TestClient,
 ) -> None:

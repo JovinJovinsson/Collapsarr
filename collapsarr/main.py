@@ -147,20 +147,23 @@ def create_app(
         # FFmpeg presence probe is now one registered check whose result is diffed
         # against persisted per-check state, so a notification fires only on a
         # pass<->fail transition (never repeatedly for an unchanged still-failing
-        # check) and /health is populated from that state. When the scheduler is
-        # enabled the loop takes the first tick immediately in its thread; when it
-        # is not (tests, one-shot use) a single synchronous tick still runs here so
-        # /health is populated and any startup pass->fail notification fires,
-        # exactly as the retired startup check did.
+        # check) and /health is populated from that state. The first tick always
+        # runs synchronously here, before `yield`, so /health is accurate the
+        # instant the app comes up and any startup pass->fail notification fires --
+        # exactly the deterministic-at-startup guarantee the retired one-shot
+        # startup check gave. With the scheduler enabled the background thread then
+        # takes over the recurring 5-minute cadence for subsequent ticks
+        # (run_immediately=False, so it does not redundantly re-tick right away);
+        # with it disabled (tests, one-shot use) the single synchronous tick above
+        # is all that runs.
         checks = default_health_checks(ffmpeg_checker)
         health_scheduler = HealthCheckScheduler(
             resolved_settings, session_factory, checks, transport=notify_transport
         )
         app.state.health_scheduler = health_scheduler
+        health_scheduler.run_once()
         if enable_scheduler:
-            health_scheduler.start()
-        else:
-            health_scheduler.run_once()
+            health_scheduler.start(run_immediately=False)
         try:
             yield
         finally:

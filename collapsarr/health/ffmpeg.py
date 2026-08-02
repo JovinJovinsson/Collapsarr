@@ -24,6 +24,15 @@ from .context import HealthCheckContext
 from .result import SEVERITY_ERROR, HealthCheckResult
 
 FFMPEG_CHECK_NAME = "ffmpeg"
+# Deliberate, PERMANENT exception to the `{SEVERITY}-{CATEGORY}-{SEQ}` Check Code
+# glossary format (CONTEXT.md). This exact string is the code the `/health`
+# liveness endpoint has surfaced since COL-38, and it is part of that endpoint's
+# public response contract: the README documents it and the frontend health
+# banner (frontend/src/test/healthBanner.test.tsx) matches on it. AC6 requires
+# `/health` keep its exact current response shape, so this code must NOT be
+# renamed to the glossary format -- doing so would break the public contract.
+# Every *other* check (the 5 sibling COL-74 tickets) MUST use the glossary
+# format; this one is the sole grandfathered exception, recorded in CONTEXT.md.
 FFMPEG_MISSING_CODE = "ffmpeg_missing"
 FFMPEG_CATEGORY = "ffmpeg"
 DEFAULT_FFMPEG_PATH = "ffmpeg"
