@@ -8,10 +8,10 @@ Key(s) it owns. A check may return several results (e.g. a per-instance check
 returns one per Arr instance).
 
 :func:`default_health_checks` is the single place the app assembles the
-registry. Each later ticket in Epic COL-74 (no-instances, Arr-unreachable, disk
-space, database-writable, failed-jobs) adds its check here; COL-75 shipped the
-migrated FFmpeg presence check and COL-77 adds the no-Arr-instances-configured
-check.
+registry. Each later ticket in Epic COL-74 (disk space, database-writable,
+failed-jobs) adds its check here; COL-75 shipped the migrated FFmpeg presence
+check, COL-77 added the no-Arr-instances-configured check, and COL-78 adds the
+per-instance Arr-unreachable connectivity check.
 """
 
 from __future__ import annotations
@@ -19,6 +19,9 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+import httpx
+
+from .arr_connectivity import ARR_CONNECTIVITY_CHECK_NAME, make_arr_connectivity_check_run
 from .arr_instances import ARR_INSTANCES_CHECK_NAME, run_arr_instances_check
 from .context import HealthCheckContext
 from .ffmpeg import (
@@ -40,12 +43,17 @@ class HealthCheck:
 
 def default_health_checks(
     ffmpeg_checker: Callable[[], FfmpegCheckResult] | None = None,
+    *,
+    arr_transport: httpx.BaseTransport | None = None,
 ) -> list[HealthCheck]:
     """Build the registry of checks the scheduler runs each tick.
 
     ``ffmpeg_checker`` overrides the FFmpeg presence probe (defaults to
     :func:`~collapsarr.health.ffmpeg.check_ffmpeg`), letting the app/tests
     simulate a present/missing FFmpeg without touching the real binary.
+    ``arr_transport`` is forwarded to every Arr-connectivity probe the
+    per-instance check makes (tests inject an ``httpx.MockTransport``;
+    production leaves it ``None`` for a real network call).
     """
     return [
         HealthCheck(
@@ -55,5 +63,9 @@ def default_health_checks(
         HealthCheck(
             name=ARR_INSTANCES_CHECK_NAME,
             run=run_arr_instances_check,
+        ),
+        HealthCheck(
+            name=ARR_CONNECTIVITY_CHECK_NAME,
+            run=make_arr_connectivity_check_run(arr_transport),
         ),
     ]

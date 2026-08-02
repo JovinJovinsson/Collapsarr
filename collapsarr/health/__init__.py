@@ -24,10 +24,19 @@ Public surface, by concern:
 - **The no-Arr-instances check** -- :func:`run_arr_instances_check`
   (:mod:`~collapsarr.health.arr_instances`, COL-77): warns when zero Sonarr/
   Radarr instances are configured.
+- **The Arr-unreachable check** -- :func:`make_arr_connectivity_check_run`
+  (:mod:`~collapsarr.health.arr_connectivity`, COL-78): a live, per-instance
+  reachability probe against every configured Arr instance.
 """
 
 from __future__ import annotations
 
+from .arr_connectivity import (
+    ARR_CONNECTIVITY_CATEGORY,
+    ARR_CONNECTIVITY_CHECK_NAME,
+    ARR_UNREACHABLE_CODE,
+    make_arr_connectivity_check_run,
+)
 from .arr_instances import (
     ARR_INSTANCES_CATEGORY,
     ARR_INSTANCES_CHECK_NAME,
@@ -61,8 +70,11 @@ from .service import (
 )
 
 __all__ = [
+    "ARR_CONNECTIVITY_CATEGORY",
+    "ARR_CONNECTIVITY_CHECK_NAME",
     "ARR_INSTANCES_CATEGORY",
     "ARR_INSTANCES_CHECK_NAME",
+    "ARR_UNREACHABLE_CODE",
     "CHECK_STATUS_FAILING",
     "CHECK_STATUS_PASSING",
     "EVENT_HEALTH_CHECK_FAILED",
@@ -85,6 +97,7 @@ __all__ = [
     "default_health_checks",
     "list_failing_checks",
     "list_health_check_states",
+    "make_arr_connectivity_check_run",
     "make_ffmpeg_check_run",
     "reconcile_health_results",
     "run_arr_instances_check",

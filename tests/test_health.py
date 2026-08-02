@@ -28,6 +28,11 @@ from collapsarr.migrations import upgrade_to_head
 from collapsarr.notify.service import update_notifier_config
 
 
+def _arr_ok_transport() -> httpx.MockTransport:
+    """A transport reporting any Arr instance as reachable."""
+    return httpx.MockTransport(lambda request: httpx.Response(200, json={"version": "4.0.0"}))
+
+
 def _seed_arr_instance(settings: Settings) -> None:
     """Pre-configure one Arr instance against ``settings``' database.
 
@@ -37,6 +42,14 @@ def _seed_arr_instance(settings: Settings) -> None:
     top of whatever these ffmpeg-focused tests are asserting. Seeding one
     instance up front keeps those assertions scoped to ffmpeg alone, matching
     their original intent from COL-75.
+
+    Every ``create_app(...)`` call following this seed must also pass
+    ``arr_transport=_arr_ok_transport()`` -- the per-instance Arr-unreachable
+    check (COL-78) re-probes this seeded instance live on every startup tick
+    (it never reads the ``status`` column this creation call stamps), so
+    without an "always reachable" transport it would otherwise make a real
+    network call to this fake host and add its own unrelated failure/
+    notification on top of these ffmpeg-focused assertions.
     """
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
@@ -48,9 +61,7 @@ def _seed_arr_instance(settings: Settings) -> None:
             instance_type=InstanceType.SONARR,
             base_url="http://sonarr.local:8989",
             api_key="seed-api-key",
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(200, json={"version": "4.0.0"})
-            ),
+            transport=_arr_ok_transport(),
         )
     engine.dispose()
 
@@ -68,7 +79,7 @@ def test_health_returns_ok(settings: Settings) -> None:
     startup tick runs.
     """
     _seed_arr_instance(settings)
-    app = create_app(settings=settings)
+    app = create_app(settings=settings, arr_transport=_arr_ok_transport())
     with TestClient(app) as test_client:
         response = test_client.get("/health")
 
@@ -103,7 +114,9 @@ def client_with_ffmpeg(settings: Settings) -> Iterator[TestClient]:
     check = FfmpegCheckResult(
         available=True, ffmpeg_path="ffmpeg", detail="FFmpeg found at '/usr/bin/ffmpeg'."
     )
-    app = create_app(settings=settings, ffmpeg_checker=lambda: check)
+    app = create_app(
+        settings=settings, ffmpeg_checker=lambda: check, arr_transport=_arr_ok_transport()
+    )
     with TestClient(app) as test_client:
         yield test_client
 
@@ -122,7 +135,9 @@ def client_without_ffmpeg(settings: Settings) -> Iterator[TestClient]:
         ffmpeg_path="ffmpeg",
         detail="FFmpeg executable 'ffmpeg' was not found on PATH.",
     )
-    app = create_app(settings=settings, ffmpeg_checker=lambda: check)
+    app = create_app(
+        settings=settings, ffmpeg_checker=lambda: check, arr_transport=_arr_ok_transport()
+    )
     with TestClient(app) as test_client:
         yield test_client
 
@@ -185,7 +200,10 @@ def test_health_reflects_the_check_synchronously_at_startup_with_the_scheduler_e
         detail="FFmpeg executable 'ffmpeg' was not found on PATH.",
     )
     app = create_app(
-        settings=settings, ffmpeg_checker=lambda: missing_check, enable_scheduler=True
+        settings=settings,
+        ffmpeg_checker=lambda: missing_check,
+        enable_scheduler=True,
+        arr_transport=_arr_ok_transport(),
     )
 
     with TestClient(app) as test_client:  # entering the context runs the lifespan
@@ -248,6 +266,7 @@ def test_app_startup_dispatches_a_notification_when_ffmpeg_is_missing_and_a_noti
         settings=settings,
         ffmpeg_checker=lambda: missing_check,
         notify_transport=httpx.MockTransport(handler),
+        arr_transport=_arr_ok_transport(),
     )
 
     with TestClient(app):  # entering the context runs the lifespan/startup
@@ -306,6 +325,7 @@ def test_app_startup_makes_no_network_call_when_ffmpeg_is_present_even_with_a_no
         settings=settings,
         ffmpeg_checker=lambda: present_check,
         notify_transport=httpx.MockTransport(handler),
+        arr_transport=_arr_ok_transport(),
     )
 
     with TestClient(app):

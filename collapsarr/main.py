@@ -61,6 +61,7 @@ def create_app(
     enable_scheduler: bool = False,
     ffmpeg_checker: Callable[[], FfmpegCheckResult] | None = None,
     notify_transport: httpx.BaseTransport | None = None,
+    arr_transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -84,7 +85,12 @@ def create_app(
     :func:`~collapsarr.health.check_ffmpeg`), letting tests simulate a
     present/missing FFmpeg without touching the real binary. ``notify_transport``
     is forwarded to the framework's transition notifications (tests inject an
-    ``httpx.MockTransport``; production leaves it ``None``).
+    ``httpx.MockTransport``; production leaves it ``None``). ``arr_transport``
+    (COL-78) is forwarded to every Arr-instance connectivity probe the
+    per-instance unreachable check makes, letting tests simulate
+    reachable/unreachable instances without a real network call; production
+    leaves it ``None`` for a real connectivity check against each configured
+    instance.
     """
     resolved_settings = settings or get_settings()
 
@@ -157,7 +163,7 @@ def create_app(
         # (run_immediately=False, so it does not redundantly re-tick right away);
         # with it disabled (tests, one-shot use) the single synchronous tick above
         # is all that runs.
-        checks = default_health_checks(ffmpeg_checker)
+        checks = default_health_checks(ffmpeg_checker, arr_transport=arr_transport)
         health_scheduler = HealthCheckScheduler(
             resolved_settings, session_factory, checks, transport=notify_transport
         )
