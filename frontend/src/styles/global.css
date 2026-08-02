@@ -297,6 +297,24 @@ a {
   font-size: var(--fs-xs);
 }
 
+/* ---- Health check dismiss/undismiss (COL-82) --------------------------- */
+
+.health-table__dismissed {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+}
+
+.health-table__dismissed--yes {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+}
+
 /* ---- Onboarding panel (COL-54) ---------------------------------------- */
 
 .onboarding-panel {

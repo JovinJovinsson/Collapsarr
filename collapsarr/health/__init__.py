@@ -41,6 +41,12 @@ Public surface, by concern:
   downmix jobs have reached ``FAILED`` in a rolling 24-hour window, read
   straight from the existing :class:`~collapsarr.jobs.models.JobHistory`
   table.
+- **Dismiss / undismiss** -- :func:`dismiss_health_check` /
+  :func:`undismiss_health_check` (:mod:`~collapsarr.health.service`, COL-82):
+  let an operator acknowledge a specific, currently-failing Check Key so it
+  drops off the ``/health`` banner while it stays visible (marked dismissed)
+  on the System > Health list page; auto-cleared on that Check Key's next
+  pass -> fail transition.
 """
 
 from __future__ import annotations
@@ -108,9 +114,13 @@ from .scheduler import INTERVAL_SECONDS, HealthCheckScheduler
 from .service import (
     EVENT_HEALTH_CHECK_FAILED,
     EVENT_HEALTH_CHECK_RECOVERED,
+    HealthCheckNotFailingError,
+    HealthCheckStateNotFoundError,
+    dismiss_health_check,
     list_failing_checks,
     list_health_check_states,
     reconcile_health_results,
+    undismiss_health_check,
 )
 
 __all__ = [
@@ -147,14 +157,17 @@ __all__ = [
     "FfmpegCheckResult",
     "HealthCheck",
     "HealthCheckContext",
+    "HealthCheckNotFailingError",
     "HealthCheckResult",
     "HealthCheckScheduler",
     "HealthCheckState",
+    "HealthCheckStateNotFoundError",
     "HealthWriteProbe",
     "Severity",
     "check_ffmpeg",
     "count_recent_failures",
     "default_health_checks",
+    "dismiss_health_check",
     "free_space_percent",
     "list_failing_checks",
     "list_health_check_states",
@@ -165,4 +178,5 @@ __all__ = [
     "reconcile_health_results",
     "run_arr_instances_check",
     "run_database_writable_check",
+    "undismiss_health_check",
 ]

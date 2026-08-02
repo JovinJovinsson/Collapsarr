@@ -1,4 +1,4 @@
-"""ORM models for persisted health-check state and probe data (COL-75, COL-80).
+"""ORM models for persisted health-check state and probe data (COL-75, COL-80, COL-82).
 
 One row per *Check Key* -- ``(code, instance_id)`` -- so the framework survives
 a restart: on boot the scheduler reads the same rows the previous process
@@ -53,6 +53,16 @@ class HealthCheckState(Base):
     ``category`` mirror the check's authored metadata; ``message`` is the latest
     detail from the check.
 
+    ``dismissed_at`` (COL-82, ``CONTEXT.md``'s "Dismiss (health check)") is set
+    when an operator acknowledges this Check Key while it is currently
+    failing, and ``None`` otherwise. It hides the row from the ``/health``
+    banner (:func:`collapsarr.health.service.list_failing_checks`) while it
+    stays visible -- marked dismissed -- on the System > Health list page
+    (``GET /api/system/health-checks``). It is automatically cleared the next
+    time this Check Key transitions from passing back to failing (see
+    :func:`collapsarr.health.service.reconcile_health_results`), so a fresh
+    recurrence is never silently hidden behind a stale dismissal.
+
     Note on the ``(code, instance_id)`` uniqueness: SQLite treats ``NULL`` as
     distinct in a ``UNIQUE`` constraint, so the constraint does not by itself
     prevent two singleton rows sharing a code. Uniqueness is instead guaranteed
@@ -77,6 +87,7 @@ class HealthCheckState(Base):
         DateTime, nullable=True, default=None
     )
     last_checked_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
@@ -84,6 +95,10 @@ class HealthCheckState(Base):
     @property
     def is_failing(self) -> bool:
         return self.status == CHECK_STATUS_FAILING
+
+    @property
+    def is_dismissed(self) -> bool:
+        return self.dismissed_at is not None
 
     def __repr__(self) -> str:
         return (

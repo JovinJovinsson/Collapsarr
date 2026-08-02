@@ -6,12 +6,14 @@ every registered check produced this tick and, per *Check Key*
 :class:`~collapsarr.health.models.HealthCheckState` rows to detect transitions:
 
 - **pass -> fail** (a key not previously failing is now failing, including the
-  very first time a key is seen failing) -> record ``first_failed_at`` and fire
-  a ``health_check_failed`` notification.
+  very first time a key is seen failing) -> record ``first_failed_at``, clear
+  any prior dismissal (COL-82 -- see below), and fire a ``health_check_failed``
+  notification.
 - **fail -> pass** (a key that was failing now passes) -> clear
   ``first_failed_at`` and fire a ``health_check_recovered`` notification.
 - **unchanged** (still failing, or still passing) -> refresh ``message`` /
-  ``last_checked_at`` only; **no** notification.
+  ``last_checked_at`` only; **no** notification, and a still-failing dismissal
+  is left in place.
 
 Because state lives in the database, a still-failing check reads ``failing`` on
 the first tick after a restart and therefore does **not** re-fire -- the
@@ -21,6 +23,17 @@ Notifications reuse the generic Connect & Notifications fan-out
 (:func:`collapsarr.notify.dispatch_notification`) exactly as the retired
 ``notify_ffmpeg_missing`` did, and are wrapped so a notifier problem can never
 break the scheduler tick.
+
+**Dismiss / undismiss (COL-82, ``CONTEXT.md``'s "Dismiss (health check)").**
+:func:`dismiss_health_check` lets an operator acknowledge a specific,
+currently-failing Check Key (stamping ``dismissed_at``); :func:`undismiss_health_check`
+clears it early. A dismissal only ever silences the *current* failing streak: a
+pass -> fail transition -- a fresh occurrence -- automatically clears
+``dismissed_at`` in :func:`reconcile_health_results` above, so a recurrence is
+never silently hidden behind a stale dismissal. Dismissed rows are excluded
+from :func:`list_failing_checks` (which backs the ``/health`` banner) but still
+appear, marked dismissed, in :func:`list_health_check_states` (which backs the
+System > Health list page).
 """
 
 from __future__ import annotations
@@ -44,6 +57,14 @@ EVENT_HEALTH_CHECK_FAILED = "health_check_failed"
 EVENT_HEALTH_CHECK_RECOVERED = "health_check_recovered"
 
 
+class HealthCheckStateNotFoundError(LookupError):
+    """No :class:`~collapsarr.health.models.HealthCheckState` row with the given id (COL-82)."""
+
+
+class HealthCheckNotFailingError(ValueError):
+    """Refused a dismiss because the targeted Check Key is not currently failing (COL-82)."""
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -57,8 +78,70 @@ def list_health_check_states(session: Session) -> list[HealthCheckState]:
 
 
 def list_failing_checks(session: Session) -> list[HealthCheckState]:
-    """Return only the currently-failing check-state rows (populates ``/health``)."""
-    return [state for state in list_health_check_states(session) if state.is_failing]
+    """Return the currently-failing, non-dismissed check-state rows (populates ``/health``).
+
+    A dismissed Check Key (COL-82) still fails underneath -- it simply drops
+    out of this list, and therefore off the ``/health`` banner, until either an
+    operator undismisses it or it next transitions from passing back to
+    failing (:func:`reconcile_health_results` auto-clears the dismissal at
+    that point). The full-detail :func:`list_health_check_states` above is
+    unaffected -- the System > Health list page still shows every row,
+    dismissed or not.
+    """
+    return [
+        state
+        for state in list_health_check_states(session)
+        if state.is_failing and not state.is_dismissed
+    ]
+
+
+def _get_health_check_state(session: Session, state_id: int) -> HealthCheckState:
+    row = session.get(HealthCheckState, state_id)
+    if row is None:
+        raise HealthCheckStateNotFoundError(f"No health-check state with id={state_id}")
+    return row
+
+
+def dismiss_health_check(
+    session: Session, state_id: int, *, now: Callable[[], datetime] = _utcnow
+) -> HealthCheckState:
+    """Dismiss the check-state row ``state_id`` (COL-82), scoped to one Check Key.
+
+    Stamps ``dismissed_at``, which drops the row out of :func:`list_failing_checks`
+    (hiding it from the ``/health`` banner) while it stays visible -- marked
+    dismissed -- in :func:`list_health_check_states` (the System > Health list
+    page). Idempotent: dismissing an already-dismissed row just refreshes the
+    timestamp.
+
+    Raises :class:`HealthCheckStateNotFoundError` for an unknown ``state_id``,
+    and :class:`HealthCheckNotFailingError` if the row is not currently
+    failing -- only a *currently-failing* check makes sense to dismiss (a
+    passing one is already invisible on the banner, and dismissing it would
+    leave a stale ``dismissed_at`` sitting around with no failing occurrence
+    for it to refer to).
+    """
+    row = _get_health_check_state(session, state_id)
+    if not row.is_failing:
+        raise HealthCheckNotFailingError(
+            f"Cannot dismiss health-check state id={state_id}: it is not currently failing"
+        )
+    row.dismissed_at = now()
+    session.commit()
+    return row
+
+
+def undismiss_health_check(session: Session, state_id: int) -> HealthCheckState:
+    """Clear a dismissal on the check-state row ``state_id`` (COL-82) early.
+
+    Idempotent: undismissing a row that isn't dismissed is a no-op. Unlike
+    :func:`dismiss_health_check`, this is allowed regardless of the row's
+    current ``status`` -- there's no harm in clearing a dismissal on a check
+    that has since recovered.
+    """
+    row = _get_health_check_state(session, state_id)
+    row.dismissed_at = None
+    session.commit()
+    return row
 
 
 def reconcile_health_results(
@@ -120,8 +203,13 @@ def reconcile_health_results(
         elif not was_failing:
             row.status = CHECK_STATUS_FAILING
             row.first_failed_at = timestamp
+            # COL-82: a pass -> fail transition is a fresh occurrence -- clear
+            # any dismissal left over from a prior failing streak so this new
+            # one isn't silently hidden behind it.
+            row.dismissed_at = None
             transitions.append((result, EVENT_HEALTH_CHECK_FAILED))
-        # else: still failing -> keep first_failed_at, no notification.
+        # else: still failing -> keep first_failed_at (and any dismissal), no
+        # notification.
 
     session.commit()
 

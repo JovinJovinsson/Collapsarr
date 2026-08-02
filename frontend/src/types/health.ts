@@ -38,7 +38,7 @@ export interface HealthStatus {
  * `id` is the row's stable database primary key -- kept here (rather than
  * keying only on `code`/`instance_id`) so a later slice can address one row
  * directly for an action, e.g. COL-82's dismiss/undismiss and COL-83's manual
- * recheck (both out of scope for this page today).
+ * recheck (the latter still out of scope for this page today).
  */
 export interface HealthCheckState {
   id: number;
@@ -53,4 +53,10 @@ export interface HealthCheckState {
   first_failed_at: string | null;
   /** ISO-8601 UTC timestamp of the most recent tick that evaluated this check. */
   last_checked_at: string;
+  /**
+   * ISO-8601 UTC; `null` unless an operator has dismissed this Check Key
+   * (COL-82) while it was failing. Auto-cleared server-side the next time
+   * this Check Key transitions from passing back to failing.
+   */
+  dismissed_at: string | null;
 }

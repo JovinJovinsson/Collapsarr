@@ -29,3 +29,43 @@ export async function fetchHealthChecks(): Promise<HealthCheckState[]> {
   }
   return (await response.json()) as HealthCheckState[];
 }
+
+/**
+ * Dismisses one currently-failing check state
+ * (`POST /api/system/health-checks/{id}/dismiss`, COL-82). Hides it from the
+ * `/health` banner while it stays visible, marked dismissed, on the System >
+ * Health list page. The server refuses with a `409` (surfaced via
+ * `apiErrorMessage`) when the check is not currently failing, and `404`s an
+ * unknown id.
+ */
+export async function dismissHealthCheck(check: Pick<HealthCheckState, "id">): Promise<HealthCheckState> {
+  const response = await apiFetch(`/api/system/health-checks/${check.id}/dismiss`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to dismiss health check (${response.status})`)
+    );
+  }
+  return (await response.json()) as HealthCheckState;
+}
+
+/**
+ * Clears a dismissal on one check state
+ * (`POST /api/system/health-checks/{id}/undismiss`, COL-82). Always succeeds
+ * regardless of the check's current passing/failing status; `404`s an
+ * unknown id.
+ */
+export async function undismissHealthCheck(
+  check: Pick<HealthCheckState, "id">
+): Promise<HealthCheckState> {
+  const response = await apiFetch(`/api/system/health-checks/${check.id}/undismiss`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to undismiss health check (${response.status})`)
+    );
+  }
+  return (await response.json()) as HealthCheckState;
+}

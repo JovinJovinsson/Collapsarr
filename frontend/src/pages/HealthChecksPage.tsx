@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { fetchHealthChecks } from "../api/health";
+import { dismissHealthCheck, fetchHealthChecks, undismissHealthCheck } from "../api/health";
 import { ErrorIcon, HealthIcon, WarningIcon } from "../components/icons";
 import type { HealthCheckState, HealthSeverity, HealthCheckStatus } from "../types/health";
 
@@ -46,12 +46,32 @@ type LoadState =
  * hardcoded to FFmpeg; a per-instance check's rows are told apart by
  * `instance_id`.
  *
- * Deliberately minimal for this slice: no dismiss/undismiss (COL-82) or manual
- * recheck (COL-83) actions yet. Each row carries the check state's stable `id`
- * so those later slices can add per-row actions without reshaping this table.
+ * COL-82 adds per-row "Dismiss"/"Undismiss" actions
+ * (`POST /api/system/health-checks/{id}/dismiss` /
+ * `.../undismiss`, `api/health.ts`). Dismissing a currently-failing row marks
+ * it "Dismissed" here (it never disappears from this page -- only the
+ * app-wide banner hides a dismissed check) and reloads the list so the badge
+ * reflects the server's state; "Dismiss" is only offered while a row is
+ * failing (the server would otherwise refuse with `409`), and "Undismiss"
+ * only once it's dismissed. A manual recheck action (COL-83) is still out of
+ * scope for this page.
  */
 export function HealthChecksPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingId, setPendingId] = useState<number | null>(null);
+
+  async function load() {
+    try {
+      const checks = await fetchHealthChecks();
+      setState({ status: "ready", checks });
+    } catch (error: unknown) {
+      setState({
+        status: "error",
+        message: error instanceof Error ? error.message : "Unknown error.",
+      });
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -74,6 +94,32 @@ export function HealthChecksPage() {
     };
   }, []);
 
+  async function handleDismiss(check: HealthCheckState) {
+    setPendingId(check.id);
+    setActionError(null);
+    try {
+      await dismissHealthCheck(check);
+      await load();
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : "Failed to dismiss health check.");
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  async function handleUndismiss(check: HealthCheckState) {
+    setPendingId(check.id);
+    setActionError(null);
+    try {
+      await undismissHealthCheck(check);
+      await load();
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : "Failed to undismiss health check.");
+    } finally {
+      setPendingId(null);
+    }
+  }
+
   return (
     <section className="view">
       <header className="view__header">
@@ -83,6 +129,8 @@ export function HealthChecksPage() {
           and any others the app monitors.
         </p>
       </header>
+
+      {actionError && <p className="view__error">{actionError}</p>}
 
       {state.status === "loading" && (
         <div className="panel panel--empty">
@@ -120,11 +168,15 @@ export function HealthChecksPage() {
                 <th scope="col">Message</th>
                 <th scope="col">First failed</th>
                 <th scope="col">Last checked</th>
+                <th scope="col">Dismissed</th>
+                <th scope="col">Actions</th>
               </tr>
             </thead>
             <tbody>
               {state.checks.map((check) => {
                 const SeverityIcon = SEVERITY_ICON[check.severity] ?? WarningIcon;
+                const isDismissed = check.dismissed_at !== null;
+                const isPending = pendingId === check.id;
                 return (
                   <tr key={check.id}>
                     <td>
@@ -150,6 +202,33 @@ export function HealthChecksPage() {
                     <td className="health-table__message">{check.message}</td>
                     <td>{formatTimestamp(check.first_failed_at)}</td>
                     <td>{formatTimestamp(check.last_checked_at)}</td>
+                    <td>
+                      <span className={`health-table__dismissed${isDismissed ? " health-table__dismissed--yes" : ""}`}>
+                        {isDismissed ? "Dismissed" : "—"}
+                      </span>
+                    </td>
+                    <td className="data-table__actions">
+                      {check.status === "failing" && !isDismissed && (
+                        <button
+                          type="button"
+                          className="btn btn--secondary btn--sm"
+                          onClick={() => handleDismiss(check)}
+                          disabled={isPending}
+                        >
+                          {isPending ? "Dismissing…" : "Dismiss"}
+                        </button>
+                      )}
+                      {isDismissed && (
+                        <button
+                          type="button"
+                          className="btn btn--secondary btn--sm"
+                          onClick={() => handleUndismiss(check)}
+                          disabled={isPending}
+                        >
+                          {isPending ? "Undismissing…" : "Undismiss"}
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 );
               })}

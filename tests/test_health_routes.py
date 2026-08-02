@@ -1,10 +1,16 @@
-"""Contract tests for the health-check detail REST endpoint (COL-76).
+"""Contract tests for the health-check detail REST endpoints (COL-76, COL-82).
 
 Covers ``GET /api/system/health-checks``: the API-gate behaviour (401 without
 a key/session), the full per-row shape (code, category, severity, status,
-message, instance_id, first/last-checked timing), and that it works
-generically for any number/kind of registered check with mixed
+message, instance_id, first/last-checked timing, dismissed_at), and that it
+works generically for any number/kind of registered check with mixed
 severities/statuses -- not hardcoded to FFmpeg.
+
+Also covers the COL-82 ``POST .../{id}/dismiss`` and ``.../{id}/undismiss``
+actions: success shape, the auth gate, the 404 (unknown id) and 409 (not
+currently failing) refusals, and that a dismiss actually removes the row from
+the unauthenticated ``/health`` banner while it stays visible -- marked
+dismissed -- on this authenticated list endpoint.
 """
 
 from __future__ import annotations
@@ -153,3 +159,105 @@ def test_returns_the_startup_ffmpeg_check_with_no_other_checks_seeded(client: Te
     assert by_code["ERR-DISK-001"]["status"] == "passing"
     assert by_code["ERR-DB-001"]["status"] == "passing"
     assert by_code["WARN-JOBS-001"]["status"] == "passing"
+
+
+# --------------------------------------------------------------------------- #
+# COL-82: dismiss / undismiss
+# --------------------------------------------------------------------------- #
+
+
+def _seeded_id(client: TestClient, code: str) -> int:
+    """Reconciles one failing Check Key and returns its persisted row id."""
+    _seed(
+        client,
+        [
+            HealthCheckResult.failed(
+                code=code, category="test", severity=SEVERITY_ERROR, message="down"
+            )
+        ],
+    )
+    headers = _auth_headers(client)
+    body = client.get("/api/system/health-checks", headers=headers).json()
+    return int(next(row["id"] for row in body if row["code"] == code))
+
+
+def test_dismiss_and_undismiss_endpoints_require_authentication(client: TestClient) -> None:
+    check_id = _seeded_id(client, "ERR-DISMISS-AUTH")
+
+    assert client.post(f"/api/system/health-checks/{check_id}/dismiss").status_code == 401
+    assert client.post(f"/api/system/health-checks/{check_id}/undismiss").status_code == 401
+
+
+def test_dismiss_returns_404_for_an_unknown_id(client: TestClient) -> None:
+    headers = _auth_headers(client)
+
+    response = client.post("/api/system/health-checks/999999/dismiss", headers=headers)
+
+    assert response.status_code == 404
+
+
+def test_undismiss_returns_404_for_an_unknown_id(client: TestClient) -> None:
+    headers = _auth_headers(client)
+
+    response = client.post("/api/system/health-checks/999999/undismiss", headers=headers)
+
+    assert response.status_code == 404
+
+
+def test_dismiss_returns_409_for_a_currently_passing_check(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    _seed(
+        client,
+        [
+            HealthCheckResult.ok(
+                code="WARN-DISMISS-PASS", category="test", severity=SEVERITY_WARNING, message="ok"
+            )
+        ],
+    )
+    check_id = next(
+        row["id"]
+        for row in client.get("/api/system/health-checks", headers=headers).json()
+        if row["code"] == "WARN-DISMISS-PASS"
+    )
+
+    response = client.post(f"/api/system/health-checks/{check_id}/dismiss", headers=headers)
+
+    assert response.status_code == 409
+
+
+def test_dismiss_hides_the_check_from_health_but_marks_it_dismissed_on_the_list(
+    client: TestClient,
+) -> None:
+    headers = _auth_headers(client)
+    check_id = _seeded_id(client, "ERR-DISMISS-HIDE")
+
+    dismiss_response = client.post(f"/api/system/health-checks/{check_id}/dismiss", headers=headers)
+    assert dismiss_response.status_code == 200
+    dismissed_row = dismiss_response.json()
+    assert dismissed_row["dismissed_at"] is not None
+
+    # Gone from the unauthenticated /health banner...
+    health = client.get("/health").json()
+    assert "ERR-DISMISS-HIDE" not in {w["code"] for w in health["warnings"]}
+
+    # ...but still present, marked dismissed, on the full list.
+    body = client.get("/api/system/health-checks", headers=headers).json()
+    row = next(r for r in body if r["code"] == "ERR-DISMISS-HIDE")
+    assert row["status"] == "failing"
+    assert row["dismissed_at"] is not None
+
+
+def test_undismiss_restores_the_check_to_the_health_banner(client: TestClient) -> None:
+    headers = _auth_headers(client)
+    check_id = _seeded_id(client, "ERR-DISMISS-RESTORE")
+    client.post(f"/api/system/health-checks/{check_id}/dismiss", headers=headers)
+    assert "ERR-DISMISS-RESTORE" not in {
+        w["code"] for w in client.get("/health").json()["warnings"]
+    }
+
+    response = client.post(f"/api/system/health-checks/{check_id}/undismiss", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["dismissed_at"] is None
+    health = client.get("/health").json()
+    assert "ERR-DISMISS-RESTORE" in {w["code"] for w in health["warnings"]}
