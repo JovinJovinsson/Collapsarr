@@ -41,6 +41,7 @@ from .health import (
     default_health_checks,
     list_failing_checks,
 )
+from .health.routes import router as health_checks_router
 from .jobs.queue import JobQueue
 from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
@@ -217,6 +218,12 @@ def create_app(
     # GET .../download or DELETE .../{id} routes above.
     app.include_router(restore_router)
 
+    # Full per-check detail GET /api/system/health-checks (COL-76): every
+    # registered check's current state (passing or failing), driving the
+    # System > Health list page. Distinct from the unauthenticated /health
+    # probe below, which stays minimal and failing-only for the app-wide banner.
+    app.include_router(health_checks_router)
+
     @app.get("/health", tags=["system"])
     def health(session: Session = Depends(get_session)) -> dict[str, object]:
         """Liveness probe. Returns 200 with the running app version and any
@@ -224,15 +231,22 @@ def create_app(
 
         ``status`` is ``"ok"`` unless a health check is currently failing -- e.g.
         FFmpeg availability -- in which case it is ``"degraded"`` and
-        ``warnings`` carries one ``{"code", "message"}`` entry per failing check,
-        read from the framework's persisted per-check state (populated by
-        :class:`~collapsarr.health.HealthCheckScheduler`). The app still starts
-        and serves requests either way (so the UI and API stay usable), but a
-        "degraded" status is the health-page signal that something (e.g. a
-        missing FFmpeg blocking downmix jobs) needs attention.
+        ``warnings`` carries one ``{"code", "message", "severity"}`` entry per
+        failing check, read from the framework's persisted per-check state
+        (populated by :class:`~collapsarr.health.HealthCheckScheduler`).
+        ``severity`` (COL-76) is ``"warning"`` or ``"error"``, letting the
+        frontend banner style multiple simultaneous warnings differently from
+        errors; it was added alongside ``code``/``message`` as a
+        backward-compatible field, not a rename (see ``CONTEXT.md``'s Check
+        Code entry on why ``code`` values themselves are frozen). The app still
+        starts and serves requests either way (so the UI and API stay usable),
+        but a "degraded" status is the health-page signal that something (e.g. a
+        missing FFmpeg blocking downmix jobs) needs attention. For the full
+        detail of *every* registered check (passing or failing), see the
+        authenticated ``GET /api/system/health-checks`` (COL-76).
         """
         warnings: list[dict[str, str]] = [
-            {"code": state.code, "message": state.message}
+            {"code": state.code, "message": state.message, "severity": state.severity}
             for state in list_failing_checks(session)
         ]
         return {

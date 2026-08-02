@@ -216,6 +216,9 @@ a {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+  /* Neutral danger-toned shell -- the per-row colour (below) carries the
+     warning/error distinction (COL-76), so a mixed-severity list still reads
+     as one coherent banner rather than two clashing panels. */
   background: var(--c-danger-tint);
   border: 1px solid var(--c-danger);
   border-radius: var(--radius-md);
@@ -228,13 +231,70 @@ a {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  color: var(--c-danger);
   font-size: var(--fs-sm);
   font-weight: 600;
 }
 
+/* Per-entry severity colour (COL-76): warning-severity checks render amber,
+   error-severity ones the banner's original red, so several simultaneous
+   checks of mixed severity are told apart at a glance. */
+.health-banner__message--warning {
+  color: var(--c-warning);
+}
+
+.health-banner__message--error {
+  color: var(--c-danger);
+}
+
 .health-banner__icon {
   flex-shrink: 0;
+}
+
+/* ---- Health checks page (COL-76) --------------------------------------- */
+
+.health-table__severity,
+.health-table__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+}
+
+.health-table__severity--warning {
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+}
+
+.health-table__severity--error {
+  color: var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.health-table__status--passing {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+}
+
+.health-table__status--failing {
+  color: var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.health-table__severity-icon {
+  flex-shrink: 0;
+}
+
+.health-table__message {
+  max-width: 40ch;
+}
+
+.health-table__instance {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
 }
 
 /* ---- Onboarding panel (COL-54) ---------------------------------------- */
