@@ -1,5 +1,11 @@
-"""Smoke tests for the application skeleton, plus the FFmpeg startup health
-check and its /health surfacing (COL-38)."""
+"""Smoke tests for the application skeleton, plus the Health Check Framework's
+startup tick, its /health surfacing, and its transition notifications (COL-75).
+
+The default ``client`` fixture builds the app with the scheduler disabled, so a
+single synchronous health tick runs during startup (see
+``collapsarr.main.create_app``'s lifespan) -- enough to populate /health and
+fire any pass->fail notification deterministically, without a background thread.
+"""
 
 from __future__ import annotations
 
@@ -74,12 +80,14 @@ def client_without_ffmpeg(settings: Settings) -> Iterator[TestClient]:
         yield test_client
 
 
-def test_startup_check_runs_and_stores_result_on_app_state(client_with_ffmpeg: TestClient) -> None:
-    """The FFmpeg check runs once at startup and its result is stashed on
-    app.state (read by the /health route), not recomputed per-request."""
+def test_startup_runs_a_health_tick_and_exposes_the_scheduler(
+    client_with_ffmpeg: TestClient,
+) -> None:
+    """The framework runs a synchronous tick at startup (populating /health from
+    persisted state) and exposes the scheduler on app.state."""
     app = client_with_ffmpeg.app
     assert isinstance(app, FastAPI)
-    assert app.state.ffmpeg_check.available is True
+    assert app.state.health_scheduler is not None
 
 
 def test_health_is_ok_with_no_warnings_when_ffmpeg_is_present(
@@ -118,10 +126,10 @@ def test_health_route_is_unauthenticated_even_when_degraded(
 
 
 # ---------------------------------------------------------------------------
-# AC: a missing FFmpeg at startup also triggers the notifier dispatch, if
-# notifiers are configured/enabled -- exercised end-to-end through the real
-# app lifespan (collapsarr.main.create_app), not just the health.py bridge
-# unit (see tests/test_health_check.py for that).
+# AC: a missing FFmpeg at startup also triggers a transition notification, if
+# notifiers are configured/enabled -- exercised end-to-end through the real app
+# lifespan (collapsarr.main.create_app)'s synchronous startup tick, not just the
+# reconcile unit (see tests/test_health_check.py for that).
 # ---------------------------------------------------------------------------
 
 

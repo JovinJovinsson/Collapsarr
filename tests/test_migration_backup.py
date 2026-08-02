@@ -60,6 +60,12 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_retention_days"),
 )
 
+#: Whole tables a post-baseline migration adds (currently just COL-75's
+#: ``health_check_state``) -- dropped after ``create_all`` for the same reason
+#: as ``_POST_BASELINE_COLUMNS``, so the migration that creates them does not
+#: collide with a table ``create_all`` already built.
+_POST_BASELINE_TABLES: tuple[str, ...] = ("health_check_state",)
+
 
 def _update_backups(settings: Settings) -> list[BackupInfo]:
     """Every finished ``update``-type backup, newest first (via the unified list)."""
@@ -81,6 +87,8 @@ def _create_unversioned_db(settings: Settings) -> None:
             connection.execute(
                 text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
             )
+        for table_name in _POST_BASELINE_TABLES:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
     engine.dispose()
 
 

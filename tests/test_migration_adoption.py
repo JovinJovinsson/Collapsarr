@@ -217,6 +217,14 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_retention_days"),
 )
 
+#: Whole tables a *post-baseline* migration adds (currently just COL-75's
+#: ``health_check_state``). ``create_all`` below builds them from the live
+#: ``Base.metadata``, so they are dropped afterwards to de-evolve the stand-in
+#: back to a real pre-COL-75 create_all-era release -- exactly as
+#: :data:`POST_BASELINE_COLUMNS` does for later-added columns -- so the adoption
+#: delta (not create_all) is what creates them.
+POST_BASELINE_TABLES: tuple[str, ...] = ("health_check_state",)
+
 
 def _build_populated_unversioned_db(settings: Settings) -> None:
     """Construct a create_all-era database: full schema, no ``alembic_version``,
@@ -242,6 +250,10 @@ def _build_populated_unversioned_db(settings: Settings) -> None:
             connection.execute(
                 text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
             )
+        # Drop whole tables a post-baseline migration owns, so the adoption delta
+        # (not create_all) is what creates them -- same reasoning as the columns.
+        for table_name in POST_BASELINE_TABLES:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
         # Populate the sentinel + a couple of indexed tables via raw DML.
         connection.execute(
             text(
