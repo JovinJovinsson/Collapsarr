@@ -359,6 +359,25 @@ def test_dismiss_sets_dismissed_at(settings: Settings) -> None:
         assert response.json()["dismissed_at"] is not None
 
 
+def test_dismiss_returns_409_when_up_to_date(settings: Settings) -> None:
+    """Must-fix (COL-89 review): dismissing while up to date -- nothing
+    currently available to dismiss -- is refused with 409, mirroring
+    ``test_health_routes.py``'s ``test_dismiss_returns_409_for_a_currently_
+    passing_check``, and must not stamp a stale ``dismissed_at``."""
+    app = _app_with_release(settings, running_version_tag(__version__))
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+        before = test_client.get("/api/system/updates", headers=headers).json()
+        assert before["update_available"] is False
+
+        response = test_client.post("/api/system/updates/dismiss", headers=headers)
+
+        assert response.status_code == 409
+
+        follow_up = test_client.get("/api/system/updates", headers=headers)
+        assert follow_up.json()["dismissed_at"] is None
+
+
 def test_undismiss_clears_dismissed_at(settings: Settings) -> None:
     app = _app_with_release(settings, "v999.0.0")
     with TestClient(app) as test_client:

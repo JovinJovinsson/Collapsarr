@@ -24,7 +24,8 @@ Endpoints:
   reconciliation path as a scheduled tick, so a manual recheck fires the same
   edge-triggered notification a scheduled tick would.
 * ``POST /api/system/updates/dismiss`` -- dismisses the current "update
-  available" notice (COL-89): ``404`` if no tick has ever run.
+  available" notice (COL-89): ``404`` if no tick has ever run, ``409`` if the
+  running version is already up to date (nothing to dismiss).
 * ``POST /api/system/updates/undismiss`` -- clears a dismissal (COL-89):
   ``404`` if no tick has ever run; otherwise always succeeds.
 
@@ -44,13 +45,13 @@ from sqlalchemy.orm import Session
 
 from .. import __version__
 from ..database import get_session
-from ..settings.models import UPDATE_CHANNEL_BETA
-from .comparison import is_up_to_date, is_up_to_date_beta
 from .scheduler import UpdateCheckScheduler
 from .service import (
     UpdateCheckStateNotFoundError,
+    UpdateNotAvailableError,
     dismiss_update_check,
     get_update_check_state,
+    is_update_available,
     undismiss_update_check,
 )
 
@@ -93,7 +94,7 @@ class UpdateCheckStateRead(BaseModel):
     field-for-field: ``running_version`` is computed from
     :data:`collapsarr.__version__` (not a persisted column), and
     ``update_available`` is computed via
-    :func:`~collapsarr.update_check.comparison.is_up_to_date` rather than
+    :func:`~collapsarr.update_check.service.is_update_available` rather than
     stored -- both would go stale the instant a new version shipped if
     persisted instead of derived on every read. ``latest_version`` is the
     fetched release's ``tag_name`` (``UpdateCheckState.latest_tag``) -- the
@@ -124,32 +125,24 @@ def _read_state(session: Session) -> UpdateCheckStateRead:
 
     The single seam both endpoints below call, so ``GET`` and the post-recheck
     response are built identically. ``state`` is ``None`` only if the app's
-    startup tick (:func:`collapsarr.main.create_app`'s lifespan) never ran --
-    handled the same way :func:`~collapsarr.update_check.comparison.
-    is_up_to_date`/:func:`~collapsarr.update_check.comparison.
-    is_up_to_date_beta` treat a ``None`` ``latest_tag``: "unknown" reports as
-    an update being available rather than silently claiming the instance is
-    current with no evidence.
+    startup tick (:func:`collapsarr.main.create_app`'s lifespan) never ran.
 
-    The comparison function is picked from ``state.channel`` (COL-88) -- the
-    channel *that tick's* fetch actually ran against, recorded on the same
-    row as ``latest_tag`` -- rather than re-reading the currently configured
-    channel, so ``latest_tag``/``update_available`` always describe the same
-    channel consistently even mid-switch (before the next tick/recheck runs
-    against the newly selected channel). Falls back to the stable comparison
-    when there's no state yet, matching the pre-COL-88 default.
+    ``update_available`` is delegated to :func:`~collapsarr.update_check.
+    service.is_update_available` -- the same seam :func:`~collapsarr.
+    update_check.service.dismiss_update_check`'s "nothing to dismiss" guard
+    uses, so this endpoint's reported value and that guard's decision can
+    never drift on which comparison function (stable vs. beta, COL-88)
+    applies for a given row, nor on the "unknown reports as available"
+    handling of a ``None`` row/``latest_tag``.
     """
     state = get_update_check_state(session)
-    latest_version = state.latest_tag if state is not None else None
-    channel = state.channel if state is not None else None
-    compare = is_up_to_date_beta if channel == UPDATE_CHANNEL_BETA else is_up_to_date
     return UpdateCheckStateRead(
         running_version=__version__,
-        latest_version=latest_version,
+        latest_version=state.latest_tag if state is not None else None,
         latest_version_label=state.latest_version_label if state is not None else None,
         changelog=state.changelog if state is not None else None,
         checked_at=state.checked_at if state is not None else None,
-        update_available=not compare(__version__, latest_version),
+        update_available=is_update_available(state, __version__),
         dismissed_at=state.dismissed_at if state is not None else None,
     )
 
@@ -195,12 +188,18 @@ def dismiss_updates_endpoint(
     Idempotent -- dismissing an already-dismissed notice just refreshes the
     timestamp. ``404`` if no Update Check tick has ever run (nothing to
     dismiss yet); in practice this only happens if the app's startup tick
-    never ran, since the lifespan always runs one synchronously.
+    never ran, since the lifespan always runs one synchronously. ``409`` if
+    the running version is already up to date -- there is no current "update
+    available" occurrence to dismiss, mirroring
+    :func:`collapsarr.health.routes.dismiss_health_check_endpoint`'s handling
+    of ``HealthCheckNotFailingError``.
     """
     try:
         dismiss_update_check(session)
     except UpdateCheckStateNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UpdateNotAvailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _read_state(session)
 
 

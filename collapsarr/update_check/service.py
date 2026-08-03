@@ -33,8 +33,12 @@ pattern, applied to the singleton Update Check row).**
 :func:`dismiss_update_check` lets an operator acknowledge the current "update
 available" notice (stamping ``dismissed_at``); :func:`undismiss_update_check`
 clears it early. Because :func:`reconcile_update_check` above auto-clears
-``dismissed_at`` the moment ``latest_tag`` next changes, a dismissal only ever
-silences the *current* known release -- an even newer one always re-surfaces.
+``dismissed_at`` the moment ``latest_tag`` next changes -- but *not* on
+"no longer available" -- :func:`dismiss_update_check` mirrors
+:func:`collapsarr.health.service.dismiss_health_check`'s guard: it refuses
+(raising :class:`UpdateNotAvailableError`) when there is nothing currently
+available to dismiss, so a dismissal always silences a genuine occurrence
+rather than leaving a stale ``dismissed_at`` with no update behind it.
 """
 
 from __future__ import annotations
@@ -48,7 +52,10 @@ from sqlalchemy.orm import Session
 
 from collapsarr.notify import NotificationEvent, dispatch_notification, get_notifier_config
 
+from .. import __version__
+from ..settings.models import UPDATE_CHANNEL_BETA
 from .client import GitHubReleaseResult
+from .comparison import is_up_to_date, is_up_to_date_beta
 from .models import UPDATE_CHECK_STATE_ID, UpdateCheckState
 
 logger = logging.getLogger(__name__)
@@ -62,6 +69,19 @@ class UpdateCheckStateNotFoundError(LookupError):
     Raised by :func:`dismiss_update_check` / :func:`undismiss_update_check`
     when called before the very first Update Check tick has ever run -- there
     is nothing to (un)dismiss yet.
+    """
+
+
+class UpdateNotAvailableError(ValueError):
+    """Refused a dismiss because no update is currently available (COL-89).
+
+    Mirrors :class:`collapsarr.health.service.HealthCheckNotFailingError`:
+    only a currently-available update makes sense to dismiss -- a passing
+    ("up to date") state is already invisible to the operator, and stamping
+    ``dismissed_at`` anyway would leave it sitting around with no occurrence
+    for it to refer to, since :func:`reconcile_update_check` only auto-clears
+    a dismissal when ``latest_tag`` *changes*, never merely because the
+    running version caught up.
     """
 
 
@@ -81,6 +101,29 @@ def _get_update_check_state_or_raise(session: Session) -> UpdateCheckState:
     return row
 
 
+def is_update_available(row: UpdateCheckState | None, running_version: str) -> bool:
+    """Return whether ``running_version`` differs from ``row``'s latest known release.
+
+    The single seam shared by :func:`dismiss_update_check` (the "nothing to
+    dismiss" guard below) and :mod:`collapsarr.update_check.routes` (the
+    ``GET``/recheck response's ``update_available`` field), so the two can
+    never drift on which comparison function applies for a given row --
+    :func:`~collapsarr.update_check.comparison.is_up_to_date_beta` when
+    ``row.channel`` is the beta channel (COL-88), :func:`~collapsarr.
+    update_check.comparison.is_up_to_date` otherwise.
+
+    ``row`` is ``None`` before the first tick has ever run -- treated the same
+    way :func:`~collapsarr.update_check.comparison.is_up_to_date`/
+    :func:`~collapsarr.update_check.comparison.is_up_to_date_beta` treat a
+    ``None`` ``latest_tag``: "unknown" reports as an update being available
+    rather than silently claiming the instance is current with no evidence.
+    """
+    latest_tag = row.latest_tag if row is not None else None
+    channel = row.channel if row is not None else None
+    compare = is_up_to_date_beta if channel == UPDATE_CHANNEL_BETA else is_up_to_date
+    return not compare(running_version, latest_tag)
+
+
 def dismiss_update_check(
     session: Session, *, now: Callable[[], datetime] = _utcnow
 ) -> UpdateCheckState:
@@ -88,9 +131,17 @@ def dismiss_update_check(
 
     Stamps ``dismissed_at`` on the singleton row. Idempotent: dismissing an
     already-dismissed row just refreshes the timestamp. Raises
-    :class:`UpdateCheckStateNotFoundError` if no tick has ever run.
+    :class:`UpdateCheckStateNotFoundError` if no tick has ever run, and
+    :class:`UpdateNotAvailableError` if the running version is already up to
+    date with ``row``'s latest known release for its channel -- mirroring
+    :func:`collapsarr.health.service.dismiss_health_check`'s
+    ``HealthCheckNotFailingError`` guard, see the module docstring.
     """
     row = _get_update_check_state_or_raise(session)
+    if not is_update_available(row, __version__):
+        raise UpdateNotAvailableError(
+            "Cannot dismiss the update-available notice: no update is currently available"
+        )
     row.dismissed_at = now()
     session.commit()
     return row
@@ -204,8 +255,10 @@ def _dispatch_update_available(
 __all__ = [
     "EVENT_UPDATE_AVAILABLE",
     "UpdateCheckStateNotFoundError",
+    "UpdateNotAvailableError",
     "dismiss_update_check",
     "get_update_check_state",
+    "is_update_available",
     "reconcile_update_check",
     "undismiss_update_check",
 ]

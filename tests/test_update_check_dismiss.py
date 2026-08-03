@@ -15,10 +15,13 @@ from datetime import datetime
 import pytest
 from sqlalchemy.orm import Session
 
+from collapsarr import __version__
 from collapsarr.settings.models import UPDATE_CHANNEL_STABLE
 from collapsarr.update_check.client import GitHubReleaseResult
+from collapsarr.update_check.comparison import running_version_tag
 from collapsarr.update_check.service import (
     UpdateCheckStateNotFoundError,
+    UpdateNotAvailableError,
     dismiss_update_check,
     get_update_check_state,
     reconcile_update_check,
@@ -62,6 +65,26 @@ def test_dismiss_is_idempotent(session: Session) -> None:
 def test_dismiss_raises_when_no_tick_has_ever_run(session: Session) -> None:
     with pytest.raises(UpdateCheckStateNotFoundError):
         dismiss_update_check(session)
+
+
+# ---------------------------------------------------------------------------
+# AC (must-fix, COL-89 review): dismiss refuses when there is nothing
+# currently available to dismiss, mirroring
+# ``dismiss_health_check``'s ``HealthCheckNotFailingError`` guard -- a
+# dismiss taken while up to date must not stamp a stale ``dismissed_at`` with
+# no occurrence behind it, since ``reconcile_update_check`` only auto-clears
+# a dismissal on a ``latest_tag`` *change*, never on "no longer available".
+# ---------------------------------------------------------------------------
+
+
+def test_dismiss_refuses_when_up_to_date(session: Session) -> None:
+    _seed(session, tag=running_version_tag(__version__))
+
+    with pytest.raises(UpdateNotAvailableError):
+        dismiss_update_check(session)
+
+    # Refusal must not have mutated the row.
+    assert _dismissed_at(session) is None
 
 
 def test_undismiss_clears_dismissed_at(session: Session) -> None:

@@ -13,10 +13,14 @@ Public surface, by concern:
   :func:`get_update_check_state` / :func:`reconcile_update_check`
   (:mod:`~collapsarr.update_check.service`) read/write the singleton row.
   :func:`dismiss_update_check` / :func:`undismiss_update_check` (COL-89)
-  acknowledge/clear the current "update available" notice; a ``latest_tag``
-  transition fires a :data:`EVENT_UPDATE_AVAILABLE` notification via
-  :func:`collapsarr.notify.dispatch_notification` and auto-clears any
-  dismissal, mirroring :mod:`collapsarr.health.service`'s pass/fail pattern.
+  acknowledge/clear the current "update available" notice -- refusing (via
+  :class:`UpdateNotAvailableError`) to dismiss when
+  :func:`is_update_available` is false, mirroring
+  :mod:`collapsarr.health.service`'s ``HealthCheckNotFailingError`` guard; a
+  ``latest_tag`` transition fires a :data:`EVENT_UPDATE_AVAILABLE`
+  notification via :func:`collapsarr.notify.dispatch_notification` and
+  auto-clears any dismissal, mirroring
+  :mod:`collapsarr.health.service`'s pass/fail pattern.
 - **The GitHub Releases client** -- :func:`fetch_latest_release` /
   :func:`fetch_latest_prerelease` + :class:`GitHubReleaseResult`
   (:mod:`~collapsarr.update_check.client`): unauthenticated, never-raising
@@ -60,8 +64,10 @@ from .scheduler import INTERVAL_SECONDS, UpdateCheckScheduler
 from .service import (
     EVENT_UPDATE_AVAILABLE,
     UpdateCheckStateNotFoundError,
+    UpdateNotAvailableError,
     dismiss_update_check,
     get_update_check_state,
+    is_update_available,
     reconcile_update_check,
     undismiss_update_check,
 )
@@ -78,6 +84,7 @@ __all__ = [
     "UpdateCheckScheduler",
     "UpdateCheckState",
     "UpdateCheckStateNotFoundError",
+    "UpdateNotAvailableError",
     "dismiss_update_check",
     "extract_beta_sha",
     "extract_beta_tag_sha",
@@ -86,6 +93,7 @@ __all__ = [
     "get_update_check_state",
     "is_up_to_date",
     "is_up_to_date_beta",
+    "is_update_available",
     "reconcile_update_check",
     "running_version_tag",
     "undismiss_update_check",
