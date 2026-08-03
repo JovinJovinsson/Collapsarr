@@ -33,6 +33,10 @@
   --c-success-tint: rgba(52, 211, 153, 0.14);
   --c-danger: #f87171;
   --c-danger-tint: rgba(248, 113, 113, 0.14);
+  /* Warning — amber, distinct from --c-danger's red so a warning-severity
+     health check (COL-76) never reads as indistinguishable from an error one. */
+  --c-warning: #fbbf24;
+  --c-warning-tint: rgba(251, 191, 36, 0.14);
 
   /* Type. System stack keeps the wheel self-contained (no bundled webfonts). */
   --font-body: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",

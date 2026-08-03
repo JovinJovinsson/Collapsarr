@@ -1,12 +1,13 @@
-"""Tests for the FFmpeg startup health check and its notifier bridge (COL-38).
+"""Tests for the FFmpeg probe, its framework adapter, and state reconciliation (COL-75).
 
 ``check_ffmpeg`` is a pure ``shutil.which`` presence check (unit tests below
 resolve a real, guaranteed-missing binary name rather than mocking
-``shutil.which``, to exercise the real lookup). ``notify_ffmpeg_missing``
-mirrors ``collapsarr.jobs.failure_notify.notify_job_failure``'s bridge
-pattern -- see ``tests/test_jobs_failure_notify.py`` for the sibling suite --
-and is driven the same way: an ``httpx.MockTransport`` so no live network call
-is made.
+``shutil.which``, to exercise the real lookup). ``make_ffmpeg_check_run`` adapts
+it into the shared :class:`HealthCheckResult` shape. ``reconcile_health_results``
+diffs a tick's results against persisted state and fires transition
+notifications through the generic notifier fan-out -- driven here with an
+``httpx.MockTransport`` so no live network call is made, the same idiom the
+retired ``notify_ffmpeg_missing`` suite used.
 """
 
 from __future__ import annotations
@@ -16,7 +17,21 @@ import json
 import httpx
 from sqlalchemy.orm import Session
 
-from collapsarr.health import FfmpegCheckResult, check_ffmpeg, notify_ffmpeg_missing
+from collapsarr.config import Settings
+from collapsarr.health import (
+    CHECK_STATUS_FAILING,
+    CHECK_STATUS_PASSING,
+    FFMPEG_MISSING_CODE,
+    SEVERITY_ERROR,
+    FfmpegCheckResult,
+    HealthCheckContext,
+    HealthCheckResult,
+    check_ffmpeg,
+    list_failing_checks,
+    list_health_check_states,
+    make_ffmpeg_check_run,
+    reconcile_health_results,
+)
 from collapsarr.notify.service import update_notifier_config
 
 _MISSING_BINARY = "collapsarr-test-definitely-not-a-real-binary"
@@ -32,8 +47,20 @@ def _ok_transport() -> tuple[httpx.MockTransport, list[httpx.Request]]:
     return httpx.MockTransport(handler), seen
 
 
+def _failing(code: str = "TEST-001", *, instance_id: int | None = None) -> HealthCheckResult:
+    return HealthCheckResult.failed(
+        code=code, category="test", severity=SEVERITY_ERROR, message="down", instance_id=instance_id
+    )
+
+
+def _passing(code: str = "TEST-001", *, instance_id: int | None = None) -> HealthCheckResult:
+    return HealthCheckResult.ok(
+        code=code, category="test", severity=SEVERITY_ERROR, message="up", instance_id=instance_id
+    )
+
+
 # ---------------------------------------------------------------------------
-# check_ffmpeg: present + missing paths.
+# check_ffmpeg: present + missing paths (unchanged signature/return type).
 # ---------------------------------------------------------------------------
 
 
@@ -57,82 +84,158 @@ def test_check_ffmpeg_reports_unavailable_when_not_found_on_path() -> None:
 
 
 # ---------------------------------------------------------------------------
-# notify_ffmpeg_missing: no-op when available, dispatches when missing.
+# FFmpeg framework adapter: probe -> shared HealthCheckResult shape.
 # ---------------------------------------------------------------------------
 
 
-def test_notify_ffmpeg_missing_is_a_noop_when_ffmpeg_is_available(session: Session) -> None:
-    check = FfmpegCheckResult(
-        available=True, ffmpeg_path="ffmpeg", detail="FFmpeg found at '/usr/bin/ffmpeg'."
+def _context(session: Session) -> HealthCheckContext:
+    return HealthCheckContext(settings=Settings(), session=session)
+
+
+def test_ffmpeg_check_run_adapts_a_present_binary_to_a_passing_result(session: Session) -> None:
+    present = FfmpegCheckResult(
+        available=True, ffmpeg_path="ffmpeg", detail="FFmpeg found at '/x'."
     )
+    run = make_ffmpeg_check_run(lambda: present)
+
+    results = list(run(_context(session)))
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.code == FFMPEG_MISSING_CODE
+    assert result.severity == SEVERITY_ERROR
+    assert result.passing is True
+    assert result.instance_id is None
+    assert result.message == present.detail
+
+
+def test_ffmpeg_check_run_adapts_a_missing_binary_to_a_failing_result(session: Session) -> None:
+    missing = FfmpegCheckResult(
+        available=False, ffmpeg_path="ffmpeg", detail="FFmpeg executable 'ffmpeg' was not found."
+    )
+    run = make_ffmpeg_check_run(lambda: missing)
+
+    result = list(run(_context(session)))[0]
+
+    assert result.code == FFMPEG_MISSING_CODE
+    assert result.passing is False
+    assert result.message == missing.detail
+
+
+# ---------------------------------------------------------------------------
+# reconcile_health_results: persistence + transition detection.
+# ---------------------------------------------------------------------------
+
+
+def test_new_failing_result_creates_a_failing_row_and_notifies(session: Session) -> None:
     update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
     transport, seen = _ok_transport()
 
-    notify_ffmpeg_missing(session, check, transport=transport)
+    reconcile_health_results(session, [_failing()], transport=transport)
 
-    assert seen == []
-
-
-def test_notify_ffmpeg_missing_dispatches_to_enabled_webhook(session: Session) -> None:
-    check = FfmpegCheckResult(
-        available=False,
-        ffmpeg_path="ffmpeg",
-        detail="FFmpeg executable 'ffmpeg' was not found on PATH.",
-    )
-    update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
-    transport, seen = _ok_transport()
-
-    notify_ffmpeg_missing(session, check, transport=transport)
-
+    rows = list_health_check_states(session)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == CHECK_STATUS_FAILING
+    assert row.first_failed_at is not None
     assert len(seen) == 1
     payload = json.loads(seen[0].content)
     assert payload["event_type"] == "health_check_failed"
-    assert payload["details"]["ffmpeg_path"] == "ffmpeg"
-    assert payload["details"]["detail"] == check.detail
+    assert payload["details"]["code"] == "TEST-001"
 
 
-def test_notify_ffmpeg_missing_dispatches_to_discord_too(session: Session) -> None:
-    check = FfmpegCheckResult(available=False, ffmpeg_path="ffmpeg", detail="missing")
-    update_notifier_config(
-        session,
-        discord_webhook_url="https://discord.com/api/webhooks/1/abc",
-        discord_enabled=True,
-    )
+def test_still_failing_does_not_notify_again_and_keeps_first_failed_at(session: Session) -> None:
+    update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
     transport, seen = _ok_transport()
 
-    notify_ffmpeg_missing(session, check, transport=transport)
+    reconcile_health_results(session, [_failing()], transport=transport)
+    first_failed_at = list_health_check_states(session)[0].first_failed_at
+    assert len(seen) == 1
+
+    # A second, still-failing tick: no new notification, streak start preserved.
+    reconcile_health_results(session, [_failing()], transport=transport)
 
     assert len(seen) == 1
-    embed = json.loads(seen[0].content)["embeds"][0]
-    assert embed["title"] == "FFmpeg not found"
+    assert list_health_check_states(session)[0].first_failed_at == first_failed_at
 
 
-def test_notify_ffmpeg_missing_makes_no_network_call_when_no_notifier_enabled(
+def test_fail_to_pass_transition_notifies_recovery_and_clears_first_failed_at(
     session: Session,
 ) -> None:
-    check = FfmpegCheckResult(available=False, ffmpeg_path="ffmpeg", detail="missing")
+    update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
     transport, seen = _ok_transport()
 
-    notify_ffmpeg_missing(session, check, transport=transport)  # must not raise
+    reconcile_health_results(session, [_failing()], transport=transport)
+    reconcile_health_results(session, [_passing()], transport=transport)
+
+    row = list_health_check_states(session)[0]
+    assert row.status == CHECK_STATUS_PASSING
+    assert row.first_failed_at is None
+    assert len(seen) == 2
+    assert json.loads(seen[1].content)["event_type"] == "health_check_recovered"
+
+
+def test_pass_to_fail_after_passing_notifies_failure(session: Session) -> None:
+    update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
+    transport, seen = _ok_transport()
+
+    # First-ever tick passing: a row is created, no notification.
+    reconcile_health_results(session, [_passing()], transport=transport)
+    assert seen == []
+    assert list_health_check_states(session)[0].status == CHECK_STATUS_PASSING
+
+    reconcile_health_results(session, [_failing()], transport=transport)
+
+    assert len(seen) == 1
+    assert json.loads(seen[0].content)["event_type"] == "health_check_failed"
+
+
+def test_passing_never_failed_creates_a_row_without_notifying(session: Session) -> None:
+    update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
+    transport, seen = _ok_transport()
+
+    reconcile_health_results(session, [_passing()], transport=transport)
 
     assert seen == []
+    assert list_failing_checks(session) == []
+    assert len(list_health_check_states(session)) == 1
 
 
-def test_notify_ffmpeg_missing_swallows_a_connection_error(session: Session) -> None:
+def test_reconcile_makes_no_network_call_when_no_notifier_enabled(session: Session) -> None:
+    transport, seen = _ok_transport()
+
+    reconcile_health_results(session, [_failing()], transport=transport)  # must not raise
+
+    assert seen == []
+    assert list_health_check_states(session)[0].status == CHECK_STATUS_FAILING
+
+
+def test_reconcile_swallows_a_connection_error(session: Session) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("Connection refused", request=request)
 
-    check = FfmpegCheckResult(available=False, ffmpeg_path="ffmpeg", detail="missing")
     update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
 
-    notify_ffmpeg_missing(session, check, transport=httpx.MockTransport(handler))  # must not raise
+    # A notifier problem must never propagate out of reconcile.
+    reconcile_health_results(session, [_failing()], transport=httpx.MockTransport(handler))
+
+    assert list_health_check_states(session)[0].status == CHECK_STATUS_FAILING
 
 
-def test_notify_ffmpeg_missing_swallows_an_http_error_status(session: Session) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, text="internal error")
-
-    check = FfmpegCheckResult(available=False, ffmpeg_path="ffmpeg", detail="missing")
+def test_per_instance_keys_are_tracked_independently(session: Session) -> None:
+    """Same code, two instance ids -> two rows, transitioning independently."""
     update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
+    transport, seen = _ok_transport()
 
-    notify_ffmpeg_missing(session, check, transport=httpx.MockTransport(handler))  # must not raise
+    reconcile_health_results(
+        session,
+        [_failing("ERR-CONN-001", instance_id=1), _passing("ERR-CONN-001", instance_id=2)],
+        transport=transport,
+    )
+
+    rows = {(r.code, r.instance_id): r for r in list_health_check_states(session)}
+    assert rows[("ERR-CONN-001", 1)].status == CHECK_STATUS_FAILING
+    assert rows[("ERR-CONN-001", 2)].status == CHECK_STATUS_PASSING
+    # Only the failing instance notified.
+    assert len(seen) == 1
+    assert json.loads(seen[0].content)["details"]["instance_id"] == "1"

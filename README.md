@@ -167,7 +167,7 @@ python -m collapsarr
 # then: curl http://localhost:8282/health
 #   ->  {"status":"ok","version":"...","warnings":[]}
 #   (or, if FFmpeg is missing: {"status":"degraded","version":"...",
-#    "warnings":[{"code":"ffmpeg_missing","message":"..."}]})
+#    "warnings":[{"code":"ffmpeg_missing","message":"...","severity":"error"}]})
 ```
 
 ## Configuration

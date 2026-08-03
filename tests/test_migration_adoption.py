@@ -204,18 +204,29 @@ def test_already_versioned_database_runs_only_pending_deltas(settings: Settings)
 # --------------------------------------------------------------------------- #
 # Stamp adoption + index heal
 # --------------------------------------------------------------------------- #
-#: Columns a *post-baseline* migration adds (currently just COL-66's backup
-#: schedule knobs). ``create_all`` below always builds the table from the
-#: live ``Base.metadata`` -- i.e. with these columns already present -- so
-#: they are dropped by raw DDL afterwards to de-evolve the stand-in back to
-#: what a real pre-COL-66 create_all-era release actually had on disk. This
-#: mirrors the ``DROP INDEX`` idiom just below for the same reason: the
-#: unversioned DB this function fabricates predates every post-baseline
-#: delta, not just the index-reconcile one.
+#: Columns a *post-baseline* migration adds (COL-66's backup schedule knobs,
+#: COL-79's disk-space thresholds). ``create_all`` below always builds the
+#: table from the live ``Base.metadata`` -- i.e. with these columns already
+#: present -- so they are dropped by raw DDL afterwards to de-evolve the
+#: stand-in back to what a real pre-COL-66/pre-COL-79 create_all-era release
+#: actually had on disk. This mirrors the ``DROP INDEX`` idiom just below for
+#: the same reason: the unversioned DB this function fabricates predates
+#: every post-baseline delta, not just the index-reconcile one.
 POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_interval_days"),
     ("global_settings", "backup_retention_days"),
+    ("global_settings", "disk_space_warning_percent"),
+    ("global_settings", "disk_space_error_percent"),
 )
+
+#: Whole tables a *post-baseline* migration adds (COL-75's
+#: ``health_check_state``, COL-80's ``health_write_probe``). ``create_all``
+#: below builds them from the live ``Base.metadata``, so they are dropped
+#: afterwards to de-evolve the stand-in back to a real pre-COL-75/pre-COL-80
+#: create_all-era release -- exactly as :data:`POST_BASELINE_COLUMNS` does for
+#: later-added columns -- so the adoption delta (not create_all) is what
+#: creates them.
+POST_BASELINE_TABLES: tuple[str, ...] = ("health_check_state", "health_write_probe")
 
 
 def _build_populated_unversioned_db(settings: Settings) -> None:
@@ -242,6 +253,10 @@ def _build_populated_unversioned_db(settings: Settings) -> None:
             connection.execute(
                 text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
             )
+        # Drop whole tables a post-baseline migration owns, so the adoption delta
+        # (not create_all) is what creates them -- same reasoning as the columns.
+        for table_name in POST_BASELINE_TABLES:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
         # Populate the sentinel + a couple of indexed tables via raw DML.
         connection.execute(
             text(

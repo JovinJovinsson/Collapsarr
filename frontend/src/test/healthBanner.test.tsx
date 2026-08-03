@@ -12,7 +12,22 @@ const okHealth: HealthStatus = { status: "ok", version: "0.1.0", warnings: [] };
 const degradedHealth: HealthStatus = {
   status: "degraded",
   version: "0.1.0",
-  warnings: [{ code: "ffmpeg_missing", message: "FFmpeg executable 'ffmpeg' was not found on PATH." }],
+  warnings: [
+    {
+      code: "ffmpeg_missing",
+      message: "FFmpeg executable 'ffmpeg' was not found on PATH.",
+      severity: "error",
+    },
+  ],
+};
+
+const mixedSeverityHealth: HealthStatus = {
+  status: "degraded",
+  version: "0.1.0",
+  warnings: [
+    { code: "ffmpeg_missing", message: "FFmpeg executable 'ffmpeg' was not found on PATH.", severity: "error" },
+    { code: "WARN-DISK-001", message: "Disk space low.", severity: "warning" },
+  ],
 };
 
 describe("HealthBanner", () => {
@@ -36,6 +51,26 @@ describe("HealthBanner", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(/ffmpeg executable 'ffmpeg' was not found on path/i);
+  });
+
+  it("visually distinguishes warning- from error-severity entries when several checks fail at once (COL-76)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(mixedSeverityHealth)));
+    render(<HealthBanner />);
+
+    const alert = await screen.findByRole("alert");
+    const messages = alert.querySelectorAll(".health-banner__message");
+    expect(messages).toHaveLength(2);
+
+    const errorEntry = Array.from(messages).find((el) => el.textContent?.includes("FFmpeg executable"));
+    const warningEntry = Array.from(messages).find((el) => el.textContent?.includes("Disk space low"));
+
+    expect(errorEntry).toBeDefined();
+    expect(warningEntry).toBeDefined();
+    expect(errorEntry).toHaveClass("health-banner__message--error");
+    expect(warningEntry).toHaveClass("health-banner__message--warning");
+    // Distinct styling, not just distinct text -- the two entries must not
+    // share the same severity modifier class.
+    expect(errorEntry?.className).not.toBe(warningEntry?.className);
   });
 
   it("renders nothing when the health fetch fails", async () => {

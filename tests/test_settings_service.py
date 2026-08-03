@@ -437,6 +437,50 @@ def test_update_global_settings_backup_schedule_persists_across_a_fresh_read(
 
 
 # ---------------------------------------------------------------------------
+# Disk-space thresholds (COL-79): warning + error free-space percentages.
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_disk_space_threshold_defaults(session: Session) -> None:
+    """COL-79: a fresh row defaults to a 5% warning / 2% error threshold."""
+    settings = get_global_settings(session)
+
+    assert settings.disk_space_warning_percent == 5.0
+    assert settings.disk_space_error_percent == 2.0
+
+
+def test_update_global_settings_updates_disk_space_thresholds(session: Session) -> None:
+    updated = update_global_settings(
+        session, disk_space_warning_percent=10.0, disk_space_error_percent=3.5
+    )
+
+    assert updated.disk_space_warning_percent == 10.0
+    assert updated.disk_space_error_percent == 3.5
+
+
+def test_update_global_settings_omitting_disk_space_thresholds_leaves_them_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, disk_space_warning_percent=8.0, disk_space_error_percent=4.0)
+
+    unchanged = update_global_settings(session, concurrency_limit=2)
+
+    assert unchanged.disk_space_warning_percent == 8.0
+    assert unchanged.disk_space_error_percent == 4.0
+
+
+def test_update_global_settings_disk_space_thresholds_persist_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, disk_space_warning_percent=6.0, disk_space_error_percent=1.0)
+
+    reread = get_global_settings(session)
+
+    assert reread.disk_space_warning_percent == 6.0
+    assert reread.disk_space_error_percent == 1.0
+
+
+# ---------------------------------------------------------------------------
 # Adapting to DownmixSettings.
 # ---------------------------------------------------------------------------
 

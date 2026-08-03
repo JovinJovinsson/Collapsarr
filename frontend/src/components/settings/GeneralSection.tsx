@@ -19,6 +19,8 @@ interface GeneralFormValues {
   stereoBitrateKbps: string;
   surroundCodec: string;
   surroundBitrateKbps: string;
+  diskSpaceWarningPercent: string;
+  diskSpaceErrorPercent: string;
 }
 
 /** Validates the general-settings form; returns an error message, or `null` when valid. */
@@ -36,6 +38,14 @@ function validateGeneralForm(form: GeneralFormValues): string | null {
   if (form.surroundBitrateKbps.trim() !== "") {
     const value = Number(form.surroundBitrateKbps);
     if (!Number.isInteger(value) || value < 1) return "Surround bitrate must be a positive whole number, or blank.";
+  }
+  const warningPercent = Number(form.diskSpaceWarningPercent);
+  if (form.diskSpaceWarningPercent.trim() === "" || !Number.isFinite(warningPercent) || warningPercent <= 0 || warningPercent > 100) {
+    return "Disk space warning threshold must be a percentage greater than 0 and at most 100.";
+  }
+  const errorPercent = Number(form.diskSpaceErrorPercent);
+  if (form.diskSpaceErrorPercent.trim() === "" || !Number.isFinite(errorPercent) || errorPercent <= 0 || errorPercent > 100) {
+    return "Disk space critical threshold must be a percentage greater than 0 and at most 100.";
   }
   return null;
 }
@@ -62,6 +72,8 @@ export function GeneralSection() {
     stereoBitrateKbps: "",
     surroundCodec: "ac3",
     surroundBitrateKbps: "",
+    diskSpaceWarningPercent: "5",
+    diskSpaceErrorPercent: "2",
   });
 
   const [saving, setSaving] = useState(false);
@@ -95,6 +107,8 @@ export function GeneralSection() {
           surroundCodec: settings.surround_codec,
           surroundBitrateKbps:
             settings.surround_bitrate_kbps === null ? "" : String(settings.surround_bitrate_kbps),
+          diskSpaceWarningPercent: String(settings.disk_space_warning_percent),
+          diskSpaceErrorPercent: String(settings.disk_space_error_percent),
         });
         setState({ status: "ready" });
       })
@@ -123,6 +137,8 @@ export function GeneralSection() {
         surround_codec: form.surroundCodec.trim(),
         surround_bitrate_kbps:
           form.surroundBitrateKbps.trim() === "" ? null : Number(form.surroundBitrateKbps),
+        disk_space_warning_percent: Number(form.diskSpaceWarningPercent),
+        disk_space_error_percent: Number(form.diskSpaceErrorPercent),
       });
       setServerApiKey(updated.api_key);
       setForm({
@@ -135,6 +151,8 @@ export function GeneralSection() {
         surroundCodec: updated.surround_codec,
         surroundBitrateKbps:
           updated.surround_bitrate_kbps === null ? "" : String(updated.surround_bitrate_kbps),
+        diskSpaceWarningPercent: String(updated.disk_space_warning_percent),
+        diskSpaceErrorPercent: String(updated.disk_space_error_percent),
       });
       setSavedAt(Date.now());
     } catch (err: unknown) {
@@ -401,6 +419,44 @@ export function GeneralSection() {
                 </button>
               </div>
               {logoutEverywhereError && <p className="form-error">{logoutEverywhereError}</p>}
+            </div>
+          </div>
+
+          <div className="panel settings-form">
+            <h3 className="settings-form__subtitle">Disk space alerts</h3>
+            <p className="settings-section__summary">
+              Free-space thresholds for the disk-space health check, read live on every check --
+              no restart needed after saving.
+            </p>
+            <div className="form-grid">
+              <div className="form-field">
+                <label htmlFor="disk-space-warning-percent">Warning threshold (% free)</label>
+                <input
+                  id="disk-space-warning-percent"
+                  type="number"
+                  min={0}
+                  max={100}
+                  step="any"
+                  value={form.diskSpaceWarningPercent}
+                  onChange={(event) => setForm({ ...form, diskSpaceWarningPercent: event.target.value })}
+                />
+                <p className="form-hint">Warn when free space drops below this percentage.</p>
+              </div>
+              <div className="form-field">
+                <label htmlFor="disk-space-error-percent">Critical threshold (% free)</label>
+                <input
+                  id="disk-space-error-percent"
+                  type="number"
+                  min={0}
+                  max={100}
+                  step="any"
+                  value={form.diskSpaceErrorPercent}
+                  onChange={(event) => setForm({ ...form, diskSpaceErrorPercent: event.target.value })}
+                />
+                <p className="form-hint">
+                  Escalate to a critical error when free space drops below this percentage.
+                </p>
+              </div>
             </div>
           </div>
 

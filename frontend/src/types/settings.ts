@@ -42,6 +42,17 @@ export interface GlobalSettings {
   backup_interval_days: number;
   /** Days a backup is kept before pruning (COL-66). Default 28; positive integer. */
   backup_retention_days: number;
+  /**
+   * Free-space percentage below which the disk-space health check warns
+   * (`WARN-DISK-001`, COL-79). Default 5; read live on every check tick.
+   */
+  disk_space_warning_percent: number;
+  /**
+   * Free-space percentage below which the disk-space health check escalates
+   * to an error (`ERR-DISK-001`, COL-79). Default 2; read live on every
+   * check tick.
+   */
+  disk_space_error_percent: number;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -68,4 +79,6 @@ export interface GlobalSettingsUpdateInput {
   auth_method?: AuthMethod;
   backup_interval_days?: number;
   backup_retention_days?: number;
+  disk_space_warning_percent?: number;
+  disk_space_error_percent?: number;
 }

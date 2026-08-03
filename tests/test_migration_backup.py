@@ -49,8 +49,8 @@ from collapsarr.migrations import (
     upgrade_to_head,
 )
 
-#: Columns a post-baseline migration adds (currently just COL-66's backup
-#: schedule knobs) -- dropped after ``create_all`` below by
+#: Columns a post-baseline migration adds (COL-66's backup schedule knobs,
+#: COL-79's disk-space thresholds) -- dropped after ``create_all`` below by
 #: :func:`_create_unversioned_db`, mirroring the same de-evolving idiom in
 #: ``test_migration_adoption.py``. Without this, ``create_all`` (which always
 #: builds from the *current* ``Base.metadata``) leaves these columns already
@@ -58,7 +58,15 @@ from collapsarr.migrations import (
 _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_interval_days"),
     ("global_settings", "backup_retention_days"),
+    ("global_settings", "disk_space_warning_percent"),
+    ("global_settings", "disk_space_error_percent"),
 )
+
+#: Whole tables a post-baseline migration adds (COL-75's ``health_check_state``,
+#: COL-80's ``health_write_probe``) -- dropped after ``create_all`` for the same
+#: reason as ``_POST_BASELINE_COLUMNS``, so the migration that creates them does
+#: not collide with a table ``create_all`` already built.
+_POST_BASELINE_TABLES: tuple[str, ...] = ("health_check_state", "health_write_probe")
 
 
 def _update_backups(settings: Settings) -> list[BackupInfo]:
@@ -81,6 +89,8 @@ def _create_unversioned_db(settings: Settings) -> None:
             connection.execute(
                 text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
             )
+        for table_name in _POST_BASELINE_TABLES:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
     engine.dispose()
 
 

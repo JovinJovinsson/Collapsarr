@@ -22,6 +22,8 @@ const baseSettings: GlobalSettings = {
   auth_method: "forms",
   backup_interval_days: 7,
   backup_retention_days: 28,
+  disk_space_warning_percent: 5,
+  disk_space_error_percent: 2,
   api_key: "server-generated-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
@@ -48,6 +50,58 @@ describe("GeneralSection", () => {
     expect(screen.getByRole("checkbox", { name: /require the api key/i })).not.toBeChecked();
     expect(screen.getByLabelText(/login requirement/i)).toHaveValue("local_bypass");
     expect(screen.getByLabelText(/sign-in method/i)).toHaveValue("forms");
+    expect(screen.getByLabelText(/warning threshold/i)).toHaveValue(5);
+    expect(screen.getByLabelText(/critical threshold/i)).toHaveValue(2);
+  });
+
+  it("saves the disk-space thresholds via PUT with the edited values", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<GeneralSection />);
+    const warningInput = await screen.findByLabelText(/warning threshold/i);
+    const errorInput = screen.getByLabelText(/critical threshold/i);
+    fireEvent.change(warningInput, { target: { value: "10" } });
+    fireEvent.change(errorInput, { target: { value: "3" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.disk_space_warning_percent).toBe(10);
+    expect(putBody.disk_space_error_percent).toBe(3);
+  });
+
+  it("validates the disk-space warning threshold before saving", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    render(<GeneralSection />);
+
+    const warningInput = await screen.findByLabelText(/warning threshold/i);
+    fireEvent.change(warningInput, { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(
+      await screen.findByText(/disk space warning threshold must be a percentage greater than 0/i),
+    ).toBeInTheDocument();
+  });
+
+  it("validates the disk-space critical threshold before saving", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    render(<GeneralSection />);
+
+    const errorInput = await screen.findByLabelText(/critical threshold/i);
+    fireEvent.change(errorInput, { target: { value: "150" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(
+      await screen.findByText(/disk space critical threshold must be a percentage greater than 0/i),
+    ).toBeInTheDocument();
   });
 
   it("saves the auth_method via PUT when switched to HTTP Basic", async () => {

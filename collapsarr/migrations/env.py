@@ -27,6 +27,7 @@ from collapsarr.database import Base
 # Base.metadata (the pattern the retired collapsarr.database.init_db used), so
 # autogenerate and upgrade see the full current schema.
 import collapsarr.arr  # noqa: F401,E402  isort:skip
+import collapsarr.health  # noqa: F401,E402  isort:skip
 import collapsarr.jobs  # noqa: F401,E402  isort:skip
 import collapsarr.media  # noqa: F401,E402  isort:skip
 import collapsarr.notify  # noqa: F401,E402  isort:skip

@@ -41,6 +41,13 @@ dedicated endpoint -- they round-trip through the same ``GET``/``PUT
 /api/settings`` as every other setting. The values are inert here: COL-67's
 scheduler is what reads the interval to decide when to run, and COL-68's
 pruning is what reads the retention to decide what to delete.
+
+``disk_space_warning_percent``/``disk_space_error_percent`` (COL-79) are the
+two free-space-percentage thresholds the disk-space health check
+(:mod:`collapsarr.health.disk_space`) reads live on every scheduler tick --
+same round-trip-only-through-Settings treatment as the backup pair, each
+constrained to ``(0, 100]`` (``Field(gt=0, le=100)``) since a percentage
+outside that range can never be crossed by a real free-space reading.
 """
 
 from __future__ import annotations
@@ -95,6 +102,8 @@ class SettingsRead(BaseModel):
     auth_method: AuthMethodMode
     backup_interval_days: int
     backup_retention_days: int
+    disk_space_warning_percent: float
+    disk_space_error_percent: float
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -123,6 +132,8 @@ class SettingsUpdate(BaseModel):
     auth_method: AuthMethodMode | None = None
     backup_interval_days: int | None = Field(default=None, gt=0)
     backup_retention_days: int | None = Field(default=None, gt=0)
+    disk_space_warning_percent: float | None = Field(default=None, gt=0, le=100)
+    disk_space_error_percent: float | None = Field(default=None, gt=0, le=100)
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -150,6 +161,8 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         auth_method=settings.auth_method,
         backup_interval_days=settings.backup_interval_days,
         backup_retention_days=settings.backup_retention_days,
+        disk_space_warning_percent=settings.disk_space_warning_percent,
+        disk_space_error_percent=settings.disk_space_error_percent,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -206,5 +219,9 @@ def update_settings_endpoint(
         kwargs["backup_interval_days"] = body.backup_interval_days
     if "backup_retention_days" in provided:
         kwargs["backup_retention_days"] = body.backup_retention_days
+    if "disk_space_warning_percent" in provided:
+        kwargs["disk_space_warning_percent"] = body.disk_space_warning_percent
+    if "disk_space_error_percent" in provided:
+        kwargs["disk_space_error_percent"] = body.disk_space_error_percent
 
     return _to_read(update_global_settings(session, **kwargs))  # type: ignore[arg-type]
