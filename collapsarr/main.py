@@ -53,6 +53,7 @@ from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
+from .update_check import UpdateCheckScheduler
 
 
 def create_app(
@@ -64,6 +65,7 @@ def create_app(
     notify_transport: httpx.BaseTransport | None = None,
     arr_transport: httpx.BaseTransport | None = None,
     disk_usage: Callable[[str], DiskUsage] | None = None,
+    update_check_transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -96,7 +98,10 @@ def create_app(
     :func:`shutil.disk_usage` probe, letting tests simulate an arbitrary
     free-space percentage without depending on the real filesystem's current
     usage; production leaves it ``None`` for a real reading against
-    ``settings.data_dir``.
+    ``settings.data_dir``. ``update_check_transport`` (COL-86) is forwarded to
+    the Update Check scheduler's GitHub Releases fetch (tests inject an
+    ``httpx.MockTransport``; production leaves it ``None`` for a real network
+    call).
     """
     resolved_settings = settings or get_settings()
 
@@ -179,6 +184,22 @@ def create_app(
         health_scheduler.run_once()
         if enable_scheduler:
             health_scheduler.start(run_immediately=False)
+
+        # Update Check scheduler (COL-86): a dedicated daemon-thread scheduler,
+        # structurally identical to the Health Check Framework's above, that
+        # fetches the latest GitHub Release on a fixed 24-hour cadence and
+        # persists it to the singleton `update_check_state` row. Same
+        # run-the-first-tick-synchronously-then-hand-off-to-the-thread shape,
+        # so the cached release data is accurate the instant the app comes up.
+        # No API/UI consumes this state yet (COL-87) and no notification fires
+        # from it in this slice -- it purely keeps the cache warm.
+        update_check_scheduler = UpdateCheckScheduler(
+            resolved_settings, session_factory, transport=update_check_transport
+        )
+        app.state.update_check_scheduler = update_check_scheduler
+        update_check_scheduler.run_once()
+        if enable_scheduler:
+            update_check_scheduler.start(run_immediately=False)
         try:
             yield
         finally:
@@ -187,6 +208,7 @@ def create_app(
             if backup_scheduler is not None:
                 backup_scheduler.stop()
             health_scheduler.stop()
+            update_check_scheduler.stop()
             engine.dispose()
 
     app = FastAPI(

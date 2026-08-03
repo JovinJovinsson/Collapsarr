@@ -74,6 +74,18 @@ worse than the warning tier by default, but the two fields are validated and
 stored independently -- see
 :func:`collapsarr.settings.service.update_global_settings`."""
 
+UPDATE_CHANNEL_STABLE = "stable"
+UPDATE_CHANNEL_BETA = "beta"
+"""Which GitHub Release stream the Update Check (COL-86, ``CONTEXT.md``'s
+"Release Channel") compares the running instance against. ``stable`` is the
+latest non-prerelease Release; ``beta`` is the latest prerelease Release
+(comparison logic for the beta channel is a later ticket -- COL-86 only
+persists the knob and always fetches the stable channel's latest release)."""
+
+DEFAULT_UPDATE_CHANNEL = UPDATE_CHANNEL_STABLE
+"""Default :attr:`GlobalSettings.update_channel` for a fresh install / an
+existing row backfilled by the additive migration."""
+
 
 def generate_api_key() -> str:
     """Return a fresh, cryptographically-random API key.
@@ -149,6 +161,14 @@ class GlobalSettings(Base):
     DB-side ``server_default``\\ s (matching ``auth_method``/``auth_required``
     above) so the additive migration backfills existing installs with the
     documented defaults (7 / 28 days) rather than leaving them ``NULL``.
+
+    ``update_channel`` (COL-86, ``CONTEXT.md``'s "Release Channel") is
+    ``stable``|``beta``, selecting which GitHub Release stream the Update
+    Check (:mod:`collapsarr.update_check`) compares the running instance
+    against. Carries the same ``server_default`` treatment as
+    ``auth_method``/``auth_required`` above so an existing install's row is
+    backfilled to ``stable`` in the same additive migration; there is no
+    Settings-page write path for it yet (a later ticket's concern).
 
     ``disk_space_warning_percent``/``disk_space_error_percent`` (COL-79) are
     the two free-space-percentage thresholds
@@ -227,6 +247,13 @@ class GlobalSettings(Base):
         nullable=False,
         default=DEFAULT_DISK_SPACE_ERROR_PERCENT,
         server_default=text(str(DEFAULT_DISK_SPACE_ERROR_PERCENT)),
+    )
+
+    update_channel: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default=DEFAULT_UPDATE_CHANNEL,
+        server_default=text(f"'{DEFAULT_UPDATE_CHANNEL}'"),
     )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
