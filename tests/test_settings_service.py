@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -21,9 +22,12 @@ from collapsarr.settings.models import (
     AUTH_METHOD_FORMS,
     AUTH_REQUIRED_ENABLED,
     AUTH_REQUIRED_LOCAL_BYPASS,
+    UPDATE_CHANNEL_BETA,
+    UPDATE_CHANNEL_STABLE,
     GlobalSettings,
 )
 from collapsarr.settings.service import (
+    _default_update_channel,
     as_downmix_settings,
     get_global_settings,
     rotate_session_secret,
@@ -478,6 +482,77 @@ def test_update_global_settings_disk_space_thresholds_persist_across_a_fresh_rea
 
     assert reread.disk_space_warning_percent == 6.0
     assert reread.disk_space_error_percent == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Update channel (COL-88).
+# ---------------------------------------------------------------------------
+
+
+def test_default_update_channel_is_stable_for_a_plain_version() -> None:
+    assert _default_update_channel("0.1.0") == UPDATE_CHANNEL_STABLE
+
+
+def test_default_update_channel_is_beta_for_a_beta_build_version() -> None:
+    assert _default_update_channel("0.1.0+beta.abc1234") == UPDATE_CHANNEL_BETA
+
+
+def test_get_global_settings_defaults_update_channel_to_stable(session: Session) -> None:
+    settings = get_global_settings(session)
+
+    assert settings.update_channel == UPDATE_CHANNEL_STABLE
+
+
+def test_get_global_settings_defaults_update_channel_to_beta_for_a_beta_build(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """COL-88: a fresh install running a ``+beta.<sha>`` build auto-defaults to beta."""
+    monkeypatch.setattr("collapsarr.settings.service.__version__", "0.1.0+beta.abc1234")
+
+    row = get_global_settings(session=_fresh_session(settings))
+
+    assert row.update_channel == UPDATE_CHANNEL_BETA
+
+
+def test_update_global_settings_switches_the_update_channel(session: Session) -> None:
+    updated = update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    assert updated.update_channel == UPDATE_CHANNEL_BETA
+
+
+def test_update_global_settings_update_channel_is_switchable_back_to_stable(
+    session: Session,
+) -> None:
+    update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    updated = update_global_settings(session, update_channel=UPDATE_CHANNEL_STABLE)
+
+    assert updated.update_channel == UPDATE_CHANNEL_STABLE
+
+
+def test_update_global_settings_rejects_an_unknown_update_channel(session: Session) -> None:
+    with pytest.raises(ValueError, match="update_channel"):
+        update_global_settings(session, update_channel="nightly")
+
+
+def test_update_global_settings_omitting_update_channel_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.update_channel == UPDATE_CHANNEL_BETA
+
+
+def test_update_global_settings_update_channel_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    reread = get_global_settings(session)
+
+    assert reread.update_channel == UPDATE_CHANNEL_BETA
 
 
 # ---------------------------------------------------------------------------

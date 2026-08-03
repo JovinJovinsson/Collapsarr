@@ -21,8 +21,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.migrations import upgrade_to_head
-from collapsarr.settings.models import UPDATE_CHANNEL_STABLE
-from collapsarr.settings.service import get_global_settings
+from collapsarr.settings.models import UPDATE_CHANNEL_BETA, UPDATE_CHANNEL_STABLE
+from collapsarr.settings.service import get_global_settings, update_global_settings
 from collapsarr.update_check.scheduler import UpdateCheckScheduler
 from collapsarr.update_check.service import get_update_check_state
 
@@ -61,6 +61,22 @@ def _failing_transport() -> httpx.MockTransport:
         raise httpx.ConnectError("connection refused")
 
     return httpx.MockTransport(handler)
+
+
+def _prerelease_transport(
+    tag: str = "beta-abc1234",
+) -> tuple[httpx.MockTransport, list[httpx.Request]]:
+    """A transport whose ``/releases`` list has exactly one prerelease entry (COL-88)."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json=[{"tag_name": tag, "prerelease": True, "name": tag, "body": "beta notes"}],
+        )
+
+    return httpx.MockTransport(handler), seen
 
 
 def _make_scheduler(
@@ -120,6 +136,44 @@ def test_run_once_reads_the_configured_channel_fresh_each_tick(
         state = get_update_check_state(session)
         assert state is not None
         assert state.channel == "beta"
+
+
+# ---------------------------------------------------------------------------
+# Beta channel fetch dispatch (COL-88).
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_fetches_the_prerelease_endpoint_when_channel_is_beta(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    with session_factory() as session:
+        update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    transport, seen = _prerelease_transport("beta-abc1234")
+    scheduler = _make_scheduler(settings, session_factory, transport=transport)
+
+    result = scheduler.run_once()
+
+    assert len(seen) == 1
+    assert str(seen[0].url).endswith("/releases")
+    assert result.latest_tag == "beta-abc1234"
+    with session_factory() as session:
+        row = get_update_check_state(session)
+        assert row is not None
+        assert row.channel == UPDATE_CHANNEL_BETA
+        assert row.latest_tag == "beta-abc1234"
+
+
+def test_run_once_fetches_the_latest_endpoint_when_channel_is_stable(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    transport, seen = _success_transport("v1.2.3")
+    scheduler = _make_scheduler(settings, session_factory, transport=transport)
+
+    scheduler.run_once()
+
+    assert len(seen) == 1
+    assert str(seen[0].url).endswith("/releases/latest")
 
 
 # ---------------------------------------------------------------------------

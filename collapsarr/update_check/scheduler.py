@@ -1,4 +1,4 @@
-"""The Update Check scheduler (COL-86).
+"""The Update Check scheduler (COL-86, beta channel dispatch COL-88).
 
 Structurally identical to :class:`collapsarr.health.scheduler.
 HealthCheckScheduler`: a daemon thread running a plain sleep/wake loop, an
@@ -8,6 +8,13 @@ The one structural difference is cadence and cardinality -- there is a single
 fixed check (fetch the latest release, reconcile one singleton row), not a
 registry of pluggable checks -- so there is no ``checks: Sequence[...]``
 parameter here.
+
+Each tick fetches from whichever endpoint matches the currently configured
+channel: :func:`~collapsarr.update_check.client.fetch_latest_release` for
+``stable``, :func:`~collapsarr.update_check.client.fetch_latest_prerelease`
+for ``beta`` (COL-88) -- selected fresh every tick from
+:attr:`~collapsarr.settings.models.GlobalSettings.update_channel`, so an
+operator switching channels takes effect on the very next tick.
 
 Threads, not asyncio: matches every sibling scheduler's rationale -- the fetch
 is blocking I/O (``httpx``) and there is no external scheduler dependency in
@@ -31,9 +38,10 @@ import httpx
 from sqlalchemy.orm import Session, sessionmaker
 
 from collapsarr.config import Settings
+from collapsarr.settings.models import UPDATE_CHANNEL_BETA
 from collapsarr.settings.service import get_global_settings
 
-from .client import fetch_latest_release
+from .client import fetch_latest_prerelease, fetch_latest_release
 from .models import UpdateCheckState
 from .service import reconcile_update_check
 
@@ -84,14 +92,21 @@ class UpdateCheckScheduler:
         injectable-clock tests drive directly. Reads the configured channel
         from :class:`~collapsarr.settings.models.GlobalSettings` fresh every
         tick, so an operator changing it takes effect on the next tick with no
-        restart. The GitHub fetch itself never raises (see
-        :func:`~collapsarr.update_check.client.fetch_latest_release`); a
-        failed fetch still reconciles (persisting a "no result" tick) --
-        see :mod:`collapsarr.update_check.service`.
+        restart -- and picks the matching fetch function (COL-88): the beta
+        channel's latest prerelease
+        (:func:`~collapsarr.update_check.client.fetch_latest_prerelease`)
+        rather than the stable channel's latest release
+        (:func:`~collapsarr.update_check.client.fetch_latest_release`).
+        Neither fetch function ever raises; a failed fetch still reconciles
+        (persisting a "no result" tick) -- see
+        :mod:`collapsarr.update_check.service`.
         """
         with self._session_factory() as session:
             channel = get_global_settings(session).update_channel
-            result = fetch_latest_release(transport=self._transport)
+            fetch = (
+                fetch_latest_prerelease if channel == UPDATE_CHANNEL_BETA else fetch_latest_release
+            )
+            result = fetch(transport=self._transport)
             return reconcile_update_check(session, result, channel, now=self._now)
 
     def start(self, *, run_immediately: bool = True) -> None:

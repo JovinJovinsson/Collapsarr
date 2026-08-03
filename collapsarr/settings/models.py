@@ -84,7 +84,24 @@ persists the knob and always fetches the stable channel's latest release)."""
 
 DEFAULT_UPDATE_CHANNEL = UPDATE_CHANNEL_STABLE
 """Default :attr:`GlobalSettings.update_channel` for a fresh install / an
-existing row backfilled by the additive migration."""
+existing row backfilled by the additive migration. This is the ORM/DB-level
+default (the column's ``default=``/``server_default=``); a fresh row's
+*actual* value is decided by :func:`collapsarr.settings.service.
+get_global_settings` at creation time, which overrides it with ``"beta"``
+when the running build is itself a beta build (COL-88) -- see
+:data:`BETA_LOCAL_SEGMENT_PREFIX`."""
+
+BETA_LOCAL_SEGMENT_PREFIX = "+beta."
+"""The literal substring immediately preceding a beta build's embedded
+short-SHA in the running ``collapsarr.__version__`` (COL-88) -- e.g.
+``"1.2.3+beta.abc1234"``, stamped by ``.github/workflows/beta.yml``'s
+``build-wheel`` job. Used by :func:`collapsarr.settings.service.
+get_global_settings` to auto-default a fresh install's ``update_channel`` to
+``"beta"`` when the running build is itself a beta build. Deliberately
+duplicated (not imported) in :data:`collapsarr.update_check.comparison.
+BETA_LOCAL_SEGMENT_PREFIX`, which needs the same literal for beta-channel
+version comparison -- see that module's docstring for why it isn't shared via
+import."""
 
 
 def generate_api_key() -> str:
@@ -167,8 +184,10 @@ class GlobalSettings(Base):
     Check (:mod:`collapsarr.update_check`) compares the running instance
     against. Carries the same ``server_default`` treatment as
     ``auth_method``/``auth_required`` above so an existing install's row is
-    backfilled to ``stable`` in the same additive migration; there is no
-    Settings-page write path for it yet (a later ticket's concern).
+    backfilled to ``stable`` in the same additive migration. Validated to the
+    two-value enum by :func:`collapsarr.settings.service.
+    update_global_settings` (COL-88) and read/write through the Settings page
+    (``GET``/``PUT /api/settings``) same as every other setting.
 
     ``disk_space_warning_percent``/``disk_space_error_percent`` (COL-79) are
     the two free-space-percentage thresholds

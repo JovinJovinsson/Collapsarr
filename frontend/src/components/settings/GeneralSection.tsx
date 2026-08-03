@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { changePassword, logoutEverywhere } from "../../api/auth";
 import { getStoredApiKey, redirectToLogin, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
-import type { AuthMethod, AuthRequiredMode } from "../../types/settings";
+import type { AuthMethod, AuthRequiredMode, UpdateChannel } from "../../types/settings";
 
 type LoadState =
   | { status: "loading" }
@@ -15,6 +16,7 @@ interface GeneralFormValues {
   uiAuthEnabled: boolean;
   authRequired: AuthRequiredMode;
   authMethod: AuthMethod;
+  updateChannel: UpdateChannel;
   stereoCodec: string;
   stereoBitrateKbps: string;
   surroundCodec: string;
@@ -68,6 +70,7 @@ export function GeneralSection() {
     uiAuthEnabled: false,
     authRequired: "local_bypass",
     authMethod: "forms",
+    updateChannel: "stable",
     stereoCodec: "aac",
     stereoBitrateKbps: "",
     surroundCodec: "ac3",
@@ -102,6 +105,7 @@ export function GeneralSection() {
           uiAuthEnabled: settings.ui_auth_enabled,
           authRequired: settings.auth_required,
           authMethod: settings.auth_method,
+          updateChannel: settings.update_channel,
           stereoCodec: settings.stereo_codec,
           stereoBitrateKbps: settings.stereo_bitrate_kbps === null ? "" : String(settings.stereo_bitrate_kbps),
           surroundCodec: settings.surround_codec,
@@ -132,6 +136,7 @@ export function GeneralSection() {
         ui_auth_enabled: form.uiAuthEnabled,
         auth_required: form.authRequired,
         auth_method: form.authMethod,
+        update_channel: form.updateChannel,
         stereo_codec: form.stereoCodec.trim(),
         stereo_bitrate_kbps: form.stereoBitrateKbps.trim() === "" ? null : Number(form.stereoBitrateKbps),
         surround_codec: form.surroundCodec.trim(),
@@ -146,6 +151,7 @@ export function GeneralSection() {
         uiAuthEnabled: updated.ui_auth_enabled,
         authRequired: updated.auth_required,
         authMethod: updated.auth_method,
+        updateChannel: updated.update_channel,
         stereoCodec: updated.stereo_codec,
         stereoBitrateKbps: updated.stereo_bitrate_kbps === null ? "" : String(updated.stereo_bitrate_kbps),
         surroundCodec: updated.surround_codec,
@@ -348,6 +354,29 @@ export function GeneralSection() {
                 onChange={(event) => setForm({ ...form, concurrencyLimit: event.target.value })}
               />
               <p className="form-hint">Maximum downmix jobs running at once.</p>
+            </div>
+          </div>
+
+          <div className="panel settings-form">
+            <h3 className="settings-form__subtitle">Update channel</h3>
+            <div className="form-field form-field--narrow">
+              <label htmlFor="update-channel">Release channel</label>
+              <select
+                id="update-channel"
+                value={form.updateChannel}
+                onChange={(event) =>
+                  setForm({ ...form, updateChannel: event.target.value as typeof form.updateChannel })
+                }
+              >
+                <option value="stable">Stable</option>
+                <option value="beta">Beta</option>
+              </select>
+              <p className="form-hint">
+                <strong>Stable</strong> (default) checks for the latest tagged GitHub release.{" "}
+                <strong>Beta</strong> checks for the latest pre-release build instead -- may be
+                less stable, intended for early testing. See the{" "}
+                <Link to="/system/updates">Updates page</Link> for the current comparison result.
+              </p>
             </div>
           </div>
 

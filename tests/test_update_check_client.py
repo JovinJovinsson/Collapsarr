@@ -1,4 +1,4 @@
-"""Tests for the GitHub Releases client (COL-86).
+"""Tests for the GitHub Releases client (COL-86, beta channel COL-88).
 
 Mirrors :mod:`collapsarr.arr.client`'s own test idiom (never raises; a
 ``transport`` (``httpx.MockTransport``) stands in for the real network call).
@@ -9,7 +9,11 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from collapsarr.update_check.client import GITHUB_REPO, fetch_latest_release
+from collapsarr.update_check.client import (
+    GITHUB_REPO,
+    fetch_latest_prerelease,
+    fetch_latest_release,
+)
 
 
 def _transport(handler: object) -> httpx.MockTransport:
@@ -137,3 +141,122 @@ def test_missing_optional_fields_default_to_none(missing_field: str) -> None:
 
     assert result.ok is True
     assert getattr(result, missing_field) is None
+
+
+# ---------------------------------------------------------------------------
+# fetch_latest_prerelease (COL-88): beta channel.
+# ---------------------------------------------------------------------------
+
+
+def test_prerelease_requests_the_correct_repo_releases_endpoint() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=[{"tag_name": "beta-abc1234", "prerelease": True}])
+
+    fetch_latest_prerelease(transport=_transport(handler))
+
+    assert len(seen) == 1
+    assert str(seen[0].url) == f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+
+
+def test_prerelease_picks_the_first_prerelease_entry() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"tag_name": "v2.0.0", "prerelease": False, "draft": False},
+                {"tag_name": "beta-abc1234", "prerelease": True, "name": "Beta build abc1234"},
+                {"tag_name": "beta-def5678", "prerelease": True, "name": "Beta build def5678"},
+            ],
+        )
+
+    result = fetch_latest_prerelease(transport=_transport(handler))
+
+    assert result.ok is True
+    assert result.tag == "beta-abc1234"
+    assert result.name == "Beta build abc1234"
+
+
+def test_prerelease_never_raises_when_no_prerelease_entry_exists() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"tag_name": "v2.0.0", "prerelease": False}])
+
+    result = fetch_latest_prerelease(transport=_transport(handler))
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_prerelease_never_raises_on_an_empty_list() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    result = fetch_latest_prerelease(transport=_transport(handler))
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_prerelease_never_raises_when_response_is_not_a_list() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"tag_name": "v1.2.3"})
+
+    result = fetch_latest_prerelease(transport=_transport(handler))
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_prerelease_never_raises_on_connection_error() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    result = fetch_latest_prerelease(transport=_transport(handler))
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_prerelease_never_raises_on_non_2xx_status() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="Not Found")
+
+    result = fetch_latest_prerelease(transport=_transport(handler))
+
+    assert result.ok is False
+    assert "404" in (result.error or "")
+
+
+def test_prerelease_never_raises_when_tag_name_is_missing() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"prerelease": True, "name": "no tag here"}])
+
+    result = fetch_latest_prerelease(transport=_transport(handler))
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_prerelease_parses_published_at_and_changelog() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "tag_name": "beta-abc1234",
+                    "prerelease": True,
+                    "name": "Beta build abc1234",
+                    "body": "- experimental change",
+                    "published_at": "2026-08-01T12:30:00Z",
+                }
+            ],
+        )
+
+    result = fetch_latest_prerelease(transport=_transport(handler))
+
+    assert result.ok is True
+    assert result.body == "- experimental change"
+    assert result.published_at is not None
+    assert result.published_at.year == 2026

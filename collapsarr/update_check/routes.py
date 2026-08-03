@@ -38,7 +38,8 @@ from sqlalchemy.orm import Session
 
 from .. import __version__
 from ..database import get_session
-from .comparison import is_up_to_date
+from ..settings.models import UPDATE_CHANNEL_BETA
+from .comparison import is_up_to_date, is_up_to_date_beta
 from .scheduler import UpdateCheckScheduler
 from .service import get_update_check_state
 
@@ -110,19 +111,30 @@ def _read_state(session: Session) -> UpdateCheckStateRead:
     response are built identically. ``state`` is ``None`` only if the app's
     startup tick (:func:`collapsarr.main.create_app`'s lifespan) never ran --
     handled the same way :func:`~collapsarr.update_check.comparison.
-    is_up_to_date` treats a ``None`` ``latest_tag``: "unknown" reports as an
-    update being available rather than silently claiming the instance is
+    is_up_to_date`/:func:`~collapsarr.update_check.comparison.
+    is_up_to_date_beta` treat a ``None`` ``latest_tag``: "unknown" reports as
+    an update being available rather than silently claiming the instance is
     current with no evidence.
+
+    The comparison function is picked from ``state.channel`` (COL-88) -- the
+    channel *that tick's* fetch actually ran against, recorded on the same
+    row as ``latest_tag`` -- rather than re-reading the currently configured
+    channel, so ``latest_tag``/``update_available`` always describe the same
+    channel consistently even mid-switch (before the next tick/recheck runs
+    against the newly selected channel). Falls back to the stable comparison
+    when there's no state yet, matching the pre-COL-88 default.
     """
     state = get_update_check_state(session)
     latest_version = state.latest_tag if state is not None else None
+    channel = state.channel if state is not None else None
+    compare = is_up_to_date_beta if channel == UPDATE_CHANNEL_BETA else is_up_to_date
     return UpdateCheckStateRead(
         running_version=__version__,
         latest_version=latest_version,
         latest_version_label=state.latest_version_label if state is not None else None,
         changelog=state.changelog if state is not None else None,
         checked_at=state.checked_at if state is not None else None,
-        update_available=not is_up_to_date(__version__, latest_version),
+        update_available=not compare(__version__, latest_version),
     )
 
 

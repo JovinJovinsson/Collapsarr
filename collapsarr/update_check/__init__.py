@@ -12,12 +12,15 @@ Public surface, by concern:
   imported here so the model registers with :data:`collapsarr.database.Base.metadata`.
   :func:`get_update_check_state` / :func:`reconcile_update_check`
   (:mod:`~collapsarr.update_check.service`) read/write the singleton row.
-- **The GitHub Releases client** -- :func:`fetch_latest_release` +
-  :class:`GitHubReleaseResult` (:mod:`~collapsarr.update_check.client`): an
-  unauthenticated, never-raising fetch of the stable channel's latest release.
-- **Version-identity comparison** -- :func:`is_up_to_date`
-  (:mod:`~collapsarr.update_check.comparison`): a pure, I/O-free match/no-match
-  check against the stable channel (no semver ordering -- that's a later slice).
+- **The GitHub Releases client** -- :func:`fetch_latest_release` /
+  :func:`fetch_latest_prerelease` + :class:`GitHubReleaseResult`
+  (:mod:`~collapsarr.update_check.client`): unauthenticated, never-raising
+  fetches of the stable channel's latest release / the beta channel's latest
+  prerelease (COL-88) respectively.
+- **Version-identity comparison** -- :func:`is_up_to_date` /
+  :func:`is_up_to_date_beta` (:mod:`~collapsarr.update_check.comparison`): pure,
+  I/O-free match/no-match checks against the stable / beta channel (COL-88;
+  no semver ordering either way).
 - **Orchestration** -- :class:`UpdateCheckScheduler`
   (:mod:`~collapsarr.update_check.scheduler`): a daemon-thread scheduler,
   structurally identical to :class:`~collapsarr.health.HealthCheckScheduler`,
@@ -36,13 +39,24 @@ frontend half (``frontend/src/pages/UpdatesPage.tsx``,
 
 from __future__ import annotations
 
-from .client import GITHUB_REPO, GitHubReleaseResult, fetch_latest_release
-from .comparison import VERSION_TAG_PREFIX, is_up_to_date, running_version_tag
+from .client import GITHUB_REPO, GitHubReleaseResult, fetch_latest_prerelease, fetch_latest_release
+from .comparison import (
+    BETA_LOCAL_SEGMENT_PREFIX,
+    BETA_TAG_PREFIX,
+    VERSION_TAG_PREFIX,
+    extract_beta_sha,
+    extract_beta_tag_sha,
+    is_up_to_date,
+    is_up_to_date_beta,
+    running_version_tag,
+)
 from .models import UPDATE_CHECK_STATE_ID, UpdateCheckState
 from .scheduler import INTERVAL_SECONDS, UpdateCheckScheduler
 from .service import get_update_check_state, reconcile_update_check
 
 __all__ = [
+    "BETA_LOCAL_SEGMENT_PREFIX",
+    "BETA_TAG_PREFIX",
     "GITHUB_REPO",
     "INTERVAL_SECONDS",
     "UPDATE_CHECK_STATE_ID",
@@ -50,9 +64,13 @@ __all__ = [
     "GitHubReleaseResult",
     "UpdateCheckScheduler",
     "UpdateCheckState",
+    "extract_beta_sha",
+    "extract_beta_tag_sha",
+    "fetch_latest_prerelease",
     "fetch_latest_release",
     "get_update_check_state",
     "is_up_to_date",
+    "is_up_to_date_beta",
     "reconcile_update_check",
     "running_version_tag",
 ]
