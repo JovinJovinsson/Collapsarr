@@ -36,3 +36,41 @@ export async function recheckUpdateStatus(): Promise<UpdateCheckState> {
   }
   return (await response.json()) as UpdateCheckState;
 }
+
+/**
+ * Dismisses the current "update available" notice
+ * (`POST /api/system/updates/dismiss`, COL-89). Mirrors `dismissHealthCheck`
+ * (`api/health.ts`), but scoped to the singleton Update Check row -- no id
+ * parameter, since there is only ever one.
+ */
+export async function dismissUpdateStatus(): Promise<UpdateCheckState> {
+  const response = await apiFetch("/api/system/updates/dismiss", {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to dismiss the update notice (${response.status})`)
+    );
+  }
+  return (await response.json()) as UpdateCheckState;
+}
+
+/**
+ * Clears a dismissal on the current "update available" notice early
+ * (`POST /api/system/updates/undismiss`, COL-89). Mirrors
+ * `undismissHealthCheck` (`api/health.ts`).
+ */
+export async function undismissUpdateStatus(): Promise<UpdateCheckState> {
+  const response = await apiFetch("/api/system/updates/undismiss", {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(
+        response,
+        `Failed to undismiss the update notice (${response.status})`
+      )
+    );
+  }
+  return (await response.json()) as UpdateCheckState;
+}

@@ -89,8 +89,11 @@ def create_app(
     Health Check Framework (COL-75; defaults to
     :func:`~collapsarr.health.check_ffmpeg`), letting tests simulate a
     present/missing FFmpeg without touching the real binary. ``notify_transport``
-    is forwarded to the framework's transition notifications (tests inject an
-    ``httpx.MockTransport``; production leaves it ``None``). ``arr_transport``
+    is forwarded to both the Health Check Framework's transition notifications
+    and the Update Check scheduler's edge-triggered "update available"
+    notification (COL-89) -- one shared notifier config, so tests inject a
+    single ``httpx.MockTransport`` to capture either; production leaves it
+    ``None``. ``arr_transport``
     (COL-78) is forwarded to every Arr-instance connectivity probe the
     per-instance unreachable check makes, letting tests simulate
     reachable/unreachable instances without a real network call; production
@@ -186,17 +189,24 @@ def create_app(
         if enable_scheduler:
             health_scheduler.start(run_immediately=False)
 
-        # Update Check scheduler (COL-86): a dedicated daemon-thread scheduler,
-        # structurally identical to the Health Check Framework's above, that
-        # fetches the latest GitHub Release on a fixed 24-hour cadence and
-        # persists it to the singleton `update_check_state` row. Same
-        # run-the-first-tick-synchronously-then-hand-off-to-the-thread shape,
-        # so the cached release data is accurate the instant the app comes up.
-        # GET/POST /api/system/updates{,/recheck} (COL-87, update_checks_router
-        # below) expose this state; no notification fires from it in this
-        # slice -- it purely keeps the cache warm and readable.
+        # Update Check scheduler (COL-86, COL-89): a dedicated daemon-thread
+        # scheduler, structurally identical to the Health Check Framework's
+        # above, that fetches the latest GitHub Release on a fixed 24-hour
+        # cadence and persists it to the singleton `update_check_state` row.
+        # Same run-the-first-tick-synchronously-then-hand-off-to-the-thread
+        # shape, so the cached release data is accurate the instant the app
+        # comes up. GET/POST /api/system/updates{,/recheck,/dismiss,
+        # /undismiss} (COL-87/COL-89, update_checks_router below) expose this
+        # state. A tick whose fetched `latest_tag` differs from the
+        # previously-stored one fires an edge-triggered notification over the
+        # same `notify_transport` the health framework's transitions use
+        # (COL-89) -- one shared notifier config, one shared mock transport in
+        # tests.
         update_check_scheduler = UpdateCheckScheduler(
-            resolved_settings, session_factory, transport=update_check_transport
+            resolved_settings,
+            session_factory,
+            transport=update_check_transport,
+            notify_transport=notify_transport,
         )
         app.state.update_check_scheduler = update_check_scheduler
         update_check_scheduler.run_once()

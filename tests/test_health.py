@@ -34,6 +34,23 @@ def _arr_ok_transport() -> httpx.MockTransport:
     return httpx.MockTransport(lambda request: httpx.Response(200, json={"version": "4.0.0"}))
 
 
+def _offline_update_check_transport() -> httpx.MockTransport:
+    """A deterministic stand-in for the Update Check scheduler's GitHub fetch.
+
+    Mirrors ``conftest.py``'s ``_offline_update_check_transport``: the app
+    lifespan also runs an ``UpdateCheckScheduler.run_once()`` tick
+    synchronously on startup (COL-86), which -- since COL-89 -- shares this
+    module's ``notify_transport`` mock for its own edge-triggered "update
+    available" notification. Left unpinned, that tick would hit the real
+    ``api.github.com`` and, on a successful first-ever fetch, fire an
+    unrelated notification through the very mock these tests use to assert
+    ffmpeg-only notification counts. Reporting a fixed failure keeps that tick
+    a guaranteed no-op (no tag, no transition, no notification), scoping these
+    tests back to ffmpeg alone.
+    """
+    return httpx.MockTransport(lambda _request: httpx.Response(503, text="offline in tests"))
+
+
 class _FakeUsage(NamedTuple):
     total: int
     used: int
@@ -300,6 +317,7 @@ def test_app_startup_dispatches_a_notification_when_ffmpeg_is_missing_and_a_noti
         notify_transport=httpx.MockTransport(handler),
         arr_transport=_arr_ok_transport(),
         disk_usage=_ample_free_space(),
+        update_check_transport=_offline_update_check_transport(),
     )
 
     with TestClient(app):  # entering the context runs the lifespan/startup
@@ -360,6 +378,7 @@ def test_app_startup_makes_no_network_call_when_ffmpeg_is_present_even_with_a_no
         notify_transport=httpx.MockTransport(handler),
         arr_transport=_arr_ok_transport(),
         disk_usage=_ample_free_space(),
+        update_check_transport=_offline_update_check_transport(),
     )
 
     with TestClient(app):

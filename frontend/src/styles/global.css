@@ -1268,6 +1268,13 @@ a {
   font-family: var(--font-mono);
 }
 
+.update-panel__status-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
 .update-panel__status {
   display: inline-flex;
   align-items: center;
@@ -1288,6 +1295,18 @@ a {
 
 .update-panel__status-icon {
   flex-shrink: 0;
+}
+
+.update-panel__dismissed-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
 }
 
 .update-panel__changelog {

@@ -20,6 +20,13 @@ import { UpdateIcon } from "./icons";
  * (`.update-indicator`, matching `OnboardingPanel`'s accent-tinted shell)
  * rather than `HealthBanner`'s danger-toned one. Links to `/system/updates`
  * so an operator can see the details (running vs. latest version, changelog).
+ *
+ * COL-89: also hides once the notice is dismissed (`dismissed_at` set),
+ * mirroring `HealthBanner`'s treatment of a dismissed health check -- the
+ * ambient, every-page nag goes away, while `UpdatesPage` (the dedicated
+ * System > Updates view) still shows the update, marked dismissed, with an
+ * Undismiss action. The server auto-clears the dismissal the moment a newer
+ * release is published, so this indicator reappears on its own then.
  */
 export function UpdateIndicator() {
   const [update, setUpdate] = useState<UpdateCheckState | null>(null);
@@ -40,7 +47,7 @@ export function UpdateIndicator() {
     };
   }, []);
 
-  if (!update || !update.update_available) {
+  if (!update || !update.update_available || update.dismissed_at) {
     return null;
   }
 

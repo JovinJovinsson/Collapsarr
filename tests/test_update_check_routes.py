@@ -1,4 +1,4 @@
-"""Contract tests for the Update Check REST endpoints (COL-87).
+"""Contract tests for the Update Check REST endpoints (COL-87, dismiss/undismiss COL-89).
 
 Covers ``GET /api/system/updates``: the API-gate behaviour (401 without a
 key/session), the response shape (running version, latest version, changelog,
@@ -7,10 +7,15 @@ available" states.
 
 Also covers ``POST /api/system/updates/recheck``: the auth gate, that it runs
 a real tick and returns the refreshed state, that a manual recheck is
-reflected by a subsequent ``GET``, and that it never disturbs the background
-scheduler's own periodic thread/timer -- the same guarantees
+reflected by a subsequent ``GET``, that it fires the same edge-triggered
+notification a scheduled tick would, and that it never disturbs the
+background scheduler's own periodic thread/timer -- the same guarantees
 ``tests/test_health_routes.py`` asserts for the health-checks recheck
 endpoint.
+
+``POST /api/system/updates/dismiss`` / ``.../undismiss`` (COL-89) round-trip
+the singleton row's ``dismissed_at``, mirroring
+``tests/test_health_routes.py``'s per-check dismiss/undismiss endpoint tests.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.main import create_app
 from collapsarr.migrations import upgrade_to_head
+from collapsarr.notify.service import update_notifier_config
 from collapsarr.settings.models import UPDATE_CHANNEL_BETA
 from collapsarr.settings.service import get_global_settings, update_global_settings
 from collapsarr.update_check.comparison import running_version_tag
@@ -129,6 +135,14 @@ def test_get_updates_requires_authentication(client: TestClient) -> None:
 
 def test_recheck_requires_authentication(client: TestClient) -> None:
     assert client.post("/api/system/updates/recheck").status_code == 401
+
+
+def test_dismiss_requires_authentication(client: TestClient) -> None:
+    assert client.post("/api/system/updates/dismiss").status_code == 401
+
+
+def test_undismiss_requires_authentication(client: TestClient) -> None:
+    assert client.post("/api/system/updates/undismiss").status_code == 401
 
 
 # --------------------------------------------------------------------------- #
@@ -327,3 +341,114 @@ def test_recheck_does_not_disrupt_the_background_scheduler(settings: Settings) -
         assert scheduler._thread is thread_before
         assert scheduler._thread is not None
         assert scheduler._thread.is_alive()
+
+
+# --------------------------------------------------------------------------- #
+# COL-89: POST /api/system/updates/dismiss and /undismiss
+# --------------------------------------------------------------------------- #
+
+
+def test_dismiss_sets_dismissed_at(settings: Settings) -> None:
+    app = _app_with_release(settings, "v999.0.0")
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+
+        response = test_client.post("/api/system/updates/dismiss", headers=headers)
+
+        assert response.status_code == 200
+        assert response.json()["dismissed_at"] is not None
+
+
+def test_undismiss_clears_dismissed_at(settings: Settings) -> None:
+    app = _app_with_release(settings, "v999.0.0")
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+        test_client.post("/api/system/updates/dismiss", headers=headers)
+
+        response = test_client.post("/api/system/updates/undismiss", headers=headers)
+
+        assert response.status_code == 200
+        assert response.json()["dismissed_at"] is None
+
+        follow_up = test_client.get("/api/system/updates", headers=headers)
+        assert follow_up.json()["dismissed_at"] is None
+
+
+def test_a_new_recheck_result_clears_a_prior_dismissal(settings: Settings) -> None:
+    """AC: a dismissed notice automatically reappears once an even newer
+    version is published -- the same reconcile transition logic clears it."""
+    app = create_app(
+        settings=settings,
+        update_check_transport=_combined_transport(stable_tag="v1.0.0", beta_tag="beta-abc1234"),
+    )
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+        test_client.post("/api/system/updates/dismiss", headers=headers)
+        assert (
+            test_client.get("/api/system/updates", headers=headers).json()["dismissed_at"]
+            is not None
+        )
+
+        # A recheck against a transport whose stable tag genuinely changed.
+        app2 = create_app(
+            settings=settings, update_check_transport=_release_transport("v2.0.0")
+        )
+    with TestClient(app2) as test_client2:
+        headers2 = _auth_headers(test_client2)
+        response = test_client2.post("/api/system/updates/recheck", headers=headers2)
+
+        assert response.status_code == 200
+        assert response.json()["dismissed_at"] is None
+
+
+# --------------------------------------------------------------------------- #
+# COL-89: recheck fires the same edge-triggered notification a scheduled tick
+# would -- same reconciliation path, not a separate mechanism.
+# --------------------------------------------------------------------------- #
+
+
+def test_recheck_fires_a_notification_when_the_latest_tag_is_new(settings: Settings) -> None:
+    # `notify_transport` is shared by the Health Check Framework's own
+    # transition notifications too (one notifier config, see
+    # `collapsarr.main.create_app`'s docstring) -- the app's startup tick
+    # notifies about the sandbox's default-failing health checks (e.g.
+    # ffmpeg_missing) independently of the update-available event this test
+    # cares about, so filter captured requests down to the `update_available`
+    # event type rather than asserting on the raw request count.
+    seen: list[httpx.Request] = []
+
+    def notify_handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    def update_available_requests() -> list[httpx.Request]:
+        return [r for r in seen if r.content and b'"update_available"' in r.content]
+
+    upgrade_to_head(settings)
+    engine = create_engine_from_settings(settings)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        update_notifier_config(
+            session, webhook_url="https://example.com/hook", webhook_enabled=True
+        )
+    engine.dispose()
+
+    app = create_app(
+        settings=settings,
+        update_check_transport=_release_transport("v9.9.9"),
+        notify_transport=httpx.MockTransport(notify_handler),
+    )
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+
+        response = test_client.post("/api/system/updates/recheck", headers=headers)
+
+        assert response.status_code == 200
+        # The startup tick already fired one (first-ever fetch, v9.9.9); this
+        # recheck sees the same tag, so it must not fire a second one.
+        assert len(update_available_requests()) == 1
+
+        # Rechecking again against the same tag must not fire a second one.
+        again = test_client.post("/api/system/updates/recheck", headers=headers)
+        assert again.status_code == 200
+        assert len(update_available_requests()) == 1

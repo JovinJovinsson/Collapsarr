@@ -1,4 +1,4 @@
-"""Update Check scheduler & persistence (COL-86, part of Epic COL-85).
+"""Update Check scheduler & persistence (COL-86, COL-89, part of Epic COL-85).
 
 The foundational, non-UI slice: the schema, GitHub client, comparison logic,
 and scheduler everything else in the "Update detection & notifications" epic
@@ -12,6 +12,11 @@ Public surface, by concern:
   imported here so the model registers with :data:`collapsarr.database.Base.metadata`.
   :func:`get_update_check_state` / :func:`reconcile_update_check`
   (:mod:`~collapsarr.update_check.service`) read/write the singleton row.
+  :func:`dismiss_update_check` / :func:`undismiss_update_check` (COL-89)
+  acknowledge/clear the current "update available" notice; a ``latest_tag``
+  transition fires a :data:`EVENT_UPDATE_AVAILABLE` notification via
+  :func:`collapsarr.notify.dispatch_notification` and auto-clears any
+  dismissal, mirroring :mod:`collapsarr.health.service`'s pass/fail pattern.
 - **The GitHub Releases client** -- :func:`fetch_latest_release` /
   :func:`fetch_latest_prerelease` + :class:`GitHubReleaseResult`
   (:mod:`~collapsarr.update_check.client`): unauthenticated, never-raising
@@ -52,11 +57,19 @@ from .comparison import (
 )
 from .models import UPDATE_CHECK_STATE_ID, UpdateCheckState
 from .scheduler import INTERVAL_SECONDS, UpdateCheckScheduler
-from .service import get_update_check_state, reconcile_update_check
+from .service import (
+    EVENT_UPDATE_AVAILABLE,
+    UpdateCheckStateNotFoundError,
+    dismiss_update_check,
+    get_update_check_state,
+    reconcile_update_check,
+    undismiss_update_check,
+)
 
 __all__ = [
     "BETA_LOCAL_SEGMENT_PREFIX",
     "BETA_TAG_PREFIX",
+    "EVENT_UPDATE_AVAILABLE",
     "GITHUB_REPO",
     "INTERVAL_SECONDS",
     "UPDATE_CHECK_STATE_ID",
@@ -64,6 +77,8 @@ __all__ = [
     "GitHubReleaseResult",
     "UpdateCheckScheduler",
     "UpdateCheckState",
+    "UpdateCheckStateNotFoundError",
+    "dismiss_update_check",
     "extract_beta_sha",
     "extract_beta_tag_sha",
     "fetch_latest_prerelease",
@@ -73,4 +88,5 @@ __all__ = [
     "is_up_to_date_beta",
     "reconcile_update_check",
     "running_version_tag",
+    "undismiss_update_check",
 ]

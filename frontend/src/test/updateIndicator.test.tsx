@@ -16,6 +16,7 @@ const upToDate: UpdateCheckState = {
   changelog: null,
   checked_at: "2026-08-02T10:00:00Z",
   update_available: false,
+  dismissed_at: null,
 };
 
 const updateAvailable: UpdateCheckState = {
@@ -25,6 +26,7 @@ const updateAvailable: UpdateCheckState = {
   changelog: "- added things",
   checked_at: "2026-08-02T10:00:00Z",
   update_available: true,
+  dismissed_at: null,
 };
 
 function renderIndicator() {
@@ -86,5 +88,16 @@ describe("UpdateIndicator", () => {
     const { container } = renderIndicator();
 
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing when the update notice has been dismissed (COL-89)", async () => {
+    const dismissed: UpdateCheckState = { ...updateAvailable, dismissed_at: "2026-08-02T11:00:00Z" };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(dismissed));
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = renderIndicator();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/system/updates", expect.anything()));
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 });

@@ -1,4 +1,4 @@
-"""HTTP REST endpoints for the persisted Update Check state (COL-87).
+"""HTTP REST endpoints for the persisted Update Check state (COL-87, COL-89).
 
 Thin layer over :mod:`collapsarr.update_check.service`, exposed as a FastAPI
 :class:`~fastapi.APIRouter` mounted under ``/api/system`` by
@@ -6,9 +6,9 @@ Thin layer over :mod:`collapsarr.update_check.service`, exposed as a FastAPI
 under ``/api`` inherits the session/API-key middleware; see
 :mod:`collapsarr.auth.enforcement`) as :mod:`collapsarr.health.routes`, which
 this module deliberately mirrors in shape. Unlike the Health Check Framework,
-there is exactly one singleton state row (no per-Check-Key id), so there is no
-list endpoint and no dismiss/undismiss action here -- just "read the current
-state" and "recheck now".
+there is exactly one singleton state row (no per-Check-Key id), so dismiss/
+undismiss (COL-89) take no id parameter either -- they always act on that one
+row.
 
 Endpoints:
 
@@ -20,7 +20,13 @@ Endpoints:
   tick synchronously (mirrors :meth:`collapsarr.health.scheduler.
   HealthCheckScheduler.run_once` via ``POST /api/system/health-checks/
   recheck``) and returns the refreshed state, without disturbing the
-  background scheduler's own periodic timer/thread.
+  background scheduler's own periodic timer/thread. Reuses the exact same
+  reconciliation path as a scheduled tick, so a manual recheck fires the same
+  edge-triggered notification a scheduled tick would.
+* ``POST /api/system/updates/dismiss`` -- dismisses the current "update
+  available" notice (COL-89): ``404`` if no tick has ever run.
+* ``POST /api/system/updates/undismiss`` -- clears a dismissal (COL-89):
+  ``404`` if no tick has ever run; otherwise always succeeds.
 
 An "update available" is informational, not a failure state (see
 ``CONTEXT.md``'s Update Check entry) -- there is no severity/Check Code here,
@@ -41,7 +47,12 @@ from ..database import get_session
 from ..settings.models import UPDATE_CHANNEL_BETA
 from .comparison import is_up_to_date, is_up_to_date_beta
 from .scheduler import UpdateCheckScheduler
-from .service import get_update_check_state
+from .service import (
+    UpdateCheckStateNotFoundError,
+    dismiss_update_check,
+    get_update_check_state,
+    undismiss_update_check,
+)
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -90,7 +101,10 @@ class UpdateCheckStateRead(BaseModel):
     carries the release's human-readable name (``UpdateCheckState.
     latest_version_label``) for display, when it differs from the tag.
     Every ``latest_*``/``changelog``/``checked_at`` field is ``None`` before
-    the very first tick has run.
+    the very first tick has run. ``dismissed_at`` (COL-89) is ``None`` unless
+    an operator has dismissed the current "update available" notice; it is
+    automatically cleared the next time ``latest_tag`` changes (see
+    :func:`~collapsarr.update_check.service.reconcile_update_check`).
     """
 
     running_version: str
@@ -99,6 +113,7 @@ class UpdateCheckStateRead(BaseModel):
     changelog: str | None
     checked_at: datetime | None
     update_available: bool
+    dismissed_at: datetime | None
 
 
 # --- helpers -------------------------------------------------------------
@@ -135,6 +150,7 @@ def _read_state(session: Session) -> UpdateCheckStateRead:
         changelog=state.changelog if state is not None else None,
         checked_at=state.checked_at if state is not None else None,
         update_available=not compare(__version__, latest_version),
+        dismissed_at=state.dismissed_at if state is not None else None,
     )
 
 
@@ -167,6 +183,40 @@ def recheck_updates_endpoint(
     :func:`collapsarr.health.routes.recheck_health_checks_endpoint`).
     """
     scheduler.run_once()
+    return _read_state(session)
+
+
+@router.post("/updates/dismiss", response_model=UpdateCheckStateRead)
+def dismiss_updates_endpoint(
+    session: Session = Depends(get_session),
+) -> UpdateCheckStateRead:
+    """Dismiss the current "update available" notice (COL-89).
+
+    Idempotent -- dismissing an already-dismissed notice just refreshes the
+    timestamp. ``404`` if no Update Check tick has ever run (nothing to
+    dismiss yet); in practice this only happens if the app's startup tick
+    never ran, since the lifespan always runs one synchronously.
+    """
+    try:
+        dismiss_update_check(session)
+    except UpdateCheckStateNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _read_state(session)
+
+
+@router.post("/updates/undismiss", response_model=UpdateCheckStateRead)
+def undismiss_updates_endpoint(
+    session: Session = Depends(get_session),
+) -> UpdateCheckStateRead:
+    """Clear a dismissal on the current "update available" notice early (COL-89).
+
+    Idempotent -- undismissing a notice that isn't dismissed is a no-op.
+    ``404`` if no Update Check tick has ever run.
+    """
+    try:
+        undismiss_update_check(session)
+    except UpdateCheckStateNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return _read_state(session)
 
 

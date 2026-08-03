@@ -1,4 +1,5 @@
-"""Tests for the Update Check scheduler orchestration (COL-86).
+"""Tests for the Update Check scheduler orchestration (COL-86, edge-triggered
+notification COL-89).
 
 Follows :mod:`tests.test_health_scheduler`'s idiom: an injectable clock
 (``now``) so ``checked_at`` is asserted without real wall-clock time,
@@ -21,6 +22,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.migrations import upgrade_to_head
+from collapsarr.notify.service import update_notifier_config
 from collapsarr.settings.models import UPDATE_CHANNEL_BETA, UPDATE_CHANNEL_STABLE
 from collapsarr.settings.service import get_global_settings, update_global_settings
 from collapsarr.update_check.scheduler import UpdateCheckScheduler
@@ -85,10 +87,34 @@ def _make_scheduler(
     *,
     now: datetime = _FIXED_NOW,
     transport: httpx.BaseTransport | None = None,
+    notify_transport: httpx.BaseTransport | None = None,
 ) -> UpdateCheckScheduler:
     if transport is None:
         transport, _ = _success_transport()
-    return UpdateCheckScheduler(settings, session_factory, now=lambda: now, transport=transport)
+    return UpdateCheckScheduler(
+        settings,
+        session_factory,
+        now=lambda: now,
+        transport=transport,
+        notify_transport=notify_transport,
+    )
+
+
+def _notify_capture_transport() -> tuple[httpx.MockTransport, list[httpx.Request]]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    return httpx.MockTransport(handler), seen
+
+
+def _enable_notifier(session_factory: sessionmaker[Session]) -> None:
+    with session_factory() as session:
+        update_notifier_config(
+            session, webhook_url="https://example.com/hook", webhook_enabled=True
+        )
 
 
 def _state(session_factory: sessionmaker[Session]) -> object:
@@ -174,6 +200,52 @@ def test_run_once_fetches_the_latest_endpoint_when_channel_is_stable(
 
     assert len(seen) == 1
     assert str(seen[0].url).endswith("/releases/latest")
+
+
+# ---------------------------------------------------------------------------
+# Edge-triggered notification (COL-89): fires on a run_once() whose fetched
+# tag transitions, not on a repeat run_once() with the same tag.
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_notifies_once_on_a_new_tag_and_not_again_while_unchanged(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _enable_notifier(session_factory)
+    fetch_transport, _ = _success_transport("v1.0.0")
+    notify_transport, notified = _notify_capture_transport()
+    scheduler = _make_scheduler(
+        settings, session_factory, transport=fetch_transport, notify_transport=notify_transport
+    )
+
+    scheduler.run_once()  # first-ever fetch -- a transition
+    assert len(notified) == 1
+
+    scheduler.run_once()  # same tag again -- no new notification
+    scheduler.run_once()
+    assert len(notified) == 1
+
+
+def test_run_once_notifies_again_on_a_genuinely_new_tag(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _enable_notifier(session_factory)
+    notify_transport, notified = _notify_capture_transport()
+
+    first_fetch, _ = _success_transport("v1.0.0")
+    scheduler = _make_scheduler(
+        settings, session_factory, transport=first_fetch, notify_transport=notify_transport
+    )
+    scheduler.run_once()
+    assert len(notified) == 1
+
+    second_fetch, _ = _success_transport("v2.0.0")
+    scheduler = _make_scheduler(
+        settings, session_factory, transport=second_fetch, notify_transport=notify_transport
+    )
+    scheduler.run_once()
+
+    assert len(notified) == 2
 
 
 # ---------------------------------------------------------------------------

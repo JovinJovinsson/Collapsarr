@@ -15,6 +15,7 @@ const upToDate: UpdateCheckState = {
   changelog: null,
   checked_at: "2026-08-02T10:00:00Z",
   update_available: false,
+  dismissed_at: null,
 };
 
 const updateAvailable: UpdateCheckState = {
@@ -24,6 +25,12 @@ const updateAvailable: UpdateCheckState = {
   changelog: "- added things\n- fixed things",
   checked_at: "2026-08-02T10:00:00Z",
   update_available: true,
+  dismissed_at: null,
+};
+
+const updateDismissed: UpdateCheckState = {
+  ...updateAvailable,
+  dismissed_at: "2026-08-02T11:00:00Z",
 };
 
 const neverChecked: UpdateCheckState = {
@@ -33,6 +40,7 @@ const neverChecked: UpdateCheckState = {
   changelog: null,
   checked_at: null,
   update_available: true,
+  dismissed_at: null,
 };
 
 afterEach(() => {
@@ -117,5 +125,84 @@ describe("UpdatesPage", () => {
 
     await waitFor(() => expect(screen.getByText(/scheduler unavailable/i)).toBeInTheDocument());
     expect(screen.getByText(/you're up to date/i)).toBeInTheDocument();
+  });
+
+  // COL-89: dismiss/undismiss.
+
+  it("offers a Dismiss button when an update is available and not yet dismissed", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(updateAvailable)));
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByText(/an update is available/i)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Undismiss" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/dismissed/i)).not.toBeInTheDocument();
+  });
+
+  it("does not offer Dismiss when there is no update available", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(upToDate)));
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByText(/you're up to date/i)).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Dismiss" })).not.toBeInTheDocument();
+  });
+
+  it("dismissing calls the dismiss endpoint and switches to an Undismiss button", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(updateAvailable))
+      .mockResolvedValueOnce(jsonResponse(updateDismissed));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/system/updates/dismiss",
+      expect.objectContaining({ method: "POST" })
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Undismiss" })).toBeInTheDocument()
+    );
+    expect(screen.getByText(/dismissed/i)).toBeInTheDocument();
+  });
+
+  it("undismissing calls the undismiss endpoint and switches back to a Dismiss button", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(updateDismissed))
+      .mockResolvedValueOnce(jsonResponse(updateAvailable));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<UpdatesPage />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Undismiss" })).toBeInTheDocument()
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Undismiss" }));
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/system/updates/undismiss",
+      expect.objectContaining({ method: "POST" })
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument());
+    expect(screen.queryByText(/dismissed/i)).not.toBeInTheDocument();
+  });
+
+  it("shows an error when a dismiss action fails, leaving the button in place", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(updateAvailable))
+      .mockResolvedValueOnce(jsonResponse({ detail: "boom" }, 500));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    await waitFor(() => expect(screen.getByText(/boom/i)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
   });
 });

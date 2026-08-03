@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 
-import { fetchUpdateStatus, recheckUpdateStatus } from "../api/updates";
+import {
+  dismissUpdateStatus,
+  fetchUpdateStatus,
+  recheckUpdateStatus,
+  undismissUpdateStatus,
+} from "../api/updates";
 import { UpdateIcon } from "../components/icons";
 import type { UpdateCheckState } from "../types/updates";
 
@@ -33,11 +38,22 @@ type LoadState =
  * Changelog rendering (Markdown) and install-method-specific upgrade
  * instructions are out of scope for this slice -- the changelog renders as
  * plain text; a later slice replaces it with rendered Markdown.
+ *
+ * COL-89 adds Dismiss/Undismiss actions (`POST /api/system/updates/dismiss` /
+ * `.../undismiss`, `api/updates.ts`), mirroring `HealthChecksPage`'s per-row
+ * dismiss/undismiss -- but scoped to the single Update Check row rather than
+ * a list. "Dismiss" is only offered while an update is available and not
+ * already dismissed; "Undismiss" only once it is. The server auto-clears a
+ * dismissal the moment a newer release is published (COL-89's edge-triggered
+ * reconciliation), so a stale dismissal never silently hides a genuinely new
+ * update -- this page simply reflects whatever `dismissed_at` the server
+ * reports on each load/action.
  */
 export function UpdatesPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [actionError, setActionError] = useState<string | null>(null);
   const [rechecking, setRechecking] = useState(false);
+  const [dismissing, setDismissing] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,6 +86,34 @@ export function UpdatesPage() {
       setActionError(error instanceof Error ? error.message : "Failed to check for updates.");
     } finally {
       setRechecking(false);
+    }
+  }
+
+  async function handleDismiss() {
+    setDismissing(true);
+    setActionError(null);
+    try {
+      const update = await dismissUpdateStatus();
+      setState({ status: "ready", state: update });
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : "Failed to dismiss the update notice.");
+    } finally {
+      setDismissing(false);
+    }
+  }
+
+  async function handleUndismiss() {
+    setDismissing(true);
+    setActionError(null);
+    try {
+      const update = await undismissUpdateStatus();
+      setState({ status: "ready", state: update });
+    } catch (error: unknown) {
+      setActionError(
+        error instanceof Error ? error.message : "Failed to undismiss the update notice."
+      );
+    } finally {
+      setDismissing(false);
     }
   }
 
@@ -129,16 +173,41 @@ export function UpdatesPage() {
             </div>
           </dl>
 
-          <p
-            className={`update-panel__status${
-              state.state.update_available ? " update-panel__status--available" : ""
-            }`}
-          >
-            <UpdateIcon width={16} height={16} className="update-panel__status-icon" />
-            {state.state.update_available
-              ? `An update is available${state.state.latest_version ? ` (${state.state.latest_version})` : ""}.`
-              : "You're up to date."}
-          </p>
+          <div className="update-panel__status-row">
+            <p
+              className={`update-panel__status${
+                state.state.update_available ? " update-panel__status--available" : ""
+              }`}
+            >
+              <UpdateIcon width={16} height={16} className="update-panel__status-icon" />
+              {state.state.update_available
+                ? `An update is available${state.state.latest_version ? ` (${state.state.latest_version})` : ""}.`
+                : "You're up to date."}
+              {state.state.dismissed_at && (
+                <span className="update-panel__dismissed-badge">Dismissed</span>
+              )}
+            </p>
+            {state.state.update_available && !state.state.dismissed_at && (
+              <button
+                type="button"
+                className="btn btn--secondary btn--sm"
+                onClick={handleDismiss}
+                disabled={dismissing}
+              >
+                {dismissing ? "Dismissing…" : "Dismiss"}
+              </button>
+            )}
+            {state.state.dismissed_at && (
+              <button
+                type="button"
+                className="btn btn--secondary btn--sm"
+                onClick={handleUndismiss}
+                disabled={dismissing}
+              >
+                {dismissing ? "Undismissing…" : "Undismiss"}
+              </button>
+            )}
+          </div>
 
           {state.state.update_available && state.state.changelog && (
             <div className="update-panel__changelog">

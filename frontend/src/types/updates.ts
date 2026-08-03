@@ -6,7 +6,7 @@
 
 /**
  * The singleton Update Check state, as returned by `GET /api/system/updates`
- * / `POST /api/system/updates/recheck`
+ * / `POST /api/system/updates/recheck` / `.../dismiss` / `.../undismiss`
  * (`collapsarr/update_check/routes.py::UpdateCheckStateRead`).
  *
  * `latest_version`/`latest_version_label`/`changelog`/`checked_at` are all
@@ -30,4 +30,11 @@ export interface UpdateCheckState {
   checked_at: string | null;
   /** Whether the running version differs from the latest known release -- informational, not a failure state. */
   update_available: boolean;
+  /**
+   * ISO-8601 UTC timestamp of when an operator dismissed the current "update
+   * available" notice (COL-89), or `null` if it hasn't been dismissed.
+   * Automatically cleared server-side the next time `latest_version`
+   * changes -- a dismissal only ever silences the *current* known release.
+   */
+  dismissed_at: string | null;
 }

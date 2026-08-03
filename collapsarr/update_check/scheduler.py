@@ -16,6 +16,16 @@ for ``beta`` (COL-88) -- selected fresh every tick from
 :attr:`~collapsarr.settings.models.GlobalSettings.update_channel`, so an
 operator switching channels takes effect on the very next tick.
 
+Two independent transports (COL-89): ``transport`` is forwarded to the
+GitHub Releases fetch above; ``notify_transport`` is forwarded to
+:func:`~collapsarr.update_check.service.reconcile_update_check`'s notifier
+dispatch, which fires only on a ``latest_tag`` transition -- mirroring
+:class:`collapsarr.health.scheduler.HealthCheckScheduler`'s single
+``transport`` (there, the checks make their own network calls via
+``arr_transport``, so the scheduler's own ``transport`` param is free to mean
+"notifier dispatch" alone; here the scheduler itself also fetches, so the two
+concerns need separate params).
+
 Threads, not asyncio: matches every sibling scheduler's rationale -- the fetch
 is blocking I/O (``httpx``) and there is no external scheduler dependency in
 ``pyproject.toml``. One bad tick (a raised exception anywhere in
@@ -64,8 +74,9 @@ class UpdateCheckScheduler:
     ``now`` is an injectable clock (defaults to real UTC now); tests pass a
     fixed one to assert ``checked_at`` without real wall-clock time.
     ``transport`` is forwarded to the GitHub client (tests inject an
-    ``httpx.MockTransport``). ``interval_seconds`` is overridable for tests
-    but defaults to the fixed 24-hour cadence.
+    ``httpx.MockTransport``); ``notify_transport`` (COL-89) is forwarded to
+    the edge-triggered notifier dispatch. ``interval_seconds`` is overridable
+    for tests but defaults to the fixed 24-hour cadence.
     """
 
     def __init__(
@@ -75,12 +86,14 @@ class UpdateCheckScheduler:
         *,
         now: Callable[[], datetime] = _utcnow,
         transport: httpx.BaseTransport | None = None,
+        notify_transport: httpx.BaseTransport | None = None,
         interval_seconds: float = INTERVAL_SECONDS,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._now = now
         self._transport = transport
+        self._notify_transport = notify_transport
         self._interval_seconds = interval_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -99,7 +112,10 @@ class UpdateCheckScheduler:
         (:func:`~collapsarr.update_check.client.fetch_latest_release`).
         Neither fetch function ever raises; a failed fetch still reconciles
         (persisting a "no result" tick) -- see
-        :mod:`collapsarr.update_check.service`.
+        :mod:`collapsarr.update_check.service`. A successful fetch whose tag
+        differs from the previously-stored ``latest_tag`` fires an
+        edge-triggered notification (COL-89), dispatched over
+        ``notify_transport``.
         """
         with self._session_factory() as session:
             channel = get_global_settings(session).update_channel
@@ -107,7 +123,9 @@ class UpdateCheckScheduler:
                 fetch_latest_prerelease if channel == UPDATE_CHANNEL_BETA else fetch_latest_release
             )
             result = fetch(transport=self._transport)
-            return reconcile_update_check(session, result, channel, now=self._now)
+            return reconcile_update_check(
+                session, result, channel, now=self._now, transport=self._notify_transport
+            )
 
     def start(self, *, run_immediately: bool = True) -> None:
         """Start the background loop in a daemon thread.
