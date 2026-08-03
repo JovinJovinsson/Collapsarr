@@ -54,6 +54,7 @@ from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
 from .update_check import UpdateCheckScheduler
+from .update_check.routes import router as update_checks_router
 
 
 def create_app(
@@ -191,8 +192,9 @@ def create_app(
         # persists it to the singleton `update_check_state` row. Same
         # run-the-first-tick-synchronously-then-hand-off-to-the-thread shape,
         # so the cached release data is accurate the instant the app comes up.
-        # No API/UI consumes this state yet (COL-87) and no notification fires
-        # from it in this slice -- it purely keeps the cache warm.
+        # GET/POST /api/system/updates{,/recheck} (COL-87, update_checks_router
+        # below) expose this state; no notification fires from it in this
+        # slice -- it purely keeps the cache warm and readable.
         update_check_scheduler = UpdateCheckScheduler(
             resolved_settings, session_factory, transport=update_check_transport
         )
@@ -259,6 +261,11 @@ def create_app(
     # System > Health list page. Distinct from the unauthenticated /health
     # probe below, which stays minimal and failing-only for the app-wide banner.
     app.include_router(health_checks_router)
+
+    # Update Check state GET/POST /api/system/updates{,/recheck} (COL-87):
+    # exposes the singleton state COL-86's scheduler keeps warm, driving the
+    # System > Updates page and the app-wide "update available" indicator.
+    app.include_router(update_checks_router)
 
     @app.get("/health", tags=["system"])
     def health(session: Session = Depends(get_session)) -> dict[str, object]:

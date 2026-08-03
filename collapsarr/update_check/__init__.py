@@ -22,8 +22,16 @@ Public surface, by concern:
   (:mod:`~collapsarr.update_check.scheduler`): a daemon-thread scheduler,
   structurally identical to :class:`~collapsarr.health.HealthCheckScheduler`,
   on a fixed 24h cadence.
+- **API routes** -- ``GET /api/system/updates`` / ``POST /api/system/updates/
+  recheck`` (:mod:`~collapsarr.update_check.routes`, COL-87): exposes the
+  persisted state to an authenticated caller, mirroring
+  :mod:`collapsarr.health.routes`'s shape. Mounted directly in
+  :func:`collapsarr.main.create_app` (not re-exported here), same convention
+  as ``health_checks_router``.
 
-No API routes or UI in this slice -- that's COL-87.
+The Updates page and the app-wide "update available" indicator are COL-87's
+frontend half (``frontend/src/pages/UpdatesPage.tsx``,
+``frontend/src/components/UpdateIndicator.tsx``).
 """
 
 from __future__ import annotations
