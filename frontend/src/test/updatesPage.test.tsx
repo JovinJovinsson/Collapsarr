@@ -16,6 +16,7 @@ const upToDate: UpdateCheckState = {
   checked_at: "2026-08-02T10:00:00Z",
   update_available: false,
   dismissed_at: null,
+  is_docker: false,
 };
 
 const updateAvailable: UpdateCheckState = {
@@ -26,6 +27,12 @@ const updateAvailable: UpdateCheckState = {
   checked_at: "2026-08-02T10:00:00Z",
   update_available: true,
   dismissed_at: null,
+  is_docker: false,
+};
+
+const updateAvailableDocker: UpdateCheckState = {
+  ...updateAvailable,
+  is_docker: true,
 };
 
 const updateDismissed: UpdateCheckState = {
@@ -41,6 +48,7 @@ const neverChecked: UpdateCheckState = {
   checked_at: null,
   update_available: true,
   dismissed_at: null,
+  is_docker: false,
 };
 
 afterEach(() => {
@@ -68,6 +76,80 @@ describe("UpdatesPage", () => {
     expect(screen.getAllByText("v1.3.0").length).toBeGreaterThan(0);
     expect(screen.getByText("Collapsarr v1.3.0")).toBeInTheDocument();
     expect(screen.getByText(/added things/)).toBeInTheDocument();
+  });
+
+  // COL-90: changelog Markdown rendering.
+
+  it("renders changelog Markdown (headings, bullet lists, links) as formatted content", async () => {
+    const markdownChangelog: UpdateCheckState = {
+      ...updateAvailable,
+      changelog: "## Highlights\n\n- fixed a bug\n\nSee the [full notes](https://example.com/notes).",
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(markdownChangelog)));
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByText(/an update is available/i)).toBeInTheDocument());
+
+    // A `##` heading becomes a real heading element, not literal "##" text.
+    const heading = screen.getByRole("heading", { name: "Highlights" });
+    expect(heading.tagName).toBe("H2");
+    // A `- ` bullet becomes a real list item.
+    const listItem = screen.getByText("fixed a bug");
+    expect(listItem.tagName).toBe("LI");
+    // A `[text](url)` link becomes a real anchor with the target href.
+    const link = screen.getByRole("link", { name: "full notes" });
+    expect(link).toHaveAttribute("href", "https://example.com/notes");
+  });
+
+  it("never renders raw HTML embedded in the changelog body as HTML", async () => {
+    const htmlInjectionChangelog: UpdateCheckState = {
+      ...updateAvailable,
+      changelog: '<img src="x" onerror="window.__pwned = true" /><script>window.__pwned = true</script>',
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(htmlInjectionChangelog)));
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByText(/an update is available/i)).toBeInTheDocument());
+
+    // Neither tag was mounted as a real DOM element -- `rehype-raw` is
+    // deliberately not enabled, so react-markdown treats the raw HTML as
+    // inert text rather than rendering it (which would otherwise let an
+    // externally-sourced changelog inject an `onerror` handler or a
+    // `<script>` tag).
+    expect(document.querySelector("img")).not.toBeInTheDocument();
+    expect(document.querySelector("script")).not.toBeInTheDocument();
+    expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
+  });
+
+  // COL-90: install-method instructions.
+
+  it("shows docker pull + recreate-container instructions when the API reports Docker", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(updateAvailableDocker)));
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByText(/how to update/i)).toBeInTheDocument());
+    expect(screen.getByText(/docker pull odxnsson\/collapsarr:1\.3\.0/)).toBeInTheDocument();
+    expect(screen.getByText(/docker compose up -d/)).toBeInTheDocument();
+    expect(screen.queryByText(/pipx upgrade collapsarr/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/pip install --upgrade collapsarr/)).not.toBeInTheDocument();
+  });
+
+  it("shows pipx and pip instructions when the API does not report Docker", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(updateAvailable)));
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByText(/how to update/i)).toBeInTheDocument());
+    expect(screen.getByText(/pipx upgrade collapsarr/)).toBeInTheDocument();
+    expect(screen.getByText(/pip install --upgrade collapsarr/)).toBeInTheDocument();
+    expect(screen.queryByText(/docker pull/)).not.toBeInTheDocument();
+  });
+
+  it("does not show install instructions when there is no update available", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(upToDate)));
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByText(/you're up to date/i)).toBeInTheDocument());
+    expect(screen.queryByText(/how to update/i)).not.toBeInTheDocument();
   });
 
   it("handles a never-checked state without a latest version", async () => {

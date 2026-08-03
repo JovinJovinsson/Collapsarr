@@ -17,6 +17,7 @@ const upToDate: UpdateCheckState = {
   checked_at: "2026-08-02T10:00:00Z",
   update_available: false,
   dismissed_at: null,
+  is_docker: false,
 };
 
 const updateAvailable: UpdateCheckState = {
@@ -27,6 +28,7 @@ const updateAvailable: UpdateCheckState = {
   checked_at: "2026-08-02T10:00:00Z",
   update_available: true,
   dismissed_at: null,
+  is_docker: false,
 };
 
 function renderIndicator() {

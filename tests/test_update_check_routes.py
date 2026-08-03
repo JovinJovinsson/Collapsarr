@@ -168,6 +168,51 @@ def test_get_updates_before_any_successful_fetch(client: TestClient) -> None:
     # No confirmed match -- "unknown" reports as an update possibly being
     # available rather than falsely claiming the instance is current.
     assert body["update_available"] is True
+    # The test process itself is never running inside a Docker container.
+    assert body["is_docker"] is False
+
+
+# --------------------------------------------------------------------------- #
+# COL-90: `is_docker` install-method detection
+# --------------------------------------------------------------------------- #
+
+
+def test_get_updates_reports_is_docker_true_when_the_marker_file_is_present(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("collapsarr.update_check.routes.is_docker_environment", lambda: True)
+    headers = _auth_headers(client)
+
+    response = client.get("/api/system/updates", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["is_docker"] is True
+
+
+def test_get_updates_reports_is_docker_false_when_the_marker_file_is_absent(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("collapsarr.update_check.routes.is_docker_environment", lambda: False)
+    headers = _auth_headers(client)
+
+    response = client.get("/api/system/updates", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["is_docker"] is False
+
+
+def test_recheck_also_reports_is_docker(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("collapsarr.update_check.routes.is_docker_environment", lambda: True)
+    app = _app_with_release(settings, "v2.0.0")
+    with TestClient(app) as test_client:
+        headers = _auth_headers(test_client)
+
+        response = test_client.post("/api/system/updates/recheck", headers=headers)
+
+        assert response.status_code == 200
+        assert response.json()["is_docker"] is True
 
 
 def test_get_updates_reports_up_to_date_when_latest_tag_matches_running_version(

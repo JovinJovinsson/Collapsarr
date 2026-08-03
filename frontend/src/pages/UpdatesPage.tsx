@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import ReactMarkdown from "react-markdown";
 
 import {
   dismissUpdateStatus,
@@ -9,12 +10,29 @@ import {
 import { UpdateIcon } from "../components/icons";
 import type { UpdateCheckState } from "../types/updates";
 
+/** The Docker Hub repository the release pipeline publishes to (`.github/workflows/release.yml`'s `IMAGE_NAME`). */
+const DOCKER_IMAGE = "odxnsson/collapsarr";
+
 /** Formats an ISO timestamp in the viewer's local time, or an em dash when absent/unparseable. */
 function formatTimestamp(value: string | null): string {
   if (!value) return "—";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
+}
+
+/**
+ * Derives the Docker tag to pull from the latest known release tag.
+ *
+ * The release pipeline (`.github/workflows/release.yml`) publishes Docker
+ * tags *without* the `v` prefix GitHub release tags carry (e.g. release tag
+ * `v1.2.3` -> Docker tag `1.2.3`), so this strips a leading `v` rather than
+ * passing `latestVersion` through verbatim. Falls back to `latest` when no
+ * release has been fetched yet (`latestVersion` is `null`).
+ */
+function dockerTagFor(latestVersion: string | null): string {
+  if (!latestVersion) return "latest";
+  return latestVersion.replace(/^v/, "");
 }
 
 type LoadState =
@@ -35,9 +53,17 @@ type LoadState =
  * (`UpdateIndicator`) deliberately do not reuse `HealthBanner`'s
  * error/warning-oriented styling.
  *
- * Changelog rendering (Markdown) and install-method-specific upgrade
- * instructions are out of scope for this slice -- the changelog renders as
- * plain text; a later slice replaces it with rendered Markdown.
+ * Changelog rendering and install-method-specific upgrade instructions
+ * (COL-90): the changelog (raw Markdown from the GitHub Release body,
+ * `UpdateCheckState.changelog`) renders via `react-markdown` -- no
+ * `dangerouslySetInnerHTML`, and the `rehype-raw` plugin is deliberately not
+ * enabled, so raw HTML embedded in a changelog body is never rendered as
+ * HTML (that content is externally sourced, from a GitHub Release body).
+ * The "How to update" block renders Docker instructions
+ * (`docker pull`/recreate) when the API's `is_docker` field is true,
+ * otherwise both `pipx upgrade`/`pip install --upgrade` -- see
+ * `docs/adr/0001-update-check-detect-notify-only.md` for why detection is
+ * backend-only and why no code path here executes either command itself.
  *
  * COL-89 adds Dismiss/Undismiss actions (`POST /api/system/updates/dismiss` /
  * `.../undismiss`, `api/updates.ts`), mirroring `HealthChecksPage`'s per-row
@@ -214,7 +240,54 @@ export function UpdatesPage() {
               <h2 className="update-panel__changelog-title">
                 {state.state.latest_version_label ?? state.state.latest_version}
               </h2>
-              <pre className="update-panel__changelog-body">{state.state.changelog}</pre>
+              {/* No `dangerouslySetInnerHTML`, and `rehype-raw` is deliberately not
+                  enabled -- `changelog` is externally-sourced (a GitHub Release
+                  body), so raw HTML embedded in it must never be rendered as HTML. */}
+              <div className="update-panel__changelog-body">
+                <ReactMarkdown>{state.state.changelog}</ReactMarkdown>
+              </div>
+            </div>
+          )}
+
+          {state.state.update_available && (
+            <div className="update-panel__instructions">
+              <h2 className="update-panel__instructions-title">How to update</h2>
+              {state.state.is_docker ? (
+                <ol className="update-panel__instructions-steps">
+                  <li>
+                    Pull the new image:
+                    <pre className="update-panel__command">
+                      <code>
+                        docker pull {DOCKER_IMAGE}:{dockerTagFor(state.state.latest_version)}
+                      </code>
+                    </pre>
+                  </li>
+                  <li>
+                    Recreate the container so it picks up the freshly pulled image:
+                    <pre className="update-panel__command">
+                      <code>docker compose up -d</code>
+                    </pre>
+                    (or, without Compose:{" "}
+                    <code>docker stop collapsarr &amp;&amp; docker rm collapsarr</code>, then
+                    re-run your <code>docker run</code> command.)
+                  </li>
+                </ol>
+              ) : (
+                <ol className="update-panel__instructions-steps">
+                  <li>
+                    Using pipx:
+                    <pre className="update-panel__command">
+                      <code>pipx upgrade collapsarr</code>
+                    </pre>
+                  </li>
+                  <li>
+                    Or, using pip directly:
+                    <pre className="update-panel__command">
+                      <code>pip install --upgrade collapsarr</code>
+                    </pre>
+                  </li>
+                </ol>
+              )}
             </div>
           )}
         </div>

@@ -70,3 +70,14 @@ GitHub Release for the configured **Release Channel**. Owned by a dedicated
 scheduler/persisted-state/edge-triggered-notification pattern, but an Update
 Check is deliberately **not** a Health Check — an available update is not a
 failure state (no severity, no Check Code), it is informational.
+
+## Install Method
+
+How this instance is running — Docker vs. pipx/bare-metal — detected
+server-side via the presence of `/.dockerenv` (the frontend has no
+filesystem access to detect it itself). Surfaced as `is_docker` on
+`GET /api/system/updates`, and used solely to pick which upgrade
+*instructions* the Updates page displays (`docker pull` + recreate-container
+vs. `pipx upgrade`/`pip install --upgrade`) — see
+`docs/adr/0001-update-check-detect-notify-only.md`. No code path executes
+either command; the operator always runs it themselves.

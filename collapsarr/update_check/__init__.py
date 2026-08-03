@@ -40,6 +40,12 @@ Public surface, by concern:
   :mod:`collapsarr.health.routes`'s shape. Mounted directly in
   :func:`collapsarr.main.create_app` (not re-exported here), same convention
   as ``health_checks_router``.
+- **Install-method detection** -- :func:`is_docker_environment`
+  (:mod:`~collapsarr.update_check.environment`, COL-90): a ``/.dockerenv``
+  presence probe, surfaced as ``is_docker`` on ``GET /api/system/updates`` so
+  the frontend renders the matching Docker vs. pipx/pip upgrade instructions
+  without any detection logic of its own (see ``docs/adr/
+  0001-update-check-detect-notify-only.md``).
 
 The Updates page and the app-wide "update available" indicator are COL-87's
 frontend half (``frontend/src/pages/UpdatesPage.tsx``,
@@ -59,6 +65,7 @@ from .comparison import (
     is_up_to_date_beta,
     running_version_tag,
 )
+from .environment import DOCKERENV_PATH, is_docker_environment
 from .models import UPDATE_CHECK_STATE_ID, UpdateCheckState
 from .scheduler import INTERVAL_SECONDS, UpdateCheckScheduler
 from .service import (
@@ -75,6 +82,7 @@ from .service import (
 __all__ = [
     "BETA_LOCAL_SEGMENT_PREFIX",
     "BETA_TAG_PREFIX",
+    "DOCKERENV_PATH",
     "EVENT_UPDATE_AVAILABLE",
     "GITHUB_REPO",
     "INTERVAL_SECONDS",
@@ -91,6 +99,7 @@ __all__ = [
     "fetch_latest_prerelease",
     "fetch_latest_release",
     "get_update_check_state",
+    "is_docker_environment",
     "is_up_to_date",
     "is_up_to_date_beta",
     "is_update_available",

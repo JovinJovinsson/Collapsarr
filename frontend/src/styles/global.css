@@ -1321,12 +1321,59 @@ a {
 }
 
 .update-panel__changelog-body {
-  white-space: pre-wrap;
-  word-break: break-word;
   font-family: var(--font-body);
   font-size: var(--fs-sm);
   color: var(--c-text-muted);
+}
+
+.update-panel__changelog-body :first-child {
+  margin-top: 0;
+}
+
+.update-panel__changelog-body :last-child {
+  margin-bottom: 0;
+}
+
+.update-panel__instructions {
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--sp-4);
+}
+
+.update-panel__instructions-title {
+  font-size: var(--fs-base);
+  font-weight: 650;
+  margin-bottom: var(--sp-2);
+}
+
+.update-panel__instructions-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
   margin: 0;
+  padding-left: var(--sp-5);
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+
+.update-panel__command {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-text);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+  margin: var(--sp-1) 0;
+  overflow-x: auto;
+}
+
+.update-panel__instructions-steps code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--sp-1);
 }
 
 @media (prefers-reduced-motion: reduce) {

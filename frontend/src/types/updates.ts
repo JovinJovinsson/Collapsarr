@@ -37,4 +37,13 @@ export interface UpdateCheckState {
    * changes -- a dismissal only ever silences the *current* known release.
    */
   dismissed_at: string | null;
+  /**
+   * Whether this instance is running under Docker (COL-90), detected
+   * server-side via `/.dockerenv` (`collapsarr/update_check/environment.py`)
+   * -- the frontend has no filesystem access, so it can't detect this
+   * itself. Selects which upgrade-instruction block `UpdatesPage` renders:
+   * `docker pull` + recreate-container when `true`, `pipx upgrade`/`pip
+   * install --upgrade` otherwise.
+   */
+  is_docker: boolean;
 }
