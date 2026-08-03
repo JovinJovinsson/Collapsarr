@@ -12,6 +12,7 @@ and its tests already use.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -25,6 +26,7 @@ from collapsarr.health import (
     FAILURE_THRESHOLD,
     SEVERITY_WARNING,
     HealthCheckContext,
+    HealthCheckResult,
     default_health_checks,
     make_failed_jobs_check_run,
 )
@@ -66,7 +68,9 @@ def _context(settings: Settings, session: Session) -> HealthCheckContext:
     return HealthCheckContext(settings=settings, session=session)
 
 
-def _run(session: Session, settings: Settings, *, recent_failures: int, now: datetime = _FIXED_NOW):
+def _run(
+    session: Session, settings: Settings, *, recent_failures: int, now: datetime = _FIXED_NOW
+) -> Sequence[HealthCheckResult]:
     run = make_failed_jobs_check_run(lambda: now)
     for _ in range(recent_failures):
         _add_failure(session, ended_at=now - timedelta(hours=1))
