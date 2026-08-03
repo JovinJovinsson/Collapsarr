@@ -17,21 +17,12 @@ never match even when the SHAs are identical.
 
 from __future__ import annotations
 
+from collapsarr.settings.models import BETA_LOCAL_SEGMENT_PREFIX
+
 VERSION_TAG_PREFIX = "v"
 """Tags this repo's release workflow cuts are prefixed with this (``v1.2.3``),
 matching the git tag pattern documented in ``docs/TRACKER.md`` /
 ``CONTEXT.md``'s Release Channel entry (``v*.*.*`` on ``main``)."""
-
-BETA_LOCAL_SEGMENT_PREFIX = "+beta."
-"""The literal substring immediately preceding a beta build's embedded
-short-SHA in the running ``collapsarr.__version__`` (COL-88) -- e.g.
-``"1.2.3+beta.abc1234"``, stamped by ``.github/workflows/beta.yml``'s
-``build-wheel`` job. Deliberately duplicated (not imported) in
-:data:`collapsarr.settings.models.BETA_LOCAL_SEGMENT_PREFIX`, which needs the
-same literal to pick a fresh install's default channel -- importing across
-that boundary either way would create a circular import between the
-``update_check`` and ``settings`` packages (:mod:`collapsarr.update_check`'s
-own scheduler already imports from :mod:`collapsarr.settings.service`)."""
 
 BETA_TAG_PREFIX = "beta-"
 """The beta channel's GitHub Release tag prefix: the same workflow tags each

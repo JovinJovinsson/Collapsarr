@@ -97,11 +97,14 @@ short-SHA in the running ``collapsarr.__version__`` (COL-88) -- e.g.
 ``"1.2.3+beta.abc1234"``, stamped by ``.github/workflows/beta.yml``'s
 ``build-wheel`` job. Used by :func:`collapsarr.settings.service.
 get_global_settings` to auto-default a fresh install's ``update_channel`` to
-``"beta"`` when the running build is itself a beta build. Deliberately
-duplicated (not imported) in :data:`collapsarr.update_check.comparison.
-BETA_LOCAL_SEGMENT_PREFIX`, which needs the same literal for beta-channel
-version comparison -- see that module's docstring for why it isn't shared via
-import."""
+``"beta"`` when the running build is itself a beta build. This is the single
+source of truth for the literal: :mod:`collapsarr.update_check.comparison`
+imports it directly for its own beta-channel version comparison rather than
+redefining it -- ``update_check`` already imports from :mod:`collapsarr.
+settings.models`/:mod:`collapsarr.settings.service` elsewhere (e.g.
+:mod:`collapsarr.update_check.scheduler`), and nothing in :mod:`collapsarr.
+settings` imports :mod:`collapsarr.update_check`, so there is no circular
+import risk."""
 
 
 def generate_api_key() -> str:
