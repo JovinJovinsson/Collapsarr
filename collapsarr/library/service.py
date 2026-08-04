@@ -431,10 +431,14 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
                     episodes=episodes_out,
                 )
             )
+        assert series.sonarr_series_id is not None, (
+            f"library node {series.id} has kind SERIES but sonarr_series_id is NULL "
+            "-- this is a data-integrity violation, not a legitimate missing id"
+        )
         series_out.append(
             TreeSeries(
                 id=series.id,
-                sonarr_series_id=series.sonarr_series_id or 0,
+                sonarr_series_id=series.sonarr_series_id,
                 title=series.title,
                 tracked=resolve_tracked(series, nodes_by_id, default_tracked),
                 seasons=tuple(seasons_out),
@@ -458,15 +462,20 @@ def build_movie_tree(session: Session, instance_id: int) -> MovieLibraryTree:
 
     movie_nodes = [n for n in nodes if n.kind is LibraryNodeKind.MOVIE and not n.hidden]
 
-    movies_out = tuple(
-        TreeMovie(
-            id=movie.id,
-            radarr_movie_id=movie.radarr_movie_id or 0,
-            title=movie.title,
-            has_file=movie.has_file,
-            tracked=resolve_tracked(movie, nodes_by_id, default_tracked),
+    movies_out: list[TreeMovie] = []
+    for movie in sorted(movie_nodes, key=lambda n: (n.title, n.id)):
+        assert movie.radarr_movie_id is not None, (
+            f"library node {movie.id} has kind MOVIE but radarr_movie_id is NULL "
+            "-- this is a data-integrity violation, not a legitimate missing id"
         )
-        for movie in sorted(movie_nodes, key=lambda n: (n.title, n.id))
-    )
+        movies_out.append(
+            TreeMovie(
+                id=movie.id,
+                radarr_movie_id=movie.radarr_movie_id,
+                title=movie.title,
+                has_file=movie.has_file,
+                tracked=resolve_tracked(movie, nodes_by_id, default_tracked),
+            )
+        )
 
-    return MovieLibraryTree(instance_id=instance_id, movies=movies_out)
+    return MovieLibraryTree(instance_id=instance_id, movies=tuple(movies_out))
