@@ -552,3 +552,108 @@ def test_webhook_import_of_a_not_tracked_episode_is_not_enqueued_or_wanted(
     assert response.status_code == 200, response.text
     assert queue.list_jobs() == []  # AC3: the webhook pass did not enqueue
     assert _wanted_paths(client) == set()  # AC2
+
+
+# ---------------------------------------------------------------------------
+# COL-97: flipping an already-Wanted file's node to Not-Tracked must remove it
+# from /api/wanted immediately, without a rescan -- exercised at every layer
+# a real "untrack" action can come from (direct service call, a Series-level
+# cascade onto an already-discovered episode, and the actual HTTP endpoint the
+# frontend calls).
+# ---------------------------------------------------------------------------
+
+
+def test_untracking_an_already_wanted_file_removes_it_from_wanted(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)  # inherits default (True)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        _IMPORT_PATH, instance_id=instance_id, sonarr_episode_id=101
+    )
+    assert job is not None
+    assert _wanted_paths(client) == {_IMPORT_PATH}
+
+    with session_factory() as session:
+        node = get_node_by_source_id(session, instance_id=instance_id, sonarr_episode_id=101)
+        assert node is not None
+        set_tracked(session, node_id=node.id, tracked=False)
+
+    assert _wanted_paths(client) == set()
+
+
+def test_untracking_a_series_cascades_and_removes_its_wanted_episode(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        _IMPORT_PATH, instance_id=instance_id, sonarr_episode_id=101
+    )
+    assert job is not None
+    assert _wanted_paths(client) == {_IMPORT_PATH}
+
+    with session_factory() as session:
+        episode_node = get_node_by_source_id(
+            session, instance_id=instance_id, sonarr_episode_id=101
+        )
+        assert episode_node is not None
+        season_node = session.get(type(episode_node), episode_node.parent_id)
+        assert season_node is not None
+        set_tracked(session, node_id=season_node.parent_id, tracked=False)  # the series
+
+    assert _wanted_paths(client) == set()
+
+
+def test_untracking_via_the_http_endpoint_removes_it_from_wanted(
+    settings: Settings, client: TestClient
+) -> None:
+    """Exercises the real path the frontend's `TrackedToggleButton` drives."""
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        _IMPORT_PATH, instance_id=instance_id, sonarr_episode_id=101
+    )
+    assert job is not None
+    assert _wanted_paths(client) == {_IMPORT_PATH}
+
+    with session_factory() as session:
+        node = get_node_by_source_id(session, instance_id=instance_id, sonarr_episode_id=101)
+        assert node is not None
+        node_id = node.id
+
+    response = client.post(
+        "/api/library/tracked",
+        json={"references": [{"node_type": "episode", "node_id": node_id}], "tracked": False},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 200, response.text
+
+    assert _wanted_paths(client) == set()
