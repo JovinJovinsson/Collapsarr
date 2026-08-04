@@ -88,6 +88,46 @@ const seriesTree: LibraryTreeResponse = {
   ],
 };
 
+/**
+ * A two-series tree (COL-103): `seriesTree` above only has one Series/one
+ * Season/two Episodes, which can't exercise "check boxes across different
+ * series/seasons/levels" -- this adds a second Series branch (with its own
+ * Season/Episode) so a test can select rows spanning both series.
+ */
+const twoSeriesTree: LibraryTreeResponse = {
+  instance_id: 1,
+  series: [
+    ...seriesTree.series,
+    {
+      id: 11,
+      kind: "series",
+      sonarr_series_id: 101,
+      title: "Better Call Saul",
+      tracked: true,
+      seasons: [
+        {
+          id: 21,
+          kind: "season",
+          season_number: 1,
+          tracked: true,
+          episodes: [
+            {
+              id: 32,
+              kind: "episode",
+              sonarr_episode_id: 302,
+              season_number: 1,
+              episode_number: 1,
+              title: "Uno",
+              has_file: true,
+              tracked: true,
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 const movieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
@@ -407,5 +447,138 @@ describe("LibraryPage (COL-100)", () => {
     // Row still reads its original (unchanged) Tracked state -- the failed
     // request never got a chance to flip it via a refetch.
     expect(within(seriesRow).getByRole("button", { name: /^tracked$/i })).not.toBeDisabled();
+  });
+
+  it("shows the bulk-action toolbar only while at least one row is selected (COL-103)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: seriesTree }));
+    renderLibraryPage(1);
+
+    expect(screen.queryByRole("toolbar", { name: /bulk tracked actions/i })).not.toBeInTheDocument();
+
+    const seriesCheckbox = await screen.findByRole("checkbox", { name: /select breaking bad$/i });
+    fireEvent.click(seriesCheckbox);
+
+    expect(await screen.findByRole("toolbar", { name: /bulk tracked actions/i })).toBeInTheDocument();
+    expect(screen.getByText(/1 row selected/i)).toBeInTheDocument();
+
+    fireEvent.click(seriesCheckbox);
+
+    expect(screen.queryByRole("toolbar", { name: /bulk tracked actions/i })).not.toBeInTheDocument();
+  });
+
+  it("retains checkbox selections across different series/seasons/levels through expand/collapse (COL-103)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: twoSeriesTree }));
+    renderLibraryPage(1);
+
+    // Select the second series' row without expanding it.
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select better call saul$/i }));
+
+    // Expand the first series down to its episodes and select one there too
+    // -- a cross-branch, cross-level selection (Series + Episode).
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select breaking bad s1e1 pilot/i }));
+
+    expect(await screen.findByText(/2 rows selected/i)).toBeInTheDocument();
+
+    // Collapse the season and the series, then re-expand both -- the
+    // episode checkbox must still read checked, since the selection lives
+    // in LibraryPage, not the collapsed subtree's own local expand state.
+    fireEvent.click(screen.getByRole("button", { name: /season 1/i }));
+    fireEvent.click(screen.getByRole("button", { name: /breaking bad/i }));
+    expect(screen.getByText(/2 rows selected/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+    expect(
+      await screen.findByRole("checkbox", { name: /select breaking bad s1e1 pilot/i }),
+    ).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /select better call saul$/i })).toBeChecked();
+  });
+
+  it("applies a bulk action to the whole mixed-level selection in one request and reflects the result, including cascade, without a manual refresh (COL-103)", async () => {
+    const { fetchMock, calls, setTree } = mockLibraryApiWithToggle({
+      instances: [sonarrInstance],
+      tree: twoSeriesTree,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderLibraryPage(1);
+
+    // Cross-branch, cross-level selection: the "Better Call Saul" series row
+    // plus "Breaking Bad"'s sibling episode "Cat's in the Bag...".
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select better call saul$/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select breaking bad s1e2/i }));
+
+    expect(await screen.findByText(/2 rows selected/i)).toBeInTheDocument();
+
+    // Server-side result of the bulk apply: the directly-selected episode
+    // flips, and the selected series' cascade flips its own season/episode.
+    const afterBulk: LibraryTreeResponse = {
+      instance_id: 1,
+      series: [
+        {
+          ...twoSeriesTree.series[0],
+          seasons: [
+            {
+              ...twoSeriesTree.series[0].seasons[0],
+              episodes: [
+                twoSeriesTree.series[0].seasons[0].episodes[0],
+                { ...twoSeriesTree.series[0].seasons[0].episodes[1], tracked: false },
+              ],
+            },
+          ],
+        },
+        {
+          ...twoSeriesTree.series[1],
+          tracked: false,
+          seasons: twoSeriesTree.series[1].seasons.map((season) => ({
+            ...season,
+            tracked: false,
+            episodes: season.episodes.map((episode) => ({ ...episode, tracked: false })),
+          })),
+        },
+      ],
+    };
+    setTree(afterBulk);
+
+    fireEvent.click(screen.getByRole("button", { name: /mark not tracked/i }));
+
+    const bulkCall = await vi.waitFor(() => {
+      const match = calls.find((call) => call.url === "/api/library/tracked");
+      if (!match) throw new Error("not yet called");
+      return match;
+    });
+    expect(bulkCall.init?.method).toBe("POST");
+    const body = JSON.parse(String(bulkCall.init?.body)) as {
+      references: { node_type: string; node_id: number }[];
+      tracked: boolean;
+    };
+    expect(body.tracked).toBe(false);
+    expect(body.references).toHaveLength(2);
+    expect(body.references).toEqual(
+      expect.arrayContaining([
+        { node_type: "series", node_id: 11 },
+        { node_type: "episode", node_id: 31 },
+      ]),
+    );
+
+    // Toolbar disappears -- selection cleared after a successful apply.
+    await vi.waitFor(() => {
+      expect(screen.queryByRole("toolbar", { name: /bulk tracked actions/i })).not.toBeInTheDocument();
+    });
+
+    // Refetch landed without a manual refresh: the directly-selected sibling
+    // episode is Not Tracked...
+    const siblingRow = (await screen.findByText(/cat's in the bag/i)).closest("tr") as HTMLElement;
+    expect(within(siblingRow).getByRole("button", { name: /^not tracked$/i })).toBeInTheDocument();
+
+    // ...and the selected series' cascade to its own descendants landed too.
+    fireEvent.click(screen.getByRole("button", { name: /breaking bad/i })); // collapse, avoids a duplicate "Season 1" label
+    fireEvent.click(screen.getByRole("button", { name: /better call saul/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+    const unoRow = (await screen.findByText(/uno/i)).closest("tr") as HTMLElement;
+    expect(within(unoRow).getByRole("button", { name: /^not tracked$/i })).toBeInTheDocument();
   });
 });

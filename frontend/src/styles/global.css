@@ -1250,6 +1250,53 @@ a {
   border-color: var(--c-border);
 }
 
+/* Row-level Select checkbox (COL-103): first column of every Library
+   tree/table row, backing the cross-level bulk selection. */
+.library-tree-table__select {
+  cursor: pointer;
+}
+
+.library-tree-table__select:disabled {
+  cursor: not-allowed;
+}
+
+/* The bulk-action toolbar (COL-103): appears above the tree/table once the
+   cross-level selection holds at least one row, offering a single Mark
+   Tracked / Mark Not Tracked action across the whole mixed-level selection. */
+.library-bulk-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4);
+  border-radius: var(--radius-md);
+  background: var(--c-surface-raised);
+  border: 1px solid var(--c-border);
+}
+
+.library-bulk-toolbar__count {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--c-text);
+  margin-right: auto;
+}
+
+.library-bulk-toolbar__clear {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--c-text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.library-bulk-toolbar__clear:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 /* ---- Responsive: collapse the sidebar to a top bar on narrow screens - */
 
 @media (max-width: 640px) {

@@ -3,6 +3,7 @@ import type {
   BulkTrackedUpdateResponse,
   LibraryNodeKind,
   LibraryTree,
+  TrackedNodeReference,
 } from "../types/library";
 import { apiErrorMessage, apiFetch } from "./client";
 
@@ -56,6 +57,28 @@ export function rememberVisitedLibraryInstance(instanceId: number): void {
 }
 
 /**
+ * Shared `POST /api/library/tracked` call backing both `updateTracked`
+ * (single reference) and `bulkUpdateTracked` (COL-103, a mixed-level
+ * selection) -- the endpoint always takes a list of references, so a single
+ * toggle is just the one-element case of a bulk update.
+ */
+async function postTrackedUpdate(
+  references: TrackedNodeReference[],
+  tracked: boolean,
+): Promise<BulkTrackedUpdateResponse> {
+  const body: BulkTrackedUpdateRequest = { references, tracked };
+  const response = await apiFetch("/api/library/tracked", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to update Tracked (${response.status})`));
+  }
+  return (await response.json()) as BulkTrackedUpdateResponse;
+}
+
+/**
  * Sets Tracked on a single Library node (`POST /api/library/tracked`, COL-101),
  * cascading to its descendants server-side when it's a Series/Season
  * reference. Callers re-fetch the tree (`fetchLibraryTree`) afterwards to
@@ -67,17 +90,20 @@ export async function updateTracked(
   nodeId: number,
   tracked: boolean,
 ): Promise<BulkTrackedUpdateResponse> {
-  const body: BulkTrackedUpdateRequest = {
-    references: [{ node_type: nodeType, node_id: nodeId }],
-    tracked,
-  };
-  const response = await apiFetch("/api/library/tracked", {
-    method: "POST",
-    headers: JSON_HEADERS,
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    throw new Error(await apiErrorMessage(response, `Failed to update Tracked (${response.status})`));
-  }
-  return (await response.json()) as BulkTrackedUpdateResponse;
+  return postTrackedUpdate([{ node_type: nodeType, node_id: nodeId }], tracked);
+}
+
+/**
+ * Sets Tracked on an arbitrary mixed-level selection of Library nodes in one
+ * request (COL-103, e.g. a Series from one branch plus an Episode from
+ * another) -- the bulk-action toolbar's counterpart to `updateTracked`'s
+ * single-reference form. Same cascade/refetch contract: a Series/Season
+ * reference cascades to its descendants server-side, and the caller
+ * re-fetches the tree to reflect the full resulting state.
+ */
+export async function bulkUpdateTracked(
+  references: TrackedNodeReference[],
+  tracked: boolean,
+): Promise<BulkTrackedUpdateResponse> {
+  return postTrackedUpdate(references, tracked);
 }
