@@ -74,7 +74,10 @@ a {
 
 .sidebar__brand-mark {
   display: inline-flex;
-  color: var(--c-accent);
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
 }
 
 .sidebar__brand-name {

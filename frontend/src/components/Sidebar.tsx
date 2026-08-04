@@ -6,7 +6,6 @@ import type { ReactNode } from "react";
 import { logout } from "../api/auth";
 import { LIBRARIES_PATH, navItems, systemNavItems } from "../routes/nav";
 import type { NavItem } from "../routes/nav";
-import { BrandMark } from "./icons";
 import { LibraryNavSection } from "./LibraryNavSection";
 
 /** Renders one nav link; shared by the primary and System sections. */
@@ -44,9 +43,12 @@ export function Sidebar() {
   return (
     <nav className="sidebar" aria-label="Primary">
       <div className="sidebar__brand">
-        <span className="sidebar__brand-mark" aria-hidden>
-          <BrandMark />
-        </span>
+        <img
+          className="sidebar__brand-mark"
+          src="/apple-touch-icon.png"
+          alt=""
+          aria-hidden
+        />
         <span className="sidebar__brand-name">Collapsarr</span>
       </div>
 
