@@ -381,13 +381,29 @@ def _upsert_node(
 # --- Tracked write + cascade -------------------------------------------------
 
 
-def set_tracked(session: Session, *, node_id: int, tracked: bool) -> LibraryNode:
+def set_tracked(
+    session: Session, *, node_id: int, tracked: bool, commit: bool = True
+) -> LibraryNode:
     """Set an explicit Tracked override on a node, cascading to descendants.
 
     Writes ``node.tracked_override = tracked``. When the node is a Series or
     Season, every existing descendant node's ``tracked_override`` is overwritten
     to the same value -- the cascade-on-toggle rule. (An Episode has no
     descendants, so only its own override changes.)
+
+    ``commit`` defaults to ``True`` (this function's original, standalone
+    behaviour: commit and refresh before returning). A caller that needs to
+    apply several of these writes as one all-or-nothing unit -- e.g.
+    ``POST /api/library/tracked``'s bulk endpoint
+    (:mod:`collapsarr.library.routes`) -- passes ``commit=False`` to flush the
+    write into the *current* transaction without ending it, so a later write
+    in the same batch failing can still roll every earlier one in that batch
+    back. ``node`` is not refreshed in that case: ``tracked_override`` (and
+    any cascaded descendants') were just set in Python above, so the caller's
+    view of it is already correct without a round-trip; a full refresh
+    would additionally require an autoflush of the *uncommitted* write to
+    stay consistent, which this session factory disables
+    (:func:`collapsarr.database.create_session_factory`).
 
     Raises:
         LibraryNodeNotFoundError: if ``node_id`` does not exist.
@@ -410,8 +426,11 @@ def set_tracked(session: Session, *, node_id: int, tracked: bool) -> LibraryNode
             descendant.tracked_override = tracked
             stack.extend(children_by_parent[descendant.id])
 
-    session.commit()
-    session.refresh(node)
+    if commit:
+        session.commit()
+        session.refresh(node)
+    else:
+        session.flush()
     return node
 
 

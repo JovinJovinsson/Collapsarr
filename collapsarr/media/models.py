@@ -89,9 +89,19 @@ class TrackedMediaFile(Base):
 
     #: The Arr instance this file was last scanned/webhooked from. ``NULL`` if
     #: never resolved via a scan/webhook (e.g. only ever manually triggered by
-    #: bare path). Deleting the instance nulls this out (``SET NULL``) rather
-    #: than cascading -- a tracked file's downmix history outlives the Arr
-    #: instance that originally reported it.
+    #: bare path). ``ondelete="SET NULL"`` here is a *schema-level* FK
+    #: declaration only -- a tracked file's downmix history is meant to
+    #: outlive the Arr instance that originally reported it, rather than
+    #: cascading away with it -- consistent with how
+    #: :class:`~collapsarr.library.models.LibraryNode` declares its own
+    #: ``instance_id``/``parent_id`` FKs. Like those, whether this is actually
+    #: *enforced* at runtime depends on SQLite's ``PRAGMA foreign_keys`` being
+    #: enabled, which :mod:`collapsarr.database` does not currently do (see
+    #: COL-98/99's tracked FK-enforcement follow-up) -- so
+    #: :func:`collapsarr.arr.service.delete_instance` deleting an
+    #: :class:`~collapsarr.arr.models.ArrInstance` does *not* currently null
+    #: this column out; it can be left pointing at a since-deleted instance
+    #: id until that follow-up lands.
     instance_id: Mapped[int | None] = mapped_column(
         ForeignKey("arr_instances.id", ondelete="SET NULL"), nullable=True, index=True
     )

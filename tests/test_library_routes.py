@@ -15,6 +15,7 @@ factory (there is no create-node endpoint; the mirror is scan-driven).
 
 from __future__ import annotations
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -27,8 +28,14 @@ from collapsarr.arr.catalog import (
     SonarrCatalog,
 )
 from collapsarr.arr.models import ArrInstance, InstanceType
+from collapsarr.library import routes as library_routes
 from collapsarr.library.models import LibraryNodeKind, make_node_key
-from collapsarr.library.service import list_nodes, sync_library
+from collapsarr.library.service import (
+    LibraryNodeNotFoundError,
+    list_nodes,
+    set_tracked,
+    sync_library,
+)
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
 UNREACHABLE_URL = "http://127.0.0.1:9"
@@ -335,6 +342,61 @@ def test_bulk_update_is_atomic_a_bad_reference_leaves_earlier_ones_unwritten(
     with app.state.session_factory() as session:
         nodes_by_key = {n.node_key: n for n in list_nodes(session, instance_id)}
         assert nodes_by_key[episode_key].tracked_override is None  # nothing written
+
+
+def test_bulk_update_mid_loop_failure_rolls_back_earlier_writes_in_the_batch(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-request TOCTOU: a reference passes pre-validation but its write
+    fails mid-loop (simulated here by making the second call to
+    :func:`~collapsarr.library.service.set_tracked` raise
+    :class:`~collapsarr.library.service.LibraryNodeNotFoundError`, standing in
+    for a node deleted by a concurrent request between validation and the
+    write loop). The first reference's write must not survive as a partial
+    commit: the whole batch rolls back and the endpoint returns ``404``.
+    """
+    instance_id = _seed_library(client)
+    episode_key = make_node_key(LibraryNodeKind.EPISODE, series_id=1, episode_id=101)
+    other_episode_key = make_node_key(LibraryNodeKind.EPISODE, series_id=1, episode_id=102)
+    episode_id = _node_id(client, instance_id, episode_key)
+    other_episode_id = _node_id(client, instance_id, other_episode_key)
+
+    call_count = 0
+
+    def flaky_set_tracked(
+        session: Session, *, node_id: int, tracked: bool, commit: bool = True
+    ) -> object:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise LibraryNodeNotFoundError(f"No library node with id={node_id}")
+        return set_tracked(session, node_id=node_id, tracked=tracked, commit=commit)
+
+    monkeypatch.setattr(library_routes, "set_tracked", flaky_set_tracked)
+
+    response = client.post(
+        "/api/library/tracked",
+        json={
+            "references": [
+                {"node_type": "episode", "node_id": episode_id},
+                {"node_type": "episode", "node_id": other_episode_id},
+            ],
+            "tracked": False,
+        },
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 404
+
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        nodes_by_key = {n.node_key: n for n in list_nodes(session, instance_id)}
+        # The first reference's write must have been rolled back, not just
+        # left un-attempted -- it succeeded (flushed) before the second
+        # reference's failure triggered the batch rollback.
+        assert nodes_by_key[episode_key].tracked_override is None
+        assert nodes_by_key[other_episode_key].tracked_override is None
 
 
 def test_bulk_update_requires_at_least_one_reference(client: TestClient) -> None:

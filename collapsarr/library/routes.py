@@ -30,7 +30,7 @@ from ..arr.models import InstanceType
 from ..arr.service import get_instance
 from ..database import get_session
 from .models import LibraryNode, LibraryNodeKind
-from .service import build_movie_tree, build_tree, get_node, set_tracked
+from .service import LibraryNodeNotFoundError, build_movie_tree, build_tree, get_node, set_tracked
 
 router = APIRouter(prefix="/api", tags=["library"])
 
@@ -216,14 +216,23 @@ def bulk_update_tracked_endpoint(
 ) -> BulkTrackedUpdateResponse:
     """Set Tracked on one or more Library nodes, cascading per COL-98's rule (COL-101).
 
-    Every reference is resolved and validated *before* any write happens, so a
-    bad reference partway through a multi-item request never leaves a partial
-    update: ``404`` if any ``node_id`` doesn't exist, ``422`` if any
-    reference's ``node_type`` doesn't match that node's actual kind. Once all
-    references check out, :func:`~collapsarr.library.service.set_tracked` is
-    called for each -- a Series/Season reference cascades to its existing
-    descendants exactly as that function already does; an Episode/Movie
-    reference only ever touches itself.
+    Every reference is resolved and validated *before* any write happens:
+    ``404`` if any ``node_id`` doesn't exist, ``422`` if any reference's
+    ``node_type`` doesn't match that node's actual kind. Once all references
+    check out, :func:`~collapsarr.library.service.set_tracked` is called for
+    each with ``commit=False`` -- a Series/Season reference cascades to its
+    existing descendants exactly as that function already does; an
+    Episode/Movie reference only ever touches itself -- and the whole batch is
+    committed in a single transaction only once every reference has written
+    successfully. If a reference that passed pre-validation turns out to be
+    gone by the time its write is attempted (a same-request TOCTOU: e.g. it
+    was deleted by a concurrent request in the gap between this endpoint's
+    validation pass and its write loop), :func:`~collapsarr.library.service.
+    set_tracked` raises :class:`~collapsarr.library.service.
+    LibraryNodeNotFoundError`; the whole batch is rolled back rather than
+    committing the references written so far, and a ``404`` is returned --
+    so a bad reference, whether caught up front or mid-loop, never leaves a
+    partial update.
 
     The response reports each *directly*-referenced node's resulting state,
     not the full cascaded set -- callers needing the resulting tree (including
@@ -248,10 +257,16 @@ def bulk_update_tracked_endpoint(
         resolved.append(node)
 
     updated: list[UpdatedTrackedNode] = []
-    for node in resolved:
-        saved = set_tracked(session, node_id=node.id, tracked=payload.tracked)
-        assert saved.tracked_override is not None  # just written above
-        updated.append(
-            UpdatedTrackedNode(id=saved.id, kind=saved.kind, tracked=saved.tracked_override)
-        )
+    try:
+        for node in resolved:
+            saved = set_tracked(session, node_id=node.id, tracked=payload.tracked, commit=False)
+            assert saved.tracked_override is not None  # just written above
+            updated.append(
+                UpdatedTrackedNode(id=saved.id, kind=saved.kind, tracked=saved.tracked_override)
+            )
+    except LibraryNodeNotFoundError as exc:
+        session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    session.commit()
     return BulkTrackedUpdateResponse(updated=updated)
