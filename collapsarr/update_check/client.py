@@ -20,7 +20,7 @@ Two fetch functions, one per channel:
   (COL-88), which lists *every* Release, time-ordered (most recent first);
   this walks that list and returns the first ``prerelease: true`` entry, i.e.
   the latest beta build (cut by ``.github/workflows/beta.yml`` on every push
-  to ``uat``, tagged ``beta-<short-sha>``).
+  to ``uat``, tagged ``beta-v<base>.<build>`` e.g. ``beta-v0.2.1.0007``, COL-96).
 
 Both share :func:`_parse_release_object` for turning a single Release JSON
 object into a :class:`GitHubReleaseResult` -- the two endpoints return the
@@ -149,7 +149,8 @@ def fetch_latest_prerelease(
     and returns the **first** entry with ``prerelease: true``, i.e. the most
     recently published beta build's Release (cut by
     ``.github/workflows/beta.yml`` on every push to ``uat``, tagged
-    ``beta-<short-sha>``). A stable Release interleaved above it in the list
+    ``beta-v<base>.<build>`` e.g. ``beta-v0.2.1.0007``, COL-96). A stable
+    Release interleaved above it in the list
     is skipped, not mistaken for a match.
 
     Never raises, same "no result -> failed :class:`GitHubReleaseResult`"
