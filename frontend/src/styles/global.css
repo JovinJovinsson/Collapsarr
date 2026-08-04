@@ -1211,11 +1211,13 @@ a {
   background: var(--c-surface-raised);
 }
 
-/* The per-row Tracked toggle (COL-101): mirrors the file badge's pill shape
-   so both status affordances on a row read as the same visual language, but
-   stays a real <button> (border, cursor, disabled state) since it's
-   interactive, unlike the read-only file badge. */
-.library-tree-table__tracked-toggle {
+/* The Tracked toggle (COL-101), shared by LibraryPage's rows and
+   FileDetailPage's Tracked panel (components/TrackedToggleButton.tsx):
+   mirrors the file badge's pill shape so both status affordances on a row
+   read as the same visual language, but stays a real <button> (border,
+   cursor, disabled state) since it's interactive, unlike the read-only file
+   badge. */
+.tracked-toggle {
   display: inline-flex;
   align-items: center;
   font: inherit;
@@ -1228,18 +1230,18 @@ a {
   border: 1px solid transparent;
 }
 
-.library-tree-table__tracked-toggle:disabled {
+.tracked-toggle:disabled {
   cursor: default;
   opacity: 0.7;
 }
 
-.library-tree-table__tracked-toggle--on {
+.tracked-toggle--on {
   color: var(--c-success);
   background: var(--c-success-tint);
   border-color: var(--c-success-tint);
 }
 
-.library-tree-table__tracked-toggle--off {
+.tracked-toggle--off {
   color: var(--c-text-muted);
   background: var(--c-surface-raised);
   border-color: var(--c-border);

@@ -23,6 +23,7 @@ from collapsarr.library.models import LibraryNode, LibraryNodeKind, make_node_ke
 from collapsarr.library.service import (
     build_movie_tree,
     build_tree,
+    get_node_by_source_id,
     list_nodes,
     resolve_tracked,
     set_tracked,
@@ -31,9 +32,11 @@ from collapsarr.library.service import (
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
 
-def _seed_instance(session: Session, *, type_: InstanceType = InstanceType.SONARR) -> ArrInstance:
+def _seed_instance(
+    session: Session, *, type_: InstanceType = InstanceType.SONARR, name: str | None = None
+) -> ArrInstance:
     instance = ArrInstance(
-        name=f"Instance {type_.value}",
+        name=name or f"Instance {type_.value}",
         type=type_,
         base_url="http://arr.local:8989",
         api_key="k",
@@ -373,3 +376,59 @@ def test_build_movie_tree_excludes_hidden_movies(session: Session) -> None:
 
     tree = build_movie_tree(session, instance.id)
     assert {m.radarr_movie_id for m in tree.movies} == {1}  # movie 2 hidden
+
+
+# --- get_node_by_source_id (COL-101) ------------------------------------------
+
+
+def test_get_node_by_source_id_finds_the_matching_episode(session: Session) -> None:
+    instance = _seed_instance(session)
+    sync_library(session, instance_id=instance.id, catalog=_catalog(instance.id))
+    expected = _episode(session, instance.id, 101)
+
+    found = get_node_by_source_id(session, instance_id=instance.id, sonarr_episode_id=101)
+
+    assert found is not None
+    assert found.id == expected.id
+
+
+def test_get_node_by_source_id_finds_the_matching_movie(session: Session) -> None:
+    instance = _seed_instance(session, type_=InstanceType.RADARR)
+    sync_library(session, instance_id=instance.id, catalog=_radarr_catalog(instance.id))
+    expected = _movie(session, instance.id, 1)
+
+    found = get_node_by_source_id(session, instance_id=instance.id, radarr_movie_id=1)
+
+    assert found is not None
+    assert found.id == expected.id
+
+
+def test_get_node_by_source_id_scopes_by_instance(session: Session) -> None:
+    """Two Sonarr instances that happen to reuse the same episode id don't collide."""
+    instance_a = _seed_instance(session, name="Instance A")
+    sync_library(session, instance_id=instance_a.id, catalog=_catalog(instance_a.id))
+    instance_b = _seed_instance(session, name="Instance B")
+    sync_library(session, instance_id=instance_b.id, catalog=_catalog(instance_b.id))
+
+    found_a = get_node_by_source_id(session, instance_id=instance_a.id, sonarr_episode_id=101)
+    found_b = get_node_by_source_id(session, instance_id=instance_b.id, sonarr_episode_id=101)
+
+    assert found_a is not None
+    assert found_b is not None
+    assert found_a.id != found_b.id
+    assert found_a.instance_id == instance_a.id
+    assert found_b.instance_id == instance_b.id
+
+
+def test_get_node_by_source_id_returns_none_for_unknown_id(session: Session) -> None:
+    instance = _seed_instance(session)
+    sync_library(session, instance_id=instance.id, catalog=_catalog(instance.id))
+
+    assert get_node_by_source_id(session, instance_id=instance.id, sonarr_episode_id=999) is None
+
+
+def test_get_node_by_source_id_returns_none_when_neither_id_given(session: Session) -> None:
+    instance = _seed_instance(session)
+    sync_library(session, instance_id=instance.id, catalog=_catalog(instance.id))
+
+    assert get_node_by_source_id(session, instance_id=instance.id) is None

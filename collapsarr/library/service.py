@@ -139,6 +139,42 @@ def get_node(session: Session, node_id: int) -> LibraryNode | None:
     return session.get(LibraryNode, node_id)
 
 
+def get_node_by_source_id(
+    session: Session,
+    *,
+    instance_id: int,
+    sonarr_episode_id: int | None = None,
+    radarr_movie_id: int | None = None,
+) -> LibraryNode | None:
+    """Return the Episode/Movie node matching an Arr instance's own object id (COL-101).
+
+    The bridge :mod:`collapsarr.media`'s ``TrackedMediaFile`` (keyed only by
+    file path) uses to find *its* owning node -- and so its Tracked value --
+    without parsing ``file_path`` (``CONTEXT.md`` rules that out: paths
+    aren't a stable catalog identity). Exactly one of ``sonarr_episode_id``/
+    ``radarr_movie_id`` is expected to be given, matching ``instance_id``'s
+    Arr instance type; if neither is given, there is nothing to look up and
+    this returns ``None`` without querying. Scoped by ``instance_id`` because
+    Sonarr/Radarr's own object ids are only unique *within* one instance, not
+    globally.
+    """
+    if sonarr_episode_id is not None:
+        stmt = select(LibraryNode).where(
+            LibraryNode.instance_id == instance_id,
+            LibraryNode.kind == LibraryNodeKind.EPISODE,
+            LibraryNode.sonarr_episode_id == sonarr_episode_id,
+        )
+    elif radarr_movie_id is not None:
+        stmt = select(LibraryNode).where(
+            LibraryNode.instance_id == instance_id,
+            LibraryNode.kind == LibraryNodeKind.MOVIE,
+            LibraryNode.radarr_movie_id == radarr_movie_id,
+        )
+    else:
+        return None
+    return session.scalars(stmt).one_or_none()
+
+
 # --- Tracked resolution ------------------------------------------------------
 
 

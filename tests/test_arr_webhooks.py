@@ -73,6 +73,7 @@ def test_parse_sonarr_webhook_on_import() -> None:
         file_path="/tv/Breaking Bad/Season 01/Breaking Bad - S01E01 - Pilot.mkv",
         is_upgrade=False,
         source_file_id=101,
+        sonarr_episode_id=101,
     )
 
 
@@ -85,6 +86,21 @@ def test_parse_sonarr_webhook_on_upgrade() -> None:
     assert file is not None
     assert file.is_upgrade is True
     assert file.file_path.endswith("Cats in the Bag.mkv")
+    assert file.sonarr_episode_id == 102
+
+
+def test_parse_sonarr_webhook_episode_id_absent_when_episodes_missing() -> None:
+    """A Download event with no `episodes` array still parses -- id just stays None."""
+    file = parse_sonarr_webhook(
+        {
+            "eventType": "Download",
+            "series": {"title": "X"},
+            "episodeFile": {"path": "/x", "id": 1},
+        }
+    )
+
+    assert file is not None
+    assert file.sonarr_episode_id is None
 
 
 def test_parse_sonarr_webhook_ignores_non_download_event() -> None:
@@ -120,6 +136,7 @@ def test_parse_radarr_webhook_on_import() -> None:
         file_path="/movies/Interstellar (2014)/Interstellar (2014) Bluray-1080p.mkv",
         is_upgrade=False,
         source_file_id=501,
+        radarr_movie_id=1,
     )
 
 
@@ -132,6 +149,7 @@ def test_parse_radarr_webhook_on_upgrade() -> None:
     assert file is not None
     assert file.is_upgrade is True
     assert file.media_title == "Silent Film"
+    assert file.radarr_movie_id == 4
 
 
 def test_parse_radarr_webhook_download_missing_movie_file_is_malformed() -> None:
@@ -173,6 +191,7 @@ def test_resolve_webhook_file_applies_path_mapping() -> None:
         file_path="/tv/Breaking Bad/Season 01/Pilot.mkv",
         is_upgrade=False,
         source_file_id=101,
+        sonarr_episode_id=101,
     )
 
     resolved = resolve_webhook_file(instance, raw, [mapping])
@@ -184,6 +203,7 @@ def test_resolve_webhook_file_applies_path_mapping() -> None:
         file_path="/mnt/media/tv/Breaking Bad/Season 01/Pilot.mkv",
         is_upgrade=False,
         source_file_id=101,
+        sonarr_episode_id=101,
     )
 
 

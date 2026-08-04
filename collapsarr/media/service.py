@@ -95,6 +95,9 @@ def upsert_tracked_media(
     file_path: str | Path,
     streams: Sequence[AudioStreamInfo],
     settings: DownmixSettings,
+    instance_id: int | None = None,
+    sonarr_episode_id: int | None = None,
+    radarr_movie_id: int | None = None,
 ) -> TrackedMediaFile:
     """Create or update a tracked media row from freshly-probed stream metadata.
 
@@ -121,6 +124,15 @@ def upsert_tracked_media(
     are updated in place, never duplicated (enforced by
     :class:`~collapsarr.media.models.TrackedMediaTargetStatus`'s
     ``(media_id, language, target)`` unique constraint).
+
+    ``instance_id``/``sonarr_episode_id``/``radarr_movie_id`` (COL-101) are
+    the Arr instance's own object ids for this file, when the caller has them
+    (a scan or webhook event does; a manual trigger by bare file path
+    doesn't). Each is written *only when given* (non-``None``) -- an id-less
+    call (e.g. a manual trigger) never clobbers a linkage an earlier
+    scan/webhook already established, so the bridge back to this file's
+    :class:`~collapsarr.library.models.LibraryNode` (and so its **Tracked**
+    value) survives even when a later call has no fresher id to offer.
     """
     path_str = str(file_path)
     media = get_tracked_media(session, path_str)
@@ -128,6 +140,13 @@ def upsert_tracked_media(
         media = TrackedMediaFile(file_path=path_str)
         session.add(media)
         session.flush()
+
+    if instance_id is not None:
+        media.instance_id = instance_id
+    if sonarr_episode_id is not None:
+        media.sonarr_episode_id = sonarr_episode_id
+    if radarr_movie_id is not None:
+        media.radarr_movie_id = radarr_movie_id
 
     channels_by_language = _channels_by_language(streams)
     qualifying = {(qt.language, qt.target) for qt in detect_qualifying_targets(streams, settings)}

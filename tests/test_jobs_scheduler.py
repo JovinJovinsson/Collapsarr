@@ -32,6 +32,7 @@ from collapsarr.jobs import scheduler as scheduler_module
 from collapsarr.jobs.history import record_job_history
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
 from collapsarr.jobs.scheduler import JobScheduler
+from collapsarr.media.service import get_tracked_media
 from collapsarr.migrations import upgrade_to_head
 
 # A 5.1 stream: with default (Stereo) settings, Stereo (2ch < 6ch, not present)
@@ -286,6 +287,30 @@ def test_on_file_ready_does_not_enqueue_when_nothing_to_do(
     assert scheduler._queue.list_jobs() == []
 
 
+def test_on_file_ready_persists_the_library_node_bridge_ids(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """The webhook's episode/movie id lands on the tracked-media row (COL-101)."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    file = ResolvedWebhookFile(
+        instance_id=7,
+        instance_name="inst",
+        media_title="Show",
+        file_path="/media/movie.mkv",
+        is_upgrade=False,
+        sonarr_episode_id=101,
+    )
+
+    scheduler.on_file_ready(file)
+
+    with session_factory() as session:
+        media = get_tracked_media(session, "/media/movie.mkv")
+        assert media is not None
+        assert media.instance_id == 7
+        assert media.sonarr_episode_id == 101
+        assert media.radarr_movie_id is None
+
+
 # ---------------------------------------------------------------------------
 # Full-library scan.
 # ---------------------------------------------------------------------------
@@ -326,6 +351,35 @@ def test_scan_once_enqueues_qualifying_files_and_resolves_paths(
 
     assert len(enqueued) == 1
     assert enqueued[0].file_path == Path("/mnt/media/tv/a.mkv")
+
+
+def test_scan_once_persists_the_library_node_bridge_ids(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scanned file's Sonarr episode id lands on its tracked-media row (COL-101)."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id,
+                    media_title="Show",
+                    file_path="/tv/a.mkv",
+                    sonarr_episode_id=101,
+                )
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    scheduler.scan_once()
+
+    with session_factory() as session:
+        media = get_tracked_media(session, "/tv/a.mkv")
+        assert media is not None
+        assert media.instance_id == instance.id
+        assert media.sonarr_episode_id == 101
 
 
 def test_scan_once_skips_files_with_nothing_to_do(

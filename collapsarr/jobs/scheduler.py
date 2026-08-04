@@ -197,8 +197,18 @@ class JobScheduler:
         so it is a host-local path ready to probe. Enqueuing a job (rather than
         running the pipeline inline) keeps the webhook response fast; the
         background loop, woken here, drains it promptly.
+
+        Passes ``file``'s ``instance_id``/``sonarr_episode_id``/
+        ``radarr_movie_id`` (COL-101) through to :meth:`enqueue_file` so the
+        resulting tracked-media row carries the Library-node bridge from the
+        moment a file first shows up via webhook.
         """
-        job = self.enqueue_file(file.file_path)
+        job = self.enqueue_file(
+            file.file_path,
+            instance_id=file.instance_id,
+            sonarr_episode_id=file.sonarr_episode_id,
+            radarr_movie_id=file.radarr_movie_id,
+        )
         if job is None:
             logger.info(
                 "webhook: no job enqueued for %s (duplicate or nothing to do)",
@@ -214,6 +224,9 @@ class JobScheduler:
         *,
         session: Session | None = None,
         settings: DownmixSettings | None = None,
+        instance_id: int | None = None,
+        sonarr_episode_id: int | None = None,
+        radarr_movie_id: int | None = None,
     ) -> Job | None:
         """Enqueue a downmix job for ``file_path`` unless it should be skipped.
 
@@ -228,6 +241,15 @@ class JobScheduler:
         override without mutating the scheduler's own default. It defaults to
         ``self._downmix_settings``, which is what :meth:`on_file_ready` and
         :meth:`scan_once` implicitly use.
+
+        ``instance_id``/``sonarr_episode_id``/``radarr_movie_id`` (COL-101) are
+        the Arr instance's own object ids for ``file_path``, when the caller
+        has them (:meth:`on_file_ready` and :meth:`scan_once` do;
+        :meth:`trigger_file`'s manual-trigger-by-bare-path callers don't).
+        Passed straight through to :meth:`_track_media` -- see
+        :func:`~collapsarr.media.service.upsert_tracked_media` for how an
+        id-less call is handled without clobbering a previously-established
+        linkage.
 
         The cheap dedup check runs first so an already-handled file isn't probed
         needlessly. It is re-checked under :attr:`_enqueue_lock` immediately
@@ -257,7 +279,15 @@ class JobScheduler:
             logger.warning("skipping %s: could not probe audio streams: %s", path, exc)
             return None
 
-        self._track_media(path, streams, effective_settings, session)
+        self._track_media(
+            path,
+            streams,
+            effective_settings,
+            session,
+            instance_id=instance_id,
+            sonarr_episode_id=sonarr_episode_id,
+            radarr_movie_id=radarr_movie_id,
+        )
 
         if not detect_qualifying_targets(streams, effective_settings):
             return None
@@ -273,8 +303,12 @@ class JobScheduler:
         streams: Sequence[AudioStreamInfo],
         settings: DownmixSettings,
         session: Session | None,
+        *,
+        instance_id: int | None = None,
+        sonarr_episode_id: int | None = None,
+        radarr_movie_id: int | None = None,
     ) -> None:
-        """Upsert ``path``'s tracked-media row from ``streams`` (COL-95).
+        """Upsert ``path``'s tracked-media row from ``streams`` (COL-95/COL-101).
 
         Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
         when the caller passed one (:meth:`scan_once` does, since it already
@@ -283,11 +317,25 @@ class JobScheduler:
         don't have one open).
         """
         if session is not None:
-            upsert_tracked_media(session, file_path=path, streams=streams, settings=settings)
+            upsert_tracked_media(
+                session,
+                file_path=path,
+                streams=streams,
+                settings=settings,
+                instance_id=instance_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_movie_id=radarr_movie_id,
+            )
             return
         with self._session_factory() as owned_session:
             upsert_tracked_media(
-                owned_session, file_path=path, streams=streams, settings=settings
+                owned_session,
+                file_path=path,
+                streams=streams,
+                settings=settings,
+                instance_id=instance_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_movie_id=radarr_movie_id,
             )
 
     def trigger_file(
@@ -421,7 +469,13 @@ class JobScheduler:
                 mappings = list_path_mappings(session, instance.id)
                 for monitored in files:
                     local_path = resolve_path(monitored.file_path, mappings)
-                    job = self.enqueue_file(local_path, session=session)
+                    job = self.enqueue_file(
+                        local_path,
+                        session=session,
+                        instance_id=monitored.instance_id,
+                        sonarr_episode_id=monitored.sonarr_episode_id,
+                        radarr_movie_id=monitored.radarr_movie_id,
+                    )
                     if job is not None:
                         enqueued.append(job)
         logger.info(

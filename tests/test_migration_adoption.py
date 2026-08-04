@@ -25,6 +25,7 @@ import re
 from pathlib import Path
 
 from alembic import command
+from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
@@ -205,13 +206,14 @@ def test_already_versioned_database_runs_only_pending_deltas(settings: Settings)
 # Stamp adoption + index heal
 # --------------------------------------------------------------------------- #
 #: Columns a *post-baseline* migration adds (COL-66's backup schedule knobs,
-#: COL-79's disk-space thresholds). ``create_all`` below always builds the
-#: table from the live ``Base.metadata`` -- i.e. with these columns already
-#: present -- so they are dropped by raw DDL afterwards to de-evolve the
-#: stand-in back to what a real pre-COL-66/pre-COL-79 create_all-era release
-#: actually had on disk. This mirrors the ``DROP INDEX`` idiom just below for
-#: the same reason: the unversioned DB this function fabricates predates
-#: every post-baseline delta, not just the index-reconcile one.
+#: COL-79's disk-space thresholds, COL-101's Library-node bridge ids).
+#: ``create_all`` below always builds the table from the live
+#: ``Base.metadata`` -- i.e. with these columns already present -- so they are
+#: dropped by raw DDL afterwards to de-evolve the stand-in back to what a real
+#: pre-COL-66/pre-COL-79/pre-COL-101 create_all-era release actually had on
+#: disk. This mirrors the ``DROP INDEX`` idiom just below for the same reason:
+#: the unversioned DB this function fabricates predates every post-baseline
+#: delta, not just the index-reconcile one.
 POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_interval_days"),
     ("global_settings", "backup_retention_days"),
@@ -219,6 +221,23 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "disk_space_error_percent"),
     ("global_settings", "update_channel"),
     ("global_settings", "default_tracked"),
+    ("tracked_media_files", "instance_id"),
+    ("tracked_media_files", "sonarr_episode_id"),
+    ("tracked_media_files", "radarr_movie_id"),
+)
+
+#: Indexes a *post-baseline* migration adds on an *indexed* post-baseline
+#: column (COL-101's three -- see :data:`POST_BASELINE_COLUMNS` above; none of
+#: the earlier post-baseline columns were indexed, so this is new). Unlike
+#: :data:`BASELINE_INDEXES` (which the baseline migration itself owns and the
+#: reconcile-indexes delta heals independently of column adoption), these only
+#: exist at all because ``create_all`` built the column they index -- so they
+#: must be dropped *before* that column, mirroring the baseline's own
+#: index-then-column drop order.
+POST_BASELINE_INDEXES: tuple[str, ...] = (
+    "ix_tracked_media_files_instance_id",
+    "ix_tracked_media_files_sonarr_episode_id",
+    "ix_tracked_media_files_radarr_movie_id",
 )
 
 #: Whole tables a *post-baseline* migration adds (COL-75's
@@ -253,13 +272,37 @@ def _build_populated_unversioned_db(settings: Settings) -> None:
         # Drop every SQLAlchemy-declared index (older create_all-era DB).
         for index_name in BASELINE_INDEXES:
             connection.execute(text(f'DROP INDEX IF EXISTS "{index_name}"'))
+        # Drop indexes on post-baseline columns *before* the columns
+        # themselves (below) -- same reasoning as the baseline indexes above.
+        for index_name in POST_BASELINE_INDEXES:
+            connection.execute(text(f'DROP INDEX IF EXISTS "{index_name}"'))
         # Drop columns a post-baseline migration owns, so the adoption delta
         # (not create_all) is what adds them back -- same reasoning as the
         # dropped indexes above.
+        #
+        # ``tracked_media_files.instance_id`` is skipped by the plain-DDL loop
+        # and dropped separately just below: it carries a FK to
+        # ``arr_instances`` (created inline by ``create_all``, unlike the
+        # migration's own explicitly-named one), and SQLite's native `ALTER
+        # TABLE ... DROP COLUMN` refuses to drop a column that participates
+        # in a FK constraint defined on the same table. The real migration
+        # hits this identical limitation (see its module docstring) and works
+        # around it with a ``batch_alter_table(..., recreate='always')``
+        # table rebuild; the same approach is used here, via a bare
+        # `Operations` bound to this connection (there is no active Alembic
+        # migration context in this fixture).
         for table_name, column_name in POST_BASELINE_COLUMNS:
+            if (table_name, column_name) == ("tracked_media_files", "instance_id"):
+                continue
             connection.execute(
                 text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
             )
+        batch_ctx = MigrationContext.configure(connection)
+        batch_ops = Operations(batch_ctx)
+        with batch_ops.batch_alter_table(
+            "tracked_media_files", recreate="always"
+        ) as batch_op:
+            batch_op.drop_column("instance_id")
         # Drop whole tables a post-baseline migration owns, so the adoption delta
         # (not create_all) is what creates them -- same reasoning as the columns.
         for table_name in POST_BASELINE_TABLES:

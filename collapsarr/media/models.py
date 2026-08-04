@@ -27,7 +27,7 @@ import enum
 from datetime import UTC, datetime
 
 from sqlalchemy import Enum as SAEnum
-from sqlalchemy import ForeignKey, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from collapsarr.database import Base
@@ -65,12 +65,42 @@ class TrackedMediaFile(Base):
     status lives in :class:`TrackedMediaTargetStatus` rows rather than on
     this row directly, since a single file can have many languages, each
     with its own per-target status.
+
+    :attr:`instance_id` + :attr:`sonarr_episode_id`/:attr:`radarr_movie_id`
+    (COL-101) are the bridge back to this file's owning
+    :class:`~collapsarr.library.models.LibraryNode` -- the unit **Tracked**
+    (``CONTEXT.md``) actually lives on. All three are nullable and
+    populated *when known* (a scan or webhook event carries the Arr
+    instance's own object ids; a manual trigger by bare file path does
+    not), and deliberately Arr-object-id-keyed rather than derived from
+    :attr:`file_path` -- ``CONTEXT.md`` rules out parsing on-disk paths to
+    infer catalog identity, since paths are unstable/remappable and don't
+    durably identify a catalog object across the scan/webhook mirror
+    boundary. Exactly one of :attr:`sonarr_episode_id`/:attr:`radarr_movie_id`
+    is set, matching :attr:`instance_id`'s Arr instance type -- the same
+    one-of-two-nullable-columns shape :class:`~collapsarr.library.models.LibraryNode`
+    already uses for the same distinction.
     """
 
     __tablename__ = "tracked_media_files"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     file_path: Mapped[str] = mapped_column(String(1000), nullable=False, unique=True, index=True)
+
+    #: The Arr instance this file was last scanned/webhooked from. ``NULL`` if
+    #: never resolved via a scan/webhook (e.g. only ever manually triggered by
+    #: bare path). Deleting the instance nulls this out (``SET NULL``) rather
+    #: than cascading -- a tracked file's downmix history outlives the Arr
+    #: instance that originally reported it.
+    instance_id: Mapped[int | None] = mapped_column(
+        ForeignKey("arr_instances.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    #: Sonarr's own episode id (COL-101), set when this file came from a
+    #: Sonarr instance. ``NULL`` on a Radarr file or an unresolved row.
+    sonarr_episode_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    #: Radarr's own movie id (COL-101), set when this file came from a Radarr
+    #: instance. ``NULL`` on a Sonarr file or an unresolved row.
+    radarr_movie_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)

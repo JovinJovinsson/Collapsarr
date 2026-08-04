@@ -1,0 +1,29 @@
+[
+  {
+    "id": 5001,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 1,
+    "title": "Pilot",
+    "hasFile": true,
+    "episodeFileId": 101
+  },
+  {
+    "id": 5002,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 2,
+    "title": "Cat's in the Bag...",
+    "hasFile": true,
+    "episodeFileId": 102
+  },
+  {
+    "id": 5003,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 3,
+    "title": "...And the Bag's in the River",
+    "hasFile": false,
+    "episodeFileId": 0
+  }
+]

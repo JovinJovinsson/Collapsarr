@@ -3,6 +3,7 @@ import { useParams } from "react-router-dom";
 
 import { fetchLibraryTree, rememberVisitedLibraryInstance, updateTracked } from "../api/library";
 import { LibraryIcon } from "../components/icons";
+import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import { useInstances } from "../hooks/useInstances";
 import type { ArrInstance } from "../types/instances";
 import type {
@@ -34,43 +35,6 @@ function FileStatusBadge({ hasFile }: { hasFile: boolean }) {
     >
       {hasFile ? "Has file" : "Missing"}
     </span>
-  );
-}
-
-/**
- * The single-item Tracked toggle (COL-101): a row-level button reading the
- * node's *resolved* Tracked value and flipping it via `POST
- * /api/library/tracked`. `pending` (this row's own toggle in flight) disables
- * the button and swaps its label so a double-click can't fire two overlapping
- * requests; the row stays showing its pre-toggle value until the request
- * resolves and the tree is re-fetched (`LibraryPage`'s `onToggle`), rather
- * than optimistically flipping ahead of the server -- a Series/Season toggle
- * cascades to descendants the button itself has no knowledge of, so an
- * optimistic local flip would be wrong for every row but this one.
- */
-function TrackedToggleButton({
-  tracked,
-  pending,
-  onToggle,
-}: {
-  tracked: boolean;
-  pending: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={
-        tracked
-          ? "library-tree-table__tracked-toggle library-tree-table__tracked-toggle--on"
-          : "library-tree-table__tracked-toggle library-tree-table__tracked-toggle--off"
-      }
-      onClick={onToggle}
-      disabled={pending}
-      aria-pressed={tracked}
-    >
-      {pending ? "Updating…" : tracked ? "Tracked" : "Not Tracked"}
-    </button>
   );
 }
 

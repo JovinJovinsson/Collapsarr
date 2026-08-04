@@ -7,15 +7,31 @@ expose that information differently:
 - Sonarr has no single "all monitored episode files" endpoint. Series are
   fetched via ``GET /api/v3/series`` (each with a ``monitored`` flag), and for
   every *monitored* series its files are fetched via
-  ``GET /api/v3/episodefile?seriesId=<id>``.
+  ``GET /api/v3/episodefile?seriesId=<id>``. Sonarr's ``episodefile`` objects
+  carry no ``episodeId`` of their own (a file can cover more than one episode
+  for a multi-episode release), so resolving *which* episode(s) a file
+  belongs to means cross-referencing ``GET /api/v3/episode?seriesId=<id>``
+  (the same endpoint :mod:`collapsarr.arr.catalog` already calls for the
+  Library mirror) and matching on each episode's own ``episodeFileId``
+  back-reference (COL-101).
 - Radarr's ``GET /api/v3/movie`` returns every movie in one call, each with
   ``monitored``/``hasFile`` flags and (when present) an embedded
-  ``movieFile`` object — no second request needed.
+  ``movieFile`` object — no second request needed; the movie's own ``id`` is
+  already in scope.
 
 Both variants are normalized to the same :class:`MonitoredFile` shape and
 reached through the single :func:`fetch_monitored_files` entry point, which
 dispatches on :attr:`~collapsarr.arr.models.ArrInstance.type` so callers don't
-need to special-case Sonarr vs. Radarr.
+need to special-case Sonarr vs. Radarr. Each carries the Arr instance's own
+``sonarr_episode_id``/``radarr_movie_id`` (COL-101) when resolvable -- the
+bridge :func:`~collapsarr.media.service.upsert_tracked_media` persists onto
+:class:`~collapsarr.media.models.TrackedMediaFile` so a scanned file's
+**Tracked** value (owned by the matching
+:class:`~collapsarr.library.models.LibraryNode`) can be looked up without
+parsing ``file_path`` (``CONTEXT.md`` rules that out -- paths aren't a stable
+catalog identity). A multi-episode Sonarr file resolves to its *first*
+matching episode id -- good enough to link back to *a* Tracked value, even
+though technically more than one episode shares the file.
 
 Audio metadata is taken from the Arr APIs' ``mediaInfo`` block, which reports
 *aggregate* fields (codec, total channel count, language list, stream count)
@@ -42,6 +58,7 @@ from .models import ArrInstance, InstanceType
 
 _SERIES_PATH = "/api/v3/series"
 _EPISODE_FILE_PATH = "/api/v3/episodefile"
+_EPISODE_PATH = "/api/v3/episode"
 _MOVIE_PATH = "/api/v3/movie"
 _DEFAULT_TIMEOUT = 10.0
 
@@ -63,12 +80,24 @@ class AudioInfo:
 
 @dataclass(frozen=True, slots=True)
 class MonitoredFile:
-    """A single monitored media file, normalized across Sonarr and Radarr."""
+    """A single monitored media file, normalized across Sonarr and Radarr.
+
+    ``sonarr_episode_id``/``radarr_movie_id`` (COL-101) are the Arr
+    instance's own object ids for the episode/movie this file belongs to --
+    distinct from ``source_file_id`` (the *file* row's own id, e.g. Sonarr's
+    ``episodefile.id``). Exactly one is set, matching ``instance_id``'s Arr
+    instance type; both are ``None`` only if the id genuinely couldn't be
+    resolved (e.g. a Sonarr file whose ``episodefile.id`` has no matching
+    ``episode.episodeFileId``, which shouldn't happen for a well-formed Sonarr
+    response but is handled rather than assumed).
+    """
 
     instance_id: int
     media_title: str
     file_path: str
     source_file_id: int | None = None
+    sonarr_episode_id: int | None = None
+    radarr_movie_id: int | None = None
     audio: AudioInfo | None = None
 
 
@@ -119,6 +148,35 @@ def _extract_audio_info(media_info: object) -> AudioInfo | None:
     )
 
 
+def _episode_id_by_file_id(episodes_payload: object) -> dict[int, int]:
+    """Map ``episodefile.id`` -> ``episode.id`` from a Sonarr ``/episode`` response.
+
+    Sonarr's episode objects carry the back-reference (``episodeFileId``); the
+    ``episodefile`` objects :func:`_fetch_sonarr_files` iterates don't carry
+    the forward one, so this is built once per series and used to resolve
+    each file's owning episode id (COL-101). When more than one episode
+    shares a file (a multi-episode release), the *first* one encountered
+    wins -- good enough to link back to a Tracked value, even though more
+    than one episode technically shares the file.
+    """
+    mapping: dict[int, int] = {}
+    if not isinstance(episodes_payload, list):
+        return mapping
+    for episode in episodes_payload:
+        if not isinstance(episode, dict):
+            continue
+        episode_id = episode.get("id")
+        episode_file_id = episode.get("episodeFileId")
+        if (
+            isinstance(episode_id, int)
+            and isinstance(episode_file_id, int)
+            and episode_file_id
+            and episode_file_id not in mapping
+        ):
+            mapping[episode_file_id] = episode_id
+    return mapping
+
+
 def _fetch_sonarr_files(
     instance: ArrInstance, *, timeout: float, transport: httpx.BaseTransport | None
 ) -> list[MonitoredFile]:
@@ -151,6 +209,14 @@ def _fetch_sonarr_files(
             if not isinstance(episode_files, list):
                 continue
 
+            episodes_response = client.get(
+                f"{base_url}{_EPISODE_PATH}",
+                params={"seriesId": series_id},
+                headers=headers,
+            )
+            episodes_response.raise_for_status()
+            episode_id_by_file_id = _episode_id_by_file_id(episodes_response.json())
+
             for episode_file in episode_files:
                 if not isinstance(episode_file, dict):
                     continue
@@ -164,6 +230,11 @@ def _fetch_sonarr_files(
                         media_title=series_title,
                         file_path=path,
                         source_file_id=file_id if isinstance(file_id, int) else None,
+                        sonarr_episode_id=(
+                            episode_id_by_file_id.get(file_id)
+                            if isinstance(file_id, int)
+                            else None
+                        ),
                         audio=_extract_audio_info(episode_file.get("mediaInfo")),
                     )
                 )
@@ -198,12 +269,14 @@ def _fetch_radarr_files(
             if not isinstance(path, str) or not path or not isinstance(title, str):
                 continue
             file_id = movie_file.get("id")
+            movie_id = movie.get("id")
             results.append(
                 MonitoredFile(
                     instance_id=instance.id,
                     media_title=title,
                     file_path=path,
                     source_file_id=file_id if isinstance(file_id, int) else None,
+                    radarr_movie_id=movie_id if isinstance(movie_id, int) else None,
                     audio=_extract_audio_info(movie_file.get("mediaInfo")),
                 )
             )
