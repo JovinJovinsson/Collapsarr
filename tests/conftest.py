@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -45,6 +46,24 @@ def _ample_free_space(_path: str) -> DiskUsage:
     return _FakeDiskUsage(total=1000, used=100, free=900)
 
 
+def _offline_update_check_transport() -> httpx.MockTransport:
+    """A deterministic stand-in for the Update Check scheduler's GitHub fetch (COL-86).
+
+    The app lifespan runs an ``UpdateCheckScheduler.run_once()`` tick
+    synchronously on every startup regardless of ``enable_scheduler`` -- same
+    as the health scheduler above -- which would otherwise make a real network
+    call to ``api.github.com`` on every test using the shared ``client``
+    fixture. Reports a fixed "no result" (mirrors a real offline/CI
+    environment; the client never raises either way), keeping every test's
+    startup tick fast, offline, and deterministic.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="offline in tests")
+
+    return httpx.MockTransport(handler)
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     """Settings backed by a throwaway SQLite file under a temp directory.
@@ -68,7 +87,11 @@ def client(settings: Settings) -> Iterator[TestClient]:
     check's startup-tick result is deterministic across hosts/CI runners --
     see :func:`_ample_free_space`.
     """
-    app = create_app(settings=settings, disk_usage=_ample_free_space)
+    app = create_app(
+        settings=settings,
+        disk_usage=_ample_free_space,
+        update_check_transport=_offline_update_check_transport(),
+    )
     with TestClient(app) as test_client:
         yield test_client
 

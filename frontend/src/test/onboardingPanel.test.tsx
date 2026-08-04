@@ -25,6 +25,7 @@ const settings: GlobalSettings = {
   backup_retention_days: 28,
   disk_space_warning_percent: 5,
   disk_space_error_percent: 2,
+  update_channel: "stable",
   api_key: "onboarding-server-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",

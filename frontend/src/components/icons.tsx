@@ -92,6 +92,19 @@ export function HealthIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Update: a downward arrow into a tray -- a neutral "new version available"
+// glyph, deliberately unlike WarningIcon/ErrorIcon's alert shapes (COL-87);
+// used by the System > Updates page and the app-wide update indicator.
+export function UpdateIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <path d="M12 3.5v10.5" />
+      <path d="M8 10.5 12 14.5 16 10.5" />
+      <path d="M4.5 17.5v1.5a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-1.5" />
+    </svg>
+  );
+}
+
 // Wordmark glyph: converging channels funneling into two bars, echoing the
 // downmix concept. Placeholder mark only — final logo lands in COL-9.
 export function BrandMark(props: SVGProps<SVGSVGElement>) {

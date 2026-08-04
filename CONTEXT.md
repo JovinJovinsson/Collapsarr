@@ -49,3 +49,35 @@ Marks a specific, currently-failing **Check Key** as acknowledged (sets
 `dismissed_at`). Automatically cleared the next time that Check Key
 transitions from passing back to failing — a dismiss silences the *current*
 occurrence, not the code forever.
+
+## Release Channel
+
+A `GlobalSettings.update_channel` value (`stable`|`beta`) selecting which
+GitHub Release stream the **Update Check** compares the running instance
+against. `stable` = the latest non-prerelease Release (cut by `release.yml`
+on a `v*.*.*` tag on `main`); `beta` = the latest prerelease Release (cut by
+`beta.yml` on every push to `uat`, tagged `beta-<sha>`). Defaults to
+`stable`; auto-detected as `beta` on first boot if the running `__version__`
+carries a `+beta.<sha>` local segment. Not to be confused with a Docker image
+tag or a Health Check category — it is purely the update-detection setting.
+
+## Update Check
+
+The periodic (24h, plus manual "Check now") comparison of the running
+instance's version *identity* (not semver ordering) against the latest
+GitHub Release for the configured **Release Channel**. Owned by a dedicated
+`UpdateCheckScheduler` that mirrors the Health Check Framework's
+scheduler/persisted-state/edge-triggered-notification pattern, but an Update
+Check is deliberately **not** a Health Check — an available update is not a
+failure state (no severity, no Check Code), it is informational.
+
+## Install Method
+
+How this instance is running — Docker vs. pipx/bare-metal — detected
+server-side via the presence of `/.dockerenv` (the frontend has no
+filesystem access to detect it itself). Surfaced as `is_docker` on
+`GET /api/system/updates`, and used solely to pick which upgrade
+*instructions* the Updates page displays (`docker pull` + recreate-container
+vs. `pipx upgrade`/`pip install --upgrade`) — see
+`docs/adr/0001-update-check-detect-notify-only.md`. No code path executes
+either command; the operator always runs it themselves.

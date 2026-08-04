@@ -48,6 +48,15 @@ two free-space-percentage thresholds the disk-space health check
 same round-trip-only-through-Settings treatment as the backup pair, each
 constrained to ``(0, 100]`` (``Field(gt=0, le=100)``) since a percentage
 outside that range can never be crossed by a real free-space reading.
+
+``update_channel`` (COL-88) is also read/write here -- ``"stable"`` (default)
+vs. ``"beta"`` -- selecting which GitHub Release stream the Update Check
+(:mod:`collapsarr.update_check`) compares the running instance against. Typed
+as a ``Literal`` the same way as ``auth_required``/``auth_method`` so an
+unrecognised value is rejected with a ``422`` before it reaches the service
+layer, which validates it again independently (see
+:func:`collapsarr.settings.service.update_global_settings`) for callers that
+bypass this HTTP layer.
 """
 
 from __future__ import annotations
@@ -77,6 +86,12 @@ AuthMethodMode = Literal["forms", "basic"]
 :data:`~collapsarr.settings.models.AUTH_METHOD_BASIC` -- spelled out as
 literals for the same reason as :data:`AuthRequiredMode`."""
 
+UpdateChannelMode = Literal["stable", "beta"]
+"""The two release channels settable from Settings (COL-88), matching
+:data:`collapsarr.settings.models.UPDATE_CHANNEL_STABLE` /
+:data:`~collapsarr.settings.models.UPDATE_CHANNEL_BETA` -- spelled out as
+literals for the same reason as :data:`AuthRequiredMode`."""
+
 router = APIRouter(prefix="/api", tags=["settings"])
 
 
@@ -104,6 +119,7 @@ class SettingsRead(BaseModel):
     backup_retention_days: int
     disk_space_warning_percent: float
     disk_space_error_percent: float
+    update_channel: UpdateChannelMode
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -134,6 +150,7 @@ class SettingsUpdate(BaseModel):
     backup_retention_days: int | None = Field(default=None, gt=0)
     disk_space_warning_percent: float | None = Field(default=None, gt=0, le=100)
     disk_space_error_percent: float | None = Field(default=None, gt=0, le=100)
+    update_channel: UpdateChannelMode | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -163,6 +180,7 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         backup_retention_days=settings.backup_retention_days,
         disk_space_warning_percent=settings.disk_space_warning_percent,
         disk_space_error_percent=settings.disk_space_error_percent,
+        update_channel=settings.update_channel,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -223,5 +241,7 @@ def update_settings_endpoint(
         kwargs["disk_space_warning_percent"] = body.disk_space_warning_percent
     if "disk_space_error_percent" in provided:
         kwargs["disk_space_error_percent"] = body.disk_space_error_percent
+    if "update_channel" in provided:
+        kwargs["update_channel"] = body.update_channel
 
     return _to_read(update_global_settings(session, **kwargs))  # type: ignore[arg-type]

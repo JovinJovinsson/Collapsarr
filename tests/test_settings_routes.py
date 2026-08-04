@@ -44,6 +44,7 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["backup_retention_days"] == 28  # COL-66 default
     assert body["disk_space_warning_percent"] == 5.0  # COL-79 default
     assert body["disk_space_error_percent"] == 2.0  # COL-79 default
+    assert body["update_channel"] == "stable"  # COL-88 default
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -268,6 +269,56 @@ def test_put_settings_rejects_a_disk_space_error_percent_above_100(client: TestC
         headers=_auth_headers(client),
     )
     assert response.status_code == 422
+
+
+# --- update channel (COL-88) -----------------------------------------------------
+
+
+def test_put_settings_switches_update_channel(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"update_channel": "beta"},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["update_channel"] == "beta"
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["update_channel"] == "beta"
+
+
+def test_put_settings_update_channel_is_switchable_back_to_stable(client: TestClient) -> None:
+    client.put("/api/settings", json={"update_channel": "beta"}, headers=_auth_headers(client))
+
+    response = client.put(
+        "/api/settings",
+        json={"update_channel": "stable"},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["update_channel"] == "stable"
+
+
+def test_put_settings_rejects_an_unknown_update_channel(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"update_channel": "nightly"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+def test_put_settings_leaves_update_channel_untouched_when_omitted(client: TestClient) -> None:
+    client.put("/api/settings", json={"update_channel": "beta"}, headers=_auth_headers(client))
+
+    client.put("/api/settings", json={"concurrency_limit": 3}, headers=_auth_headers(client))
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["update_channel"] == "beta"
+    assert body["concurrency_limit"] == 3
 
 
 # --- auth-required behaviour ---------------------------------------------------

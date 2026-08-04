@@ -53,6 +53,8 @@ from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
+from .update_check import UpdateCheckScheduler
+from .update_check.routes import router as update_checks_router
 
 
 def create_app(
@@ -64,6 +66,7 @@ def create_app(
     notify_transport: httpx.BaseTransport | None = None,
     arr_transport: httpx.BaseTransport | None = None,
     disk_usage: Callable[[str], DiskUsage] | None = None,
+    update_check_transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -86,8 +89,11 @@ def create_app(
     Health Check Framework (COL-75; defaults to
     :func:`~collapsarr.health.check_ffmpeg`), letting tests simulate a
     present/missing FFmpeg without touching the real binary. ``notify_transport``
-    is forwarded to the framework's transition notifications (tests inject an
-    ``httpx.MockTransport``; production leaves it ``None``). ``arr_transport``
+    is forwarded to both the Health Check Framework's transition notifications
+    and the Update Check scheduler's edge-triggered "update available"
+    notification (COL-89) -- one shared notifier config, so tests inject a
+    single ``httpx.MockTransport`` to capture either; production leaves it
+    ``None``. ``arr_transport``
     (COL-78) is forwarded to every Arr-instance connectivity probe the
     per-instance unreachable check makes, letting tests simulate
     reachable/unreachable instances without a real network call; production
@@ -96,7 +102,10 @@ def create_app(
     :func:`shutil.disk_usage` probe, letting tests simulate an arbitrary
     free-space percentage without depending on the real filesystem's current
     usage; production leaves it ``None`` for a real reading against
-    ``settings.data_dir``.
+    ``settings.data_dir``. ``update_check_transport`` (COL-86) is forwarded to
+    the Update Check scheduler's GitHub Releases fetch (tests inject an
+    ``httpx.MockTransport``; production leaves it ``None`` for a real network
+    call).
     """
     resolved_settings = settings or get_settings()
 
@@ -179,6 +188,30 @@ def create_app(
         health_scheduler.run_once()
         if enable_scheduler:
             health_scheduler.start(run_immediately=False)
+
+        # Update Check scheduler (COL-86, COL-89): a dedicated daemon-thread
+        # scheduler, structurally identical to the Health Check Framework's
+        # above, that fetches the latest GitHub Release on a fixed 24-hour
+        # cadence and persists it to the singleton `update_check_state` row.
+        # Same run-the-first-tick-synchronously-then-hand-off-to-the-thread
+        # shape, so the cached release data is accurate the instant the app
+        # comes up. GET/POST /api/system/updates{,/recheck,/dismiss,
+        # /undismiss} (COL-87/COL-89, update_checks_router below) expose this
+        # state. A tick whose fetched `latest_tag` differs from the
+        # previously-stored one fires an edge-triggered notification over the
+        # same `notify_transport` the health framework's transitions use
+        # (COL-89) -- one shared notifier config, one shared mock transport in
+        # tests.
+        update_check_scheduler = UpdateCheckScheduler(
+            resolved_settings,
+            session_factory,
+            transport=update_check_transport,
+            notify_transport=notify_transport,
+        )
+        app.state.update_check_scheduler = update_check_scheduler
+        update_check_scheduler.run_once()
+        if enable_scheduler:
+            update_check_scheduler.start(run_immediately=False)
         try:
             yield
         finally:
@@ -187,6 +220,7 @@ def create_app(
             if backup_scheduler is not None:
                 backup_scheduler.stop()
             health_scheduler.stop()
+            update_check_scheduler.stop()
             engine.dispose()
 
     app = FastAPI(
@@ -237,6 +271,11 @@ def create_app(
     # System > Health list page. Distinct from the unauthenticated /health
     # probe below, which stays minimal and failing-only for the app-wide banner.
     app.include_router(health_checks_router)
+
+    # Update Check state GET/POST /api/system/updates{,/recheck} (COL-87):
+    # exposes the singleton state COL-86's scheduler keeps warm, driving the
+    # System > Updates page and the app-wide "update available" indicator.
+    app.include_router(update_checks_router)
 
     @app.get("/health", tags=["system"])
     def health(session: Session = Depends(get_session)) -> dict[str, object]:

@@ -26,6 +26,14 @@ export type AuthRequiredMode = "enabled" | "local_bypass";
  */
 export type AuthMethod = "forms" | "basic";
 
+/**
+ * Which GitHub Release stream the Update Check compares the running instance
+ * against (COL-88, `collapsarr.settings.models.UPDATE_CHANNEL_STABLE` /
+ * `UPDATE_CHANNEL_BETA`): `"stable"` (the default) is the latest non-prerelease
+ * Release; `"beta"` is the latest prerelease Release.
+ */
+export type UpdateChannel = "stable" | "beta";
+
 /** The persisted global settings row, decoded to its JSON response shape. */
 export interface GlobalSettings {
   enabled_targets: DownmixTarget[];
@@ -53,6 +61,8 @@ export interface GlobalSettings {
    * check tick.
    */
   disk_space_error_percent: number;
+  /** Which GitHub Release stream the Update Check compares against (COL-88). Default `"stable"`. */
+  update_channel: UpdateChannel;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -81,4 +91,5 @@ export interface GlobalSettingsUpdateInput {
   backup_retention_days?: number;
   disk_space_warning_percent?: number;
   disk_space_error_percent?: number;
+  update_channel?: UpdateChannel;
 }

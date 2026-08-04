@@ -315,6 +315,35 @@ a {
   background: var(--c-warning-tint);
 }
 
+/* ---- Update indicator (COL-87) ----------------------------------------
+   Deliberately *not* built on --c-danger/--c-warning like .health-banner --
+   an available update is informational, nothing is broken, so it borrows
+   .onboarding-panel's neutral accent tone instead: a calm, glanceable notice
+   rather than an alert. */
+
+.update-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: fit-content;
+  background: var(--c-accent-tint);
+  border: 1px solid var(--c-accent-tint-strong);
+  border-radius: var(--radius-md);
+  padding: var(--sp-2) var(--sp-4);
+  margin-bottom: var(--sp-5);
+  color: var(--c-accent-hover);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.update-indicator:hover {
+  border-color: var(--c-accent);
+}
+
+.update-indicator__icon {
+  flex-shrink: 0;
+}
+
 /* ---- Onboarding panel (COL-54) ---------------------------------------- */
 
 .onboarding-panel {
@@ -1205,6 +1234,146 @@ a {
   color: var(--c-danger);
   font-size: 0.85rem;
   font-weight: 500;
+}
+
+/* ---- Updates page (COL-87) --------------------------------------------
+   Same neutral accent tone as .update-indicator (never .health-table's
+   warning/error palette) -- this page never shows a failure state. */
+
+.update-panel {
+  padding: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.update-panel__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--sp-4);
+}
+
+.update-panel__row dt {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--sp-1);
+}
+
+.update-panel__row dd {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
+.update-panel__status-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
+.update-panel__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: fit-content;
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  background: var(--c-success-tint);
+  color: var(--c-success);
+}
+
+.update-panel__status--available {
+  background: var(--c-accent-tint);
+  color: var(--c-accent-hover);
+}
+
+.update-panel__status-icon {
+  flex-shrink: 0;
+}
+
+.update-panel__dismissed-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+}
+
+.update-panel__changelog {
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--sp-4);
+}
+
+.update-panel__changelog-title {
+  font-size: var(--fs-base);
+  font-weight: 650;
+  margin-bottom: var(--sp-2);
+}
+
+.update-panel__changelog-body {
+  font-family: var(--font-body);
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+
+.update-panel__changelog-body :first-child {
+  margin-top: 0;
+}
+
+.update-panel__changelog-body :last-child {
+  margin-bottom: 0;
+}
+
+.update-panel__instructions {
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--sp-4);
+}
+
+.update-panel__instructions-title {
+  font-size: var(--fs-base);
+  font-weight: 650;
+  margin-bottom: var(--sp-2);
+}
+
+.update-panel__instructions-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin: 0;
+  padding-left: var(--sp-5);
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+
+.update-panel__command {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-text);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+  margin: var(--sp-1) 0;
+  overflow-x: auto;
+}
+
+.update-panel__instructions-steps code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--sp-1);
 }
 
 @media (prefers-reduced-motion: reduce) {
