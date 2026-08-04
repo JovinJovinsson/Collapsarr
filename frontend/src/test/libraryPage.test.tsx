@@ -128,6 +128,51 @@ const twoSeriesTree: LibraryTreeResponse = {
   ],
 };
 
+/**
+ * A two-series tree with differing top-level resolved Tracked values
+ * (COL-104): `twoSeriesTree` above has both series (and everything under
+ * them) resolving Tracked, which can't exercise the Tracked filter
+ * narrowing anything out. This flips "Better Call Saul" (series, season,
+ * and episode alike) to resolve Not Tracked, so search + Tracked-filter
+ * tests have a clean per-series split to narrow against -- "Breaking Bad"
+ * stays fully Tracked throughout its own subtree, so it never surfaces
+ * under a Not-Tracked filter even as ancestor context for some deeper
+ * override (there isn't one here).
+ */
+const mixedTrackedTree: LibraryTreeResponse = {
+  instance_id: 1,
+  series: [
+    seriesTree.series[0],
+    {
+      id: 11,
+      kind: "series",
+      sonarr_series_id: 101,
+      title: "Better Call Saul",
+      tracked: false,
+      seasons: [
+        {
+          id: 21,
+          kind: "season",
+          season_number: 1,
+          tracked: false,
+          episodes: [
+            {
+              id: 32,
+              kind: "episode",
+              sonarr_episode_id: 302,
+              season_number: 1,
+              episode_number: 1,
+              title: "Uno",
+              has_file: true,
+              tracked: false,
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 const movieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
@@ -139,6 +184,22 @@ const movieTree: MovieLibraryTreeResponse = {
       title: "Dune: Part Two",
       has_file: false,
       tracked: true,
+    },
+  ],
+};
+
+/** A flat Movie list with mixed resolved Tracked values (COL-104), for the Radarr-side Tracked filter test. */
+const mixedTrackedMovieTree: MovieLibraryTreeResponse = {
+  instance_id: 2,
+  movies: [
+    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true },
+    {
+      id: 41,
+      kind: "movie",
+      radarr_movie_id: 401,
+      title: "Dune: Part Two",
+      has_file: false,
+      tracked: false,
     },
   ],
 };
@@ -582,5 +643,139 @@ describe("LibraryPage (COL-100)", () => {
     fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
     const unoRow = (await screen.findByText(/uno/i)).closest("tr") as HTMLElement;
     expect(within(unoRow).getByRole("button", { name: /^not tracked$/i })).toBeInTheDocument();
+  });
+
+  it("narrows to the Series matching the search query and shows its whole subtree (COL-104)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: twoSeriesTree }));
+    renderLibraryPage(1);
+
+    await screen.findByRole("button", { name: /breaking bad/i });
+    fireEvent.change(screen.getByRole("searchbox", { name: /search titles/i }), {
+      target: { value: "Call Saul" },
+    });
+
+    // The unmatched series is gone entirely...
+    expect(screen.queryByRole("button", { name: /breaking bad/i })).not.toBeInTheDocument();
+    // ...and the matched series' whole subtree is shown, already expanded
+    // (COL-104: a search match shouldn't hide behind a collapsed toggle).
+    expect(await screen.findByRole("button", { name: /better call saul/i })).toBeInTheDocument();
+    expect(screen.getByText(/season 1/i)).toBeInTheDocument();
+    expect(screen.getByText(/uno/i)).toBeInTheDocument();
+  });
+
+  it("finding a matching Episode keeps its ancestor Series/Season for context, without pulling in unrelated siblings (COL-104)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: twoSeriesTree }));
+    renderLibraryPage(1);
+
+    await screen.findByRole("button", { name: /breaking bad/i });
+    fireEvent.change(screen.getByRole("searchbox", { name: /search titles/i }), {
+      target: { value: "Cat's in the Bag" },
+    });
+
+    // Ancestor context for the match, auto-expanded.
+    expect(await screen.findByRole("button", { name: /breaking bad/i })).toBeInTheDocument();
+    expect(screen.getByText(/cat's in the bag/i)).toBeInTheDocument();
+
+    // The matching Episode's own sibling and the unrelated second Series
+    // don't come along for the ride.
+    expect(screen.queryByText(/^pilot$/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /better call saul/i })).not.toBeInTheDocument();
+  });
+
+  it("shows a no-matches message when the search query matches nothing", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: twoSeriesTree }));
+    renderLibraryPage(1);
+
+    await screen.findByRole("button", { name: /breaking bad/i });
+    fireEvent.change(screen.getByRole("searchbox", { name: /search titles/i }), {
+      target: { value: "no such title anywhere" },
+    });
+
+    expect(await screen.findByText(/no series match your search or filter/i)).toBeInTheDocument();
+  });
+
+  it("narrows to only rows whose resolved Tracked value matches the selected Tracked filter (COL-104)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: mixedTrackedTree }));
+    renderLibraryPage(1);
+
+    await screen.findByRole("button", { name: /breaking bad/i });
+    const trackedFilterSelect = screen.getByRole("combobox", { name: /tracked filter/i });
+
+    // "Not Tracked" narrows to the series that resolves Not Tracked...
+    fireEvent.change(trackedFilterSelect, { target: { value: "not-tracked" } });
+    expect(await screen.findByRole("button", { name: /better call saul/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^breaking bad$/i })).not.toBeInTheDocument();
+
+    // ...and "Tracked" narrows to the one that resolves Tracked instead.
+    fireEvent.change(trackedFilterSelect, { target: { value: "tracked" } });
+    expect(await screen.findByRole("button", { name: /breaking bad/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /better call saul/i })).not.toBeInTheDocument();
+
+    // "All" (the default) shows everything again.
+    fireEvent.change(trackedFilterSelect, { target: { value: "all" } });
+    expect(await screen.findByRole("button", { name: /breaking bad/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /better call saul/i })).toBeInTheDocument();
+  });
+
+  it("narrows a flat Movie list to only rows whose resolved Tracked value matches the selected Tracked filter (COL-104)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [radarrInstance], tree: mixedTrackedMovieTree }));
+    renderLibraryPage(2);
+
+    await screen.findByText("Interstellar");
+    fireEvent.change(screen.getByRole("combobox", { name: /tracked filter/i }), {
+      target: { value: "not-tracked" },
+    });
+
+    expect(await screen.findByText("Dune: Part Two")).toBeInTheDocument();
+    expect(screen.queryByText("Interstellar")).not.toBeInTheDocument();
+  });
+
+  it("composes search and the Tracked filter together (AND), narrowing correctly in combination (COL-104)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: mixedTrackedTree }));
+    renderLibraryPage(1);
+
+    await screen.findByRole("button", { name: /breaking bad/i });
+    fireEvent.change(screen.getByRole("searchbox", { name: /search titles/i }), {
+      target: { value: "Bad" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: /tracked filter/i }), {
+      target: { value: "not-tracked" },
+    });
+
+    // "Bad" only matches the series that resolves Tracked, so combined with
+    // the Not-Tracked filter neither series has anything left to show.
+    expect(await screen.findByText(/no series match your search or filter/i)).toBeInTheDocument();
+
+    // Switching the filter to "Tracked" keeps the same search query and now
+    // matches the "Breaking Bad" series again.
+    fireEvent.change(screen.getByRole("combobox", { name: /tracked filter/i }), {
+      target: { value: "tracked" },
+    });
+    expect(await screen.findByRole("button", { name: /breaking bad/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /better call saul/i })).not.toBeInTheDocument();
+  });
+
+  it("keeps a filtered-out row's cross-level selection intact rather than dropping it (COL-103/COL-104)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: twoSeriesTree }));
+    renderLibraryPage(1);
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select breaking bad$/i }));
+    expect(await screen.findByText(/1 row selected/i)).toBeInTheDocument();
+
+    // Search narrows "Breaking Bad" out of view entirely.
+    fireEvent.change(screen.getByRole("searchbox", { name: /search titles/i }), {
+      target: { value: "Call Saul" },
+    });
+    await screen.findByRole("button", { name: /better call saul/i });
+    expect(screen.queryByRole("button", { name: /breaking bad/i })).not.toBeInTheDocument();
+
+    // Its selection persists even while hidden.
+    expect(screen.getByText(/1 row selected/i)).toBeInTheDocument();
+
+    // Clearing the search brings the row back, still checked.
+    fireEvent.change(screen.getByRole("searchbox", { name: /search titles/i }), { target: { value: "" } });
+    expect(
+      await screen.findByRole("checkbox", { name: /select breaking bad$/i }),
+    ).toBeChecked();
   });
 });

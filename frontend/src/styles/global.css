@@ -1297,6 +1297,40 @@ a {
   opacity: 0.6;
 }
 
+/* The title search box + Tracked filter (COL-104): narrows the already-fetched
+   tree/table client-side, same layout as .activity-filters. */
+.library-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.library-filters__input,
+.library-filters__select {
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-md);
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+}
+
+.library-filters__input {
+  flex: 1 1 240px;
+  min-width: 200px;
+}
+
+.library-filters__input::placeholder {
+  color: var(--c-text-faint);
+}
+
+.library-filters__input:focus,
+.library-filters__select:focus {
+  outline: none;
+  border-color: var(--c-accent);
+}
+
 /* ---- Responsive: collapse the sidebar to a top bar on narrow screens - */
 
 @media (max-width: 640px) {

@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
 import {
@@ -95,6 +95,113 @@ function decodeSelectionKey(key: string): TrackedNodeReference {
   };
 }
 
+/**
+ * The Tracked-status filter's three states (COL-104): "all" (the default)
+ * shows every row regardless of its resolved Tracked value; the other two
+ * narrow to rows whose *resolved* Tracked value (the same `tracked` field
+ * `resolve_tracked` already stamps on every node server-side, per
+ * `collapsarr/library/service.py`) matches.
+ */
+type TrackedFilterValue = "all" | "tracked" | "not-tracked";
+
+/** True if a node's resolved Tracked value satisfies the selected Tracked filter (COL-104). */
+function matchesTrackedFilter(tracked: boolean, filter: TrackedFilterValue): boolean {
+  if (filter === "all") return true;
+  return filter === "tracked" ? tracked : !tracked;
+}
+
+/** Case-insensitive substring match against the search query (COL-104); a blank query matches everything. */
+function matchesSearchQuery(title: string, query: string): boolean {
+  const needle = query.trim().toLowerCase();
+  return needle === "" || title.toLowerCase().includes(needle);
+}
+
+/**
+ * Filters one Episode leaf (COL-104). Kept if its own resolved Tracked value
+ * satisfies the Tracked filter, and -- unless an ancestor Series title
+ * already satisfied the search query, in which case the whole subtree is in
+ * scope -- its own title matches the search query too.
+ */
+function filterEpisode(
+  episode: EpisodeNode,
+  query: string,
+  trackedFilter: TrackedFilterValue,
+  ancestorSearchSatisfied: boolean,
+): EpisodeNode | null {
+  const searchSatisfied = ancestorSearchSatisfied || matchesSearchQuery(episode.title, query);
+  return matchesTrackedFilter(episode.tracked, trackedFilter) && searchSatisfied ? episode : null;
+}
+
+/**
+ * Filters one Season (COL-104). A Season carries no title of its own to
+ * search against, so it only counts as a direct match (unlocking every
+ * Episode beneath it, still narrowed by the Tracked filter) once an
+ * ancestor Series title has already satisfied the search *and* the
+ * Season's own resolved Tracked value matches the filter. Otherwise it's
+ * kept only as context for a matching descendant Episode, narrowed to just
+ * the Episodes that matched -- a search for one Episode shouldn't drag its
+ * unrelated siblings back into view.
+ */
+function filterSeason(
+  season: SeasonNode,
+  query: string,
+  trackedFilter: TrackedFilterValue,
+  ancestorSearchSatisfied: boolean,
+): SeasonNode | null {
+  const episodes = season.episodes
+    .map((episode) => filterEpisode(episode, query, trackedFilter, ancestorSearchSatisfied))
+    .filter((episode): episode is EpisodeNode => episode !== null);
+  if (ancestorSearchSatisfied && matchesTrackedFilter(season.tracked, trackedFilter)) {
+    return { ...season, episodes };
+  }
+  return episodes.length > 0 ? { ...season, episodes } : null;
+}
+
+/**
+ * Filters one Series (COL-104): kept if its own title matches the search
+ * query *and* its own resolved Tracked value matches the filter, in which
+ * case every descendant Season/Episode is shown too (still narrowed by the
+ * Tracked filter) -- "search finds the Series, its whole subtree comes
+ * along". Otherwise kept only when a descendant Season/Episode matches both
+ * filters on its own, so the Series row still renders as the context a
+ * matching Season/Episode needs to have somewhere to render under.
+ */
+function filterSeriesNode(
+  series: SeriesNode,
+  query: string,
+  trackedFilter: TrackedFilterValue,
+): SeriesNode | null {
+  const ownSearchMatch = matchesSearchQuery(series.title, query);
+  const seasons = series.seasons
+    .map((season) => filterSeason(season, query, trackedFilter, ownSearchMatch))
+    .filter((season): season is SeasonNode => season !== null);
+  if (ownSearchMatch && matchesTrackedFilter(series.tracked, trackedFilter)) {
+    return { ...series, seasons };
+  }
+  return seasons.length > 0 ? { ...series, seasons } : null;
+}
+
+/** Filters a Sonarr Library's whole Series list (COL-104); see `filterSeriesNode`. */
+function filterSeriesList(
+  series: SeriesNode[],
+  query: string,
+  trackedFilter: TrackedFilterValue,
+): SeriesNode[] {
+  return series
+    .map((node) => filterSeriesNode(node, query, trackedFilter))
+    .filter((node): node is SeriesNode => node !== null);
+}
+
+/**
+ * Filters a Radarr Library's flat Movie list (COL-104): no hierarchy to
+ * preserve context through, so a straight per-row AND of both filters.
+ */
+function filterMovies(movies: MovieNode[], query: string, trackedFilter: TrackedFilterValue): MovieNode[] {
+  return movies.filter(
+    (movie) => matchesSearchQuery(movie.title, query) && matchesTrackedFilter(movie.tracked, trackedFilter),
+  );
+}
+
 /** Shared shape every row-level Tracked toggle needs from `LibraryPage` (COL-101). */
 interface TrackedToggleProps {
   pendingNodeId: number | null;
@@ -146,6 +253,13 @@ function SelectionCheckbox({
  * own Tracked toggle (COL-101): toggling a Series or Season row cascades
  * server-side to its descendants, reflected here once the caller's refetch
  * (triggered by `onToggle`) lands with their updated resolved values.
+ *
+ * `expandAll` (COL-104): while a search query or Tracked filter is active,
+ * `LibraryPage` passes this as `true` so a filtered-in Season/Episode is
+ * actually visible without the user separately clicking every ancestor's
+ * expand toggle -- the whole point of showing an ancestor "for context" is
+ * defeated if it's still collapsed. Local expand/collapse state is
+ * preserved underneath and resumes once filters clear.
  */
 function SeriesTree({
   series,
@@ -154,7 +268,8 @@ function SeriesTree({
   isSelected,
   onToggleSelect,
   selectionDisabled,
-}: { series: SeriesNode[] } & TrackedToggleProps & SelectionProps) {
+  expandAll,
+}: { series: SeriesNode[]; expandAll: boolean } & TrackedToggleProps & SelectionProps) {
   const [expandedSeries, toggleSeries] = useExpandable();
   const [expandedSeasons, toggleSeason] = useExpandable();
   const selection: SelectionProps = { isSelected, onToggleSelect, selectionDisabled };
@@ -172,7 +287,7 @@ function SeriesTree({
         </thead>
         <tbody>
           {series.map((seriesNode) => {
-            const seriesOpen = expandedSeries.has(seriesNode.id);
+            const seriesOpen = expandAll || expandedSeries.has(seriesNode.id);
             return (
               <Fragment key={seriesNode.id}>
                 <tr className="library-tree-table__row library-tree-table__row--series">
@@ -208,7 +323,7 @@ function SeriesTree({
                 </tr>
                 {seriesOpen &&
                   seriesNode.seasons.map((seasonNode: SeasonNode) => {
-                    const seasonOpen = expandedSeasons.has(seasonNode.id);
+                    const seasonOpen = expandAll || expandedSeasons.has(seasonNode.id);
                     return (
                       <Fragment key={seasonNode.id}>
                         <tr className="library-tree-table__row library-tree-table__row--season">
@@ -418,6 +533,15 @@ function BulkActionToolbar({
  * `LibraryNavSection` and `LibrariesIndexPage` via `InstancesProvider` in
  * `AppShell` -- this page no longer fetches its own copy of the full
  * instance list just to look up one entry.
+ *
+ * A title search box and a Tracked-status filter (COL-104) narrow which of
+ * the already-fetched rows are visible -- both are purely client-side over
+ * `treeState`'s tree, no separate endpoint/query param, since the whole
+ * tree is already in hand once the page has loaded. They compose via AND
+ * (`filterSeriesList`/`filterMovies`) and are independent of the COL-103
+ * selection: `selected` is never touched when the filters change, so a
+ * selected-but-now-filtered-out row's selection persists (it reappears
+ * checked once the filter that hid it is cleared).
  */
 export function LibraryPage() {
   const { instanceId: instanceIdParam } = useParams<{ instanceId: string }>();
@@ -431,6 +555,9 @@ export function LibraryPage() {
   // references at once, independent of which branch each lives under.
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkPending, setBulkPending] = useState(false);
+  // Title search + Tracked filter (COL-104), composed via AND below.
+  const [searchQuery, setSearchQuery] = useState("");
+  const [trackedFilter, setTrackedFilter] = useState<TrackedFilterValue>("all");
   const instancesState = useInstances();
 
   // Monotonic token guarding against a stale response landing after a newer
@@ -466,6 +593,10 @@ export function LibraryPage() {
     // selection made against the previous tree rather than carry over
     // references that no longer mean anything here.
     setSelected(new Set());
+    // A search/filter scoped to the previous instance's titles isn't
+    // meaningful here either (COL-104).
+    setSearchQuery("");
+    setTrackedFilter("all");
     void loadTree();
   }, [loadTree]);
 
@@ -530,6 +661,25 @@ export function LibraryPage() {
       ? (instancesState.instances.find((candidate) => candidate.id === instanceId) ?? null)
       : null;
 
+  // A filter is "active" once it could narrow anything, driving `SeriesTree`'s
+  // `expandAll` (COL-104) -- a filtered-in Season/Episode should be visible
+  // immediately, not hidden behind an ancestor's default-collapsed state.
+  const filtersActive = searchQuery.trim() !== "" || trackedFilter !== "all";
+
+  const filteredSeries = useMemo(() => {
+    if (treeState.status !== "ready" || isMovieTree(treeState.tree)) return [];
+    return filterSeriesList(treeState.tree.series, searchQuery, trackedFilter);
+  }, [treeState, searchQuery, trackedFilter]);
+
+  const filteredMovies = useMemo(() => {
+    if (treeState.status !== "ready" || !isMovieTree(treeState.tree)) return [];
+    return filterMovies(treeState.tree.movies, searchQuery, trackedFilter);
+  }, [treeState, searchQuery, trackedFilter]);
+
+  const hasOriginalNodes =
+    treeState.status === "ready" &&
+    (isMovieTree(treeState.tree) ? treeState.tree.movies.length > 0 : treeState.tree.series.length > 0);
+
   return (
     <section className="view">
       <header className="view__header">
@@ -540,6 +690,29 @@ export function LibraryPage() {
             : "Series/Season/Episode or Movie catalog for this instance."}
         </p>
       </header>
+
+      {hasOriginalNodes && (
+        <div className="library-filters">
+          <input
+            type="search"
+            className="library-filters__input"
+            placeholder="Search titles…"
+            aria-label="Search titles"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+          />
+          <select
+            className="library-filters__select"
+            aria-label="Tracked filter"
+            value={trackedFilter}
+            onChange={(event) => setTrackedFilter(event.target.value as TrackedFilterValue)}
+          >
+            <option value="all">All</option>
+            <option value="tracked">Tracked</option>
+            <option value="not-tracked">Not Tracked</option>
+          </select>
+        </div>
+      )}
 
       {toggleError && <p className="form-error">Couldn&apos;t update Tracked: {toggleError}</p>}
 
@@ -574,14 +747,22 @@ export function LibraryPage() {
             </span>
             <p className="panel__message">No series found in this library yet.</p>
           </div>
+        ) : filteredSeries.length === 0 ? (
+          <div className="panel panel--empty">
+            <span className="panel__icon" aria-hidden>
+              <LibraryIcon width={28} height={28} />
+            </span>
+            <p className="panel__message">No series match your search or filter.</p>
+          </div>
         ) : (
           <SeriesTree
-            series={treeState.tree.series}
+            series={filteredSeries}
             pendingNodeId={pendingNodeId}
             onToggle={handleToggle}
             isSelected={isSelected}
             onToggleSelect={handleToggleSelect}
             selectionDisabled={bulkPending}
+            expandAll={filtersActive}
           />
         ))}
 
@@ -594,9 +775,16 @@ export function LibraryPage() {
             </span>
             <p className="panel__message">No movies found in this library yet.</p>
           </div>
+        ) : filteredMovies.length === 0 ? (
+          <div className="panel panel--empty">
+            <span className="panel__icon" aria-hidden>
+              <LibraryIcon width={28} height={28} />
+            </span>
+            <p className="panel__message">No movies match your search or filter.</p>
+          </div>
         ) : (
           <MovieTable
-            movies={treeState.tree.movies}
+            movies={filteredMovies}
             pendingNodeId={pendingNodeId}
             onToggle={handleToggle}
             isSelected={isSelected}
