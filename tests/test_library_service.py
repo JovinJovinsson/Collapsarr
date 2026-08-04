@@ -9,6 +9,7 @@ DTOs are built in-memory and fed to :func:`~collapsarr.library.service.sync_libr
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.orm import Session
 
 from collapsarr.arr.catalog import (
@@ -267,6 +268,35 @@ def test_build_tree_excludes_hidden_nodes(session: Session) -> None:
     assert season_numbers == [1]  # season 2 hidden
     ep_ids = {e.sonarr_episode_id for s in tree.series[0].seasons for e in s.episodes}
     assert ep_ids == {101}  # 102, 201 hidden
+
+
+@pytest.mark.parametrize("field", ["sonarr_episode_id", "season_number", "episode_number"])
+def test_build_tree_raises_when_episode_id_field_is_null(session: Session, field: str) -> None:
+    """An Episode node missing an Arr-instance id/number is a data-integrity bug,
+    not a legitimate "unknown" value -- build_tree must fail loudly (COL-99
+    follow-up) rather than silently render it as ``0``.
+    """
+    instance = _seed_instance(session)
+    sync_library(session, instance_id=instance.id, catalog=_catalog(instance.id))
+
+    episode = _episode(session, instance.id, 101)
+    setattr(episode, field, None)
+    session.commit()
+
+    with pytest.raises(AssertionError, match=f"{field} is NULL"):
+        build_tree(session, instance.id)
+
+
+def test_build_tree_raises_when_season_number_is_null(session: Session) -> None:
+    instance = _seed_instance(session)
+    sync_library(session, instance_id=instance.id, catalog=_catalog(instance.id))
+
+    season = _season(session, instance.id, 1)
+    season.season_number = None
+    session.commit()
+
+    with pytest.raises(AssertionError, match="season_number is NULL"):
+        build_tree(session, instance.id)
 
 
 def test_default_tracked_is_true_on_fresh_settings(session: Session) -> None:

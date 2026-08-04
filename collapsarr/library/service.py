@@ -577,26 +577,43 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
     for series in sorted(series_nodes, key=lambda n: (n.title, n.id)):
         seasons_out: list[TreeSeason] = []
         for season in sorted(seasons_by_parent[series.id], key=lambda n: n.season_number or 0):
-            episodes_out = tuple(
-                TreeEpisode(
-                    id=episode.id,
-                    sonarr_episode_id=episode.sonarr_episode_id or 0,
-                    season_number=episode.season_number or 0,
-                    episode_number=episode.episode_number or 0,
-                    title=episode.title,
-                    has_file=episode.has_file,
-                    tracked=resolve_tracked(episode, nodes_by_id, default_tracked),
+            episodes_out: list[TreeEpisode] = []
+            for episode in sorted(
+                episodes_by_parent[season.id], key=lambda n: n.episode_number or 0
+            ):
+                assert episode.sonarr_episode_id is not None, (
+                    f"library node {episode.id} has kind EPISODE but sonarr_episode_id is NULL "
+                    "-- this is a data-integrity violation, not a legitimate missing id"
                 )
-                for episode in sorted(
-                    episodes_by_parent[season.id], key=lambda n: n.episode_number or 0
+                assert episode.season_number is not None, (
+                    f"library node {episode.id} has kind EPISODE but season_number is NULL "
+                    "-- this is a data-integrity violation, not a legitimate missing id"
                 )
+                assert episode.episode_number is not None, (
+                    f"library node {episode.id} has kind EPISODE but episode_number is NULL "
+                    "-- this is a data-integrity violation, not a legitimate missing id"
+                )
+                episodes_out.append(
+                    TreeEpisode(
+                        id=episode.id,
+                        sonarr_episode_id=episode.sonarr_episode_id,
+                        season_number=episode.season_number,
+                        episode_number=episode.episode_number,
+                        title=episode.title,
+                        has_file=episode.has_file,
+                        tracked=resolve_tracked(episode, nodes_by_id, default_tracked),
+                    )
+                )
+            assert season.season_number is not None, (
+                f"library node {season.id} has kind SEASON but season_number is NULL "
+                "-- this is a data-integrity violation, not a legitimate missing id"
             )
             seasons_out.append(
                 TreeSeason(
                     id=season.id,
-                    season_number=season.season_number or 0,
+                    season_number=season.season_number,
                     tracked=resolve_tracked(season, nodes_by_id, default_tracked),
-                    episodes=episodes_out,
+                    episodes=tuple(episodes_out),
                 )
             )
         assert series.sonarr_series_id is not None, (
