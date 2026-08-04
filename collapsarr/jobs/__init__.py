@@ -29,7 +29,9 @@ from .queue import (
     JobQueue,
     JobStatus,
     PipelineRunner,
+    TrackedMediaRecorder,
 )
+from .tracked_media import make_tracked_media_recorder, record_tracked_media
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
@@ -40,10 +42,13 @@ __all__ = [
     "JobQueue",
     "JobStatus",
     "PipelineRunner",
+    "TrackedMediaRecorder",
     "get_job_history",
     "list_job_history",
     "make_failure_notifier",
     "make_history_recorder",
+    "make_tracked_media_recorder",
     "notify_job_failure",
     "record_job_history",
+    "record_tracked_media",
 ]
