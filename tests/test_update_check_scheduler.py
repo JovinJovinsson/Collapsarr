@@ -66,7 +66,7 @@ def _failing_transport() -> httpx.MockTransport:
 
 
 def _prerelease_transport(
-    tag: str = "beta-abc1234",
+    tag: str = "beta-v0.2.1.0007",
 ) -> tuple[httpx.MockTransport, list[httpx.Request]]:
     """A transport whose ``/releases`` list has exactly one prerelease entry (COL-88)."""
     seen: list[httpx.Request] = []
@@ -175,19 +175,19 @@ def test_run_once_fetches_the_prerelease_endpoint_when_channel_is_beta(
     with session_factory() as session:
         update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
 
-    transport, seen = _prerelease_transport("beta-abc1234")
+    transport, seen = _prerelease_transport("beta-v0.2.1.0007")
     scheduler = _make_scheduler(settings, session_factory, transport=transport)
 
     result = scheduler.run_once()
 
     assert len(seen) == 1
     assert str(seen[0].url).endswith("/releases")
-    assert result.latest_tag == "beta-abc1234"
+    assert result.latest_tag == "beta-v0.2.1.0007"
     with session_factory() as session:
         row = get_update_check_state(session)
         assert row is not None
         assert row.channel == UPDATE_CHANNEL_BETA
-        assert row.latest_tag == "beta-abc1234"
+        assert row.latest_tag == "beta-v0.2.1.0007"
 
 
 def test_run_once_fetches_the_latest_endpoint_when_channel_is_stable(

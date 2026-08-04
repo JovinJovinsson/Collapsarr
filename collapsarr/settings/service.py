@@ -120,7 +120,7 @@ def get_global_settings(session: Session) -> GlobalSettings:
 
     ``update_channel`` is seeded with :func:`_default_update_channel` rather
     than the column's plain static default -- a fresh install running a beta
-    build (``collapsarr.__version__`` carrying a ``+beta.<sha>`` segment)
+    build (``collapsarr.__version__`` carrying a ``+beta`` local segment)
     starts already tracking the beta channel (COL-88).
     """
     settings = session.get(GlobalSettings, SETTINGS_ID)

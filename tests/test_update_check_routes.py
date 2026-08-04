@@ -285,12 +285,12 @@ def test_recheck_runs_a_tick_and_returns_the_refreshed_state(settings: Settings)
 # --------------------------------------------------------------------------- #
 
 
-def test_get_updates_reports_up_to_date_on_beta_channel_when_sha_matches(
+def test_get_updates_reports_up_to_date_on_beta_channel_when_version_matches(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("collapsarr.update_check.routes.__version__", "0.1.0+beta.abc1234")
+    monkeypatch.setattr("collapsarr.update_check.routes.__version__", "0.2.1.0007+beta")
     _seed_update_channel(settings, UPDATE_CHANNEL_BETA)
-    app = _app_with_prerelease(settings, "beta-abc1234", name="Beta build abc1234")
+    app = _app_with_prerelease(settings, "beta-v0.2.1.0007", name="Beta build 0.2.1.0007")
     with TestClient(app) as test_client:
         headers = _auth_headers(test_client)
 
@@ -298,16 +298,16 @@ def test_get_updates_reports_up_to_date_on_beta_channel_when_sha_matches(
 
         assert response.status_code == 200
         body = response.json()
-        assert body["latest_version"] == "beta-abc1234"
+        assert body["latest_version"] == "beta-v0.2.1.0007"
         assert body["update_available"] is False
 
 
-def test_get_updates_reports_update_available_on_beta_channel_when_sha_differs(
+def test_get_updates_reports_update_available_on_beta_channel_when_version_differs(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("collapsarr.update_check.routes.__version__", "0.1.0+beta.abc1234")
+    monkeypatch.setattr("collapsarr.update_check.routes.__version__", "0.2.1.0007+beta")
     _seed_update_channel(settings, UPDATE_CHANNEL_BETA)
-    app = _app_with_prerelease(settings, "beta-def5678", name="Beta build def5678")
+    app = _app_with_prerelease(settings, "beta-v0.2.1.0008", name="Beta build 0.2.1.0008")
     with TestClient(app) as test_client:
         headers = _auth_headers(test_client)
 
@@ -315,18 +315,19 @@ def test_get_updates_reports_update_available_on_beta_channel_when_sha_differs(
 
         assert response.status_code == 200
         body = response.json()
-        assert body["latest_version"] == "beta-def5678"
+        assert body["latest_version"] == "beta-v0.2.1.0008"
         assert body["update_available"] is True
 
 
 def test_get_updates_reports_update_available_on_beta_channel_for_a_stable_running_version(
     settings: Settings,
 ) -> None:
-    """Documented edge case (COL-88's acceptance criteria): a stable build
-    switched to the beta channel has no embedded SHA to compare, so it shows
-    "update available" rather than being treated as a bug."""
+    """Documented edge case (COL-88's acceptance criteria, carried by COL-96): a
+    stable build switched to the beta channel has no ``+beta`` marker to
+    compare, so it shows "update available" rather than being treated as a
+    bug."""
     _seed_update_channel(settings, UPDATE_CHANNEL_BETA)
-    app = _app_with_prerelease(settings, "beta-abc1234", name="Beta build abc1234")
+    app = _app_with_prerelease(settings, "beta-v0.2.1.0007", name="Beta build 0.2.1.0007")
     with TestClient(app) as test_client:
         headers = _auth_headers(test_client)
 
@@ -344,7 +345,9 @@ def test_recheck_after_switching_channel_reflects_the_new_channels_latest_releas
     stale cached data -- on both the recheck response and a follow-up GET."""
     app = create_app(
         settings=settings,
-        update_check_transport=_combined_transport(stable_tag="v1.0.0", beta_tag="beta-abc1234"),
+        update_check_transport=_combined_transport(
+            stable_tag="v1.0.0", beta_tag="beta-v0.2.1.0007"
+        ),
     )
     with TestClient(app) as test_client:
         headers = _auth_headers(test_client)
@@ -359,10 +362,10 @@ def test_recheck_after_switching_channel_reflects_the_new_channels_latest_releas
         response = test_client.post("/api/system/updates/recheck", headers=headers)
 
         assert response.status_code == 200
-        assert response.json()["latest_version"] == "beta-abc1234"
+        assert response.json()["latest_version"] == "beta-v0.2.1.0007"
 
         follow_up = test_client.get("/api/system/updates", headers=headers)
-        assert follow_up.json()["latest_version"] == "beta-abc1234"
+        assert follow_up.json()["latest_version"] == "beta-v0.2.1.0007"
 
 
 def test_recheck_does_not_disrupt_the_background_scheduler(settings: Settings) -> None:
@@ -443,7 +446,9 @@ def test_a_new_recheck_result_clears_a_prior_dismissal(settings: Settings) -> No
     version is published -- the same reconcile transition logic clears it."""
     app = create_app(
         settings=settings,
-        update_check_transport=_combined_transport(stable_tag="v1.0.0", beta_tag="beta-abc1234"),
+        update_check_transport=_combined_transport(
+            stable_tag="v1.0.0", beta_tag="beta-v0.2.1.0007"
+        ),
     )
     with TestClient(app) as test_client:
         headers = _auth_headers(test_client)

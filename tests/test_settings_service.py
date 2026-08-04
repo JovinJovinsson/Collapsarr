@@ -494,7 +494,7 @@ def test_default_update_channel_is_stable_for_a_plain_version() -> None:
 
 
 def test_default_update_channel_is_beta_for_a_beta_build_version() -> None:
-    assert _default_update_channel("0.1.0+beta.abc1234") == UPDATE_CHANNEL_BETA
+    assert _default_update_channel("0.2.1.0007+beta") == UPDATE_CHANNEL_BETA
 
 
 def test_get_global_settings_defaults_update_channel_to_stable(session: Session) -> None:
@@ -506,8 +506,8 @@ def test_get_global_settings_defaults_update_channel_to_stable(session: Session)
 def test_get_global_settings_defaults_update_channel_to_beta_for_a_beta_build(
     settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """COL-88: a fresh install running a ``+beta.<sha>`` build auto-defaults to beta."""
-    monkeypatch.setattr("collapsarr.settings.service.__version__", "0.1.0+beta.abc1234")
+    """COL-88/COL-96: a fresh install running a ``+beta`` build auto-defaults to beta."""
+    monkeypatch.setattr("collapsarr.settings.service.__version__", "0.2.1.0007+beta")
 
     row = get_global_settings(session=_fresh_session(settings))
 

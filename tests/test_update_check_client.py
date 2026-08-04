@@ -153,7 +153,7 @@ def test_prerelease_requests_the_correct_repo_releases_endpoint() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, json=[{"tag_name": "beta-abc1234", "prerelease": True}])
+        return httpx.Response(200, json=[{"tag_name": "beta-v0.2.1.0007", "prerelease": True}])
 
     fetch_latest_prerelease(transport=_transport(handler))
 
@@ -167,16 +167,24 @@ def test_prerelease_picks_the_first_prerelease_entry() -> None:
             200,
             json=[
                 {"tag_name": "v2.0.0", "prerelease": False, "draft": False},
-                {"tag_name": "beta-abc1234", "prerelease": True, "name": "Beta build abc1234"},
-                {"tag_name": "beta-def5678", "prerelease": True, "name": "Beta build def5678"},
+                {
+                    "tag_name": "beta-v0.2.1.0007",
+                    "prerelease": True,
+                    "name": "Beta build 0.2.1.0007",
+                },
+                {
+                    "tag_name": "beta-v0.2.1.0008",
+                    "prerelease": True,
+                    "name": "Beta build 0.2.1.0008",
+                },
             ],
         )
 
     result = fetch_latest_prerelease(transport=_transport(handler))
 
     assert result.ok is True
-    assert result.tag == "beta-abc1234"
-    assert result.name == "Beta build abc1234"
+    assert result.tag == "beta-v0.2.1.0007"
+    assert result.name == "Beta build 0.2.1.0007"
 
 
 def test_prerelease_never_raises_when_no_prerelease_entry_exists() -> None:
@@ -245,9 +253,9 @@ def test_prerelease_parses_published_at_and_changelog() -> None:
             200,
             json=[
                 {
-                    "tag_name": "beta-abc1234",
+                    "tag_name": "beta-v0.2.1.0007",
                     "prerelease": True,
-                    "name": "Beta build abc1234",
+                    "name": "Beta build 0.2.1.0007",
                     "body": "- experimental change",
                     "published_at": "2026-08-01T12:30:00Z",
                 }
