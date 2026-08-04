@@ -82,6 +82,14 @@ latest non-prerelease Release; ``beta`` is the latest prerelease Release
 (comparison logic for the beta channel is a later ticket -- COL-86 only
 persists the knob and always fetches the stable channel's latest release)."""
 
+DEFAULT_TRACKED = True
+"""Default :attr:`GlobalSettings.default_tracked` for a fresh install / an
+existing row backfilled by the additive migration (COL-98). A Library node
+whose ancestry carries no explicit **Tracked** override falls back to this
+instance-wide default; ``True`` means Collapsarr acts automatically on newly
+discovered media unless the user opts a subtree out (see ``CONTEXT.md``'s
+"Tracked")."""
+
 DEFAULT_UPDATE_CHANNEL = UPDATE_CHANNEL_STABLE
 """Default :attr:`GlobalSettings.update_channel` for a fresh install / an
 existing row backfilled by the additive migration. This is the ORM/DB-level
@@ -278,6 +286,13 @@ class GlobalSettings(Base):
         nullable=False,
         default=DEFAULT_UPDATE_CHANNEL,
         server_default=text(f"'{DEFAULT_UPDATE_CHANNEL}'"),
+    )
+
+    default_tracked: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=DEFAULT_TRACKED,
+        server_default=text("1"),
     )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)

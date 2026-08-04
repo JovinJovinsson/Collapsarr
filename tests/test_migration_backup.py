@@ -61,6 +61,7 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "disk_space_warning_percent"),
     ("global_settings", "disk_space_error_percent"),
     ("global_settings", "update_channel"),
+    ("global_settings", "default_tracked"),
 )
 
 #: Whole tables a post-baseline migration adds (COL-75's ``health_check_state``,
@@ -71,6 +72,7 @@ _POST_BASELINE_TABLES: tuple[str, ...] = (
     "health_check_state",
     "health_write_probe",
     "update_check_state",
+    "library_nodes",
 )
 
 

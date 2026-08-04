@@ -88,8 +88,9 @@ from pathlib import Path
 import httpx
 from sqlalchemy.orm import Session, sessionmaker
 
+from collapsarr.arr.catalog import SonarrCatalog, fetch_sonarr_catalog
 from collapsarr.arr.files import fetch_monitored_files
-from collapsarr.arr.models import resolve_path
+from collapsarr.arr.models import ArrInstance, InstanceType, resolve_path
 from collapsarr.arr.service import list_instances, list_path_mappings
 from collapsarr.arr.webhooks import ResolvedWebhookFile
 from collapsarr.config import Settings
@@ -97,6 +98,7 @@ from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_
 from collapsarr.downmix.targets import DownmixSettings, detect_qualifying_targets
 from collapsarr.jobs.history import list_job_history
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus
+from collapsarr.library.service import sync_library
 from collapsarr.media.service import upsert_tracked_media
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,11 @@ logger = logging.getLogger(__name__)
 #: :func:`~collapsarr.downmix.probe.probe_audio_streams` (called positionally),
 #: and is injectable so tests need neither ``ffprobe`` nor real media files.
 ProbeFn = Callable[[Path], Sequence[AudioStreamInfo]]
+
+#: Signature of the catalog-fetch seam: pull a Sonarr instance's full catalog.
+#: Matches :func:`~collapsarr.arr.catalog.fetch_sonarr_catalog`, and is
+#: injectable so the library-sync integration test needs no real Sonarr.
+CatalogFetchFn = Callable[[ArrInstance], SonarrCatalog]
 
 #: A job is "in flight" -- and so a duplicate -- when in either of these states.
 _ACTIVE_STATUSES = (JobStatus.PENDING, JobStatus.RUNNING)
@@ -134,8 +141,11 @@ class JobScheduler:
     downmix engine already takes a ``DownmixSettings`` argument, and a real
     settings store can be threaded through here later.
 
-    ``probe`` and ``now`` are injectable seams for testing (a stub probe and a
-    controllable clock); both default to the real implementations.
+    ``probe``, ``catalog_fetch`` and ``now`` are injectable seams for testing (a
+    stub probe, a stub Sonarr full-catalog fetch, and a controllable clock); all
+    default to the real implementations. ``catalog_fetch`` (COL-98) is what the
+    scan uses to mirror each Sonarr instance's catalog into the Library on the
+    same cadence -- see :meth:`scan_once`.
     """
 
     def __init__(
@@ -146,6 +156,7 @@ class JobScheduler:
         *,
         downmix_settings: DownmixSettings | None = None,
         probe: ProbeFn = probe_audio_streams,
+        catalog_fetch: CatalogFetchFn = fetch_sonarr_catalog,
         now: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._queue = queue
@@ -153,6 +164,7 @@ class JobScheduler:
         self._settings = settings
         self._downmix_settings = downmix_settings or DownmixSettings()
         self._probe = probe
+        self._catalog_fetch = catalog_fetch
         self._now = now
         self._interval_seconds = settings.scan_interval_hours * 3600.0
         self._dedup_window = timedelta(hours=settings.scan_interval_hours)
@@ -358,17 +370,29 @@ class JobScheduler:
         return self.scan_once()
 
     def scan_once(self) -> list[Job]:
-        """Scan every configured instance's monitored files and enqueue qualifying ones.
+        """Scan every configured instance: mirror its Library and enqueue qualifying files.
+
+        Two independent per-instance passes share the one scan cadence:
+
+        - **Library mirror (COL-98):** for each Sonarr instance, fetch its full
+          catalog (:attr:`_catalog_fetch`) and
+          :func:`~collapsarr.library.service.sync_library` -- upserting every
+          Series/Season/Episode node (files-not-yet-present included) and
+          soft-hiding any node the catalog no longer reports.
+        - **Downmix discovery (COL-22):** enqueue every monitored file with a
+          qualifying missing target.
 
         Returns the jobs enqueued this pass (skipped/no-op files excluded). A
-        fetch failure for one instance is logged and skipped rather than
-        aborting the whole scan, so one unreachable Sonarr/Radarr doesn't stop
-        the others from being scanned.
+        fetch failure for one instance -- for either pass -- is logged and
+        skipped rather than aborting the whole scan, so one unreachable
+        Sonarr/Radarr doesn't stop the others (or the other pass) from running.
         """
         enqueued: list[Job] = []
         with self._session_factory() as session:
             instances = list_instances(session)
             for instance in instances:
+                self._sync_instance_library(session, instance)
+
                 try:
                     files = fetch_monitored_files(instance)
                 except httpx.HTTPError as exc:
@@ -391,6 +415,28 @@ class JobScheduler:
             len(instances),
         )
         return enqueued
+
+    def _sync_instance_library(self, session: Session, instance: ArrInstance) -> None:
+        """Mirror one Sonarr instance's catalog into the Library (COL-98).
+
+        A no-op for non-Sonarr instances (Radarr library support is a later
+        ticket). A catalog-fetch failure is logged and swallowed so it never
+        aborts the scan -- crucially, ``sync_library`` is *not* called on a
+        failed fetch, so a transient outage never soft-hides the whole mirror.
+        """
+        if instance.type is not InstanceType.SONARR:
+            return
+        try:
+            catalog = self._catalog_fetch(instance)
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "scan: failed to fetch catalog from instance %r (id=%s): %s",
+                instance.name,
+                instance.id,
+                exc,
+            )
+            return
+        sync_library(session, instance_id=instance.id, catalog=catalog)
 
     # -- Background loop lifecycle ------------------------------------------
 

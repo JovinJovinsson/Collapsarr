@@ -46,6 +46,7 @@ from .health.routes import router as health_checks_router
 from .jobs.queue import JobQueue
 from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
+from .library.routes import router as library_router
 from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
@@ -252,6 +253,11 @@ def create_app(
 
     # Job history GET + on-demand scan/trigger POSTs (COL-29), under /api.
     app.include_router(jobs_router)
+
+    # Read-only Library tree GET /api/library/instances/{id}/tree (COL-98),
+    # under /api. The per-instance Sonarr Series > Season > Episode mirror the
+    # periodic scan keeps in sync, each node carrying its resolved Tracked value.
+    app.include_router(library_router)
 
     # Notifier config GET/PUT (COL-36), under /api.
     app.include_router(notifiers_router)

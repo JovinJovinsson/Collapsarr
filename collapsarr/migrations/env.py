@@ -29,6 +29,7 @@ from collapsarr.database import Base
 import collapsarr.arr  # noqa: F401,E402  isort:skip
 import collapsarr.health  # noqa: F401,E402  isort:skip
 import collapsarr.jobs  # noqa: F401,E402  isort:skip
+import collapsarr.library  # noqa: F401,E402  isort:skip
 import collapsarr.media  # noqa: F401,E402  isort:skip
 import collapsarr.notify  # noqa: F401,E402  isort:skip
 import collapsarr.settings  # noqa: F401,E402  isort:skip
