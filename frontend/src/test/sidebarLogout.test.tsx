@@ -3,19 +3,24 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Sidebar } from "../components/Sidebar";
+import { InstancesProvider } from "../components/InstancesProvider";
 
 /**
  * Renders the Sidebar at "/" with a stub /login route so that clicking "Sign
  * out" (which POSTs /api/auth/logout then navigates to /login) is observable by
- * the login marker appearing.
+ * the login marker appearing. Wrapped in `InstancesProvider` (COL-100 code
+ * review) since `Sidebar`'s `LibraryNavSection` reads the shared instance
+ * list via `useInstances()`, which requires the provider even while collapsed.
  */
 function renderSidebar() {
   return render(
     <MemoryRouter initialEntries={["/"]}>
-      <Routes>
-        <Route path="/" element={<Sidebar />} />
-        <Route path="/login" element={<div>Login view</div>} />
-      </Routes>
+      <InstancesProvider>
+        <Routes>
+          <Route path="/" element={<Sidebar />} />
+          <Route path="/login" element={<div>Login view</div>} />
+        </Routes>
+      </InstancesProvider>
     </MemoryRouter>,
   );
 }

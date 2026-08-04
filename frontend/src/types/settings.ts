@@ -63,6 +63,12 @@ export interface GlobalSettings {
   disk_space_error_percent: number;
   /** Which GitHub Release stream the Update Check compares against (COL-88). Default `"stable"`. */
   update_channel: UpdateChannel;
+  /**
+   * Default Tracked setting for newly-discovered library items (COL-98).
+   * When a Library node has no explicit ancestor override, its Tracked value
+   * resolves to this instance-wide default. Default `true`.
+   */
+  default_tracked: boolean;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -92,4 +98,5 @@ export interface GlobalSettingsUpdateInput {
   disk_space_warning_percent?: number;
   disk_space_error_percent?: number;
   update_channel?: UpdateChannel;
+  default_tracked?: boolean;
 }

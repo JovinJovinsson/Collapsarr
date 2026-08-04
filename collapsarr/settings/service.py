@@ -162,6 +162,7 @@ def update_global_settings(
     disk_space_warning_percent: float | None = None,
     disk_space_error_percent: float | None = None,
     update_channel: str | None = None,
+    default_tracked: bool | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -198,6 +199,13 @@ def update_global_settings(
     can persist an invalid channel. The Update Check scheduler reads this
     live from the row on every tick, so a change here takes effect on the
     next tick with no restart.
+
+    ``default_tracked`` (COL-98) follows the same "only change what's passed"
+    rule as every other boolean field here. It is the instance-wide fallback
+    a Library node's Tracked value resolves to when nothing in its ancestry
+    carries an explicit override (see
+    :func:`collapsarr.library.service.resolve_tracked`); the Settings-page
+    toggle exposing it is a later ticket.
     """
     settings = get_global_settings(session)
 
@@ -240,6 +248,8 @@ def update_global_settings(
                 f"{UPDATE_CHANNEL_STABLE!r}/{UPDATE_CHANNEL_BETA!r}; got {update_channel!r}"
             )
         settings.update_channel = update_channel
+    if default_tracked is not None:
+        settings.default_tracked = default_tracked
 
     session.commit()
     session.refresh(settings)

@@ -46,6 +46,7 @@ def _radarr_instance() -> ArrInstance:
 def _sonarr_transport() -> tuple[httpx.MockTransport, list[httpx.Request]]:
     series_payload = _load_fixture("sonarr_series_list.json")
     episodefiles_payload = _load_fixture("sonarr_episodefiles_series1.json")
+    episodes_payload = _load_fixture("sonarr_episodes_series1.json")
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -57,6 +58,11 @@ def _sonarr_transport() -> tuple[httpx.MockTransport, list[httpx.Request]]:
                 "should only fetch episode files for the monitored series"
             )
             return httpx.Response(200, json=episodefiles_payload)
+        if request.url.path == "/api/v3/episode":
+            assert request.url.params.get("seriesId") == "1", (
+                "should only fetch episodes for the monitored series"
+            )
+            return httpx.Response(200, json=episodes_payload)
         raise AssertionError(f"unexpected request: {request.url}")
 
     return httpx.MockTransport(handler), seen
@@ -84,6 +90,7 @@ def test_fetch_sonarr_monitored_files_returns_normalized_list() -> None:
             media_title="Breaking Bad",
             file_path="/tv/Breaking Bad/Season 01/Breaking Bad - S01E01 - Pilot.mkv",
             source_file_id=101,
+            sonarr_episode_id=5001,
             audio=AudioInfo(codec="AC3", channels=5.1, languages="eng", stream_count=1),
         ),
         MonitoredFile(
@@ -91,6 +98,7 @@ def test_fetch_sonarr_monitored_files_returns_normalized_list() -> None:
             media_title="Breaking Bad",
             file_path="/tv/Breaking Bad/Season 01/Breaking Bad - S01E02 - Cats in the Bag.mkv",
             source_file_id=102,
+            sonarr_episode_id=5002,
             audio=AudioInfo(codec="AAC", channels=2.0, languages="eng", stream_count=1),
         ),
     ]
@@ -102,9 +110,10 @@ def test_fetch_sonarr_never_queries_unmonitored_series() -> None:
 
     fetch_monitored_files(_sonarr_instance(), transport=transport)
 
-    assert len(seen) == 2  # one /series call, one /episodefile call (series 1 only)
+    # One /series call, one /episodefile + one /episode call (series 1 only).
+    assert len(seen) == 3
     paths = [request.url.path for request in seen]
-    assert paths == ["/api/v3/series", "/api/v3/episodefile"]
+    assert paths == ["/api/v3/series", "/api/v3/episodefile", "/api/v3/episode"]
 
 
 def test_fetch_sonarr_request_carries_api_key_header() -> None:
@@ -133,6 +142,7 @@ def test_fetch_radarr_monitored_files_returns_normalized_list() -> None:
             media_title="Interstellar",
             file_path="/movies/Interstellar (2014)/Interstellar (2014) Bluray-1080p.mkv",
             source_file_id=501,
+            radarr_movie_id=1,
             audio=AudioInfo(codec="DTS-HD MA", channels=7.1, languages="eng", stream_count=2),
         ),
         MonitoredFile(
@@ -140,6 +150,7 @@ def test_fetch_radarr_monitored_files_returns_normalized_list() -> None:
             media_title="Silent Film",
             file_path="/movies/Silent Film (1921)/Silent Film (1921) DVD.mkv",
             source_file_id=504,
+            radarr_movie_id=4,
             audio=None,
         ),
     ]

@@ -33,6 +33,8 @@ from collapsarr.arr.webhooks import (
     resolve_webhook_file,
 )
 from collapsarr.config import Settings
+from collapsarr.library.models import LibraryNodeKind
+from collapsarr.library.service import get_node_by_source_id, list_nodes
 from collapsarr.main import create_app
 from collapsarr.settings.service import get_global_settings
 
@@ -73,6 +75,11 @@ def test_parse_sonarr_webhook_on_import() -> None:
         file_path="/tv/Breaking Bad/Season 01/Breaking Bad - S01E01 - Pilot.mkv",
         is_upgrade=False,
         source_file_id=101,
+        sonarr_episode_id=101,
+        sonarr_series_id=1,
+        season_number=1,
+        episode_number=1,
+        episode_title="Pilot",
     )
 
 
@@ -85,6 +92,40 @@ def test_parse_sonarr_webhook_on_upgrade() -> None:
     assert file is not None
     assert file.is_upgrade is True
     assert file.file_path.endswith("Cats in the Bag.mkv")
+    assert file.sonarr_episode_id == 102
+
+
+def test_parse_sonarr_webhook_extracts_series_season_episode_catalog_fields() -> None:
+    """The Series > Season > Episode fields needed to upsert a Library node (COL-102)."""
+    payload = _load_fixture("sonarr_webhook_on_upgrade.json")
+
+    file = parse_sonarr_webhook(payload)
+
+    assert file is not None
+    assert file.sonarr_series_id == 1
+    assert file.season_number == 1
+    assert file.episode_number == 2
+    assert file.episode_title == "Cat's in the Bag..."
+
+
+def test_parse_sonarr_webhook_episode_id_absent_when_episodes_missing() -> None:
+    """A Download event with no `episodes` array still parses -- ids just stay None."""
+    file = parse_sonarr_webhook(
+        {
+            "eventType": "Download",
+            "series": {"title": "X"},
+            "episodeFile": {"path": "/x", "id": 1},
+        }
+    )
+
+    assert file is not None
+    assert file.sonarr_episode_id is None
+    # The remaining per-episode catalog fields are absent too (COL-102) -- and
+    # with no episode id, main._sync_webhook_library_node skips the upsert
+    # rather than keying a node on None.
+    assert file.season_number is None
+    assert file.episode_number is None
+    assert file.episode_title is None
 
 
 def test_parse_sonarr_webhook_ignores_non_download_event() -> None:
@@ -120,6 +161,7 @@ def test_parse_radarr_webhook_on_import() -> None:
         file_path="/movies/Interstellar (2014)/Interstellar (2014) Bluray-1080p.mkv",
         is_upgrade=False,
         source_file_id=501,
+        radarr_movie_id=1,
     )
 
 
@@ -132,6 +174,7 @@ def test_parse_radarr_webhook_on_upgrade() -> None:
     assert file is not None
     assert file.is_upgrade is True
     assert file.media_title == "Silent Film"
+    assert file.radarr_movie_id == 4
 
 
 def test_parse_radarr_webhook_download_missing_movie_file_is_malformed() -> None:
@@ -173,6 +216,7 @@ def test_resolve_webhook_file_applies_path_mapping() -> None:
         file_path="/tv/Breaking Bad/Season 01/Pilot.mkv",
         is_upgrade=False,
         source_file_id=101,
+        sonarr_episode_id=101,
     )
 
     resolved = resolve_webhook_file(instance, raw, [mapping])
@@ -184,6 +228,7 @@ def test_resolve_webhook_file_applies_path_mapping() -> None:
         file_path="/mnt/media/tv/Breaking Bad/Season 01/Pilot.mkv",
         is_upgrade=False,
         source_file_id=101,
+        sonarr_episode_id=101,
     )
 
 
@@ -277,6 +322,61 @@ def test_webhook_endpoint_accepts_radarr_upgrade_and_returns_200(
     assert len(captured) == 1
     assert captured[0].is_upgrade is True
     assert captured[0].media_title == "Silent Film"
+
+
+def test_webhook_import_upserts_the_sonarr_library_nodes(
+    settings: Settings, session: Session
+) -> None:
+    """AC1: a Sonarr import upserts the Series > Season > Episode chain (COL-102)."""
+    instance = _instance(session, instance_type=InstanceType.SONARR)
+
+    app = create_app(settings=settings)
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/webhook/arr/{instance.id}",
+            json=_load_fixture("sonarr_webhook_on_import.json"),
+            headers=_auth_headers(client),
+        )
+        assert response.status_code == 200
+        session_factory = app.state.session_factory
+        with session_factory() as check:
+            episode = get_node_by_source_id(
+                check, instance_id=instance.id, sonarr_episode_id=101
+            )
+            assert episode is not None
+            assert episode.kind is LibraryNodeKind.EPISODE
+            assert episode.title == "Pilot"
+            assert episode.has_file is True
+            # The full ancestry was upserted, not just the leaf.
+            kinds = {node.kind for node in list_nodes(check, instance.id)}
+            assert kinds == {
+                LibraryNodeKind.SERIES,
+                LibraryNodeKind.SEASON,
+                LibraryNodeKind.EPISODE,
+            }
+
+
+def test_webhook_import_upserts_the_radarr_library_node(
+    settings: Settings, session: Session
+) -> None:
+    """AC1: a Radarr import upserts the flat Movie node (COL-102)."""
+    instance = _instance(session, instance_type=InstanceType.RADARR)
+
+    app = create_app(settings=settings)
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/webhook/arr/{instance.id}",
+            json=_load_fixture("radarr_webhook_on_import.json"),
+            headers=_auth_headers(client),
+        )
+        assert response.status_code == 200
+        session_factory = app.state.session_factory
+        with session_factory() as check:
+            movie = get_node_by_source_id(check, instance_id=instance.id, radarr_movie_id=1)
+            assert movie is not None
+            assert movie.kind is LibraryNodeKind.MOVIE
+            assert movie.title == "Interstellar"
+            assert movie.has_file is True
 
 
 def test_webhook_endpoint_resolves_path_via_instance_mapping(

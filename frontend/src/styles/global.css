@@ -74,7 +74,10 @@ a {
 
 .sidebar__brand-mark {
   display: inline-flex;
-  color: var(--c-accent);
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
 }
 
 .sidebar__brand-name {
@@ -132,6 +135,56 @@ a {
 
 .sidebar__link:hover .sidebar__link-icon {
   color: inherit;
+}
+
+/* ---- Libraries nav section (COL-100): expandable per-instance sub-items - */
+
+.sidebar__nav-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar__caret {
+  margin-left: auto;
+  color: var(--c-text-faint);
+  font-size: var(--fs-xs);
+}
+
+.sidebar__subnav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: var(--sp-1) 0 var(--sp-1) var(--sp-5);
+}
+
+.sidebar__sublink {
+  display: block;
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--radius-md);
+  color: var(--c-text-faint);
+  font-size: var(--fs-sm);
+  border-left: 2px solid transparent;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+
+.sidebar__sublink:hover {
+  background: var(--c-surface);
+  color: var(--c-text);
+}
+
+.sidebar__sublink--active,
+.sidebar__sublink--active:hover {
+  background: var(--c-accent-tint);
+  color: var(--c-text);
+  border-left-color: var(--c-accent);
+}
+
+.sidebar__subnav-message {
+  padding: var(--sp-1) var(--sp-3);
+  color: var(--c-text-faint);
+  font-size: var(--fs-xs);
 }
 
 .sidebar__footer {
@@ -1064,6 +1117,218 @@ a {
 
 .file-detail__hint {
   max-width: none;
+}
+
+/* ---- Library browsing page (COL-100) ------------------------------------
+   Series > Season > Episode tree (Sonarr) or flat Movie table (Radarr),
+   rendered from GET /api/library/instances/{id}/tree. */
+
+.library-tree-panel {
+  overflow-x: auto;
+}
+
+.library-tree-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.library-tree-table th,
+.library-tree-table td {
+  padding: var(--sp-2) var(--sp-4);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.library-tree-table thead th {
+  color: var(--c-text-muted);
+  font-weight: 600;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--c-border);
+  white-space: nowrap;
+}
+
+.library-tree-table tbody tr + tr td {
+  border-top: 1px solid var(--c-border);
+}
+
+.library-tree-table__row--series td:first-child {
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+/* Nodes with no file yet (COL-100 AC): dimmed row, distinct from the
+   badge below so the distinction reads even without colour. */
+.library-tree-table__row--dimmed {
+  opacity: 0.6;
+}
+
+.library-tree-table__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.library-tree-table__caret {
+  display: inline-flex;
+  width: 1em;
+  color: var(--c-text-faint);
+  font-size: var(--fs-xs);
+}
+
+.library-tree-table__cell--indent-1 {
+  padding-left: calc(var(--sp-4) + var(--sp-5));
+}
+
+.library-tree-table__cell--indent-2 {
+  padding-left: calc(var(--sp-4) + var(--sp-5) * 2);
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+}
+
+.library-tree-table__file-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+}
+
+.library-tree-table__file-badge--present {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+}
+
+.library-tree-table__file-badge--missing {
+  color: var(--c-text-muted);
+  background: var(--c-surface-raised);
+}
+
+/* The Tracked toggle (COL-101), shared by LibraryPage's rows and
+   FileDetailPage's Tracked panel (components/TrackedToggleButton.tsx):
+   mirrors the file badge's pill shape so both status affordances on a row
+   read as the same visual language, but stays a real <button> (border,
+   cursor, disabled state) since it's interactive, unlike the read-only file
+   badge. */
+.tracked-toggle {
+  display: inline-flex;
+  align-items: center;
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.tracked-toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.tracked-toggle--on {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+  border-color: var(--c-success-tint);
+}
+
+.tracked-toggle--off {
+  color: var(--c-text-muted);
+  background: var(--c-surface-raised);
+  border-color: var(--c-border);
+}
+
+/* Row-level Select checkbox (COL-103): first column of every Library
+   tree/table row, backing the cross-level bulk selection. */
+.library-tree-table__select {
+  cursor: pointer;
+}
+
+.library-tree-table__select:disabled {
+  cursor: not-allowed;
+}
+
+/* The bulk-action toolbar (COL-103): appears above the tree/table once the
+   cross-level selection holds at least one row, offering a single Mark
+   Tracked / Mark Not Tracked action across the whole mixed-level selection. */
+.library-bulk-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4);
+  border-radius: var(--radius-md);
+  background: var(--c-surface-raised);
+  border: 1px solid var(--c-border);
+}
+
+.library-bulk-toolbar__count {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--c-text);
+  margin-right: auto;
+}
+
+.library-bulk-toolbar__clear {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--c-text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.library-bulk-toolbar__clear:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* The title search box + Tracked filter (COL-104): narrows the already-fetched
+   tree/table client-side, same layout as .activity-filters. */
+.library-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.library-filters__input,
+.library-filters__select {
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-md);
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+}
+
+.library-filters__input {
+  flex: 1 1 240px;
+  min-width: 200px;
+}
+
+.library-filters__input::placeholder {
+  color: var(--c-text-faint);
+}
+
+.library-filters__input:focus,
+.library-filters__select:focus {
+  outline: none;
+  border-color: var(--c-accent);
 }
 
 /* ---- Responsive: collapse the sidebar to a top bar on narrow screens - */

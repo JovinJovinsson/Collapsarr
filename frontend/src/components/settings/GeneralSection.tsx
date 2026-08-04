@@ -23,6 +23,7 @@ interface GeneralFormValues {
   surroundBitrateKbps: string;
   diskSpaceWarningPercent: string;
   diskSpaceErrorPercent: string;
+  defaultTracked: boolean;
 }
 
 /** Validates the general-settings form; returns an error message, or `null` when valid. */
@@ -77,6 +78,7 @@ export function GeneralSection() {
     surroundBitrateKbps: "",
     diskSpaceWarningPercent: "5",
     diskSpaceErrorPercent: "2",
+    defaultTracked: true,
   });
 
   const [saving, setSaving] = useState(false);
@@ -113,6 +115,7 @@ export function GeneralSection() {
             settings.surround_bitrate_kbps === null ? "" : String(settings.surround_bitrate_kbps),
           diskSpaceWarningPercent: String(settings.disk_space_warning_percent),
           diskSpaceErrorPercent: String(settings.disk_space_error_percent),
+          defaultTracked: settings.default_tracked,
         });
         setState({ status: "ready" });
       })
@@ -144,6 +147,7 @@ export function GeneralSection() {
           form.surroundBitrateKbps.trim() === "" ? null : Number(form.surroundBitrateKbps),
         disk_space_warning_percent: Number(form.diskSpaceWarningPercent),
         disk_space_error_percent: Number(form.diskSpaceErrorPercent),
+        default_tracked: form.defaultTracked,
       });
       setServerApiKey(updated.api_key);
       setForm({
@@ -159,6 +163,7 @@ export function GeneralSection() {
           updated.surround_bitrate_kbps === null ? "" : String(updated.surround_bitrate_kbps),
         diskSpaceWarningPercent: String(updated.disk_space_warning_percent),
         diskSpaceErrorPercent: String(updated.disk_space_error_percent),
+        defaultTracked: updated.default_tracked,
       });
       setSavedAt(Date.now());
     } catch (err: unknown) {
@@ -342,6 +347,15 @@ export function GeneralSection() {
                 onChange={(event) => setForm({ ...form, uiAuthEnabled: event.target.checked })}
               />
               Require the API key for UI requests
+            </label>
+
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={form.defaultTracked}
+                onChange={(event) => setForm({ ...form, defaultTracked: event.target.checked })}
+              />
+              Default Tracked for new library items
             </label>
 
             <div className="form-field form-field--narrow">

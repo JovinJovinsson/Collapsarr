@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { fetchJobHistory, triggerDownmix } from "../api/activity";
+import { updateTracked } from "../api/library";
 import { fetchSettings } from "../api/settings";
 import { fetchWantedList } from "../api/wanted";
 import { WantedIcon } from "../components/icons";
+import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import type { JobHistoryEntry, JobStatus, ManualTriggerResult } from "../types/activity";
 import type { GlobalSettings } from "../types/settings";
 import type { DownmixTarget, WantedFile } from "../types/wanted";
@@ -118,6 +120,14 @@ function buildStatusRows(file: WantedFile, history: JobHistoryEntry[]): StatusRo
  * dedicated per-file detail endpoint yet), `GET /api/jobs/history?file=`
  * (COL-29, this file's past job runs), and `GET /api/settings` (COL-28, to
  * display the current language allow-list for context).
+ *
+ * Also shows and toggles this file's **Tracked** status (COL-101), bridged
+ * from `GET /api/wanted`'s `library_node_id`/`node_type`/`tracked` fields
+ * (`collapsarr/media/routes.py`'s bridge from a tracked-media row back to
+ * its owning `LibraryNode`). When the bridge hasn't resolved yet (no
+ * instance/episode/movie id captured for this file), the panel shows a
+ * "status unavailable" message rather than a broken toggle -- see that
+ * module's docstring for when this happens.
  */
 export function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
@@ -127,6 +137,8 @@ export function FileDetailPage() {
   const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
   const [triggerState, setTriggerState] = useState<TriggerState>({ status: "idle" });
   const [extraLanguages, setExtraLanguages] = useState("");
+  const [trackedPending, setTrackedPending] = useState(false);
+  const [trackedError, setTrackedError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -226,6 +238,38 @@ export function FileDetailPage() {
     }
   }
 
+  /**
+   * Toggles this file's bridged Library node's Tracked value (COL-101),
+   * calling the same `POST /api/library/tracked` endpoint LibraryPage's row
+   * toggles do, with this file's `library_node_id`/`node_type` as the single
+   * reference. Unlike LibraryPage's toggle, no refetch-the-tree dance is
+   * needed afterwards: this file's bridged node is always an Episode/Movie
+   * leaf (never a Series/Season), so there's no cascade to reflect --
+   * patching `fileState` directly from the response's resulting value is
+   * both correct and avoids a redundant round-trip.
+   */
+  async function handleTrackedToggle() {
+    if (fileState.status !== "ready") return;
+    const file = fileState.file;
+    if (file.library_node_id === null || file.node_type === null) return;
+    const nextTracked = !file.tracked;
+
+    setTrackedError(null);
+    setTrackedPending(true);
+    try {
+      const result = await updateTracked(file.node_type, file.library_node_id, nextTracked);
+      const updated = result.updated.find((entry) => entry.id === file.library_node_id);
+      setFileState({
+        status: "ready",
+        file: { ...file, tracked: updated ? updated.tracked : nextTracked },
+      });
+    } catch (error: unknown) {
+      setTrackedError(error instanceof Error ? error.message : "Unknown error.");
+    } finally {
+      setTrackedPending(false);
+    }
+  }
+
   return (
     <section className="view">
       <header className="view__header">
@@ -269,6 +313,33 @@ export function FileDetailPage() {
 
       {fileState.status === "ready" && (
         <>
+          <div className="panel file-detail__panel">
+            <h2 className="settings-form__subtitle">Tracked</h2>
+            {fileState.file.library_node_id !== null &&
+            fileState.file.node_type !== null &&
+            fileState.file.tracked !== null ? (
+              <>
+                <p className="panel__message file-detail__hint">
+                  Tracked gates automatic downmixing for this file. A Not-Tracked file can still be
+                  downmixed via the manual trigger below.
+                </p>
+                <TrackedToggleButton
+                  tracked={fileState.file.tracked}
+                  pending={trackedPending}
+                  onToggle={handleTrackedToggle}
+                />
+              </>
+            ) : (
+              <p className="panel__message">
+                Tracked status is unavailable for this file (it hasn&apos;t been linked back to its
+                library entry yet — try rescanning).
+              </p>
+            )}
+            {trackedError && (
+              <p className="form-error">Couldn&apos;t update Tracked: {trackedError}</p>
+            )}
+          </div>
+
           <div className="panel file-detail__panel">
             <h2 className="settings-form__subtitle">Per-target / per-language status</h2>
             {statusRows.length === 0 ? (

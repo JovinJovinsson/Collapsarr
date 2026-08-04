@@ -16,6 +16,9 @@ const wantedResponse: WantedFile[] = [
     missing_targets: [{ language: "en", target: "5.1" }],
     created_at: "2026-07-01T00:00:00Z",
     updated_at: "2026-07-02T00:00:00Z",
+    library_node_id: 42,
+    node_type: "movie",
+    tracked: true,
   },
 ];
 
@@ -52,6 +55,7 @@ const settingsResponse: GlobalSettings = {
   disk_space_warning_percent: 5,
   disk_space_error_percent: 2,
   update_channel: "stable",
+  default_tracked: true,
   api_key: "test-key",
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
@@ -88,6 +92,7 @@ function defaultHandler(
     history: unknown;
     settings: unknown;
     trigger: { ok: boolean; status?: number; body: unknown };
+    tracked: { ok: boolean; status?: number; body: unknown };
   }> = {},
 ): Handler {
   return (url, init) => {
@@ -99,6 +104,23 @@ function defaultHandler(
     }
     if (url.startsWith("/api/settings")) {
       return { ok: true, body: overrides.settings ?? settingsResponse };
+    }
+    if (url === "/api/library/tracked") {
+      if (overrides.tracked) return overrides.tracked;
+      const parsed = JSON.parse(String(init?.body)) as {
+        references: { node_type: string; node_id: number }[];
+        tracked: boolean;
+      };
+      return {
+        ok: true,
+        body: {
+          updated: parsed.references.map((r) => ({
+            id: r.node_id,
+            kind: r.node_type,
+            tracked: parsed.tracked,
+          })),
+        },
+      };
     }
     if (url.startsWith("/api/wanted")) {
       return { ok: true, body: overrides.wanted ?? wantedResponse };
@@ -241,5 +263,71 @@ describe("FileDetailPage", () => {
     resolveTrigger({ ok: true, status: 202, json: () => Promise.resolve({ enqueued: true, job: { id: "job-9", file_path: FILE_PATH, status: "pending" } }) });
 
     expect(await screen.findByText("Queued")).toBeInTheDocument();
+  });
+
+  // --- Tracked indicator + toggle (COL-101) -----------------------------------
+
+  it("shows the bridged file's current Tracked status", async () => {
+    mockFetchRouter(defaultHandler());
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(screen.getByRole("button", { name: /^tracked$/i })).toBeInTheDocument();
+  });
+
+  it("toggling Tracked calls the bulk-update endpoint with this file's node reference and flips the indicator", async () => {
+    const { calls } = mockFetchRouter(defaultHandler());
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    fireEvent.click(screen.getByRole("button", { name: /^tracked$/i }));
+
+    const trackedCall = await vi.waitFor(() => {
+      const match = calls.find((call) => call.url === "/api/library/tracked");
+      if (!match) throw new Error("not yet called");
+      return match;
+    });
+    expect(trackedCall.init?.method).toBe("POST");
+    expect(JSON.parse(String(trackedCall.init?.body))).toEqual({
+      references: [{ node_type: "movie", node_id: 42 }],
+      tracked: false,
+    });
+
+    expect(await screen.findByRole("button", { name: /^not tracked$/i })).toBeInTheDocument();
+  });
+
+  it("shows a status-unavailable message when the file has no resolved Library node bridge", async () => {
+    mockFetchRouter(
+      defaultHandler({
+        wanted: [
+          {
+            ...wantedResponse[0],
+            library_node_id: null,
+            node_type: null,
+            tracked: null,
+          },
+        ],
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(screen.getByText(/tracked status is unavailable/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /tracked/i })).not.toBeInTheDocument();
+  });
+
+  it("shows an inline error and leaves the indicator unchanged when the Tracked update fails", async () => {
+    mockFetchRouter(
+      defaultHandler({ tracked: { ok: false, status: 500, body: { detail: "boom" } } }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    fireEvent.click(screen.getByRole("button", { name: /^tracked$/i }));
+
+    expect(await screen.findByText(/couldn't update tracked: boom/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^tracked$/i })).not.toBeDisabled();
   });
 });

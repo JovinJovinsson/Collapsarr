@@ -47,12 +47,36 @@ class WebhookValidationError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class WebhookFile:
-    """File info extracted from a webhook payload, before path resolution."""
+    """File info extracted from a webhook payload, before path resolution.
+
+    ``sonarr_episode_id``/``radarr_movie_id`` (COL-101) are the Arr
+    instance's own object ids -- read straight off the payload's
+    ``episodes``/``movie`` object, matching
+    :class:`~collapsarr.arr.files.MonitoredFile`'s scan-path fields of the
+    same name. A Sonarr multi-episode release reports more than one entry in
+    ``episodes``; only the *first* one's id is kept, same simplification
+    :func:`~collapsarr.arr.files._fetch_sonarr_files` makes for the scan path.
+
+    ``sonarr_series_id``/``season_number``/``episode_number``/``episode_title``
+    (COL-102) are the remaining Series > Season > Episode catalog fields the
+    webhook payload carries -- enough to upsert the corresponding Library
+    node(s) in real time on an import event, the same tree the periodic scan
+    mirrors (see :func:`collapsarr.library.service.upsert_series_episode_node`).
+    All are Sonarr-only and ``None`` on a Radarr file (a Movie node needs only
+    its ``radarr_movie_id`` + title). ``media_title`` doubles as the Series
+    (Sonarr) or Movie (Radarr) node title.
+    """
 
     media_title: str
     file_path: str
     is_upgrade: bool
     source_file_id: int | None = None
+    sonarr_episode_id: int | None = None
+    radarr_movie_id: int | None = None
+    sonarr_series_id: int | None = None
+    season_number: int | None = None
+    episode_number: int | None = None
+    episode_title: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +95,12 @@ class ResolvedWebhookFile:
     file_path: str
     is_upgrade: bool
     source_file_id: int | None = None
+    sonarr_episode_id: int | None = None
+    radarr_movie_id: int | None = None
+    sonarr_series_id: int | None = None
+    season_number: int | None = None
+    episode_number: int | None = None
+    episode_title: str | None = None
 
 
 OnFileReadyHook = Callable[[ResolvedWebhookFile], None]
@@ -112,6 +142,30 @@ def _optional_int(container: dict[str, Any], field: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _optional_str(container: dict[str, Any], field: str) -> str | None:
+    value = container.get(field)
+    return value if isinstance(value, str) else None
+
+
+def _first_episode(payload: dict[str, Any]) -> dict[str, Any]:
+    """The first episode object in a Sonarr webhook payload's ``episodes`` array.
+
+    Returns an empty dict when there is no ``episodes`` array (or it has no
+    dict entries), so every per-episode field
+    (:func:`_optional_int`/:func:`_optional_str`) simply resolves to ``None``
+    -- a Download event with no episode data still parses, its ids just stay
+    unset. A multi-episode release keeps only the *first* entry, the same
+    simplification the scan path makes.
+    """
+    episodes = payload.get("episodes")
+    if not isinstance(episodes, list):
+        return {}
+    for episode in episodes:
+        if isinstance(episode, dict):
+            return episode
+    return {}
+
+
 def parse_sonarr_webhook(payload: dict[str, Any]) -> WebhookFile | None:
     """Parse a Sonarr webhook payload into a :class:`WebhookFile`.
 
@@ -132,11 +186,17 @@ def parse_sonarr_webhook(payload: dict[str, Any]) -> WebhookFile | None:
     episode_file = _require_dict(payload.get("episodeFile"), "episodeFile")
     file_path = _require_str(episode_file, "path")
 
+    episode = _first_episode(payload)
     return WebhookFile(
         media_title=media_title,
         file_path=file_path,
         is_upgrade=bool(payload.get("isUpgrade", False)),
         source_file_id=_optional_int(episode_file, "id"),
+        sonarr_episode_id=_optional_int(episode, "id"),
+        sonarr_series_id=_optional_int(series, "id"),
+        season_number=_optional_int(episode, "seasonNumber"),
+        episode_number=_optional_int(episode, "episodeNumber"),
+        episode_title=_optional_str(episode, "title"),
     )
 
 
@@ -163,6 +223,7 @@ def parse_radarr_webhook(payload: dict[str, Any]) -> WebhookFile | None:
         file_path=file_path,
         is_upgrade=bool(payload.get("isUpgrade", False)),
         source_file_id=_optional_int(movie_file, "id"),
+        radarr_movie_id=_optional_int(movie, "id"),
     )
 
 
@@ -197,4 +258,10 @@ def resolve_webhook_file(
         file_path=resolve_path(file.file_path, mappings),
         is_upgrade=file.is_upgrade,
         source_file_id=file.source_file_id,
+        sonarr_episode_id=file.sonarr_episode_id,
+        radarr_movie_id=file.radarr_movie_id,
+        sonarr_series_id=file.sonarr_series_id,
+        season_number=file.season_number,
+        episode_number=file.episode_number,
+        episode_title=file.episode_title,
     )
