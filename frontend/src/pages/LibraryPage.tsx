@@ -1,11 +1,18 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
-import { fetchLibraryTree, rememberVisitedLibraryInstance } from "../api/library";
+import { fetchLibraryTree, rememberVisitedLibraryInstance, updateTracked } from "../api/library";
 import { LibraryIcon } from "../components/icons";
 import { useInstances } from "../hooks/useInstances";
 import type { ArrInstance } from "../types/instances";
-import type { EpisodeNode, LibraryTree, MovieNode, SeasonNode, SeriesNode } from "../types/library";
+import type {
+  EpisodeNode,
+  LibraryNodeKind,
+  LibraryTree,
+  MovieNode,
+  SeasonNode,
+  SeriesNode,
+} from "../types/library";
 import { isMovieTree } from "../types/library";
 
 type TreeLoadState =
@@ -27,6 +34,43 @@ function FileStatusBadge({ hasFile }: { hasFile: boolean }) {
     >
       {hasFile ? "Has file" : "Missing"}
     </span>
+  );
+}
+
+/**
+ * The single-item Tracked toggle (COL-101): a row-level button reading the
+ * node's *resolved* Tracked value and flipping it via `POST
+ * /api/library/tracked`. `pending` (this row's own toggle in flight) disables
+ * the button and swaps its label so a double-click can't fire two overlapping
+ * requests; the row stays showing its pre-toggle value until the request
+ * resolves and the tree is re-fetched (`LibraryPage`'s `onToggle`), rather
+ * than optimistically flipping ahead of the server -- a Series/Season toggle
+ * cascades to descendants the button itself has no knowledge of, so an
+ * optimistic local flip would be wrong for every row but this one.
+ */
+function TrackedToggleButton({
+  tracked,
+  pending,
+  onToggle,
+}: {
+  tracked: boolean;
+  pending: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={
+        tracked
+          ? "library-tree-table__tracked-toggle library-tree-table__tracked-toggle--on"
+          : "library-tree-table__tracked-toggle library-tree-table__tracked-toggle--off"
+      }
+      onClick={onToggle}
+      disabled={pending}
+      aria-pressed={tracked}
+    >
+      {pending ? "Updating…" : tracked ? "Tracked" : "Not Tracked"}
+    </button>
   );
 }
 
@@ -61,13 +105,22 @@ function useExpandable(): [Set<number>, (id: number) => void] {
   return [expanded, toggle];
 }
 
+/** Shared shape every row-level Tracked toggle needs from `LibraryPage` (COL-101). */
+interface TrackedToggleProps {
+  pendingNodeId: number | null;
+  onToggle: (nodeType: LibraryNodeKind, nodeId: number, nextTracked: boolean) => void;
+}
+
 /**
  * The Sonarr Series > Season > Episode tree (COL-100): Series rows expand to
  * their Seasons, Season rows expand to their Episodes. Only Episode rows
  * carry `has_file` (per `collapsarr/library/routes.py`'s schema), so that's
- * the level the file-status badge/dimming applies to.
+ * the level the file-status badge/dimming applies to. Every row carries its
+ * own Tracked toggle (COL-101): toggling a Series or Season row cascades
+ * server-side to its descendants, reflected here once the caller's refetch
+ * (triggered by `onToggle`) lands with their updated resolved values.
  */
-function SeriesTree({ series }: { series: SeriesNode[] }) {
+function SeriesTree({ series, pendingNodeId, onToggle }: { series: SeriesNode[] } & TrackedToggleProps) {
   const [expandedSeries, toggleSeries] = useExpandable();
   const [expandedSeasons, toggleSeason] = useExpandable();
 
@@ -78,6 +131,7 @@ function SeriesTree({ series }: { series: SeriesNode[] }) {
           <tr>
             <th scope="col">Title</th>
             <th scope="col">File</th>
+            <th scope="col">Tracked</th>
           </tr>
         </thead>
         <tbody>
@@ -100,6 +154,13 @@ function SeriesTree({ series }: { series: SeriesNode[] }) {
                     </button>
                   </td>
                   <td />
+                  <td>
+                    <TrackedToggleButton
+                      tracked={seriesNode.tracked}
+                      pending={pendingNodeId === seriesNode.id}
+                      onToggle={() => onToggle("series", seriesNode.id, !seriesNode.tracked)}
+                    />
+                  </td>
                 </tr>
                 {seriesOpen &&
                   seriesNode.seasons.map((seasonNode: SeasonNode) => {
@@ -121,6 +182,13 @@ function SeriesTree({ series }: { series: SeriesNode[] }) {
                             </button>
                           </td>
                           <td />
+                          <td>
+                            <TrackedToggleButton
+                              tracked={seasonNode.tracked}
+                              pending={pendingNodeId === seasonNode.id}
+                              onToggle={() => onToggle("season", seasonNode.id, !seasonNode.tracked)}
+                            />
+                          </td>
                         </tr>
                         {seasonOpen &&
                           seasonNode.episodes.map((episode: EpisodeNode) => (
@@ -138,6 +206,13 @@ function SeriesTree({ series }: { series: SeriesNode[] }) {
                               <td>
                                 <FileStatusBadge hasFile={episode.has_file} />
                               </td>
+                              <td>
+                                <TrackedToggleButton
+                                  tracked={episode.tracked}
+                                  pending={pendingNodeId === episode.id}
+                                  onToggle={() => onToggle("episode", episode.id, !episode.tracked)}
+                                />
+                              </td>
                             </tr>
                           ))}
                       </Fragment>
@@ -153,7 +228,7 @@ function SeriesTree({ series }: { series: SeriesNode[] }) {
 }
 
 /** The flat Radarr Movie list (COL-99/COL-100): no Season/Episode nesting. */
-function MovieTable({ movies }: { movies: MovieNode[] }) {
+function MovieTable({ movies, pendingNodeId, onToggle }: { movies: MovieNode[] } & TrackedToggleProps) {
   return (
     <div className="panel library-tree-panel">
       <table className="library-tree-table">
@@ -161,6 +236,7 @@ function MovieTable({ movies }: { movies: MovieNode[] }) {
           <tr>
             <th scope="col">Title</th>
             <th scope="col">File</th>
+            <th scope="col">Tracked</th>
           </tr>
         </thead>
         <tbody>
@@ -169,6 +245,13 @@ function MovieTable({ movies }: { movies: MovieNode[] }) {
               <td>{movie.title}</td>
               <td>
                 <FileStatusBadge hasFile={movie.has_file} />
+              </td>
+              <td>
+                <TrackedToggleButton
+                  tracked={movie.tracked}
+                  pending={pendingNodeId === movie.id}
+                  onToggle={() => onToggle("movie", movie.id, !movie.tracked)}
+                />
               </td>
             </tr>
           ))}
@@ -179,12 +262,15 @@ function MovieTable({ movies }: { movies: MovieNode[] }) {
 }
 
 /**
- * An instance's Library browsing page (COL-100), the per-instance page every
- * Libraries sidebar sub-item and the `LibrariesIndexPage` redirect ultimately
- * land on. Sourced from `GET /api/library/instances/{id}/tree`
+ * An instance's Library browsing page (COL-100/COL-101), the per-instance page
+ * every Libraries sidebar sub-item and the `LibrariesIndexPage` redirect
+ * ultimately land on. Sourced from `GET /api/library/instances/{id}/tree`
  * (COL-98/COL-99): renders the Series > Season > Episode tree for a Sonarr
- * instance, or the flat Movie table for a Radarr one -- read-only for this
- * slice, no Tracked toggling yet (COL-101).
+ * instance, or the flat Movie table for a Radarr one. Every row's Tracked
+ * toggle (COL-101) calls `POST /api/library/tracked` with a single node
+ * reference, then re-fetches the tree so a Series/Season toggle's
+ * server-side cascade to its descendants is reflected across every affected
+ * row without a manual page refresh.
  *
  * On a successful load, records this instance as the last-visited one
  * (`rememberVisitedLibraryInstance`) so a later bare "Libraries" click
@@ -201,35 +287,57 @@ export function LibraryPage() {
   const instanceId = Number(instanceIdParam);
 
   const [treeState, setTreeState] = useState<TreeLoadState>({ status: "loading" });
+  const [pendingNodeId, setPendingNodeId] = useState<number | null>(null);
+  const [toggleError, setToggleError] = useState<string | null>(null);
   const instancesState = useInstances();
 
-  useEffect(() => {
+  // Monotonic token guarding against a stale response landing after a newer
+  // one (e.g. `instanceId` changes again, or a toggle's own refetch races an
+  // in-flight one) -- replaces the original effect-local `cancelled` flag
+  // now that both the instance-driven load and the toggle-driven reload
+  // share this one function.
+  const loadTokenRef = useRef(0);
+
+  const loadTree = useCallback(async (): Promise<void> => {
     if (!Number.isInteger(instanceId)) {
       setTreeState({ status: "error", message: "Invalid instance id." });
       return;
     }
-    let cancelled = false;
-    setTreeState({ status: "loading" });
-
-    fetchLibraryTree(instanceId)
-      .then((tree) => {
-        if (cancelled) return;
-        setTreeState({ status: "ready", tree });
-        rememberVisitedLibraryInstance(instanceId);
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setTreeState({
-            status: "error",
-            message: error instanceof Error ? error.message : "Unknown error.",
-          });
-        }
+    const requestToken = ++loadTokenRef.current;
+    try {
+      const tree = await fetchLibraryTree(instanceId);
+      if (loadTokenRef.current !== requestToken) return;
+      setTreeState({ status: "ready", tree });
+      rememberVisitedLibraryInstance(instanceId);
+    } catch (error: unknown) {
+      if (loadTokenRef.current !== requestToken) return;
+      setTreeState({
+        status: "error",
+        message: error instanceof Error ? error.message : "Unknown error.",
       });
-
-    return () => {
-      cancelled = true;
-    };
+    }
   }, [instanceId]);
+
+  useEffect(() => {
+    setTreeState({ status: "loading" });
+    void loadTree();
+  }, [loadTree]);
+
+  async function handleToggle(nodeType: LibraryNodeKind, nodeId: number, nextTracked: boolean) {
+    setToggleError(null);
+    setPendingNodeId(nodeId);
+    try {
+      await updateTracked(nodeType, nodeId, nextTracked);
+      // Re-fetch rather than patch local state: a Series/Season toggle
+      // cascades to descendants server-side, and this is the one place that
+      // already knows how to render the resulting tree correctly.
+      await loadTree();
+    } catch (error: unknown) {
+      setToggleError(error instanceof Error ? error.message : "Unknown error.");
+    } finally {
+      setPendingNodeId(null);
+    }
+  }
 
   const instance =
     instancesState.status === "ready"
@@ -246,6 +354,8 @@ export function LibraryPage() {
             : "Series/Season/Episode or Movie catalog for this instance."}
         </p>
       </header>
+
+      {toggleError && <p className="form-error">Couldn&apos;t update Tracked: {toggleError}</p>}
 
       {treeState.status === "loading" && (
         <div className="panel panel--empty">
@@ -272,7 +382,7 @@ export function LibraryPage() {
             <p className="panel__message">No series found in this library yet.</p>
           </div>
         ) : (
-          <SeriesTree series={treeState.tree.series} />
+          <SeriesTree series={treeState.tree.series} pendingNodeId={pendingNodeId} onToggle={handleToggle} />
         ))}
 
       {treeState.status === "ready" &&
@@ -285,7 +395,7 @@ export function LibraryPage() {
             <p className="panel__message">No movies found in this library yet.</p>
           </div>
         ) : (
-          <MovieTable movies={treeState.tree.movies} />
+          <MovieTable movies={treeState.tree.movies} pendingNodeId={pendingNodeId} onToggle={handleToggle} />
         ))}
     </section>
   );

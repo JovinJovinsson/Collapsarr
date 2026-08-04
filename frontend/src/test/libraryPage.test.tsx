@@ -117,6 +117,48 @@ function mockLibraryApi({
   });
 }
 
+interface FetchCall {
+  url: string;
+  init?: RequestInit;
+}
+
+/**
+ * Routes GET tree/instances requests to canned responses (mutable, so a
+ * toggle test can swap the tree response mid-test to simulate the
+ * server-side cascade) and POST /api/library/tracked to a canned
+ * `{updated: [...]}` ack -- recording every call so a test can assert the
+ * request body/order.
+ */
+function mockLibraryApiWithToggle({
+  instances,
+  tree,
+}: {
+  instances: ArrInstance[];
+  tree: LibraryTreeResponse | MovieLibraryTreeResponse;
+}): { fetchMock: ReturnType<typeof vi.fn>; calls: FetchCall[]; setTree: (next: typeof tree) => void } {
+  let currentTree = tree;
+  const calls: FetchCall[] = [];
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    calls.push({ url, init });
+    if (url === "/api/instances") return jsonResponse(instances);
+    if (/^\/api\/library\/instances\/\d+\/tree$/.test(url)) return jsonResponse(currentTree);
+    if (url === "/api/library/tracked" && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { references: { node_id: number; node_type: string }[]; tracked: boolean };
+      return jsonResponse({
+        updated: body.references.map((r) => ({ id: r.node_id, kind: r.node_type, tracked: body.tracked })),
+      });
+    }
+    throw new Error(`Unhandled request in test mock: ${String(init?.method ?? "GET")} ${url}`);
+  });
+  return {
+    fetchMock,
+    calls,
+    setTree: (next) => {
+      currentTree = next;
+    },
+  };
+}
+
 describe("LibraryPage (COL-100)", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -200,5 +242,170 @@ describe("LibraryPage (COL-100)", () => {
     renderLibraryPage(1);
 
     expect(await screen.findByText(/no series found in this library yet/i)).toBeInTheDocument();
+  });
+
+  it("toggling a single Episode row's Tracked control updates only that node (COL-101)", async () => {
+    const { fetchMock, calls, setTree } = mockLibraryApiWithToggle({
+      instances: [sonarrInstance],
+      tree: seriesTree,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderLibraryPage(1);
+
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+    const pilotRow = (await screen.findByText(/pilot/i)).closest("tr") as HTMLElement;
+
+    // Server-side response to the refetch this toggle triggers: only the
+    // Pilot episode flips, everything else (series, season, sibling
+    // episode) stays Tracked.
+    const afterToggle: LibraryTreeResponse = {
+      ...seriesTree,
+      series: [
+        {
+          ...seriesTree.series[0],
+          seasons: [
+            {
+              ...seriesTree.series[0].seasons[0],
+              episodes: [
+                { ...seriesTree.series[0].seasons[0].episodes[0], tracked: false },
+                seriesTree.series[0].seasons[0].episodes[1],
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    setTree(afterToggle);
+
+    fireEvent.click(within(pilotRow).getByRole("button", { name: /tracked/i }));
+
+    const trackedCall = await vi.waitFor(() => {
+      const match = calls.find((call) => call.url === "/api/library/tracked");
+      if (!match) throw new Error("not yet called");
+      return match;
+    });
+    expect(trackedCall.init?.method).toBe("POST");
+    expect(JSON.parse(String(trackedCall.init?.body))).toEqual({
+      references: [{ node_type: "episode", node_id: 30 }],
+      tracked: false,
+    });
+
+    // Refetch lands: this row now reads Not Tracked, its sibling is untouched.
+    const updatedPilotRow = (await screen.findByText(/pilot/i)).closest("tr") as HTMLElement;
+    expect(within(updatedPilotRow).getByRole("button", { name: /^not tracked$/i })).toBeInTheDocument();
+    const siblingRow = screen.getByText(/cat's in the bag/i).closest("tr") as HTMLElement;
+    expect(within(siblingRow).getByRole("button", { name: /^tracked$/i })).toBeInTheDocument();
+  });
+
+  it("toggling a Series row cascades to its Season/Episode descendants, visible without a manual refresh (COL-101)", async () => {
+    const { fetchMock, calls, setTree } = mockLibraryApiWithToggle({
+      instances: [sonarrInstance],
+      tree: seriesTree,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderLibraryPage(1);
+
+    const seriesRow = (await screen.findByRole("button", { name: /breaking bad/i })).closest(
+      "tr",
+    ) as HTMLElement;
+
+    // The server-side cascade: every descendant flips to Not Tracked too.
+    const afterCascade: LibraryTreeResponse = {
+      instance_id: 1,
+      series: [
+        {
+          ...seriesTree.series[0],
+          tracked: false,
+          seasons: seriesTree.series[0].seasons.map((season) => ({
+            ...season,
+            tracked: false,
+            episodes: season.episodes.map((episode) => ({ ...episode, tracked: false })),
+          })),
+        },
+      ],
+    };
+    setTree(afterCascade);
+
+    fireEvent.click(within(seriesRow).getByRole("button", { name: /tracked/i }));
+
+    const trackedCall = await vi.waitFor(() => {
+      const match = calls.find((call) => call.url === "/api/library/tracked");
+      if (!match) throw new Error("not yet called");
+      return match;
+    });
+    expect(JSON.parse(String(trackedCall.init?.body))).toEqual({
+      references: [{ node_type: "series", node_id: 10 }],
+      tracked: false,
+    });
+
+    const updatedSeriesRow = (
+      await screen.findByRole("button", { name: /breaking bad/i })
+    ).closest("tr") as HTMLElement;
+    expect(
+      within(updatedSeriesRow).getByRole("button", { name: /^not tracked$/i }),
+    ).toBeInTheDocument();
+
+    // Expand down to the episodes: the cascade landed on every descendant too.
+    fireEvent.click(screen.getByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+    const pilotRow = (await screen.findByText(/pilot/i)).closest("tr") as HTMLElement;
+    expect(within(pilotRow).getByRole("button", { name: /^not tracked$/i })).toBeInTheDocument();
+  });
+
+  it("toggling a Movie row's Tracked control calls the endpoint with a movie reference (COL-101)", async () => {
+    const { fetchMock, calls, setTree } = mockLibraryApiWithToggle({
+      instances: [radarrInstance],
+      tree: movieTree,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderLibraryPage(2);
+
+    const interstellarRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+
+    setTree({
+      ...movieTree,
+      movies: [{ ...movieTree.movies[0], tracked: false }, movieTree.movies[1]],
+    });
+
+    fireEvent.click(within(interstellarRow).getByRole("button", { name: /tracked/i }));
+
+    const trackedCall = await vi.waitFor(() => {
+      const match = calls.find((call) => call.url === "/api/library/tracked");
+      if (!match) throw new Error("not yet called");
+      return match;
+    });
+    expect(JSON.parse(String(trackedCall.init?.body))).toEqual({
+      references: [{ node_type: "movie", node_id: 40 }],
+      tracked: false,
+    });
+
+    const updatedRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+    expect(within(updatedRow).getByRole("button", { name: /^not tracked$/i })).toBeInTheDocument();
+  });
+
+  it("shows an inline error and re-enables the toggle when the update request fails", async () => {
+    const { calls } = mockLibraryApiWithToggle({ instances: [sonarrInstance], tree: seriesTree });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        if (url === "/api/instances") return jsonResponse([sonarrInstance]);
+        if (/^\/api\/library\/instances\/\d+\/tree$/.test(url)) return jsonResponse(seriesTree);
+        if (url === "/api/library/tracked") return jsonResponse({ detail: "boom" }, 500);
+        throw new Error(`Unhandled request in test mock: GET ${url}`);
+      }),
+    );
+    renderLibraryPage(1);
+
+    const seriesRow = (await screen.findByRole("button", { name: /breaking bad/i })).closest(
+      "tr",
+    ) as HTMLElement;
+    fireEvent.click(within(seriesRow).getByRole("button", { name: /tracked/i }));
+
+    expect(await screen.findByText(/couldn't update tracked: boom/i)).toBeInTheDocument();
+    // Row still reads its original (unchanged) Tracked state -- the failed
+    // request never got a chance to flip it via a refetch.
+    expect(within(seriesRow).getByRole("button", { name: /^tracked$/i })).not.toBeDisabled();
   });
 });

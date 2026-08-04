@@ -71,3 +71,33 @@ export type LibraryTree = LibraryTreeResponse | MovieLibraryTreeResponse;
 export function isMovieTree(tree: LibraryTree): tree is MovieLibraryTreeResponse {
   return "movies" in tree;
 }
+
+/**
+ * The kind of a Library node, matching `collapsarr.library.models.LibraryNodeKind`
+ * -- the `node_type` a `POST /api/library/tracked` (COL-101) reference names.
+ */
+export type LibraryNodeKind = "series" | "season" | "episode" | "movie";
+
+/** One `{node_type, node_id}` reference, matching `...routes.TrackedNodeReference`. */
+export interface TrackedNodeReference {
+  node_type: LibraryNodeKind;
+  node_id: number;
+}
+
+/** Body for `POST /api/library/tracked`, matching `...routes.BulkTrackedUpdateRequest`. */
+export interface BulkTrackedUpdateRequest {
+  references: TrackedNodeReference[];
+  tracked: boolean;
+}
+
+/** One updated node's resulting state, matching `...routes.UpdatedTrackedNode`. */
+export interface UpdatedTrackedNode {
+  id: number;
+  kind: LibraryNodeKind;
+  tracked: boolean;
+}
+
+/** Response for `POST /api/library/tracked`, matching `...routes.BulkTrackedUpdateResponse`. */
+export interface BulkTrackedUpdateResponse {
+  updated: UpdatedTrackedNode[];
+}

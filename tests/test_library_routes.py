@@ -1,10 +1,14 @@
-"""Contract tests for the Library tree endpoint (COL-98/COL-99).
+"""Contract tests for the Library tree and Tracked-update endpoints (COL-98/COL-99/COL-101).
 
-Covers the response shape (both the Sonarr Series/Season/Episode tree and the
-Radarr flat Movie list), the resolved Tracked values, hidden-node exclusion,
-unknown-instance ``404``, and the API-key-required behaviour for
+Covers the tree response shape (both the Sonarr Series/Season/Episode tree and
+the Radarr flat Movie list), the resolved Tracked values, hidden-node
+exclusion, unknown-instance ``404``, and the API-key-required behaviour for
 ``GET /api/library/instances/{id}/tree`` -- mirroring
-:mod:`tests.test_arr_routes`. Library nodes are seeded through the real
+:mod:`tests.test_arr_routes` -- plus the ``POST /api/library/tracked`` bulk
+Tracked-update endpoint (COL-101): single-reference and cascading
+multi-reference requests, unknown-node ``404``, node-type-mismatch ``422``,
+and the atomic-validation ("nothing written if any reference is bad")
+guarantee. Library nodes are seeded through the real
 :func:`~collapsarr.library.service.sync_library` against the app's own session
 factory (there is no create-node endpoint; the mirror is scan-driven).
 """
@@ -23,7 +27,8 @@ from collapsarr.arr.catalog import (
     SonarrCatalog,
 )
 from collapsarr.arr.models import ArrInstance, InstanceType
-from collapsarr.library.service import sync_library
+from collapsarr.library.models import LibraryNodeKind, make_node_key
+from collapsarr.library.service import list_nodes, sync_library
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
 UNREACHABLE_URL = "http://127.0.0.1:9"
@@ -174,4 +179,188 @@ def test_tree_requires_the_api_key(client: TestClient) -> None:
         update_global_settings(session, ui_auth_enabled=True)
 
     response = client.get(f"/api/library/instances/{instance_id}/tree")
+    assert response.status_code == 401
+
+
+# --- POST /api/library/tracked (COL-101) --------------------------------------
+
+
+def _node_id(client: TestClient, instance_id: int, node_key: str) -> int:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        match = next(n for n in list_nodes(session, instance_id) if n.node_key == node_key)
+        return match.id
+
+
+def test_bulk_update_single_episode_reference_updates_only_that_node(client: TestClient) -> None:
+    instance_id = _seed_library(client)
+    episode_key = make_node_key(LibraryNodeKind.EPISODE, series_id=1, episode_id=101)
+    other_episode_key = make_node_key(LibraryNodeKind.EPISODE, series_id=1, episode_id=102)
+    episode_id = _node_id(client, instance_id, episode_key)
+
+    response = client.post(
+        "/api/library/tracked",
+        json={"references": [{"node_type": "episode", "node_id": episode_id}], "tracked": False},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["updated"] == [{"id": episode_id, "kind": "episode", "tracked": False}]
+
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        nodes_by_key = {n.node_key: n for n in list_nodes(session, instance_id)}
+        assert nodes_by_key[episode_key].tracked_override is False
+        assert nodes_by_key[other_episode_key].tracked_override is None  # untouched
+
+
+def test_bulk_update_series_reference_cascades_to_all_descendants(client: TestClient) -> None:
+    instance_id = _seed_library(client)
+    series_id = _node_id(client, instance_id, make_node_key(LibraryNodeKind.SERIES, series_id=1))
+
+    response = client.post(
+        "/api/library/tracked",
+        json={"references": [{"node_type": "series", "node_id": series_id}], "tracked": False},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["updated"] == [{"id": series_id, "kind": "series", "tracked": False}]
+
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        for node in list_nodes(session, instance_id):
+            assert node.tracked_override is False, node
+
+
+def test_bulk_update_accepts_multiple_cascading_references_in_one_request(
+    client: TestClient,
+) -> None:
+    """A Radarr Movie reference alongside a Sonarr Series reference in one batch.
+
+    Nodes are looked up by id only (no instance scoping on the endpoint), so a
+    single request spanning two instances -- one cascading (Series), one leaf
+    (Movie) -- is exercised here rather than as two separate requests.
+    """
+    sonarr_instance_id = _seed_library(client, type_=InstanceType.SONARR)
+    radarr_instance_id = _seed_library(client, type_=InstanceType.RADARR)
+    series_id = _node_id(
+        client, sonarr_instance_id, make_node_key(LibraryNodeKind.SERIES, series_id=1)
+    )
+    movie_id = _node_id(
+        client, radarr_instance_id, make_node_key(LibraryNodeKind.MOVIE, movie_id=1)
+    )
+
+    response = client.post(
+        "/api/library/tracked",
+        json={
+            "references": [
+                {"node_type": "series", "node_id": series_id},
+                {"node_type": "movie", "node_id": movie_id},
+            ],
+            "tracked": False,
+        },
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    updated = response.json()["updated"]
+    assert {(u["id"], u["kind"], u["tracked"]) for u in updated} == {
+        (series_id, "series", False),
+        (movie_id, "movie", False),
+    }
+
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        assert all(n.tracked_override is False for n in list_nodes(session, sonarr_instance_id))
+        movie_node = next(
+            n for n in list_nodes(session, radarr_instance_id) if n.id == movie_id
+        )
+        assert movie_node.tracked_override is False
+
+
+def test_bulk_update_unknown_node_id_returns_404(client: TestClient) -> None:
+    _seed_library(client)
+
+    response = client.post(
+        "/api/library/tracked",
+        json={"references": [{"node_type": "episode", "node_id": 999999}], "tracked": True},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 404
+
+
+def test_bulk_update_mismatched_node_type_returns_422(client: TestClient) -> None:
+    instance_id = _seed_library(client)
+    series_id = _node_id(client, instance_id, make_node_key(LibraryNodeKind.SERIES, series_id=1))
+
+    response = client.post(
+        "/api/library/tracked",
+        json={"references": [{"node_type": "episode", "node_id": series_id}], "tracked": False},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 422
+
+
+def test_bulk_update_is_atomic_a_bad_reference_leaves_earlier_ones_unwritten(
+    client: TestClient,
+) -> None:
+    instance_id = _seed_library(client)
+    episode_key = make_node_key(LibraryNodeKind.EPISODE, series_id=1, episode_id=101)
+    episode_id = _node_id(client, instance_id, episode_key)
+
+    response = client.post(
+        "/api/library/tracked",
+        json={
+            "references": [
+                {"node_type": "episode", "node_id": episode_id},
+                {"node_type": "episode", "node_id": 999999},
+            ],
+            "tracked": False,
+        },
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 404
+
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        nodes_by_key = {n.node_key: n for n in list_nodes(session, instance_id)}
+        assert nodes_by_key[episode_key].tracked_override is None  # nothing written
+
+
+def test_bulk_update_requires_at_least_one_reference(client: TestClient) -> None:
+    _seed_library(client)
+
+    response = client.post(
+        "/api/library/tracked",
+        json={"references": [], "tracked": True},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 422
+
+
+def test_bulk_update_requires_the_api_key(client: TestClient) -> None:
+    instance_id = _seed_library(client)
+    episode_id = _node_id(
+        client, instance_id, make_node_key(LibraryNodeKind.EPISODE, series_id=1, episode_id=101)
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        update_global_settings(session, ui_auth_enabled=True)
+
+    response = client.post(
+        "/api/library/tracked",
+        json={"references": [{"node_type": "episode", "node_id": episode_id}], "tracked": False},
+    )
     assert response.status_code == 401

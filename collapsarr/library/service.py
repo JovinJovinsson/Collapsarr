@@ -24,8 +24,10 @@ Four responsibilities:
   no ancestor, so this is just its own override or the global default.
 - :func:`set_tracked` -- write an explicit override on a node and, for a Series
   or Season, **cascade**: overwrite every existing descendant's override to
-  match. (No route exposes this yet -- the Libraries toggle UI is a later
-  ticket -- but the cascade logic is part of this foundational slice.)
+  match. Exposed via ``POST /api/library/tracked``
+  (:mod:`collapsarr.library.routes`, COL-101), which resolves each request's
+  ``{node_type, node_id}`` reference to a node and calls this function per
+  reference.
 - :func:`build_tree` / :func:`build_movie_tree` -- the read paths behind
   ``GET /api/library/instances/{id}/tree``: the visible Series > Season >
   Episode tree, or the visible flat Movie list, each node carrying its
