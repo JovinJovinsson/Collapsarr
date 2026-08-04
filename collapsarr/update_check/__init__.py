@@ -59,10 +59,10 @@ from .comparison import (
     BETA_LOCAL_SEGMENT_PREFIX,
     BETA_TAG_PREFIX,
     VERSION_TAG_PREFIX,
-    extract_beta_sha,
-    extract_beta_tag_sha,
     is_up_to_date,
     is_up_to_date_beta,
+    public_version,
+    running_beta_version_tag,
     running_version_tag,
 )
 from .environment import DOCKERENV_PATH, is_docker_environment
@@ -94,8 +94,6 @@ __all__ = [
     "UpdateCheckStateNotFoundError",
     "UpdateNotAvailableError",
     "dismiss_update_check",
-    "extract_beta_sha",
-    "extract_beta_tag_sha",
     "fetch_latest_prerelease",
     "fetch_latest_release",
     "get_update_check_state",
@@ -103,7 +101,9 @@ __all__ = [
     "is_up_to_date",
     "is_up_to_date_beta",
     "is_update_available",
+    "public_version",
     "reconcile_update_check",
+    "running_beta_version_tag",
     "running_version_tag",
     "undismiss_update_check",
 ]

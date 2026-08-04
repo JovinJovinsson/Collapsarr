@@ -1,18 +1,30 @@
 # Beta release track (UAT branch) — build & publish testable artifacts before
 # anything is cut on main.
 #
+# Beta builds use an orderable `beta-v<base>.<build>` version scheme (COL-96),
+# derived automatically per build by the `meta` job — no manual pyproject bump:
+#   * <base>  = next patch after the latest stable `v*.*.*` git tag
+#               (e.g. latest stable `v0.2.0` → base `0.2.1`, until the next
+#               real tag lands, then it advances to whatever's next).
+#   * <build> = zero-padded 4-digit count of commits since that stable tag
+#               (`git rev-list --count <tag>..HEAD`), restarting at `0001`
+#               right after each real release.
+# So consecutive uat pushes produce `beta-v0.2.1.0001`, `beta-v0.2.1.0002`, …
+# which sort correctly as plain strings (unlike the old random hex short-SHA).
+#
 # Fires on every push to `uat`, then:
 #   1. test-*       — same backend (pytest/ruff/mypy) + frontend (vitest/tsc/
 #                     eslint) gate as the tagged release pipeline (release.yml);
 #                     any failure stops artifacts from being published.
 #   2. docker       — multi-arch (amd64+arm64) image build & push to Docker
 #                     Hub, tagged `beta` (rolling, always the latest uat push)
-#                     and `beta-<short-sha>` (immutable, for pinning a build).
+#                     and `beta-v<base>.<build>` (immutable, for pinning a build).
 #   3. build-wheel  — same frontend-then-wheel build as release.yml, but
-#                     stamped with a `+beta.<short-sha>` local version segment
+#                     stamped with a `<base>.<build>+beta` version (an orderable
+#                     4-part release segment plus a bare `+beta` local marker)
 #                     so it's never mistaken for a real PyPI release.
 #   4. github-release — publishes a GitHub Release marked "Pre-release" (tag
-#                     `beta-<short-sha>`) with the wheel/sdist attached, so
+#                     `beta-v<base>.<build>`) with the wheel/sdist attached, so
 #                     bare-metal/pipx users have somewhere to get a beta build
 #                     from (`pipx install <downloaded .whl>`).
 #
@@ -83,13 +95,35 @@ jobs:
         run: npm run test
 
   meta:
-    name: Derive short SHA
+    name: Derive beta version + tag
     runs-on: ubuntu-latest
     outputs:
-      short_sha: ${{ steps.sha.outputs.short_sha }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - id: sha
-        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      # fetch-depth: 0 pulls the full history + tags so `git tag`/`git rev-list`
+      # can see the latest stable tag and count commits since it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Derive orderable beta version + tag
+        run: |
+          LATEST_TAG=$(git tag --list 'v*.*.*' --sort=-v:refname | head -1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.0.0"
+            BUILD_COUNT=$(git rev-list --count HEAD)
+          else
+            BUILD_COUNT=$(git rev-list --count "${LATEST_TAG}..HEAD")
+          fi
+          LATEST_VERSION="${LATEST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_VERSION"
+          BASE_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          BUILD_NUMBER=$(printf "%04d" "$BUILD_COUNT")
+          VERSION="${BASE_VERSION}.${BUILD_NUMBER}"
+          echo "Derived beta version ${VERSION} (latest stable tag ${LATEST_TAG}, ${BUILD_COUNT} commits since)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=beta-v${VERSION}" >> "$GITHUB_OUTPUT"
 
   docker:
     name: Build & push beta image
@@ -114,7 +148,7 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:beta
-            ${{ env.IMAGE_NAME }}:beta-${{ needs.meta.outputs.short_sha }}
+            ${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.tag }}
           provenance: false
 
   # ---- Build the wheel + sdist (for bare-metal/pipx users) --------------------
@@ -139,10 +173,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Stamp a beta local-version segment
+      - name: Stamp the orderable beta version
         run: |
-          BASE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
-          VERSION="${BASE_VERSION}+beta.${{ needs.meta.outputs.short_sha }}"
+          VERSION="${{ needs.meta.outputs.version }}+beta"
           echo "Building beta version ${VERSION}"
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
       - name: Build distributions
@@ -184,8 +217,8 @@ jobs:
       - name: Create GitHub Pre-release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: beta-${{ needs.meta.outputs.short_sha }}
-          name: Beta build ${{ needs.meta.outputs.short_sha }}
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: Beta build ${{ needs.meta.outputs.tag }}
           prerelease: true
           make_latest: 'false'
           generate_release_notes: true

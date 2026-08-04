@@ -1,21 +1,32 @@
-"""Pure version-identity comparison for the stable and beta channels (COL-86, COL-88).
+"""Pure version-identity comparison for the stable and beta channels (COL-86, COL-88, COL-96).
 
 Deliberately **not** semver ordering: the running instance's version either
 *is* the latest tag/SHA or it *isn't*. This module only ever answers "does
 the running version match the latest known release", with no I/O and no
 knowledge of :mod:`collapsarr.update_check.client` or the database.
 
-The stable channel (:func:`is_up_to_date`) compares the whole tag string by
-exact identity. The beta channel (:func:`is_up_to_date_beta`, COL-88) instead
-compares just the embedded short-SHA: the beta workflow
-(``.github/workflows/beta.yml``) stamps the running ``__version__`` with a
-``+beta.<short-sha>`` local segment and tags each beta Release
-``beta-<short-sha>`` using the *same* short-SHA, so two beta builds of the
-same base version differ only in that suffix -- comparing the whole tag would
-never match even when the SHAs are identical.
+The stable channel (:func:`is_up_to_date`/:func:`running_version_tag`) is a
+straight identity comparison of the whole tag string: ``v<version>`` against a
+fetched release's ``tag_name``. The beta channel
+(:func:`is_up_to_date_beta`, COL-96) compares a *structured* ``(base, build)``
+identity instead -- the beta workflow (``.github/workflows/beta.yml``) stamps
+the running ``__version__`` with a fully-orderable ``<base>.<build>+beta``
+release+local segment (e.g. ``0.2.1.0007+beta``) and tags each beta Release
+``beta-v<base>.<build>`` (e.g. ``beta-v0.2.1.0007``) using the *same* base+build
+identity. It cannot compare those as raw strings, though: an installed wheel's
+``__version__`` has been PEP 440-normalized (leading zeros stripped from the
+release segment, so ``0.2.1.0007+beta`` reports as ``0.2.1.7+beta``) while the
+Release *tag* stays zero-padded (it's a plain string, never parsed as a
+version). So it parses both sides into ``(base, build)`` and compares the build
+as an ``int`` (:func:`_beta_identity`), immune to that padding difference. The
+old scheme (COL-88) embedded a git short-SHA and needed to be un-embedded on
+both sides before comparing; the build number carries the identity now, so that
+extraction is gone.
 """
 
 from __future__ import annotations
+
+import re
 
 from collapsarr.settings.models import BETA_LOCAL_SEGMENT_PREFIX
 
@@ -24,11 +35,12 @@ VERSION_TAG_PREFIX = "v"
 matching the git tag pattern documented in ``docs/TRACKER.md`` /
 ``CONTEXT.md``'s Release Channel entry (``v*.*.*`` on ``main``)."""
 
-BETA_TAG_PREFIX = "beta-"
-"""The beta channel's GitHub Release tag prefix: the same workflow tags each
-beta Release ``beta-<short-sha>`` (see ``.github/workflows/beta.yml``'s
-``github-release`` job), using the identical short-SHA as
-:data:`BETA_LOCAL_SEGMENT_PREFIX` above."""
+BETA_TAG_PREFIX = "beta-v"
+"""The beta channel's GitHub Release tag prefix: the workflow tags each beta
+Release ``beta-v<base>.<build>`` (see ``.github/workflows/beta.yml``'s
+``github-release`` job), i.e. the stable ``v``-prefix with a ``beta-`` marker
+in front, wrapping the same ``<base>.<build>`` identity carried by the running
+version's public part."""
 
 
 def running_version_tag(version: str) -> str:
@@ -58,68 +70,103 @@ def is_up_to_date(current_version: str, latest_tag: str | None) -> bool:
     return running_version_tag(current_version) == latest_tag
 
 
-def extract_beta_sha(version: str) -> str | None:
-    """Return the short-SHA embedded in a running version's beta local segment.
+def public_version(version: str) -> str:
+    """Strip a PEP 440 local version segment (the part after ``+``).
 
-    E.g. ``extract_beta_sha("1.2.3+beta.abc1234") == "abc1234"``. Returns
-    ``None`` when ``version`` carries no :data:`BETA_LOCAL_SEGMENT_PREFIX` --
-    a stable build's version string never contains it -- or when the segment
-    is present but the SHA after it is empty (a malformed version string).
+    E.g. ``public_version("0.2.1.0007+beta") == "0.2.1.0007"``. A version with
+    no local segment is returned unchanged. Used by
+    :func:`running_beta_version_tag` to recover the ``<base>.<build>`` identity
+    that the beta Release tag (``beta-v<base>.<build>``) is cut from.
     """
-    index = version.find(BETA_LOCAL_SEGMENT_PREFIX)
-    if index == -1:
-        return None
-    sha = version[index + len(BETA_LOCAL_SEGMENT_PREFIX) :]
-    return sha or None
+    return version.split("+", 1)[0]
 
 
-def extract_beta_tag_sha(tag: str) -> str | None:
-    """Return the short-SHA suffix of a beta prerelease tag (``beta-<sha>``).
+def running_beta_version_tag(version: str) -> str:
+    """Return the beta Release tag string a running beta ``__version__`` maps to.
 
-    Returns ``None`` when ``tag`` doesn't start with :data:`BETA_TAG_PREFIX`
-    (e.g. it's a stable ``v*.*.*`` tag) or the suffix after the prefix is
-    empty (a malformed tag).
+    ``f"beta-v{public_version(version)}"`` -- a display/reconstruction helper
+    (beta counterpart of :func:`running_version_tag`), dropping the ``+beta``
+    local segment first. **Not** the basis for identity comparison: a running
+    version's release segment has been PEP 440-normalized (leading zeros
+    stripped -- ``0.2.1.0007+beta`` installs as ``0.2.1.7+beta``), so this
+    yields ``beta-v0.2.1.7`` where the freshly-cut CI tag is the zero-padded
+    ``beta-v0.2.1.0007``. :func:`is_up_to_date_beta` therefore compares
+    *structured* ``(base, build)`` identities via :func:`_beta_identity`, not
+    these strings, so the padding difference doesn't matter (COL-96).
     """
-    if not tag.startswith(BETA_TAG_PREFIX):
+    return f"{BETA_TAG_PREFIX}{public_version(version)}"
+
+
+_BETA_IDENTITY_RE = re.compile(r"^(\d+\.\d+\.\d+)\.(\d+)$")
+"""Splits a beta public version ``<major>.<minor>.<patch>.<build>`` into its
+``(base, build)`` groups. Applied to both the running version's public part and
+the fetched tag's ``beta-v`` suffix so the build number can be compared as an
+``int`` -- immune to the leading-zero difference between a normalized installed
+version (``0.2.1.7``) and a zero-padded CI-cut tag (``0.2.1.0007``)."""
+
+
+def _beta_identity(public: str) -> tuple[str, int] | None:
+    """Parse a beta public version into a zero-padding-immune ``(base, build)``.
+
+    ``"0.2.1.0007"`` and the PEP 440-normalized ``"0.2.1.7"`` both parse to
+    ``("0.2.1", 7)`` -- the build number is compared as an ``int``, so the
+    leading zeros a CI-cut tag keeps but an installed wheel's metadata loses no
+    longer break the match. Returns ``None`` for anything that isn't the
+    expected ``<base>.<build>`` shape (a bare ``<base>``, a stable ``v`` tag's
+    suffix, junk), which the caller treats as "no beta identity -> not a match".
+    """
+    match = _BETA_IDENTITY_RE.match(public)
+    if match is None:
         return None
-    sha = tag[len(BETA_TAG_PREFIX) :]
-    return sha or None
+    return match.group(1), int(match.group(2))
 
 
 def is_up_to_date_beta(current_version: str, latest_tag: str | None) -> bool:
-    """Return whether the running version's embedded beta SHA matches the latest prerelease tag's.
+    """Return whether the running beta version matches the latest prerelease tag.
 
     Beta-channel counterpart of :func:`is_up_to_date`: still pure identity
-    comparison (no semver ordering), but comparing just the embedded
-    short-SHA (:func:`extract_beta_sha`) against the latest prerelease tag's
-    ``beta-<sha>`` suffix (:func:`extract_beta_tag_sha`) instead of the whole
-    tag string -- see the module docstring for why.
+    comparison (no semver *ordering*), but comparing the structured
+    ``(base, build)`` identity (:func:`_beta_identity`) of the running version's
+    public part against that of the fetched ``beta-v<base>.<build>`` tag's
+    suffix, rather than matching the two tag *strings* verbatim. This is
+    deliberate (COL-96): the running ``__version__`` an installed wheel reports
+    has been PEP 440-normalized -- ``0.2.1.0007+beta`` becomes ``0.2.1.7+beta``
+    -- while the GitHub Release tag stays the zero-padded ``beta-v0.2.1.0007``
+    (a plain string, never parsed as a version), so an exact string match would
+    spuriously fail for every build past ``0009``. Comparing ``int`` build
+    numbers makes the check immune to that padding difference.
 
     A ``None`` ``latest_tag`` (no successful fetch yet) reports "not up to
     date", same as :func:`is_up_to_date`. A **stable** running version (no
-    embedded beta SHA) also reports "not up to date" when checked against the
-    beta channel -- there is no SHA to compare, so this is the documented
-    "switch to beta, see 'update available' with nothing to compare yet"
-    edge case (COL-88's acceptance criteria), not a bug.
+    :data:`~collapsarr.settings.models.BETA_LOCAL_SEGMENT_PREFIX` marker) also
+    reports "not up to date" when checked against the beta channel -- there is
+    no beta identity to compare, so this is the documented "switch to beta,
+    see 'update available' with nothing to compare yet" edge case (COL-88's
+    acceptance criteria), not a bug. A non-beta tag (no ``beta-v`` prefix) or
+    either side failing to parse as ``<base>.<build>`` is likewise "not a
+    match".
     """
     if latest_tag is None:
         return False
-    current_sha = extract_beta_sha(current_version)
-    if current_sha is None:
+    if BETA_LOCAL_SEGMENT_PREFIX not in current_version:
         return False
-    latest_sha = extract_beta_tag_sha(latest_tag)
-    if latest_sha is None:
+    if not latest_tag.startswith(BETA_TAG_PREFIX):
         return False
-    return current_sha == latest_sha
+
+    running_identity = _beta_identity(public_version(current_version))
+    tag_identity = _beta_identity(latest_tag[len(BETA_TAG_PREFIX) :])
+    if running_identity is None or tag_identity is None:
+        return False
+    return running_identity == tag_identity
 
 
 __all__ = [
     "BETA_LOCAL_SEGMENT_PREFIX",
     "BETA_TAG_PREFIX",
     "VERSION_TAG_PREFIX",
-    "extract_beta_sha",
-    "extract_beta_tag_sha",
     "is_up_to_date",
     "is_up_to_date_beta",
+    "public_version",
+    "running_beta_version_tag",
     "running_version_tag",
 ]

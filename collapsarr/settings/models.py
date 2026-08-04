@@ -91,20 +91,22 @@ get_global_settings` at creation time, which overrides it with ``"beta"``
 when the running build is itself a beta build (COL-88) -- see
 :data:`BETA_LOCAL_SEGMENT_PREFIX`."""
 
-BETA_LOCAL_SEGMENT_PREFIX = "+beta."
-"""The literal substring immediately preceding a beta build's embedded
-short-SHA in the running ``collapsarr.__version__`` (COL-88) -- e.g.
-``"1.2.3+beta.abc1234"``, stamped by ``.github/workflows/beta.yml``'s
-``build-wheel`` job. Used by :func:`collapsarr.settings.service.
-get_global_settings` to auto-default a fresh install's ``update_channel`` to
-``"beta"`` when the running build is itself a beta build. This is the single
-source of truth for the literal: :mod:`collapsarr.update_check.comparison`
-imports it directly for its own beta-channel version comparison rather than
-redefining it -- ``update_check`` already imports from :mod:`collapsarr.
-settings.models`/:mod:`collapsarr.settings.service` elsewhere (e.g.
-:mod:`collapsarr.update_check.scheduler`), and nothing in :mod:`collapsarr.
-settings` imports :mod:`collapsarr.update_check`, so there is no circular
-import risk."""
+BETA_LOCAL_SEGMENT_PREFIX = "+beta"
+"""The bare PEP 440 local-version marker a beta build carries in its running
+``collapsarr.__version__`` (COL-96) -- e.g. ``"0.2.1.0007+beta"``, stamped by
+``.github/workflows/beta.yml``'s ``build-wheel`` job. It is purely a *marker*
+now: the build's ordering identity lives in the release segment
+(``<base>.<build>``) ahead of it, so nothing follows ``+beta`` (COL-88's old
+scheme appended a ``.<short-sha>`` here -- COL-96 dropped it). Used by
+:func:`collapsarr.settings.service.get_global_settings` (a substring check) to
+auto-default a fresh install's ``update_channel`` to ``"beta"`` when the
+running build is itself a beta build. This is the single source of truth for
+the literal: :mod:`collapsarr.update_check.comparison` imports it directly for
+its own beta-channel version comparison rather than redefining it --
+``update_check`` already imports from :mod:`collapsarr.settings.models`/
+:mod:`collapsarr.settings.service` elsewhere (e.g. :mod:`collapsarr.
+update_check.scheduler`), and nothing in :mod:`collapsarr.settings` imports
+:mod:`collapsarr.update_check`, so there is no circular import risk."""
 
 
 def generate_api_key() -> str:

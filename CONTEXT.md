@@ -56,10 +56,13 @@ A `GlobalSettings.update_channel` value (`stable`|`beta`) selecting which
 GitHub Release stream the **Update Check** compares the running instance
 against. `stable` = the latest non-prerelease Release (cut by `release.yml`
 on a `v*.*.*` tag on `main`); `beta` = the latest prerelease Release (cut by
-`beta.yml` on every push to `uat`, tagged `beta-<sha>`). Defaults to
+`beta.yml` on every push to `uat`, tagged `beta-v<base>.<build>` — an
+orderable next-patch-after-latest-stable base plus a zero-padded
+commits-since-that-tag build number, e.g. `beta-v0.2.1.0007`). Defaults to
 `stable`; auto-detected as `beta` on first boot if the running `__version__`
-carries a `+beta.<sha>` local segment. Not to be confused with a Docker image
-tag or a Health Check category — it is purely the update-detection setting.
+carries a bare `+beta` local-version marker. Not to be confused with a Docker
+image tag or a Health Check category — it is purely the update-detection
+setting.
 
 ## Update Check
 
