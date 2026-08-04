@@ -1127,6 +1127,15 @@ a {
   overflow-x: auto;
 }
 
+/* "Select all" (COL-109): sits above the table/tree, inside the same
+   scrollable panel so it stays adjacent to what it acts on. */
+.library-tree-panel__actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--c-border);
+}
+
 .library-tree-table {
   width: 100%;
   border-collapse: collapse;

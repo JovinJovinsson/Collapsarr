@@ -96,6 +96,34 @@ function decodeSelectionKey(key: string): TrackedNodeReference {
 }
 
 /**
+ * Every selection key in a (already search/Tracked-filtered) Series list,
+ * Series + Season + Episode alike (COL-109) -- "Select all" adds all of
+ * these to the existing cross-level selection in one shot. Independent of
+ * each branch's current expand/collapse state (`useExpandable`'s local
+ * state only controls what's in the DOM right now, not what the filters
+ * consider "currently shown"), matching COL-104's own "post search/Tracked-
+ * filter" definition of what's visible.
+ */
+function seriesListSelectionKeys(series: SeriesNode[]): string[] {
+  const keys: string[] = [];
+  for (const seriesNode of series) {
+    keys.push(selectionKey("series", seriesNode.id));
+    for (const seasonNode of seriesNode.seasons) {
+      keys.push(selectionKey("season", seasonNode.id));
+      for (const episode of seasonNode.episodes) {
+        keys.push(selectionKey("episode", episode.id));
+      }
+    }
+  }
+  return keys;
+}
+
+/** Every selection key in a (already filtered) flat Movie list (COL-109); see `seriesListSelectionKeys`. */
+function movieSelectionKeys(movies: MovieNode[]): string[] {
+  return movies.map((movie) => selectionKey("movie", movie.id));
+}
+
+/**
  * The Tracked-status filter's three states (COL-104): "all" (the default)
  * shows every row regardless of its resolved Tracked value; the other two
  * narrow to rows whose *resolved* Tracked value (the same `tracked` field
@@ -238,6 +266,41 @@ interface SelectionProps {
   selectionDisabled: boolean;
 }
 
+/**
+ * Shared shape the "Select all" control needs from `LibraryPage` (COL-109) --
+ * its own small interface, matching `TrackedToggleProps`/`SelectionProps`'s
+ * pattern, rather than a loose extra field: `SelectionCheckbox` has no use
+ * for `onSelectAll`, so it stays out of `SelectionProps` even though both
+ * share the same `selectionDisabled` guard.
+ */
+interface SelectAllProps {
+  onSelectAll: () => void;
+}
+
+/**
+ * "Select all" control (COL-109): sits at the top of the Series tree/Movie
+ * table and adds every currently-rendered (post search/Tracked-filter) node
+ * reference to `LibraryPage`'s cross-level selection in one click, reusing
+ * the same `selected` set the row checkboxes and `BulkActionToolbar` already
+ * share. Deliberately additive (never replaces the existing selection) so
+ * it composes with a selection already made elsewhere, and disabled while a
+ * bulk apply is in flight -- same guard as the row checkboxes.
+ */
+function SelectAllButton({ onSelectAll, disabled }: SelectAllProps & { disabled: boolean }) {
+  return (
+    <div className="library-tree-panel__actions">
+      <button
+        type="button"
+        className="btn btn--ghost btn--sm"
+        disabled={disabled}
+        onClick={onSelectAll}
+      >
+        Select all
+      </button>
+    </div>
+  );
+}
+
 /** One row's Select checkbox (COL-103), shared by every node kind's row. */
 function SelectionCheckbox({
   nodeType,
@@ -287,13 +350,15 @@ function SeriesTree({
   onToggleSelect,
   selectionDisabled,
   expandAll,
-}: { series: SeriesNode[]; expandAll: boolean } & TrackedToggleProps & SelectionProps) {
+  onSelectAll,
+}: { series: SeriesNode[]; expandAll: boolean } & TrackedToggleProps & SelectionProps & SelectAllProps) {
   const [expandedSeries, toggleSeries] = useExpandable();
   const [expandedSeasons, toggleSeason] = useExpandable();
   const selection: SelectionProps = { isSelected, onToggleSelect, selectionDisabled };
 
   return (
     <div className="panel library-tree-panel">
+      <SelectAllButton onSelectAll={onSelectAll} disabled={selectionDisabled} />
       <table className="library-tree-table">
         <thead>
           <tr>
@@ -428,9 +493,11 @@ function MovieTable({
   isSelected,
   onToggleSelect,
   selectionDisabled,
-}: { movies: MovieNode[] } & TrackedToggleProps & SelectionProps) {
+  onSelectAll,
+}: { movies: MovieNode[] } & TrackedToggleProps & SelectionProps & SelectAllProps) {
   return (
     <div className="panel library-tree-panel">
+      <SelectAllButton onSelectAll={onSelectAll} disabled={selectionDisabled} />
       <table className="library-tree-table">
         <thead>
           <tr>
@@ -541,6 +608,11 @@ function BulkActionToolbar({
  * (including any cascade to a selected Series/Season's descendants) without
  * a manual refresh. A successful bulk apply clears the selection; a failed
  * one leaves it as-is so the user can retry.
+ *
+ * "Select all" (COL-109), at the top of `SeriesTree`/`MovieTable`, adds every
+ * currently-rendered (post search/Tracked-filter) node's reference to that
+ * same `selected` set in one click -- `seriesListSelectionKeys`/
+ * `movieSelectionKeys` flatten whichever filtered tree/list is on screen.
  *
  * On a successful load, records this instance as the last-visited one
  * (`rememberVisitedLibraryInstance`) so a later bare "Libraries" click
@@ -653,6 +725,22 @@ export function LibraryPage() {
 
   function handleClearSelection() {
     setSelected(new Set());
+  }
+
+  /**
+   * "Select all" (COL-109): unions the given (already filtered) keys into
+   * the existing selection rather than replacing it, so it composes with
+   * whatever's already selected -- and, since it never touches `selected`
+   * based on the filter state itself, a later search/Tracked-filter change
+   * can't retroactively prune what this just added (same persistence
+   * `handleToggleSelect`'s selections already get, per COL-104).
+   */
+  function handleSelectAllVisible(keys: string[]) {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      for (const key of keys) next.add(key);
+      return next;
+    });
   }
 
   async function handleBulkApply(nextTracked: boolean) {
@@ -781,6 +869,7 @@ export function LibraryPage() {
             onToggleSelect={handleToggleSelect}
             selectionDisabled={bulkPending}
             expandAll={filtersActive}
+            onSelectAll={() => handleSelectAllVisible(seriesListSelectionKeys(filteredSeries))}
           />
         ))}
 
@@ -808,6 +897,7 @@ export function LibraryPage() {
             isSelected={isSelected}
             onToggleSelect={handleToggleSelect}
             selectionDisabled={bulkPending}
+            onSelectAll={() => handleSelectAllVisible(movieSelectionKeys(filteredMovies))}
           />
         ))}
     </section>
