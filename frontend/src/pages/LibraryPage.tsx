@@ -117,10 +117,13 @@ function matchesSearchQuery(title: string, query: string): boolean {
 }
 
 /**
- * Filters one Episode leaf (COL-104). Kept if its own resolved Tracked value
- * satisfies the Tracked filter, and -- unless an ancestor Series title
- * already satisfied the search query, in which case the whole subtree is in
- * scope -- its own title matches the search query too.
+ * Filters one Episode leaf (COL-104/COL-104 tracked-filter fix). The Tracked
+ * filter is a strict, standalone gate on the Episode's *own* resolved
+ * Tracked value -- no ancestor-context carve-out, per AC2's literal
+ * wording ("shows only nodes currently resolving to Tracked"). Only once
+ * that gate passes does the search side of things run: kept if an ancestor
+ * Series title already satisfied the search query (the whole subtree is in
+ * scope), or its own title matches the search query.
  */
 function filterEpisode(
   episode: EpisodeNode,
@@ -128,19 +131,25 @@ function filterEpisode(
   trackedFilter: TrackedFilterValue,
   ancestorSearchSatisfied: boolean,
 ): EpisodeNode | null {
+  if (!matchesTrackedFilter(episode.tracked, trackedFilter)) return null;
   const searchSatisfied = ancestorSearchSatisfied || matchesSearchQuery(episode.title, query);
-  return matchesTrackedFilter(episode.tracked, trackedFilter) && searchSatisfied ? episode : null;
+  return searchSatisfied ? episode : null;
 }
 
 /**
- * Filters one Season (COL-104). A Season carries no title of its own to
- * search against, so it only counts as a direct match (unlocking every
- * Episode beneath it, still narrowed by the Tracked filter) once an
- * ancestor Series title has already satisfied the search *and* the
- * Season's own resolved Tracked value matches the filter. Otherwise it's
- * kept only as context for a matching descendant Episode, narrowed to just
- * the Episodes that matched -- a search for one Episode shouldn't drag its
- * unrelated siblings back into view.
+ * Filters one Season (COL-104/COL-104 tracked-filter fix). The Tracked
+ * filter gates the Season's *own* resolved Tracked value first and
+ * independently of its descendants: if the Season itself doesn't resolve to
+ * the selected filter, the whole branch is dropped even when an Episode
+ * beneath it happens to match (AC2 grants search, not the Tracked filter,
+ * an ancestor-context carve-out -- see `filterEpisode`/`filterSeriesNode`).
+ * Only once that gate passes does the pre-existing search-context logic
+ * run: a Season carries no title of its own to search against, so it only
+ * counts as a direct match (unlocking every already-Tracked-filtered
+ * Episode beneath it) once an ancestor Series title has already satisfied
+ * the search. Otherwise it's kept only as context for a matching descendant
+ * Episode, narrowed to just the Episodes that matched -- a search for one
+ * Episode shouldn't drag its unrelated siblings back into view.
  */
 function filterSeason(
   season: SeasonNode,
@@ -148,34 +157,43 @@ function filterSeason(
   trackedFilter: TrackedFilterValue,
   ancestorSearchSatisfied: boolean,
 ): SeasonNode | null {
+  if (!matchesTrackedFilter(season.tracked, trackedFilter)) return null;
   const episodes = season.episodes
     .map((episode) => filterEpisode(episode, query, trackedFilter, ancestorSearchSatisfied))
     .filter((episode): episode is EpisodeNode => episode !== null);
-  if (ancestorSearchSatisfied && matchesTrackedFilter(season.tracked, trackedFilter)) {
+  if (ancestorSearchSatisfied) {
     return { ...season, episodes };
   }
   return episodes.length > 0 ? { ...season, episodes } : null;
 }
 
 /**
- * Filters one Series (COL-104): kept if its own title matches the search
- * query *and* its own resolved Tracked value matches the filter, in which
- * case every descendant Season/Episode is shown too (still narrowed by the
- * Tracked filter) -- "search finds the Series, its whole subtree comes
- * along". Otherwise kept only when a descendant Season/Episode matches both
- * filters on its own, so the Series row still renders as the context a
- * matching Season/Episode needs to have somewhere to render under.
+ * Filters one Series (COL-104/COL-104 tracked-filter fix). The Tracked
+ * filter gates the Series' *own* resolved Tracked value first and
+ * independently of its descendants: if the Series itself doesn't resolve to
+ * the selected filter, the whole subtree is dropped even when a Season or
+ * Episode beneath it happens to match -- the Tracked filter gets no
+ * ancestor-context carve-out (unlike search, see below). Only once that
+ * gate passes does the pre-existing search logic run: kept if its own title
+ * matches the search query, in which case every descendant Season/Episode
+ * is shown too (each still independently gated by the Tracked filter) --
+ * "search finds the Series, its whole subtree comes along" (AC1's
+ * "descendants when a match is found" carve-out). Otherwise kept only when
+ * a descendant Season/Episode matches on its own, so the Series row still
+ * renders as the context a matching Season/Episode needs to have somewhere
+ * to render under.
  */
 function filterSeriesNode(
   series: SeriesNode,
   query: string,
   trackedFilter: TrackedFilterValue,
 ): SeriesNode | null {
+  if (!matchesTrackedFilter(series.tracked, trackedFilter)) return null;
   const ownSearchMatch = matchesSearchQuery(series.title, query);
   const seasons = series.seasons
     .map((season) => filterSeason(season, query, trackedFilter, ownSearchMatch))
     .filter((season): season is SeasonNode => season !== null);
-  if (ownSearchMatch && matchesTrackedFilter(series.tracked, trackedFilter)) {
+  if (ownSearchMatch) {
     return { ...series, seasons };
   }
   return seasons.length > 0 ? { ...series, seasons } : null;

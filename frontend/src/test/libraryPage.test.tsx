@@ -173,6 +173,83 @@ const mixedTrackedTree: LibraryTreeResponse = {
   ],
 };
 
+/**
+ * A single-Series tree with a *mixed-within-branch* resolved Tracked state
+ * (COL-104 must-fix): unlike `mixedTrackedTree` above, which only ever flips
+ * Tracked homogeneously across an entire branch, this Series itself resolves
+ * Tracked and has two Seasons that disagree with each other -- Season 1
+ * resolves Not Tracked despite having a Tracked Episode underneath it
+ * (per-node Tracked overrides legitimately produce exactly this split, see
+ * COL-101), while Season 2 resolves Tracked throughout. This is the shape
+ * that exposed the bug where the Tracked filter reused search's
+ * ancestor-context machinery: under `trackedFilter="tracked"`, the Series'
+ * own match used to leak an `ancestorSearchSatisfied` flag down that made
+ * Season 1 render solely because its Episode matched, even though Season 1
+ * itself resolves Not Tracked. AC2 grants no such carve-out for the Tracked
+ * filter (only search gets one, per AC1) -- so Season 1 must stay hidden
+ * here, and Season 2 (which itself resolves Tracked) must still show.
+ */
+const withinBranchMixedTrackedTree: LibraryTreeResponse = {
+  instance_id: 1,
+  series: [
+    {
+      id: 12,
+      kind: "series",
+      sonarr_series_id: 102,
+      title: "The Wire",
+      tracked: true,
+      seasons: [
+        {
+          id: 22,
+          kind: "season",
+          season_number: 1,
+          tracked: false,
+          episodes: [
+            {
+              id: 33,
+              kind: "episode",
+              sonarr_episode_id: 330,
+              season_number: 1,
+              episode_number: 1,
+              title: "The Target",
+              has_file: true,
+              tracked: true,
+            },
+            {
+              id: 34,
+              kind: "episode",
+              sonarr_episode_id: 331,
+              season_number: 1,
+              episode_number: 2,
+              title: "The Detail",
+              has_file: true,
+              tracked: false,
+            },
+          ],
+        },
+        {
+          id: 23,
+          kind: "season",
+          season_number: 2,
+          tracked: true,
+          episodes: [
+            {
+              id: 35,
+              kind: "episode",
+              sonarr_episode_id: 332,
+              season_number: 2,
+              episode_number: 1,
+              title: "Ebb Tide",
+              has_file: true,
+              tracked: true,
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 const movieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
@@ -753,6 +830,34 @@ describe("LibraryPage (COL-100)", () => {
     });
     expect(await screen.findByRole("button", { name: /breaking bad/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /better call saul/i })).not.toBeInTheDocument();
+  });
+
+  it("keeps the Tracked filter strict per-node within a single branch, with no ancestor-context carve-out (COL-104 must-fix)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: withinBranchMixedTrackedTree }));
+    renderLibraryPage(1);
+
+    await screen.findByRole("button", { name: /the wire/i });
+    fireEvent.change(screen.getByRole("combobox", { name: /tracked filter/i }), {
+      target: { value: "tracked" },
+    });
+
+    // The Series itself resolves Tracked, so it still shows (the inverse
+    // case: a node that itself matches the filter must keep showing).
+    expect(await screen.findByRole("button", { name: /the wire/i })).toBeInTheDocument();
+
+    // Season 2 itself resolves Tracked, so it (and its Tracked Episode) show.
+    expect(await screen.findByRole("button", { name: /season 2/i })).toBeInTheDocument();
+    expect(screen.getByText(/ebb tide/i)).toBeInTheDocument();
+
+    // Season 1 itself resolves Not Tracked -- it must NOT render even though
+    // "The Target" underneath it resolves Tracked. Under the old
+    // ancestor-context-leaking implementation this row (and "The Target")
+    // would incorrectly appear because the Series' own match satisfied the
+    // shared `ancestorSearchSatisfied`-style flag; AC2 grants the Tracked
+    // filter no such carve-out.
+    expect(screen.queryByRole("button", { name: /season 1/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/the target/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/the detail/i)).not.toBeInTheDocument();
   });
 
   it("keeps a filtered-out row's cross-level selection intact rather than dropping it (COL-103/COL-104)", async () => {
