@@ -642,6 +642,106 @@ a {
   max-width: 32ch;
 }
 
+.activity-table__error-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-table__error-text--clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.activity-table__show-more {
+  margin-top: var(--sp-1);
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--c-accent-hover);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.activity-table__show-more:hover {
+  color: var(--c-accent);
+  text-decoration: underline;
+}
+
+/* ---- Modal -------------------------------------------------------------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-5);
+  z-index: 100;
+}
+
+.modal {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.4);
+  width: 100%;
+  max-width: 640px;
+  max-height: min(80vh, 640px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--c-border);
+}
+
+.modal__title {
+  margin: 0;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+.modal__close {
+  border: none;
+  background: none;
+  color: var(--c-text-muted);
+  font-size: var(--fs-lg);
+  line-height: 1;
+  cursor: pointer;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+}
+
+.modal__close:hover {
+  color: var(--c-text);
+  background: var(--c-surface-raised);
+}
+
+.modal__body {
+  padding: var(--sp-5);
+  overflow-y: auto;
+}
+
+.activity-error-modal__text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--c-text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .activity-table__status {
   display: inline-flex;
   align-items: center;

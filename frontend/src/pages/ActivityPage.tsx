@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { fetchJobHistory } from "../api/activity";
 import { ActivityIcon } from "../components/icons";
+import { Modal } from "../components/Modal";
 import type { JobHistoryEntry, JobStatus } from "../types/activity";
 
 const STATUS_LABEL: Record<JobStatus, string> = {
@@ -13,11 +14,19 @@ const STATUS_LABEL: Record<JobStatus, string> = {
 
 const STATUS_OPTIONS: JobStatus[] = ["pending", "running", "succeeded", "failed"];
 
+/** Error text past this length (or containing a newline) gets truncated with a "Show more" modal. */
+const ERROR_TRUNCATE_THRESHOLD = 160;
+
 /** Best-effort display title from a file path: last segment, minus extension. */
 function titleFromPath(filePath: string): string {
   const base = filePath.split(/[/\\]/).pop() || filePath;
   const dot = base.lastIndexOf(".");
   return dot > 0 ? base.slice(0, dot) : base;
+}
+
+/** Whether `text` is long/complex enough to warrant truncation + a "Show more" modal. */
+function needsTruncation(text: string): boolean {
+  return text.length > ERROR_TRUNCATE_THRESHOLD || text.includes("\n");
 }
 
 /** Formats an ISO timestamp for display, or an em dash when absent/unset. */
@@ -45,6 +54,7 @@ export function ActivityPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [fileFilter, setFileFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | JobStatus>("all");
+  const [expandedError, setExpandedError] = useState<JobHistoryEntry | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -72,7 +82,12 @@ export function ActivityPage() {
   const filtered = useMemo(() => {
     if (state.status !== "ready") return [];
     const needle = fileFilter.trim().toLowerCase();
-    return state.entries.filter((entry) => {
+    // `fetchJobHistory` returns oldest-first (matching the backend's
+    // insertion-order query, which `FileDetailPage`'s per-target status
+    // resolution depends on) -- reversed here, display-only, so the most
+    // recently queued job (including one still pending/running, COL-108)
+    // shows up at the top of the Activity table.
+    return [...state.entries].reverse().filter((entry) => {
       const matchesFile = needle === "" || entry.file_path.toLowerCase().includes(needle);
       const matchesStatus = statusFilter === "all" || entry.status === statusFilter;
       return matchesFile && matchesStatus;
@@ -183,12 +198,39 @@ export function ActivityPage() {
                   <td>{entry.exit_code ?? "—"}</td>
                   <td>{entry.target ?? "—"}</td>
                   <td>{entry.language ?? "—"}</td>
-                  <td className="activity-table__error">{entry.error_text ?? "—"}</td>
+                  <td className="activity-table__error">
+                    {entry.error_text ? (
+                      needsTruncation(entry.error_text) ? (
+                        <>
+                          <p className="activity-table__error-text activity-table__error-text--clamped">
+                            {entry.error_text}
+                          </p>
+                          <button
+                            type="button"
+                            className="activity-table__show-more"
+                            onClick={() => setExpandedError(entry)}
+                          >
+                            Show more
+                          </button>
+                        </>
+                      ) : (
+                        <p className="activity-table__error-text">{entry.error_text}</p>
+                      )
+                    ) : (
+                      "—"
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+      )}
+
+      {expandedError && (
+        <Modal title={titleFromPath(expandedError.file_path)} onClose={() => setExpandedError(null)}>
+          <pre className="activity-error-modal__text">{expandedError.error_text}</pre>
+        </Modal>
       )}
     </section>
   );
