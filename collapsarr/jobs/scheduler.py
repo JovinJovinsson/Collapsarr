@@ -88,7 +88,12 @@ from pathlib import Path
 import httpx
 from sqlalchemy.orm import Session, sessionmaker
 
-from collapsarr.arr.catalog import SonarrCatalog, fetch_sonarr_catalog
+from collapsarr.arr.catalog import (
+    RadarrCatalog,
+    SonarrCatalog,
+    fetch_radarr_catalog,
+    fetch_sonarr_catalog,
+)
 from collapsarr.arr.files import fetch_monitored_files
 from collapsarr.arr.models import ArrInstance, InstanceType, resolve_path
 from collapsarr.arr.service import list_instances, list_path_mappings
@@ -112,6 +117,12 @@ ProbeFn = Callable[[Path], Sequence[AudioStreamInfo]]
 #: Matches :func:`~collapsarr.arr.catalog.fetch_sonarr_catalog`, and is
 #: injectable so the library-sync integration test needs no real Sonarr.
 CatalogFetchFn = Callable[[ArrInstance], SonarrCatalog]
+
+#: Signature of the Radarr catalog-fetch seam (COL-99): pull a Radarr
+#: instance's full, flat movie catalog. Matches
+#: :func:`~collapsarr.arr.catalog.fetch_radarr_catalog`, and is injectable so
+#: the library-sync integration test needs no real Radarr.
+RadarrCatalogFetchFn = Callable[[ArrInstance], RadarrCatalog]
 
 #: A job is "in flight" -- and so a duplicate -- when in either of these states.
 _ACTIVE_STATUSES = (JobStatus.PENDING, JobStatus.RUNNING)
@@ -141,11 +152,12 @@ class JobScheduler:
     downmix engine already takes a ``DownmixSettings`` argument, and a real
     settings store can be threaded through here later.
 
-    ``probe``, ``catalog_fetch`` and ``now`` are injectable seams for testing (a
-    stub probe, a stub Sonarr full-catalog fetch, and a controllable clock); all
-    default to the real implementations. ``catalog_fetch`` (COL-98) is what the
-    scan uses to mirror each Sonarr instance's catalog into the Library on the
-    same cadence -- see :meth:`scan_once`.
+    ``probe``, ``catalog_fetch``, ``radarr_catalog_fetch`` and ``now`` are
+    injectable seams for testing (a stub probe, stub Sonarr/Radarr full-catalog
+    fetches, and a controllable clock); all default to the real
+    implementations. ``catalog_fetch`` (COL-98) and ``radarr_catalog_fetch``
+    (COL-99) are what the scan uses to mirror each Sonarr/Radarr instance's
+    catalog into the Library on the same cadence -- see :meth:`scan_once`.
     """
 
     def __init__(
@@ -157,6 +169,7 @@ class JobScheduler:
         downmix_settings: DownmixSettings | None = None,
         probe: ProbeFn = probe_audio_streams,
         catalog_fetch: CatalogFetchFn = fetch_sonarr_catalog,
+        radarr_catalog_fetch: RadarrCatalogFetchFn = fetch_radarr_catalog,
         now: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._queue = queue
@@ -165,6 +178,7 @@ class JobScheduler:
         self._downmix_settings = downmix_settings or DownmixSettings()
         self._probe = probe
         self._catalog_fetch = catalog_fetch
+        self._radarr_catalog_fetch = radarr_catalog_fetch
         self._now = now
         self._interval_seconds = settings.scan_interval_hours * 3600.0
         self._dedup_window = timedelta(hours=settings.scan_interval_hours)
@@ -374,11 +388,12 @@ class JobScheduler:
 
         Two independent per-instance passes share the one scan cadence:
 
-        - **Library mirror (COL-98):** for each Sonarr instance, fetch its full
-          catalog (:attr:`_catalog_fetch`) and
+        - **Library mirror (COL-98/COL-99):** for each Sonarr instance, fetch
+          its full catalog (:attr:`_catalog_fetch`); for each Radarr instance,
+          fetch its full movie catalog (:attr:`_radarr_catalog_fetch`); then
           :func:`~collapsarr.library.service.sync_library` -- upserting every
-          Series/Season/Episode node (files-not-yet-present included) and
-          soft-hiding any node the catalog no longer reports.
+          Series/Season/Episode or Movie node (files-not-yet-present included)
+          and soft-hiding any node the catalog no longer reports.
         - **Downmix discovery (COL-22):** enqueue every monitored file with a
           qualifying missing target.
 
@@ -417,17 +432,25 @@ class JobScheduler:
         return enqueued
 
     def _sync_instance_library(self, session: Session, instance: ArrInstance) -> None:
-        """Mirror one Sonarr instance's catalog into the Library (COL-98).
+        """Mirror one configured instance's catalog into the Library (COL-98/COL-99).
 
-        A no-op for non-Sonarr instances (Radarr library support is a later
-        ticket). A catalog-fetch failure is logged and swallowed so it never
-        aborts the scan -- crucially, ``sync_library`` is *not* called on a
-        failed fetch, so a transient outage never soft-hides the whole mirror.
+        Dispatches on ``instance.type``: a Sonarr instance's full
+        Series/Season/Episode catalog is fetched via :attr:`_catalog_fetch`, a
+        Radarr instance's full movie catalog via :attr:`_radarr_catalog_fetch`
+        -- both then upserted through the same
+        :func:`~collapsarr.library.service.sync_library` entry point. A
+        catalog-fetch failure is logged and swallowed so it never aborts the
+        scan -- crucially, ``sync_library`` is *not* called on a failed fetch,
+        so a transient outage never soft-hides the whole mirror.
         """
-        if instance.type is not InstanceType.SONARR:
-            return
+        catalog: SonarrCatalog | RadarrCatalog
         try:
-            catalog = self._catalog_fetch(instance)
+            if instance.type is InstanceType.SONARR:
+                catalog = self._catalog_fetch(instance)
+            elif instance.type is InstanceType.RADARR:
+                catalog = self._radarr_catalog_fetch(instance)
+            else:  # pragma: no cover - InstanceType has exactly two members
+                return
         except httpx.HTTPError as exc:
             logger.warning(
                 "scan: failed to fetch catalog from instance %r (id=%s): %s",

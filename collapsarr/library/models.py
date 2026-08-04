@@ -1,21 +1,23 @@
-"""ORM model for a Library node -- a Sonarr Series/Season/Episode mirror (COL-98).
+"""ORM model for a Library node -- a Sonarr/Radarr catalog mirror (COL-98/COL-99).
 
 A **Library** (``CONTEXT.md``) is a per-``ArrInstance`` mirror of that instance's
-Sonarr catalog, persisted in Collapsarr's own database. A **Library Node** is one
-entry in that mirror's tree: a Series, Season, or Episode. All three kinds share
-one self-referential table (:class:`LibraryNode`) rather than three parallel
-tables, because the **Tracked** flag's ancestor-override resolution and
-cascade-on-toggle both walk the same Series > Season > Episode tree uniformly --
-a single ``parent_id`` chain makes that walk trivial.
+Sonarr/Radarr catalog, persisted in Collapsarr's own database. A **Library
+Node** is one entry in that mirror's tree: a Series, Season, or Episode
+(Sonarr), or a flat Movie (Radarr, COL-99 -- no season level, ``parent_id``
+always ``None``). All four kinds share one self-referential table
+(:class:`LibraryNode`) rather than parallel tables per Arr type, because the
+**Tracked** flag's ancestor-override resolution and cascade-on-toggle both walk
+the same ``parent_id`` chain uniformly -- a Movie node is simply a one-node
+chain.
 
-Nodes are identified by Sonarr's *own* object ids, never parsed from on-disk
-paths: a Series carries Sonarr's series id, an Episode its episode id. Sonarr has
-no standalone season object, so a Season's identity is ``(series_id,
-season_number)``. To dedup upserts cleanly across all three kinds under one
-unique constraint -- SQLite treats ``NULL`` as distinct, so a
-mixed-nullability composite key would not dedup Series rows -- each node stores a
-single deterministic :attr:`node_key` string (see :func:`make_node_key`), unique
-per instance.
+Nodes are identified by Sonarr/Radarr's *own* object ids, never parsed from
+on-disk paths: a Series carries Sonarr's series id, an Episode its episode id,
+a Movie Radarr's movie id. Sonarr has no standalone season object, so a
+Season's identity is ``(series_id, season_number)``. To dedup upserts cleanly
+across all kinds under one unique constraint -- SQLite treats ``NULL`` as
+distinct, so a mixed-nullability composite key would not dedup Series/Movie
+rows -- each node stores a single deterministic :attr:`node_key` string (see
+:func:`make_node_key`), unique per instance.
 
 Each node carries:
 
@@ -45,34 +47,39 @@ from collapsarr.database import Base
 
 
 class LibraryNodeKind(enum.StrEnum):
-    """The three kinds of Sonarr Library node."""
+    """The four kinds of Library node: three Sonarr, one flat Radarr."""
 
     SERIES = "series"
     SEASON = "season"
     EPISODE = "episode"
+    MOVIE = "movie"
 
 
 def make_node_key(
     kind: LibraryNodeKind,
     *,
-    series_id: int,
+    series_id: int | None = None,
     season_number: int | None = None,
     episode_id: int | None = None,
+    movie_id: int | None = None,
 ) -> str:
     """Return the deterministic per-instance identity key for a node.
 
-    Encodes Sonarr's own ids so repeated scans upsert the same row rather than
-    duplicating it:
+    Encodes Sonarr/Radarr's own ids so repeated scans upsert the same row
+    rather than duplicating it:
 
     - Series -> ``"series:<series_id>"``
     - Season -> ``"season:<series_id>:<season_number>"``
     - Episode -> ``"episode:<episode_id>"``
+    - Movie -> ``"movie:<movie_id>"``
     """
     if kind is LibraryNodeKind.SERIES:
         return f"series:{series_id}"
     if kind is LibraryNodeKind.SEASON:
         return f"season:{series_id}:{season_number}"
-    return f"episode:{episode_id}"
+    if kind is LibraryNodeKind.EPISODE:
+        return f"episode:{episode_id}"
+    return f"movie:{movie_id}"
 
 
 def _utcnow() -> datetime:
@@ -80,13 +87,14 @@ def _utcnow() -> datetime:
 
 
 class LibraryNode(Base):
-    """One Series, Season, or Episode node in an instance's Library tree.
+    """One Series, Season, Episode, or Movie node in an instance's Library tree.
 
     Scoped to an :class:`~collapsarr.arr.models.ArrInstance` via ``instance_id``
     (cascade-deleted with it) and linked into a Series > Season > Episode tree
-    via the self-referential ``parent_id`` (``None`` for a Series root). The
-    ``(instance_id, node_key)`` pair is unique, so an upsert keyed on it is
-    idempotent across repeated scans.
+    via the self-referential ``parent_id`` (``None`` for a Series root, and
+    always ``None`` for a flat Movie node -- Radarr instances have no
+    intermediate ancestor level). The ``(instance_id, node_key)`` pair is
+    unique, so an upsert keyed on it is idempotent across repeated scans.
     """
 
     __tablename__ = "library_nodes"
@@ -111,19 +119,22 @@ class LibraryNode(Base):
     )
     node_key: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    #: Sonarr's own series id -- present on all three kinds, so a series' whole
-    #: subtree can be scoped by it.
-    sonarr_series_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-    #: Season number (Season + Episode nodes); ``None`` on a Series node.
+    #: Sonarr's own series id -- present on all three Sonarr kinds, so a
+    #: series' whole subtree can be scoped by it. ``None`` on a Movie node.
+    sonarr_series_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    #: Season number (Season + Episode nodes); ``None`` on a Series or Movie node.
     season_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: Episode number (Episode nodes); ``None`` otherwise.
     episode_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: Sonarr's own episode id (Episode nodes); ``None`` otherwise.
     sonarr_episode_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: Radarr's own movie id (Movie nodes); ``None`` otherwise.
+    radarr_movie_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
     title: Mapped[str] = mapped_column(String(500), nullable=False)
-    #: Whether this node's file exists in Sonarr (Episode nodes). Series/Season
-    #: nodes are always ``False`` -- they are containers, not files.
+    #: Whether this node's file exists in Sonarr/Radarr (Episode and Movie
+    #: nodes). Series/Season nodes are always ``False`` -- they are
+    #: containers, not files.
     has_file: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     #: Nullable Tracked override: ``None`` inherits; ``True``/``False`` is explicit.

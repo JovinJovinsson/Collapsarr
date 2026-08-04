@@ -1,9 +1,9 @@
-"""Tests for the Sonarr full-catalog fetch (COL-98).
+"""Tests for the Sonarr/Radarr full-catalog fetch (COL-98/COL-99).
 
 Every case is driven by an ``httpx.MockTransport`` -- no live network call is
 made. Unlike :mod:`tests.test_arr_files` (the monitored-only downmix fetch),
-these assert the *full* catalog is returned: unmonitored series and
-not-yet-downloaded (``hasFile: false``) episodes included.
+these assert the *full* catalog is returned: unmonitored series/movies and
+not-yet-downloaded (``hasFile: false``) episodes/movies included.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from collapsarr.arr.catalog import fetch_sonarr_catalog
+from collapsarr.arr.catalog import fetch_radarr_catalog, fetch_sonarr_catalog
 from collapsarr.arr.models import ArrInstance, InstanceType
 
 _SERIES_PAYLOAD = [
@@ -112,3 +112,64 @@ def test_fetch_propagates_http_errors() -> None:
     transport = httpx.MockTransport(handler)
     with pytest.raises(httpx.HTTPStatusError):
         fetch_sonarr_catalog(_sonarr_instance(), transport=transport)
+
+
+# --- Radarr (COL-99) ----------------------------------------------------------
+
+_MOVIE_PAYLOAD = [
+    {"id": 1, "title": "Arrival", "monitored": True, "hasFile": True},
+    # Unmonitored: must still appear in the full catalog.
+    {"id": 2, "title": "Unmonitored Movie", "monitored": False, "hasFile": False},
+    # Monitored but no file yet: must still appear.
+    {"id": 3, "title": "Not Yet Downloaded", "monitored": True, "hasFile": False},
+]
+
+
+def _radarr_instance() -> ArrInstance:
+    return ArrInstance(
+        id=9,
+        name="Main Radarr",
+        type=InstanceType.RADARR,
+        base_url="http://radarr.local:7878",
+        api_key="radarr-api-key",
+    )
+
+
+def _movie_transport() -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/movie":
+            return httpx.Response(200, json=_MOVIE_PAYLOAD)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    return httpx.MockTransport(handler)
+
+
+def test_radarr_fetch_returns_all_movies_regardless_of_monitored() -> None:
+    catalog = fetch_radarr_catalog(_radarr_instance(), transport=_movie_transport())
+
+    assert catalog.instance_id == 9
+    titles = {movie.title for movie in catalog.movies}
+    assert titles == {"Arrival", "Unmonitored Movie", "Not Yet Downloaded"}
+
+
+def test_radarr_fetch_includes_movies_without_a_file() -> None:
+    catalog = fetch_radarr_catalog(_radarr_instance(), transport=_movie_transport())
+
+    by_id = {movie.movie_id: movie for movie in catalog.movies}
+    assert by_id[1].has_file is True
+    assert by_id[2].has_file is False  # not-yet-downloaded, still present
+    assert by_id[3].has_file is False
+
+
+def test_radarr_fetch_rejects_a_sonarr_instance() -> None:
+    with pytest.raises(ValueError, match="Radarr"):
+        fetch_radarr_catalog(_sonarr_instance(), transport=_movie_transport())
+
+
+def test_radarr_fetch_propagates_http_errors() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    transport = httpx.MockTransport(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        fetch_radarr_catalog(_radarr_instance(), transport=transport)

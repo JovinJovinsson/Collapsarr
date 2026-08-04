@@ -1,7 +1,8 @@
-"""Contract tests for the Library tree endpoint (COL-98).
+"""Contract tests for the Library tree endpoint (COL-98/COL-99).
 
-Covers the response shape, the resolved Tracked values, hidden-node exclusion,
-Sonarr-only / unknown-instance ``404``s, and the API-key-required behaviour for
+Covers the response shape (both the Sonarr Series/Season/Episode tree and the
+Radarr flat Movie list), the resolved Tracked values, hidden-node exclusion,
+unknown-instance ``404``, and the API-key-required behaviour for
 ``GET /api/library/instances/{id}/tree`` -- mirroring
 :mod:`tests.test_arr_routes`. Library nodes are seeded through the real
 :func:`~collapsarr.library.service.sync_library` against the app's own session
@@ -14,7 +15,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from collapsarr.arr.catalog import CatalogEpisode, CatalogSeries, SonarrCatalog
+from collapsarr.arr.catalog import (
+    CatalogEpisode,
+    CatalogMovie,
+    CatalogSeries,
+    RadarrCatalog,
+    SonarrCatalog,
+)
 from collapsarr.arr.models import ArrInstance, InstanceType
 from collapsarr.library.service import sync_library
 from collapsarr.settings.service import get_global_settings, update_global_settings
@@ -56,6 +63,16 @@ def _catalog(instance_id: int) -> SonarrCatalog:
     )
 
 
+def _radarr_catalog(instance_id: int) -> RadarrCatalog:
+    return RadarrCatalog(
+        instance_id=instance_id,
+        movies=(
+            CatalogMovie(movie_id=1, title="Arrival", has_file=True),
+            CatalogMovie(movie_id=2, title="Not Yet Downloaded", has_file=False),
+        ),
+    )
+
+
 def _seed_library(client: TestClient, *, type_: InstanceType = InstanceType.SONARR) -> int:
     app = client.app
     assert isinstance(app, FastAPI)
@@ -63,6 +80,8 @@ def _seed_library(client: TestClient, *, type_: InstanceType = InstanceType.SONA
         instance_id = _seed_instance(session, type_=type_)
         if type_ is InstanceType.SONARR:
             sync_library(session, instance_id=instance_id, catalog=_catalog(instance_id))
+        else:
+            sync_library(session, instance_id=instance_id, catalog=_radarr_catalog(instance_id))
         return instance_id
 
 
@@ -113,12 +132,38 @@ def test_tree_unknown_instance_returns_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_tree_radarr_instance_returns_404(client: TestClient) -> None:
+def test_tree_returns_flat_movie_shape_for_a_radarr_instance(client: TestClient) -> None:
     instance_id = _seed_library(client, type_=InstanceType.RADARR)
+
     response = client.get(
         f"/api/library/instances/{instance_id}/tree", headers=_auth_headers(client)
     )
-    assert response.status_code == 404
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["instance_id"] == instance_id
+    assert "series" not in body  # flat shape, no season/episode nesting
+    movies = body["movies"]
+    assert [m["title"] for m in movies] == ["Arrival", "Not Yet Downloaded"]
+    assert movies[0]["kind"] == "movie"
+    assert movies[0]["has_file"] is True
+    assert movies[1]["has_file"] is False  # no-file movie present
+    assert all(m["tracked"] is True for m in movies)  # global default_tracked
+
+
+def test_tree_radarr_reflects_default_tracked_false(client: TestClient) -> None:
+    instance_id = _seed_library(client, type_=InstanceType.RADARR)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        update_global_settings(session, default_tracked=False)
+
+    response = client.get(
+        f"/api/library/instances/{instance_id}/tree", headers=_auth_headers(client)
+    )
+
+    assert response.status_code == 200
+    assert all(m["tracked"] is False for m in response.json()["movies"])
 
 
 def test_tree_requires_the_api_key(client: TestClient) -> None:

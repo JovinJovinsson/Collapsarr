@@ -1,4 +1,4 @@
-"""Service-layer sync, Tracked resolution, cascade, and tree read for the Library (COL-98).
+"""Service-layer sync, Tracked resolution, cascade, and tree read for the Library (COL-98/COL-99).
 
 Plain functions over a SQLAlchemy :class:`~sqlalchemy.orm.Session`, matching the
 pattern used throughout this codebase (:mod:`collapsarr.arr.service`,
@@ -9,23 +9,27 @@ nothing else creates or mutates those rows.
 Four responsibilities:
 
 - :func:`sync_library` -- upsert every node from a freshly-fetched
-  :class:`~collapsarr.arr.catalog.SonarrCatalog` and **soft-hide** (never
-  delete) any previously-synced node the catalog no longer reports. Idempotent
-  and self-correcting: a reappearing node is un-hidden with its
-  ``tracked_override`` intact. Newly-discovered nodes are created with
-  ``tracked_override = None`` (inherit) -- a new episode under a Not-Tracked
-  series therefore resolves to Not Tracked automatically, without copying the
+  :class:`~collapsarr.arr.catalog.SonarrCatalog` (Series > Season > Episode) or
+  :class:`~collapsarr.arr.catalog.RadarrCatalog` (flat Movie, COL-99) and
+  **soft-hide** (never delete) any previously-synced node the catalog no
+  longer reports. Idempotent and self-correcting: a reappearing node is
+  un-hidden with its ``tracked_override`` intact. Newly-discovered nodes are
+  created with ``tracked_override = None`` (inherit) -- a new episode under a
+  Not-Tracked series (or a newly-discovered movie) therefore resolves to Not
+  Tracked automatically whenever the global default is, without copying an
   ancestor's value down.
 - :func:`resolve_tracked` -- the ancestor-override resolution: the nearest
   explicit override walking up from a node wins; when nothing in the ancestry is
-  explicit, ``GlobalSettings.default_tracked`` is the fallback.
+  explicit, ``GlobalSettings.default_tracked`` is the fallback. A Movie node has
+  no ancestor, so this is just its own override or the global default.
 - :func:`set_tracked` -- write an explicit override on a node and, for a Series
   or Season, **cascade**: overwrite every existing descendant's override to
   match. (No route exposes this yet -- the Libraries toggle UI is a later
   ticket -- but the cascade logic is part of this foundational slice.)
-- :func:`build_tree` -- the read path behind ``GET /api/library/instances/{id}/tree``:
-  the visible Series > Season > Episode tree with each node's *resolved* Tracked
-  value. Hidden nodes are omitted.
+- :func:`build_tree` / :func:`build_movie_tree` -- the read paths behind
+  ``GET /api/library/instances/{id}/tree``: the visible Series > Season >
+  Episode tree, or the visible flat Movie list, each node carrying its
+  *resolved* Tracked value. Hidden nodes are omitted from both.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from collapsarr.arr.catalog import SonarrCatalog
+from collapsarr.arr.catalog import RadarrCatalog, SonarrCatalog
 from collapsarr.settings.service import get_global_settings
 
 from .models import LibraryNode, LibraryNodeKind, make_node_key
@@ -91,6 +95,25 @@ class LibraryTree:
     series: tuple[TreeSeries, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class TreeMovie:
+    """A Movie node in a rendered Library tree, with its resolved Tracked value."""
+
+    id: int
+    radarr_movie_id: int
+    title: str
+    has_file: bool
+    tracked: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MovieLibraryTree:
+    """A Radarr instance's full visible, flat Movie list with resolved Tracked values."""
+
+    instance_id: int
+    movies: tuple[TreeMovie, ...]
+
+
 # --- queries -----------------------------------------------------------------
 
 
@@ -140,17 +163,30 @@ def resolve_tracked(
 # --- sync --------------------------------------------------------------------
 
 
-def sync_library(session: Session, *, instance_id: int, catalog: SonarrCatalog) -> None:
+def sync_library(
+    session: Session, *, instance_id: int, catalog: SonarrCatalog | RadarrCatalog
+) -> None:
     """Upsert every node from ``catalog`` and soft-hide those it no longer reports.
 
-    Existing nodes are matched by ``node_key`` and updated in place (title,
-    file/positional fields, parent link) with their ``tracked_override``
-    preserved; a previously-hidden node reappearing in the catalog is un-hidden.
-    New nodes are created inheriting (``tracked_override = None``). Any existing
-    node whose ``node_key`` is absent from ``catalog`` is marked ``hidden`` --
-    never deleted -- so its Tracked value survives an upstream deletion and
-    returns if the node is seen again.
+    Dispatches on the catalog type: a :class:`~collapsarr.arr.catalog.SonarrCatalog`
+    upserts the Series > Season > Episode tree, a
+    :class:`~collapsarr.arr.catalog.RadarrCatalog` (COL-99) upserts the flat
+    Movie list. Both share the same mechanics: existing nodes are matched by
+    ``node_key`` and updated in place with their ``tracked_override``
+    preserved; a previously-hidden node reappearing in the catalog is
+    un-hidden; new nodes are created inheriting (``tracked_override = None``);
+    and any existing node whose ``node_key`` is absent from ``catalog`` is
+    marked ``hidden`` -- never deleted -- so its Tracked value survives an
+    upstream deletion and returns if the node is seen again.
     """
+    if isinstance(catalog, RadarrCatalog):
+        _sync_radarr_catalog(session, instance_id=instance_id, catalog=catalog)
+    else:
+        _sync_sonarr_catalog(session, instance_id=instance_id, catalog=catalog)
+
+
+def _sync_sonarr_catalog(session: Session, *, instance_id: int, catalog: SonarrCatalog) -> None:
+    """Upsert every Series/Season/Episode node from ``catalog`` (see :func:`sync_library`)."""
     existing = {node.node_key: node for node in list_nodes(session, instance_id)}
     seen: set[str] = set()
 
@@ -213,11 +249,43 @@ def sync_library(session: Session, *, instance_id: int, catalog: SonarrCatalog) 
                 has_file=episode.has_file,
             )
 
+    _soft_hide_missing(existing, seen)
+    session.commit()
+
+
+def _sync_radarr_catalog(session: Session, *, instance_id: int, catalog: RadarrCatalog) -> None:
+    """Upsert every Movie node from ``catalog`` (see :func:`sync_library`).
+
+    Flat -- Movie nodes have no parent (``parent_id=None``) and no
+    season/episode level, unlike the Sonarr Series > Season > Episode tree.
+    """
+    existing = {node.node_key: node for node in list_nodes(session, instance_id)}
+    seen: set[str] = set()
+
+    for movie in catalog.movies:
+        movie_key = make_node_key(LibraryNodeKind.MOVIE, movie_id=movie.movie_id)
+        seen.add(movie_key)
+        _upsert_node(
+            session,
+            existing,
+            instance_id=instance_id,
+            kind=LibraryNodeKind.MOVIE,
+            node_key=movie_key,
+            parent_id=None,
+            radarr_movie_id=movie.movie_id,
+            title=movie.title,
+            has_file=movie.has_file,
+        )
+
+    _soft_hide_missing(existing, seen)
+    session.commit()
+
+
+def _soft_hide_missing(existing: dict[str, LibraryNode], seen: set[str]) -> None:
+    """Mark any existing node whose key wasn't ``seen`` in this sync as hidden."""
     for node_key, node in existing.items():
         if node_key not in seen and not node.hidden:
             node.hidden = True
-
-    session.commit()
 
 
 def _upsert_node(
@@ -228,10 +296,11 @@ def _upsert_node(
     kind: LibraryNodeKind,
     node_key: str,
     parent_id: int | None,
-    sonarr_series_id: int,
+    sonarr_series_id: int | None = None,
     season_number: int | None = None,
     episode_number: int | None = None,
     sonarr_episode_id: int | None = None,
+    radarr_movie_id: int | None = None,
     title: str,
     has_file: bool = False,
 ) -> LibraryNode:
@@ -252,6 +321,7 @@ def _upsert_node(
             season_number=season_number,
             episode_number=episode_number,
             sonarr_episode_id=sonarr_episode_id,
+            radarr_movie_id=radarr_movie_id,
             title=title,
             has_file=has_file,
         )
@@ -263,6 +333,7 @@ def _upsert_node(
     node.season_number = season_number
     node.episode_number = episode_number
     node.sonarr_episode_id = sonarr_episode_id
+    node.radarr_movie_id = radarr_movie_id
     node.title = title
     node.has_file = has_file
     node.hidden = False
@@ -363,7 +434,7 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
         series_out.append(
             TreeSeries(
                 id=series.id,
-                sonarr_series_id=series.sonarr_series_id,
+                sonarr_series_id=series.sonarr_series_id or 0,
                 title=series.title,
                 tracked=resolve_tracked(series, nodes_by_id, default_tracked),
                 seasons=tuple(seasons_out),
@@ -371,3 +442,31 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
         )
 
     return LibraryTree(instance_id=instance_id, series=tuple(series_out))
+
+
+def build_movie_tree(session: Session, instance_id: int) -> MovieLibraryTree:
+    """Build the visible, flat Movie list with resolved Tracked values (COL-99).
+
+    Mirrors :func:`build_tree`'s hidden-node exclusion and Tracked resolution,
+    but flat: a Movie node has no ancestor level, so its resolved value is
+    simply its own override or the global default. Movies are ordered by
+    title.
+    """
+    default_tracked = get_global_settings(session).default_tracked
+    nodes = list_nodes(session, instance_id)
+    nodes_by_id = {node.id: node for node in nodes}
+
+    movie_nodes = [n for n in nodes if n.kind is LibraryNodeKind.MOVIE and not n.hidden]
+
+    movies_out = tuple(
+        TreeMovie(
+            id=movie.id,
+            radarr_movie_id=movie.radarr_movie_id or 0,
+            title=movie.title,
+            has_file=movie.has_file,
+            tracked=resolve_tracked(movie, nodes_by_id, default_tracked),
+        )
+        for movie in sorted(movie_nodes, key=lambda n: (n.title, n.id))
+    )
+
+    return MovieLibraryTree(instance_id=instance_id, movies=movies_out)

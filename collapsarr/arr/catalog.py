@@ -1,14 +1,14 @@
-"""Full-catalog fetch from a Sonarr instance for the Library mirror (COL-98).
+"""Full-catalog fetch from a Sonarr/Radarr instance for the Library mirror (COL-98/COL-99).
 
 Where :mod:`collapsarr.arr.files` pulls only the *monitored* file list that the
-downmix-discovery path (COL-12) acts on, this module pulls a Sonarr instance's
-**entire** catalog -- every series, every season, and every episode --
-*regardless* of Sonarr's own ``monitored``/``hasFile`` flags. That is the raw
-material the Library (``collapsarr.library``) persists and keeps in sync: a
-mirror that includes not-yet-downloaded episodes (``hasFile: false``) so a
-user can set their **Tracked** preference ahead of the file arriving.
+downmix-discovery path (COL-12) acts on, this module pulls a Sonarr or Radarr
+instance's **entire** catalog *regardless* of the instance's own
+``monitored``/``hasFile`` flags. That is the raw material the Library
+(``collapsarr.library``) persists and keeps in sync: a mirror that includes
+not-yet-downloaded episodes/movies (``hasFile: false``) so a user can set
+their **Tracked** preference ahead of the file arriving.
 
-Sonarr exposes the catalog across two endpoints:
+Sonarr exposes its catalog across two endpoints:
 
 - ``GET /api/v3/series`` -- every series, each with ``id``/``title`` and an
   embedded ``seasons`` array (each with a ``seasonNumber``).
@@ -17,13 +17,21 @@ Sonarr exposes the catalog across two endpoints:
   ``episodefile`` endpoint :mod:`collapsarr.arr.files` uses, this lists episodes
   that have no file yet.
 
-Everything is normalized into the frozen :class:`SonarrCatalog` /
-:class:`CatalogSeries` / :class:`CatalogEpisode` DTOs -- plain data, no
+Radarr (COL-99) reports its whole catalog in a single call, same as
+:mod:`collapsarr.arr.files`' Radarr path:
+
+- ``GET /api/v3/movie`` -- every movie, each with ``id``/``title``/``hasFile``.
+  No follow-up request is needed -- Radarr has no separate per-movie "file"
+  endpoint to call.
+
+Everything is normalized into frozen DTOs -- :class:`SonarrCatalog` /
+:class:`CatalogSeries` / :class:`CatalogEpisode` for Sonarr,
+:class:`RadarrCatalog` / :class:`CatalogMovie` for Radarr -- plain data, no
 persistence (that is :mod:`collapsarr.library.service`'s job), mirroring how
 :mod:`collapsarr.arr.files` returns plain :class:`~collapsarr.arr.files.MonitoredFile`
 DTOs. Season identity is ``(series_id, season_number)`` -- Sonarr has no
-standalone season object id -- while series and episodes carry Sonarr's own
-object ids.
+standalone season object id -- while series, episodes, and movies carry the
+Arr instance's own object ids.
 
 Like :mod:`collapsarr.arr.files` (and unlike
 :func:`collapsarr.arr.client.check_connectivity`), this lets ``httpx.HTTPError``
@@ -44,6 +52,7 @@ from .models import ArrInstance, InstanceType
 
 _SERIES_PATH = "/api/v3/series"
 _EPISODE_PATH = "/api/v3/episode"
+_MOVIE_PATH = "/api/v3/movie"
 _DEFAULT_TIMEOUT = 10.0
 
 
@@ -74,6 +83,23 @@ class SonarrCatalog:
 
     instance_id: int
     series: tuple[CatalogSeries, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogMovie:
+    """One movie in a Radarr instance's catalog, present whether or not it has a file."""
+
+    movie_id: int
+    title: str
+    has_file: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RadarrCatalog:
+    """A Radarr instance's full, flat Movie catalog."""
+
+    instance_id: int
+    movies: tuple[CatalogMovie, ...]
 
 
 def fetch_sonarr_catalog(
@@ -190,3 +216,65 @@ def _collect_season_numbers(
     for episode in episodes:
         numbers.add(episode.season_number)
     return tuple(sorted(numbers))
+
+
+def fetch_radarr_catalog(
+    instance: ArrInstance,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+    transport: httpx.BaseTransport | None = None,
+) -> RadarrCatalog:
+    """Fetch a Radarr instance's entire movie catalog, normalized into DTOs.
+
+    Every movie is returned regardless of Radarr's own ``monitored``/``hasFile``
+    flags -- the Library mirrors the whole catalog, including not-yet-downloaded
+    movies. Unlike Sonarr, Radarr's ``GET /api/v3/movie`` reports the full
+    catalog in a single call -- there is no follow-up per-movie request.
+
+    Raises:
+        ValueError: if ``instance`` is not a Radarr instance.
+        httpx.HTTPError: on a network failure or a non-2xx response. Not
+            swallowed -- see :func:`fetch_sonarr_catalog` for the rationale.
+    """
+    if instance.type is not InstanceType.RADARR:
+        raise ValueError(
+            f"fetch_radarr_catalog only supports Radarr instances, got {instance.type!r}"
+        )
+
+    base_url = instance.base_url.rstrip("/")
+    headers = {"X-Api-Key": instance.api_key}
+
+    if transport is not None:
+        client = httpx.Client(timeout=timeout, transport=transport)
+    else:
+        client = httpx.Client(timeout=timeout)
+
+    with client:
+        response = client.get(f"{base_url}{_MOVIE_PATH}", headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+
+    return RadarrCatalog(instance_id=instance.id, movies=_parse_movies(payload))
+
+
+def _parse_movies(payload: object) -> tuple[CatalogMovie, ...]:
+    """Normalize a Radarr ``/movie`` response into :class:`CatalogMovie` DTOs."""
+    if not isinstance(payload, list):
+        return ()
+
+    movies: list[CatalogMovie] = []
+    for movie in payload:
+        if not isinstance(movie, dict):
+            continue
+        movie_id = movie.get("id")
+        title = movie.get("title")
+        if not isinstance(movie_id, int) or not isinstance(title, str):
+            continue
+        movies.append(
+            CatalogMovie(
+                movie_id=movie_id,
+                title=title,
+                has_file=bool(movie.get("hasFile")),
+            )
+        )
+    return tuple(movies)
