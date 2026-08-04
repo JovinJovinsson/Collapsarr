@@ -45,6 +45,18 @@ export function SettingsIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Libraries: an open book — browsing a Series/Movie catalog (COL-100),
+// distinct from Backups' stacked cylinders and Activity's waveform.
+export function LibraryIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <path d="M12 6.5c-1.6-1-3.6-1.3-5.5-.8v11c1.9-.5 3.9-.2 5.5.8" />
+      <path d="M12 6.5c1.6-1 3.6-1.3 5.5-.8v11c-1.9-.5-3.9-.2-5.5.8" />
+      <path d="M12 6.5v11" />
+    </svg>
+  );
+}
+
 // Backups: stacked database cylinders — a saved snapshot of the store.
 export function BackupIcon(props: SVGProps<SVGSVGElement>) {
   return (

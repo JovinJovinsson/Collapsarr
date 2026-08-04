@@ -2,6 +2,7 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 
 import { AppShell } from "../components/AppShell";
 import { FileDetailPage } from "../pages/FileDetailPage";
+import { LibraryPage } from "../pages/LibraryPage";
 import { LoginPage } from "../pages/LoginPage";
 import { SetupPage } from "../pages/SetupPage";
 import { navItems, systemNavItems } from "./nav";
@@ -27,6 +28,12 @@ export const router = createBrowserRouter([
       // wired directly here rather than through `navItems` (the sidebar's
       // source of truth) -- it's reached from a file row, not the sidebar.
       { path: "/wanted/:fileId", element: <FileDetailPage /> },
+      // Per-instance Library browsing (COL-100): `navItems` only wires the
+      // bare `/libraries` redirect (`LibrariesIndexPage`); the per-instance
+      // tree view takes an id param, so it's wired directly here, same as
+      // `/wanted/:fileId` above. Reached from the sidebar's expanded
+      // Libraries sub-items or the index redirect, not a plain nav link.
+      { path: "/libraries/:instanceId", element: <LibraryPage /> },
       { path: "*", element: <Navigate to="/wanted" replace /> },
     ],
   },

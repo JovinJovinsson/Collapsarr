@@ -4,6 +4,7 @@ import {
   ActivityIcon,
   BackupIcon,
   HealthIcon,
+  LibraryIcon,
   SettingsIcon,
   UpdateIcon,
   WantedIcon,
@@ -11,9 +12,19 @@ import {
 import { ActivityPage } from "../pages/ActivityPage";
 import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
+import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { SettingsPage } from "../pages/SettingsPage";
 import { UpdatesPage } from "../pages/UpdatesPage";
 import { WantedPage } from "../pages/WantedPage";
+
+/**
+ * Path of the "Libraries" primary nav item (COL-100) -- pulled out as a
+ * constant since, unlike every other item, both `Sidebar` (to special-case
+ * its expandable per-instance rendering) and `router.tsx` (to wire the
+ * `/libraries/:instanceId` route alongside it) need to recognise it
+ * specifically rather than just iterating `navItems` generically.
+ */
+export const LIBRARIES_PATH = "/libraries";
 
 export interface NavItem {
   to: string;
@@ -30,6 +41,7 @@ export interface NavItem {
  */
 export const navItems: NavItem[] = [
   { to: "/wanted", label: "Wanted", icon: <WantedIcon />, element: <WantedPage /> },
+  { to: LIBRARIES_PATH, label: "Libraries", icon: <LibraryIcon />, element: <LibrariesIndexPage /> },
   { to: "/activity", label: "Activity", icon: <ActivityIcon />, element: <ActivityPage /> },
   { to: "/settings", label: "Settings", icon: <SettingsIcon />, element: <SettingsPage /> },
 ];

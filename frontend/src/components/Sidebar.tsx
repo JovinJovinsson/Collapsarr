@@ -4,9 +4,10 @@ import { NavLink, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
 
 import { logout } from "../api/auth";
+import { LIBRARIES_PATH, navItems, systemNavItems } from "../routes/nav";
 import type { NavItem } from "../routes/nav";
-import { navItems, systemNavItems } from "../routes/nav";
 import { BrandMark } from "./icons";
+import { LibraryNavSection } from "./LibraryNavSection";
 
 /** Renders one nav link; shared by the primary and System sections. */
 function NavLinkItem({ to, label, icon }: NavItem): ReactNode {
@@ -50,9 +51,17 @@ export function Sidebar() {
       </div>
 
       <ul className="sidebar__nav">
-        {navItems.map((item) => (
-          <NavLinkItem key={item.to} {...item} />
-        ))}
+        {navItems.map((item) =>
+          // Libraries (COL-100) has one sub-item per configured ArrInstance
+          // rather than a static destination, so it renders through its own
+          // expandable section instead of the plain NavLinkItem every other
+          // primary nav item uses.
+          item.to === LIBRARIES_PATH ? (
+            <LibraryNavSection key={item.to} {...item} />
+          ) : (
+            <NavLinkItem key={item.to} {...item} />
+          ),
+        )}
 
         <li className="sidebar__section" aria-hidden>
           System
