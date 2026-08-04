@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -543,7 +543,9 @@ describe("LibraryPage (COL-100)", () => {
     };
     setTree(afterBulk);
 
-    fireEvent.click(screen.getByRole("button", { name: /mark not tracked/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /mark not tracked/i }));
+    });
 
     const bulkCall = await vi.waitFor(() => {
       const match = calls.find((call) => call.url === "/api/library/tracked");
