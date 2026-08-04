@@ -13,10 +13,14 @@ Two automatic triggers feed the same de-duplicating enqueue path:
   qualifying missing downmix target (COL-16).
 
 Both funnel through :meth:`enqueue_file`, which probes the file
-(:func:`~collapsarr.downmix.probe.probe_audio_streams`, COL-15), asks
+(:func:`~collapsarr.downmix.probe.probe_audio_streams`, COL-15), records the
+probed streams onto tracked media
+(:func:`~collapsarr.media.service.upsert_tracked_media`, COL-25/COL-95 --
+the Wanted view's data source), asks
 :func:`~collapsarr.downmix.targets.detect_qualifying_targets` whether any target
 actually qualifies, and enqueues a real :class:`~collapsarr.jobs.queue.Job` only
-when one does -- a file with nothing to do is never enqueued.
+when one does -- a file with nothing to do is never enqueued (but is still
+tracked, correctly, as fully processed).
 
 COL-23 adds two manual, on-demand entry points for a future API/UI ("Scan now"
 and "trigger this file") to call, on top of the automatic ones above:
@@ -93,6 +97,7 @@ from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_
 from collapsarr.downmix.targets import DownmixSettings, detect_qualifying_targets
 from collapsarr.jobs.history import list_job_history
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus
+from collapsarr.media.service import upsert_tracked_media
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +194,8 @@ class JobScheduler:
         Returns the created :class:`~collapsarr.jobs.queue.Job`, or ``None`` when
         the file is a duplicate (already queued / recently processed), has no
         qualifying downmix target, or cannot be probed. ``session`` (when given)
-        is reused for the history-based dedup lookup; otherwise a short-lived one
-        is opened.
+        is reused for the history-based dedup lookup and the tracked-media
+        upsert below; otherwise a short-lived one is opened.
 
         ``settings`` overrides :attr:`_downmix_settings` for this call only --
         used by :meth:`trigger_file` (COL-23) to pass a per-call allow-list
@@ -202,6 +207,17 @@ class JobScheduler:
         needlessly. It is re-checked under :attr:`_enqueue_lock` immediately
         before enqueuing so two concurrent triggers can't both enqueue the same
         file.
+
+        Once probed, :func:`~collapsarr.media.service.upsert_tracked_media` is
+        called unconditionally -- before the qualifying-target check below --
+        so every probed file's tracked-media row reflects its current status
+        (COL-95): a file with a missing target is recorded ``MISSING`` (and so
+        appears in the Wanted view even though nothing was enqueued for it
+        yet, on the *next* qualifying probe -- see the early return above,
+        which only skips *duplicates*), and a file that already has every
+        enabled target is correctly recorded ``PROCESSED`` rather than left
+        untracked, even though :meth:`enqueue_file` returns ``None`` for it
+        either way.
         """
         path = Path(file_path)
         effective_settings = settings if settings is not None else self._downmix_settings
@@ -215,6 +231,8 @@ class JobScheduler:
             logger.warning("skipping %s: could not probe audio streams: %s", path, exc)
             return None
 
+        self._track_media(path, streams, effective_settings, session)
+
         if not detect_qualifying_targets(streams, effective_settings):
             return None
 
@@ -222,6 +240,29 @@ class JobScheduler:
             if self._is_duplicate(path, session):
                 return None
             return self._queue.enqueue(path, effective_settings)
+
+    def _track_media(
+        self,
+        path: Path,
+        streams: Sequence[AudioStreamInfo],
+        settings: DownmixSettings,
+        session: Session | None,
+    ) -> None:
+        """Upsert ``path``'s tracked-media row from ``streams`` (COL-95).
+
+        Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
+        when the caller passed one (:meth:`scan_once` does, since it already
+        has one open for the whole scan), else opens a short-lived one via
+        :attr:`_session_factory` (the webhook and manual-trigger paths, which
+        don't have one open).
+        """
+        if session is not None:
+            upsert_tracked_media(session, file_path=path, streams=streams, settings=settings)
+            return
+        with self._session_factory() as owned_session:
+            upsert_tracked_media(
+                owned_session, file_path=path, streams=streams, settings=settings
+            )
 
     def trigger_file(
         self,
