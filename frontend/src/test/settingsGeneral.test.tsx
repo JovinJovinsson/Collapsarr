@@ -26,6 +26,7 @@ const baseSettings: GlobalSettings = {
   disk_space_warning_percent: 5,
   disk_space_error_percent: 2,
   update_channel: "stable",
+  default_tracked: true,
   api_key: "server-generated-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
@@ -263,6 +264,29 @@ describe("GeneralSection", () => {
     const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
     const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
     expect(putBody.surround_bitrate_kbps).toBeNull();
+  });
+
+  it("displays the current default_tracked value and saves changes via PUT", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse({ ...baseSettings, default_tracked: false }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const toggleCheckbox = await screen.findByRole("checkbox", { name: /default tracked for new library items/i });
+    expect(toggleCheckbox).not.toBeChecked();
+
+    fireEvent.click(toggleCheckbox);
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.default_tracked).toBe(true);
   });
 
   it("surfaces an API error from a failed save", async () => {

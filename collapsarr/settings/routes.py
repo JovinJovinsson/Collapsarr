@@ -120,6 +120,7 @@ class SettingsRead(BaseModel):
     disk_space_warning_percent: float
     disk_space_error_percent: float
     update_channel: UpdateChannelMode
+    default_tracked: bool
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -151,6 +152,7 @@ class SettingsUpdate(BaseModel):
     disk_space_warning_percent: float | None = Field(default=None, gt=0, le=100)
     disk_space_error_percent: float | None = Field(default=None, gt=0, le=100)
     update_channel: UpdateChannelMode | None = None
+    default_tracked: bool | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -181,6 +183,7 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         disk_space_warning_percent=settings.disk_space_warning_percent,
         disk_space_error_percent=settings.disk_space_error_percent,
         update_channel=settings.update_channel,
+        default_tracked=settings.default_tracked,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -243,5 +246,7 @@ def update_settings_endpoint(
         kwargs["disk_space_error_percent"] = body.disk_space_error_percent
     if "update_channel" in provided:
         kwargs["update_channel"] = body.update_channel
+    if "default_tracked" in provided:
+        kwargs["default_tracked"] = body.default_tracked
 
     return _to_read(update_global_settings(session, **kwargs))  # type: ignore[arg-type]
