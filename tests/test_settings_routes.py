@@ -40,6 +40,11 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["concurrency_limit"] == 1
     assert body["ui_auth_enabled"] is False
     assert body["auth_required"] == "local_bypass"  # COL-51 default
+    assert body["backup_interval_days"] == 7  # COL-66 default
+    assert body["backup_retention_days"] == 28  # COL-66 default
+    assert body["disk_space_warning_percent"] == 5.0  # COL-79 default
+    assert body["disk_space_error_percent"] == 2.0  # COL-79 default
+    assert body["update_channel"] == "stable"  # COL-88 default
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -146,6 +151,174 @@ def test_put_settings_rejects_an_unknown_auth_required_value(client: TestClient)
         headers=_auth_headers(client),
     )
     assert response.status_code == 422
+
+
+# --- backup schedule (COL-66) ---------------------------------------------------
+
+
+def test_put_settings_updates_backup_interval_and_retention(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"backup_interval_days": 3, "backup_retention_days": 14},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["backup_interval_days"] == 3
+    assert body["backup_retention_days"] == 14
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["backup_interval_days"] == 3
+    assert follow_up.json()["backup_retention_days"] == 14
+
+
+def test_put_settings_leaves_backup_schedule_untouched_when_omitted(client: TestClient) -> None:
+    client.put(
+        "/api/settings",
+        json={"backup_interval_days": 5, "backup_retention_days": 20},
+        headers=_auth_headers(client),
+    )
+
+    client.put(
+        "/api/settings",
+        json={"concurrency_limit": 3},
+        headers=_auth_headers(client),
+    )
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["backup_interval_days"] == 5
+    assert body["backup_retention_days"] == 20
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_rejects_a_zero_backup_interval(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"backup_interval_days": 0},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+def test_put_settings_rejects_a_negative_backup_retention(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"backup_retention_days": -1},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+# --- disk-space thresholds (COL-79) --------------------------------------------
+
+
+def test_put_settings_updates_disk_space_thresholds(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"disk_space_warning_percent": 10.0, "disk_space_error_percent": 3.0},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["disk_space_warning_percent"] == 10.0
+    assert body["disk_space_error_percent"] == 3.0
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["disk_space_warning_percent"] == 10.0
+    assert follow_up.json()["disk_space_error_percent"] == 3.0
+
+
+def test_put_settings_leaves_disk_space_thresholds_untouched_when_omitted(
+    client: TestClient,
+) -> None:
+    client.put(
+        "/api/settings",
+        json={"disk_space_warning_percent": 8.0, "disk_space_error_percent": 4.0},
+        headers=_auth_headers(client),
+    )
+
+    client.put(
+        "/api/settings",
+        json={"concurrency_limit": 3},
+        headers=_auth_headers(client),
+    )
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["disk_space_warning_percent"] == 8.0
+    assert body["disk_space_error_percent"] == 4.0
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_rejects_a_zero_disk_space_warning_percent(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"disk_space_warning_percent": 0},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+def test_put_settings_rejects_a_disk_space_error_percent_above_100(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"disk_space_error_percent": 101},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+# --- update channel (COL-88) -----------------------------------------------------
+
+
+def test_put_settings_switches_update_channel(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"update_channel": "beta"},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["update_channel"] == "beta"
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["update_channel"] == "beta"
+
+
+def test_put_settings_update_channel_is_switchable_back_to_stable(client: TestClient) -> None:
+    client.put("/api/settings", json={"update_channel": "beta"}, headers=_auth_headers(client))
+
+    response = client.put(
+        "/api/settings",
+        json={"update_channel": "stable"},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["update_channel"] == "stable"
+
+
+def test_put_settings_rejects_an_unknown_update_channel(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"update_channel": "nightly"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+def test_put_settings_leaves_update_channel_untouched_when_omitted(client: TestClient) -> None:
+    client.put("/api/settings", json={"update_channel": "beta"}, headers=_auth_headers(client))
+
+    client.put("/api/settings", json={"concurrency_limit": 3}, headers=_auth_headers(client))
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["update_channel"] == "beta"
+    assert body["concurrency_limit"] == 3
 
 
 # --- auth-required behaviour ---------------------------------------------------

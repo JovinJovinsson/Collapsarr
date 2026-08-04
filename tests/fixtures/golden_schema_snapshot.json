@@ -1,0 +1,101 @@
+{
+  "_comment": "THROWAWAY GUARD (COL-59). Golden sqlite_master snapshot captured from a real current-release Collapsarr database built by the pre-COL-56 create_all path (Base.metadata.create_all over the shipped models). It is an INDEPENDENT, FROZEN artifact -- not regenerated from the migration chain -- so it stays honest even if models/migrations later drift: it pins what unversioned installs in the wild actually have on disk. The fidelity test asserts `upgrade head` on an empty DB reproduces this schema (modulo constraint/whitespace ordering). Retire this fixture and its test once no unversioned (create_all-era) databases remain in the wild -- there is nothing left to adopt at that point.",
+  "objects": [
+    {
+      "type": "index",
+      "name": "ix_arr_instances_name",
+      "tbl_name": "arr_instances",
+      "sql": "CREATE INDEX ix_arr_instances_name ON arr_instances (name)"
+    },
+    {
+      "type": "index",
+      "name": "ix_arr_instances_type",
+      "tbl_name": "arr_instances",
+      "sql": "CREATE INDEX ix_arr_instances_type ON arr_instances (type)"
+    },
+    {
+      "type": "index",
+      "name": "ix_job_history_file_path",
+      "tbl_name": "job_history",
+      "sql": "CREATE INDEX ix_job_history_file_path ON job_history (file_path)"
+    },
+    {
+      "type": "index",
+      "name": "ix_job_history_job_id",
+      "tbl_name": "job_history",
+      "sql": "CREATE UNIQUE INDEX ix_job_history_job_id ON job_history (job_id)"
+    },
+    {
+      "type": "index",
+      "name": "ix_job_history_status",
+      "tbl_name": "job_history",
+      "sql": "CREATE INDEX ix_job_history_status ON job_history (status)"
+    },
+    {
+      "type": "index",
+      "name": "ix_remote_path_mappings_instance_id",
+      "tbl_name": "remote_path_mappings",
+      "sql": "CREATE INDEX ix_remote_path_mappings_instance_id ON remote_path_mappings (instance_id)"
+    },
+    {
+      "type": "index",
+      "name": "ix_tracked_media_files_file_path",
+      "tbl_name": "tracked_media_files",
+      "sql": "CREATE UNIQUE INDEX ix_tracked_media_files_file_path ON tracked_media_files (file_path)"
+    },
+    {
+      "type": "index",
+      "name": "ix_tracked_media_target_status_media_id",
+      "tbl_name": "tracked_media_target_status",
+      "sql": "CREATE INDEX ix_tracked_media_target_status_media_id ON tracked_media_target_status (media_id)"
+    },
+    {
+      "type": "index",
+      "name": "ix_tracked_media_target_status_status",
+      "tbl_name": "tracked_media_target_status",
+      "sql": "CREATE INDEX ix_tracked_media_target_status_status ON tracked_media_target_status (status)"
+    },
+    {
+      "type": "table",
+      "name": "arr_instances",
+      "tbl_name": "arr_instances",
+      "sql": "CREATE TABLE arr_instances (\n\tid INTEGER NOT NULL, \n\tname VARCHAR(100) NOT NULL, \n\ttype VARCHAR(6) NOT NULL, \n\tbase_url VARCHAR(500) NOT NULL, \n\tapi_key VARCHAR(255) NOT NULL, \n\tstatus VARCHAR(7) NOT NULL, \n\tstatus_error TEXT, \n\tstatus_checked_at DATETIME, \n\tversion VARCHAR(50), \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tCONSTRAINT uq_arr_instances_name UNIQUE (name)\n)"
+    },
+    {
+      "type": "table",
+      "name": "global_settings",
+      "tbl_name": "global_settings",
+      "sql": "CREATE TABLE global_settings (\n\tid INTEGER NOT NULL, \n\tapi_key VARCHAR(64) NOT NULL, \n\tenabled_targets VARCHAR(50) NOT NULL, \n\tlanguage_allow_list VARCHAR(500), \n\tstereo_codec VARCHAR(50) NOT NULL, \n\tstereo_bitrate_kbps INTEGER, \n\tsurround_codec VARCHAR(50) NOT NULL, \n\tsurround_bitrate_kbps INTEGER, \n\tconcurrency_limit INTEGER NOT NULL, \n\tui_auth_enabled BOOLEAN NOT NULL, \n\tauth_username VARCHAR(150), \n\tauth_password_hash VARCHAR(255), \n\tauth_method VARCHAR(10) DEFAULT 'forms' NOT NULL, \n\tauth_required VARCHAR(20) DEFAULT 'local_bypass' NOT NULL, \n\tsession_secret VARCHAR(128), \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tCONSTRAINT ck_global_settings_singleton CHECK (id = 1)\n)"
+    },
+    {
+      "type": "table",
+      "name": "job_history",
+      "tbl_name": "job_history",
+      "sql": "CREATE TABLE job_history (\n\tid INTEGER NOT NULL, \n\tjob_id VARCHAR(36) NOT NULL, \n\tfile_path VARCHAR(1000) NOT NULL, \n\tstatus VARCHAR(9) NOT NULL, \n\tstarted_at DATETIME, \n\tended_at DATETIME, \n\texit_code INTEGER, \n\terror_text TEXT, \n\ttarget VARCHAR(100), \n\tlanguage VARCHAR(255), \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+    },
+    {
+      "type": "table",
+      "name": "notifier_config",
+      "tbl_name": "notifier_config",
+      "sql": "CREATE TABLE notifier_config (\n\tid INTEGER NOT NULL, \n\twebhook_url VARCHAR(2048), \n\twebhook_enabled BOOLEAN NOT NULL, \n\tdiscord_webhook_url VARCHAR(2048), \n\tdiscord_enabled BOOLEAN NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tCONSTRAINT ck_notifier_config_singleton CHECK (id = 1)\n)"
+    },
+    {
+      "type": "table",
+      "name": "remote_path_mappings",
+      "tbl_name": "remote_path_mappings",
+      "sql": "CREATE TABLE remote_path_mappings (\n\tid INTEGER NOT NULL, \n\tinstance_id INTEGER NOT NULL, \n\tremote_prefix VARCHAR(500) NOT NULL, \n\tlocal_prefix VARCHAR(500) NOT NULL, \n\t\"order\" INTEGER NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(instance_id) REFERENCES arr_instances (id) ON DELETE CASCADE\n)"
+    },
+    {
+      "type": "table",
+      "name": "tracked_media_files",
+      "tbl_name": "tracked_media_files",
+      "sql": "CREATE TABLE tracked_media_files (\n\tid INTEGER NOT NULL, \n\tfile_path VARCHAR(1000) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)"
+    },
+    {
+      "type": "table",
+      "name": "tracked_media_target_status",
+      "tbl_name": "tracked_media_target_status",
+      "sql": "CREATE TABLE tracked_media_target_status (\n\tid INTEGER NOT NULL, \n\tmedia_id INTEGER NOT NULL, \n\tlanguage VARCHAR(50) NOT NULL, \n\ttarget VARCHAR(6) NOT NULL, \n\tstatus VARCHAR(27) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tCONSTRAINT uq_tracked_media_target_status_media_language_target UNIQUE (media_id, language, target), \n\tFOREIGN KEY(media_id) REFERENCES tracked_media_files (id) ON DELETE CASCADE\n)"
+    }
+  ]
+}

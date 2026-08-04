@@ -9,7 +9,7 @@ Exposing this over HTTP/UI is COL-36's concern and lives elsewhere.
 This module is imported for its side effect of registering
 :class:`~collapsarr.notify.models.NotifierConfig` with
 :data:`collapsarr.database.Base.metadata` -- see
-:func:`collapsarr.database.init_db`.
+the Alembic migration environment (:mod:`collapsarr.migrations`).
 """
 
 from __future__ import annotations

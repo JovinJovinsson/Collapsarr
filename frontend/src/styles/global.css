@@ -216,6 +216,9 @@ a {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+  /* Neutral danger-toned shell -- the per-row colour (below) carries the
+     warning/error distinction (COL-76), so a mixed-severity list still reads
+     as one coherent banner rather than two clashing panels. */
   background: var(--c-danger-tint);
   border: 1px solid var(--c-danger);
   border-radius: var(--radius-md);
@@ -228,12 +231,116 @@ a {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  color: var(--c-danger);
   font-size: var(--fs-sm);
   font-weight: 600;
 }
 
+/* Per-entry severity colour (COL-76): warning-severity checks render amber,
+   error-severity ones the banner's original red, so several simultaneous
+   checks of mixed severity are told apart at a glance. */
+.health-banner__message--warning {
+  color: var(--c-warning);
+}
+
+.health-banner__message--error {
+  color: var(--c-danger);
+}
+
 .health-banner__icon {
+  flex-shrink: 0;
+}
+
+/* ---- Health checks page (COL-76) --------------------------------------- */
+
+.health-table__severity,
+.health-table__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+}
+
+.health-table__severity--warning {
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+}
+
+.health-table__severity--error {
+  color: var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.health-table__status--passing {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+}
+
+.health-table__status--failing {
+  color: var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.health-table__severity-icon {
+  flex-shrink: 0;
+}
+
+.health-table__message {
+  max-width: 40ch;
+}
+
+.health-table__instance {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+}
+
+/* ---- Health check dismiss/undismiss (COL-82) --------------------------- */
+
+.health-table__dismissed {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+}
+
+.health-table__dismissed--yes {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+}
+
+/* ---- Update indicator (COL-87) ----------------------------------------
+   Deliberately *not* built on --c-danger/--c-warning like .health-banner --
+   an available update is informational, nothing is broken, so it borrows
+   .onboarding-panel's neutral accent tone instead: a calm, glanceable notice
+   rather than an alert. */
+
+.update-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: fit-content;
+  background: var(--c-accent-tint);
+  border: 1px solid var(--c-accent-tint-strong);
+  border-radius: var(--radius-md);
+  padding: var(--sp-2) var(--sp-4);
+  margin-bottom: var(--sp-5);
+  color: var(--c-accent-hover);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.update-indicator:hover {
+  border-color: var(--c-accent);
+}
+
+.update-indicator__icon {
   flex-shrink: 0;
 }
 
@@ -1009,6 +1116,264 @@ a {
   .app-shell__content {
     padding: var(--sp-4);
   }
+}
+
+/* ---- System nav section + Backups page (COL-63) ------------------------ */
+
+.sidebar__section {
+  margin-top: var(--sp-4);
+  padding: var(--sp-1) var(--sp-3);
+  color: var(--c-text-faint);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Header variant that seats page-level actions beside the title block. */
+.view__header--row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--sp-4);
+}
+
+.view__actions {
+  display: flex;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+}
+
+/* Destructive-action confirmation banner (e.g. the Upload & Restore confirm,
+   COL-73) -- a bordered panel carrying the warning copy and its confirm/cancel
+   actions, in the danger palette to match the destructive per-row confirms. */
+.view__confirm {
+  margin: 0 0 var(--sp-4);
+  border: 1px solid var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.view__confirm p {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-sm);
+}
+
+/* Accessible visually-hidden helper: kept in the a11y tree (unlike display:none)
+   so a label-associated control such as the hidden file input stays reachable. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Non-error, positive-confirmation banner (e.g. "restore started") -- same
+   shape as .view__error but in the success palette (COL-71). */
+.view__notice {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-md);
+  background: var(--c-success-tint);
+  border: 1px solid var(--c-success);
+  color: var(--c-success);
+  font-size: var(--fs-sm);
+}
+
+.view__error {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-md);
+  background: var(--c-danger-tint);
+  border: 1px solid var(--c-danger);
+  color: var(--c-danger);
+  font-size: var(--fs-sm);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.data-table th,
+.data-table td {
+  padding: var(--sp-3) var(--sp-4);
+  text-align: left;
+  vertical-align: top;
+}
+
+.data-table thead th {
+  color: var(--c-text-muted);
+  font-weight: 600;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--c-border);
+  white-space: nowrap;
+}
+
+.data-table tbody tr + tr td {
+  border-top: 1px solid var(--c-border);
+}
+
+.data-table__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+/* Inline "Delete this backup?" prompt shown between the Confirm/Cancel buttons
+   while a per-row delete is being confirmed (COL-65). */
+.data-table__confirm {
+  color: var(--c-danger);
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+/* ---- Updates page (COL-87) --------------------------------------------
+   Same neutral accent tone as .update-indicator (never .health-table's
+   warning/error palette) -- this page never shows a failure state. */
+
+.update-panel {
+  padding: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.update-panel__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--sp-4);
+}
+
+.update-panel__row dt {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--sp-1);
+}
+
+.update-panel__row dd {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
+.update-panel__status-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
+.update-panel__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: fit-content;
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  background: var(--c-success-tint);
+  color: var(--c-success);
+}
+
+.update-panel__status--available {
+  background: var(--c-accent-tint);
+  color: var(--c-accent-hover);
+}
+
+.update-panel__status-icon {
+  flex-shrink: 0;
+}
+
+.update-panel__dismissed-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+}
+
+.update-panel__changelog {
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--sp-4);
+}
+
+.update-panel__changelog-title {
+  font-size: var(--fs-base);
+  font-weight: 650;
+  margin-bottom: var(--sp-2);
+}
+
+.update-panel__changelog-body {
+  font-family: var(--font-body);
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+
+.update-panel__changelog-body :first-child {
+  margin-top: 0;
+}
+
+.update-panel__changelog-body :last-child {
+  margin-bottom: 0;
+}
+
+.update-panel__instructions {
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--sp-4);
+}
+
+.update-panel__instructions-title {
+  font-size: var(--fs-base);
+  font-weight: 650;
+  margin-bottom: var(--sp-2);
+}
+
+.update-panel__instructions-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin: 0;
+  padding-left: var(--sp-5);
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+
+.update-panel__command {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-text);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+  margin: var(--sp-1) 0;
+  overflow-x: auto;
+}
+
+.update-panel__instructions-steps code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--sp-1);
 }
 
 @media (prefers-reduced-motion: reduce) {

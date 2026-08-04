@@ -26,15 +26,34 @@ told apart from "explicitly clear this override".
 shape :mod:`collapsarr.downmix.targets` already documents as the eventual
 target of "a real settings model" -- this is that adaptation, ready for the
 downmix pipeline (COL-25 and beyond) to consume.
+
+``update_channel`` (COL-88) gets two extra pieces of behaviour beyond the
+plain "only change what's passed" rule every other field follows:
+:func:`get_global_settings` picks a version-aware default the first time the
+row is ever created (``"beta"`` for a beta build, otherwise ``"stable"``),
+and :func:`update_global_settings` validates any passed value against the
+``stable``/``beta`` enum, raising :class:`ValueError` otherwise -- the
+Settings-page write path (:mod:`collapsarr.settings.routes`) also restricts
+the field to a ``Literal`` at the API boundary, but this is the single
+service-layer guard every other caller (env-seeding, scripts, tests) goes
+through too.
 """
 
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from collapsarr import __version__
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 
-from .models import SETTINGS_ID, GlobalSettings, generate_session_secret
+from .models import (
+    BETA_LOCAL_SEGMENT_PREFIX,
+    SETTINGS_ID,
+    UPDATE_CHANNEL_BETA,
+    UPDATE_CHANNEL_STABLE,
+    GlobalSettings,
+    generate_session_secret,
+)
 from .passwords import hash_password, verify_password
 
 
@@ -76,6 +95,20 @@ def _decode_languages(value: str | None) -> frozenset[str] | None:
     return frozenset(value.split(","))
 
 
+def _default_update_channel(version: str) -> str:
+    """Return the ``update_channel`` a fresh install's row should default to (COL-88).
+
+    ``"beta"`` when the running ``version`` carries a
+    :data:`~collapsarr.settings.models.BETA_LOCAL_SEGMENT_PREFIX` local
+    segment -- i.e. the running build is itself a beta build, so it makes
+    sense to keep tracking that channel by default. Otherwise ``"stable"``,
+    the documented default for every ordinary install.
+    """
+    if BETA_LOCAL_SEGMENT_PREFIX in version:
+        return UPDATE_CHANNEL_BETA
+    return UPDATE_CHANNEL_STABLE
+
+
 def get_global_settings(session: Session) -> GlobalSettings:
     """Return the singleton settings row, creating it with defaults if absent.
 
@@ -84,10 +117,17 @@ def get_global_settings(session: Session) -> GlobalSettings:
     always returned; it is never recreated or duplicated (enforced at the
     schema level by :class:`~collapsarr.settings.models.GlobalSettings`'s
     singleton check constraint).
+
+    ``update_channel`` is seeded with :func:`_default_update_channel` rather
+    than the column's plain static default -- a fresh install running a beta
+    build (``collapsarr.__version__`` carrying a ``+beta`` local segment)
+    starts already tracking the beta channel (COL-88).
     """
     settings = session.get(GlobalSettings, SETTINGS_ID)
     if settings is None:
-        settings = GlobalSettings(id=SETTINGS_ID)
+        settings = GlobalSettings(
+            id=SETTINGS_ID, update_channel=_default_update_channel(__version__)
+        )
         session.add(settings)
         session.commit()
         session.refresh(settings)
@@ -117,6 +157,11 @@ def update_global_settings(
     password: str | None | _Unset = _UNSET,
     auth_method: str | None = None,
     auth_required: str | None = None,
+    backup_interval_days: int | None = None,
+    backup_retention_days: int | None = None,
+    disk_space_warning_percent: float | None = None,
+    disk_space_error_percent: float | None = None,
+    update_channel: str | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -134,6 +179,25 @@ def update_global_settings(
     hash (:func:`collapsarr.settings.passwords.hash_password`); the plaintext
     itself is never persisted. Verify a candidate later with
     :func:`verify_auth_password`.
+
+    ``backup_interval_days``/``backup_retention_days`` (COL-66) follow the
+    same "only change what's passed" rule as every other non-nullable field
+    here -- there is no clear-to-default sentinel since both always hold a
+    positive integer (the DB-side ``server_default`` only matters for
+    pre-existing rows predating the columns, not for updates).
+
+    ``disk_space_warning_percent``/``disk_space_error_percent`` (COL-79)
+    follow the same rule as the backup pair above. The health check
+    (:mod:`collapsarr.health.disk_space`) reads them straight off this row on
+    every tick, so a change here is live on the *next* tick with no restart.
+
+    ``update_channel`` (COL-88) follows the same "only change what's passed"
+    rule, but is additionally validated against the ``stable``/``beta``
+    enum -- an unrecognised value raises :class:`ValueError` rather than
+    being written, so no caller (the Settings-page write path or otherwise)
+    can persist an invalid channel. The Update Check scheduler reads this
+    live from the row on every tick, so a change here takes effect on the
+    next tick with no restart.
     """
     settings = get_global_settings(session)
 
@@ -161,6 +225,21 @@ def update_global_settings(
         settings.auth_method = auth_method
     if auth_required is not None:
         settings.auth_required = auth_required
+    if backup_interval_days is not None:
+        settings.backup_interval_days = backup_interval_days
+    if backup_retention_days is not None:
+        settings.backup_retention_days = backup_retention_days
+    if disk_space_warning_percent is not None:
+        settings.disk_space_warning_percent = disk_space_warning_percent
+    if disk_space_error_percent is not None:
+        settings.disk_space_error_percent = disk_space_error_percent
+    if update_channel is not None:
+        if update_channel not in (UPDATE_CHANNEL_STABLE, UPDATE_CHANNEL_BETA):
+            raise ValueError(
+                "update_channel must be one of "
+                f"{UPDATE_CHANNEL_STABLE!r}/{UPDATE_CHANNEL_BETA!r}; got {update_channel!r}"
+            )
+        settings.update_channel = update_channel
 
     session.commit()
     session.refresh(settings)

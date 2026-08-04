@@ -169,7 +169,14 @@ async def enforce_auth_middleware(
     """Gate every request per the routing table in the module docstring."""
     path = request.url.path
 
-    if path == HEALTH_PATH or path in OPEN_API_PATHS or _is_static_asset(path):
+    # The static-asset bypass is for the SPA's public JS/CSS bundle only; it must
+    # never open an ``/api`` route. Without the ``API_PREFIX`` guard, any ``/api``
+    # path whose final segment has a file extension (e.g. a backup id ending in
+    # ``.zip`` -- COL-65's ``DELETE /api/system/backup/{type}/{file}.zip``) would
+    # be misread as a static asset and skip the ``/api`` session/key gate below.
+    if path == HEALTH_PATH or path in OPEN_API_PATHS or (
+        not path.startswith(API_PREFIX) and _is_static_asset(path)
+    ):
         return await call_next(request)
 
     session_factory = request.app.state.session_factory

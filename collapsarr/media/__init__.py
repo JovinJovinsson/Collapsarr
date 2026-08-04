@@ -10,7 +10,7 @@ This module is imported for its side effect of registering
 :class:`~collapsarr.media.models.TrackedMediaFile` and
 :class:`~collapsarr.media.models.TrackedMediaTargetStatus` with
 :data:`collapsarr.database.Base.metadata` -- see
-:func:`collapsarr.database.init_db`.
+the Alembic migration environment (:mod:`collapsarr.migrations`).
 """
 
 from __future__ import annotations

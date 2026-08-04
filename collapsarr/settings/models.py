@@ -28,7 +28,7 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, CheckConstraint, Integer, String, text
+from sqlalchemy import Boolean, CheckConstraint, Float, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from collapsarr.database import Base
@@ -51,6 +51,62 @@ AUTH_METHOD_BASIC = "basic"
 AUTH_REQUIRED_ENABLED = "enabled"
 AUTH_REQUIRED_LOCAL_BYPASS = "local_bypass"
 """Whether auth is always required, or bypassed for local-network callers."""
+
+DEFAULT_BACKUP_INTERVAL_DAYS = 7
+"""Default days between scheduled backups (COL-66). Consumed by the
+scheduler landing in COL-67 -- this ticket only persists the knob."""
+
+DEFAULT_BACKUP_RETENTION_DAYS = 28
+"""Default days a backup is kept before pruning (COL-66). Consumed by the
+retention pruning landing in COL-68 -- this ticket only persists the knob."""
+
+DEFAULT_DISK_SPACE_WARNING_PERCENT = 5.0
+"""Default free-space percentage below which the disk-space health check
+(COL-79) reports a warning (``WARN-DISK-001``). Consumed live -- on every
+check tick, not just at process start -- by
+:func:`collapsarr.health.disk_space.make_disk_space_check_run`."""
+
+DEFAULT_DISK_SPACE_ERROR_PERCENT = 2.0
+"""Default free-space percentage below which the disk-space health check
+(COL-79) escalates to an error (``ERR-DISK-001``). Deliberately lower than
+:data:`DEFAULT_DISK_SPACE_WARNING_PERCENT` so the error tier is strictly
+worse than the warning tier by default, but the two fields are validated and
+stored independently -- see
+:func:`collapsarr.settings.service.update_global_settings`."""
+
+UPDATE_CHANNEL_STABLE = "stable"
+UPDATE_CHANNEL_BETA = "beta"
+"""Which GitHub Release stream the Update Check (COL-86, ``CONTEXT.md``'s
+"Release Channel") compares the running instance against. ``stable`` is the
+latest non-prerelease Release; ``beta`` is the latest prerelease Release
+(comparison logic for the beta channel is a later ticket -- COL-86 only
+persists the knob and always fetches the stable channel's latest release)."""
+
+DEFAULT_UPDATE_CHANNEL = UPDATE_CHANNEL_STABLE
+"""Default :attr:`GlobalSettings.update_channel` for a fresh install / an
+existing row backfilled by the additive migration. This is the ORM/DB-level
+default (the column's ``default=``/``server_default=``); a fresh row's
+*actual* value is decided by :func:`collapsarr.settings.service.
+get_global_settings` at creation time, which overrides it with ``"beta"``
+when the running build is itself a beta build (COL-88) -- see
+:data:`BETA_LOCAL_SEGMENT_PREFIX`."""
+
+BETA_LOCAL_SEGMENT_PREFIX = "+beta"
+"""The bare PEP 440 local-version marker a beta build carries in its running
+``collapsarr.__version__`` (COL-96) -- e.g. ``"0.2.1.0007+beta"``, stamped by
+``.github/workflows/beta.yml``'s ``build-wheel`` job. It is purely a *marker*
+now: the build's ordering identity lives in the release segment
+(``<base>.<build>``) ahead of it, so nothing follows ``+beta`` (COL-88's old
+scheme appended a ``.<short-sha>`` here -- COL-96 dropped it). Used by
+:func:`collapsarr.settings.service.get_global_settings` (a substring check) to
+auto-default a fresh install's ``update_channel`` to ``"beta"`` when the
+running build is itself a beta build. This is the single source of truth for
+the literal: :mod:`collapsarr.update_check.comparison` imports it directly for
+its own beta-channel version comparison rather than redefining it --
+``update_check`` already imports from :mod:`collapsarr.settings.models`/
+:mod:`collapsarr.settings.service` elsewhere (e.g. :mod:`collapsarr.
+update_check.scheduler`), and nothing in :mod:`collapsarr.settings` imports
+:mod:`collapsarr.update_check`, so there is no circular import risk."""
 
 
 def generate_api_key() -> str:
@@ -119,6 +175,36 @@ class GlobalSettings(Base):
     behind a reverse proxy should switch this to ``enabled``, since
     classification only ever looks at the direct TCP peer (see that module's
     docstring).
+
+    ``backup_interval_days``/``backup_retention_days`` (COL-66) are the two
+    knobs later slices consume: COL-67's scheduler reads the interval to decide
+    when to take the next scheduled backup, and COL-68's pruning reads the
+    retention to decide how long a backup is kept before deletion. Both carry
+    DB-side ``server_default``\\ s (matching ``auth_method``/``auth_required``
+    above) so the additive migration backfills existing installs with the
+    documented defaults (7 / 28 days) rather than leaving them ``NULL``.
+
+    ``update_channel`` (COL-86, ``CONTEXT.md``'s "Release Channel") is
+    ``stable``|``beta``, selecting which GitHub Release stream the Update
+    Check (:mod:`collapsarr.update_check`) compares the running instance
+    against. Carries the same ``server_default`` treatment as
+    ``auth_method``/``auth_required`` above so an existing install's row is
+    backfilled to ``stable`` in the same additive migration. Validated to the
+    two-value enum by :func:`collapsarr.settings.service.
+    update_global_settings` (COL-88) and read/write through the Settings page
+    (``GET``/``PUT /api/settings``) same as every other setting.
+
+    ``disk_space_warning_percent``/``disk_space_error_percent`` (COL-79) are
+    the two free-space-percentage thresholds
+    :func:`collapsarr.health.disk_space.make_disk_space_check_run` reads --
+    live, from this row, on every scheduler tick, so editing them via Settings
+    takes effect on the next tick without a restart. Same
+    additive-with-``server_default`` treatment as the backup columns above.
+    The two are stored and validated independently (see
+    :func:`collapsarr.settings.service.update_global_settings`); there is no
+    DB-level constraint forcing the error threshold below the warning
+    threshold, matching how ``backup_interval_days``/``backup_retention_days``
+    also carry no cross-field constraint.
     """
 
     __tablename__ = "global_settings"
@@ -159,6 +245,39 @@ class GlobalSettings(Base):
     )
     session_secret: Mapped[str | None] = mapped_column(
         String(128), nullable=True, default=generate_session_secret
+    )
+
+    backup_interval_days: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_BACKUP_INTERVAL_DAYS,
+        server_default=text(str(DEFAULT_BACKUP_INTERVAL_DAYS)),
+    )
+    backup_retention_days: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_BACKUP_RETENTION_DAYS,
+        server_default=text(str(DEFAULT_BACKUP_RETENTION_DAYS)),
+    )
+
+    disk_space_warning_percent: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=DEFAULT_DISK_SPACE_WARNING_PERCENT,
+        server_default=text(str(DEFAULT_DISK_SPACE_WARNING_PERCENT)),
+    )
+    disk_space_error_percent: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=DEFAULT_DISK_SPACE_ERROR_PERCENT,
+        server_default=text(str(DEFAULT_DISK_SPACE_ERROR_PERCENT)),
+    )
+
+    update_channel: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default=DEFAULT_UPDATE_CHANNEL,
+        server_default=text(f"'{DEFAULT_UPDATE_CHANNEL}'"),
     )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)

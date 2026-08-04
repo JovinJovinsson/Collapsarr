@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SettingsPage } from "../pages/SettingsPage";
@@ -20,6 +21,11 @@ const settings: GlobalSettings = {
   ui_auth_enabled: false,
   auth_required: "local_bypass",
   auth_method: "forms",
+  backup_interval_days: 7,
+  backup_retention_days: 28,
+  disk_space_warning_percent: 5,
+  disk_space_error_percent: 2,
+  update_channel: "stable",
   api_key: "server-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
@@ -58,7 +64,11 @@ describe("SettingsPage", () => {
       }),
     );
 
-    render(<SettingsPage />);
+    render(
+      <MemoryRouter>
+        <SettingsPage />
+      </MemoryRouter>,
+    );
 
     expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(await screen.findByText(/no arr instances configured yet/i)).toBeInTheDocument();

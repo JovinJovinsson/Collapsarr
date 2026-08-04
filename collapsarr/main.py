@@ -7,7 +7,6 @@ routes together. A module-level ``app`` is provided for ASGI servers
 
 from __future__ import annotations
 
-import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -27,24 +26,35 @@ from .arr.webhooks import (
     resolve_webhook_file,
 )
 from .auth import SessionMiddleware, auth_router, enforce_auth_middleware
+from .backup.routes import router as backup_router
+from .backup.scheduler import BackupScheduler
 from .config import Settings, get_settings
 from .database import (
     create_engine_from_settings,
     create_session_factory,
     get_session,
-    init_db,
 )
 from .frontend import mount_frontend
-from .health import FfmpegCheckResult, check_ffmpeg, notify_ffmpeg_missing
+from .health import (
+    DiskUsage,
+    FfmpegCheckResult,
+    HealthCheckScheduler,
+    default_health_checks,
+    list_failing_checks,
+)
+from .health.routes import router as health_checks_router
 from .jobs.queue import JobQueue
 from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .media.routes import router as wanted_router
+from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
+from .restore.engine import apply_pending_restore
+from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
-
-logger = logging.getLogger(__name__)
+from .update_check import UpdateCheckScheduler
+from .update_check.routes import router as update_checks_router
 
 
 def create_app(
@@ -54,6 +64,9 @@ def create_app(
     enable_scheduler: bool = False,
     ffmpeg_checker: Callable[[], FfmpegCheckResult] | None = None,
     notify_transport: httpx.BaseTransport | None = None,
+    arr_transport: httpx.BaseTransport | None = None,
+    disk_usage: Callable[[str], DiskUsage] | None = None,
+    update_check_transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -72,22 +85,54 @@ def create_app(
     The live :class:`~collapsarr.jobs.scheduler.JobScheduler` is exposed on
     ``app.state.job_scheduler`` (and its queue on ``app.state.job_queue``).
 
-    ``ffmpeg_checker`` overrides the FFmpeg startup health check (COL-38;
-    defaults to :func:`~collapsarr.health.check_ffmpeg`), letting tests
-    simulate a present/missing FFmpeg without touching the real binary.
-    ``notify_transport`` is forwarded to
-    :func:`~collapsarr.health.notify_ffmpeg_missing` (tests inject an
-    ``httpx.MockTransport``; production leaves it ``None``).
+    ``ffmpeg_checker`` overrides the FFmpeg presence probe registered on the
+    Health Check Framework (COL-75; defaults to
+    :func:`~collapsarr.health.check_ffmpeg`), letting tests simulate a
+    present/missing FFmpeg without touching the real binary. ``notify_transport``
+    is forwarded to both the Health Check Framework's transition notifications
+    and the Update Check scheduler's edge-triggered "update available"
+    notification (COL-89) -- one shared notifier config, so tests inject a
+    single ``httpx.MockTransport`` to capture either; production leaves it
+    ``None``. ``arr_transport``
+    (COL-78) is forwarded to every Arr-instance connectivity probe the
+    per-instance unreachable check makes, letting tests simulate
+    reachable/unreachable instances without a real network call; production
+    leaves it ``None`` for a real connectivity check against each configured
+    instance. ``disk_usage`` (COL-79) overrides the disk-space check's
+    :func:`shutil.disk_usage` probe, letting tests simulate an arbitrary
+    free-space percentage without depending on the real filesystem's current
+    usage; production leaves it ``None`` for a real reading against
+    ``settings.data_dir``. ``update_check_transport`` (COL-86) is forwarded to
+    the Update Check scheduler's GitHub Releases fetch (tests inject an
+    ``httpx.MockTransport``; production leaves it ``None`` for a real network
+    call).
     """
     resolved_settings = settings or get_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Boot-time staged swap (COL-70): before the engine connects and before
+        # the schema upgrade below, apply a pending database restore if one is
+        # marked -- take a safety backup of the current DB, swap the staged file
+        # into place, and clear the marker. A missing/invalid staged file (or a
+        # non-file database) aborts the swap and boots normally; no marker is a
+        # clean no-op. This is the one window a raw file swap is safe: nothing has
+        # opened the database yet, and the swapped-in (possibly older) DB is then
+        # forward-migrated by upgrade_to_head.
+        apply_pending_restore(resolved_settings)
+
+        # Bring the schema up to head via Alembic before serving the first
+        # request (COL-58). Alembic is the single source of truth for schema:
+        # on a fresh install this runs the full migration chain from base; on an
+        # already-current install it is a no-op. Any migration error propagates
+        # out of the lifespan, so startup aborts (non-zero exit) rather than
+        # serve against a half-migrated schema.
+        upgrade_to_head(resolved_settings)
+
         engine = create_engine_from_settings(resolved_settings)
         app.state.engine = engine
         session_factory = create_session_factory(engine)
         app.state.session_factory = session_factory
-        init_db(engine)
 
         # Environment-seeded UI credential for headless deploys (COL-53): if
         # COLLAPSARR_AUTH_USERNAME/PASSWORD are set and no credential exists
@@ -98,18 +143,6 @@ def create_app(
         with session_factory() as seed_session:
             seed_auth_from_env(seed_session, resolved_settings)
 
-        # FFmpeg presence check (COL-38): run once at startup rather than let
-        # a missing binary surface as a cryptic mid-job failure. The result is
-        # exposed on /health as a "degraded" warning; a missing FFmpeg also
-        # fans a notification out to every enabled notifier, if configured.
-        checker = ffmpeg_checker or check_ffmpeg
-        ffmpeg_check = checker()
-        app.state.ffmpeg_check = ffmpeg_check
-        if not ffmpeg_check.available:
-            logger.error("Startup health check failed: %s", ffmpeg_check.detail)
-            with session_factory() as health_session:
-                notify_ffmpeg_missing(health_session, ffmpeg_check, transport=notify_transport)
-
         scheduler: JobScheduler | None = None
         if on_file_ready is None and enable_scheduler:
             queue = JobQueue.from_settings(resolved_settings)
@@ -118,11 +151,76 @@ def create_app(
             app.state.job_scheduler = scheduler
             app.state.on_file_ready = scheduler.on_file_ready
             scheduler.start()
+
+        # Scheduled automatic database backups (COL-67): a separate daemon-thread
+        # scheduler that takes a `scheduled` backup whenever the newest one on
+        # disk is older than `backup_interval_days`. Gated on `enable_scheduler`
+        # alone (independent of the webhook hook above), and cleanly stopped in
+        # the `finally` below. No-ops for a non-file-based / `:memory:` database.
+        backup_scheduler: BackupScheduler | None = None
+        if enable_scheduler:
+            backup_scheduler = BackupScheduler(resolved_settings, session_factory)
+            app.state.backup_scheduler = backup_scheduler
+            backup_scheduler.start()
+
+        # Health Check Framework (COL-75): a pluggable set of registered checks
+        # run by a dedicated daemon-thread scheduler on a fixed 5-minute cadence.
+        # Replaces the old one-shot startup FFmpeg check + bespoke notifier -- the
+        # FFmpeg presence probe is now one registered check whose result is diffed
+        # against persisted per-check state, so a notification fires only on a
+        # pass<->fail transition (never repeatedly for an unchanged still-failing
+        # check) and /health is populated from that state. The first tick always
+        # runs synchronously here, before `yield`, so /health is accurate the
+        # instant the app comes up and any startup pass->fail notification fires --
+        # exactly the deterministic-at-startup guarantee the retired one-shot
+        # startup check gave. With the scheduler enabled the background thread then
+        # takes over the recurring 5-minute cadence for subsequent ticks
+        # (run_immediately=False, so it does not redundantly re-tick right away);
+        # with it disabled (tests, one-shot use) the single synchronous tick above
+        # is all that runs.
+        checks = default_health_checks(
+            ffmpeg_checker, arr_transport=arr_transport, disk_usage=disk_usage
+        )
+        health_scheduler = HealthCheckScheduler(
+            resolved_settings, session_factory, checks, transport=notify_transport
+        )
+        app.state.health_scheduler = health_scheduler
+        health_scheduler.run_once()
+        if enable_scheduler:
+            health_scheduler.start(run_immediately=False)
+
+        # Update Check scheduler (COL-86, COL-89): a dedicated daemon-thread
+        # scheduler, structurally identical to the Health Check Framework's
+        # above, that fetches the latest GitHub Release on a fixed 24-hour
+        # cadence and persists it to the singleton `update_check_state` row.
+        # Same run-the-first-tick-synchronously-then-hand-off-to-the-thread
+        # shape, so the cached release data is accurate the instant the app
+        # comes up. GET/POST /api/system/updates{,/recheck,/dismiss,
+        # /undismiss} (COL-87/COL-89, update_checks_router below) expose this
+        # state. A tick whose fetched `latest_tag` differs from the
+        # previously-stored one fires an edge-triggered notification over the
+        # same `notify_transport` the health framework's transitions use
+        # (COL-89) -- one shared notifier config, one shared mock transport in
+        # tests.
+        update_check_scheduler = UpdateCheckScheduler(
+            resolved_settings,
+            session_factory,
+            transport=update_check_transport,
+            notify_transport=notify_transport,
+        )
+        app.state.update_check_scheduler = update_check_scheduler
+        update_check_scheduler.run_once()
+        if enable_scheduler:
+            update_check_scheduler.start(run_immediately=False)
         try:
             yield
         finally:
             if scheduler is not None:
                 scheduler.stop()
+            if backup_scheduler is not None:
+                backup_scheduler.stop()
+            health_scheduler.stop()
+            update_check_scheduler.stop()
             engine.dispose()
 
     app = FastAPI(
@@ -158,22 +256,52 @@ def create_app(
     # Notifier config GET/PUT (COL-36), under /api.
     app.include_router(notifiers_router)
 
-    @app.get("/health", tags=["system"])
-    def health(request: Request) -> dict[str, object]:
-        """Liveness probe. Returns 200 with the running app version and any
-        startup health warnings (COL-38).
+    # Database backup list/create (COL-63), under /api/system.
+    app.include_router(backup_router)
 
-        ``status`` is ``"ok"`` unless a startup check failed -- currently just
+    # Restore from a listed backup (COL-71), under /api/system. Stages the
+    # database + arms the marker consumed by the boot-time swap engine
+    # (COL-70); registered after backup_router but distinguished by the
+    # POST /backup/restore/{id} path and method, so it never shadows the
+    # GET .../download or DELETE .../{id} routes above.
+    app.include_router(restore_router)
+
+    # Full per-check detail GET /api/system/health-checks (COL-76): every
+    # registered check's current state (passing or failing), driving the
+    # System > Health list page. Distinct from the unauthenticated /health
+    # probe below, which stays minimal and failing-only for the app-wide banner.
+    app.include_router(health_checks_router)
+
+    # Update Check state GET/POST /api/system/updates{,/recheck} (COL-87):
+    # exposes the singleton state COL-86's scheduler keeps warm, driving the
+    # System > Updates page and the app-wide "update available" indicator.
+    app.include_router(update_checks_router)
+
+    @app.get("/health", tags=["system"])
+    def health(session: Session = Depends(get_session)) -> dict[str, object]:
+        """Liveness probe. Returns 200 with the running app version and any
+        currently-failing health checks (COL-75).
+
+        ``status`` is ``"ok"`` unless a health check is currently failing -- e.g.
         FFmpeg availability -- in which case it is ``"degraded"`` and
-        ``warnings`` carries one entry per failed check. The app still starts
-        and serves requests either way (so the UI and API stay usable), but a
-        "degraded" status is the health-page signal that downmix jobs will
-        fail until the underlying issue (e.g. installing FFmpeg) is fixed.
+        ``warnings`` carries one ``{"code", "message", "severity"}`` entry per
+        failing check, read from the framework's persisted per-check state
+        (populated by :class:`~collapsarr.health.HealthCheckScheduler`).
+        ``severity`` (COL-76) is ``"warning"`` or ``"error"``, letting the
+        frontend banner style multiple simultaneous warnings differently from
+        errors; it was added alongside ``code``/``message`` as a
+        backward-compatible field, not a rename (see ``CONTEXT.md``'s Check
+        Code entry on why ``code`` values themselves are frozen). The app still
+        starts and serves requests either way (so the UI and API stay usable),
+        but a "degraded" status is the health-page signal that something (e.g. a
+        missing FFmpeg blocking downmix jobs) needs attention. For the full
+        detail of *every* registered check (passing or failing), see the
+        authenticated ``GET /api/system/health-checks`` (COL-76).
         """
-        ffmpeg_check: FfmpegCheckResult = request.app.state.ffmpeg_check
-        warnings: list[dict[str, str]] = []
-        if not ffmpeg_check.available:
-            warnings.append({"code": "ffmpeg_missing", "message": ffmpeg_check.detail})
+        warnings: list[dict[str, str]] = [
+            {"code": state.code, "message": state.message, "severity": state.severity}
+            for state in list_failing_checks(session)
+        ]
         return {
             "status": "ok" if not warnings else "degraded",
             "version": __version__,

@@ -24,7 +24,7 @@ from collapsarr.arr.files import MonitoredFile
 from collapsarr.arr.models import ArrInstance, InstanceType, RemotePathMapping
 from collapsarr.arr.webhooks import ResolvedWebhookFile
 from collapsarr.config import Settings
-from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
+from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError
 from collapsarr.downmix.targets import DownmixSettings
@@ -32,6 +32,7 @@ from collapsarr.jobs import scheduler as scheduler_module
 from collapsarr.jobs.history import record_job_history
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
 from collapsarr.jobs.scheduler import JobScheduler
+from collapsarr.migrations import upgrade_to_head
 
 # A 5.1 stream: with default (Stereo) settings, Stereo (2ch < 6ch, not present)
 # qualifies -> enqueue.
@@ -72,7 +73,7 @@ def _probe_raising() -> scheduler_module.ProbeFn:
 def session_factory(settings: Settings) -> Iterator[sessionmaker[Session]]:
     """A schema-initialised session factory over the isolated ``settings`` DB."""
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     yield create_session_factory(engine)
     engine.dispose()
 

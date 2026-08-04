@@ -31,6 +31,32 @@ see :mod:`collapsarr.auth.enforcement` for what each mode does.
 the sign-in page) vs. ``"basic"`` (a browser's native HTTP Basic prompt) --
 so Settings can switch how the same credential (COL-49) is presented; see
 :mod:`collapsarr.auth.enforcement` for how each method challenges a request.
+
+``backup_interval_days``/``backup_retention_days`` (COL-66) are also
+read/write here -- the two knobs the Backups page's inline controls persist.
+Both are constrained to positive integers (``Field(gt=0)``, matching the
+"sensible validation" acceptance criterion): a non-positive value is rejected
+with a ``422`` before it ever reaches the service layer. Neither has a
+dedicated endpoint -- they round-trip through the same ``GET``/``PUT
+/api/settings`` as every other setting. The values are inert here: COL-67's
+scheduler is what reads the interval to decide when to run, and COL-68's
+pruning is what reads the retention to decide what to delete.
+
+``disk_space_warning_percent``/``disk_space_error_percent`` (COL-79) are the
+two free-space-percentage thresholds the disk-space health check
+(:mod:`collapsarr.health.disk_space`) reads live on every scheduler tick --
+same round-trip-only-through-Settings treatment as the backup pair, each
+constrained to ``(0, 100]`` (``Field(gt=0, le=100)``) since a percentage
+outside that range can never be crossed by a real free-space reading.
+
+``update_channel`` (COL-88) is also read/write here -- ``"stable"`` (default)
+vs. ``"beta"`` -- selecting which GitHub Release stream the Update Check
+(:mod:`collapsarr.update_check`) compares the running instance against. Typed
+as a ``Literal`` the same way as ``auth_required``/``auth_method`` so an
+unrecognised value is rejected with a ``422`` before it reaches the service
+layer, which validates it again independently (see
+:func:`collapsarr.settings.service.update_global_settings`) for callers that
+bypass this HTTP layer.
 """
 
 from __future__ import annotations
@@ -39,7 +65,7 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from ..database import get_session
@@ -58,6 +84,12 @@ AuthMethodMode = Literal["forms", "basic"]
 """The two auth methods settable from Settings (COL-52), matching
 :data:`collapsarr.settings.models.AUTH_METHOD_FORMS` /
 :data:`~collapsarr.settings.models.AUTH_METHOD_BASIC` -- spelled out as
+literals for the same reason as :data:`AuthRequiredMode`."""
+
+UpdateChannelMode = Literal["stable", "beta"]
+"""The two release channels settable from Settings (COL-88), matching
+:data:`collapsarr.settings.models.UPDATE_CHANNEL_STABLE` /
+:data:`~collapsarr.settings.models.UPDATE_CHANNEL_BETA` -- spelled out as
 literals for the same reason as :data:`AuthRequiredMode`."""
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -83,6 +115,11 @@ class SettingsRead(BaseModel):
     ui_auth_enabled: bool
     auth_required: AuthRequiredMode
     auth_method: AuthMethodMode
+    backup_interval_days: int
+    backup_retention_days: int
+    disk_space_warning_percent: float
+    disk_space_error_percent: float
+    update_channel: UpdateChannelMode
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -109,6 +146,11 @@ class SettingsUpdate(BaseModel):
     ui_auth_enabled: bool | None = None
     auth_required: AuthRequiredMode | None = None
     auth_method: AuthMethodMode | None = None
+    backup_interval_days: int | None = Field(default=None, gt=0)
+    backup_retention_days: int | None = Field(default=None, gt=0)
+    disk_space_warning_percent: float | None = Field(default=None, gt=0, le=100)
+    disk_space_error_percent: float | None = Field(default=None, gt=0, le=100)
+    update_channel: UpdateChannelMode | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -134,6 +176,11 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         ui_auth_enabled=settings.ui_auth_enabled,
         auth_required=settings.auth_required,
         auth_method=settings.auth_method,
+        backup_interval_days=settings.backup_interval_days,
+        backup_retention_days=settings.backup_retention_days,
+        disk_space_warning_percent=settings.disk_space_warning_percent,
+        disk_space_error_percent=settings.disk_space_error_percent,
+        update_channel=settings.update_channel,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -186,5 +233,15 @@ def update_settings_endpoint(
         kwargs["auth_required"] = body.auth_required
     if "auth_method" in provided:
         kwargs["auth_method"] = body.auth_method
+    if "backup_interval_days" in provided:
+        kwargs["backup_interval_days"] = body.backup_interval_days
+    if "backup_retention_days" in provided:
+        kwargs["backup_retention_days"] = body.backup_retention_days
+    if "disk_space_warning_percent" in provided:
+        kwargs["disk_space_warning_percent"] = body.disk_space_warning_percent
+    if "disk_space_error_percent" in provided:
+        kwargs["disk_space_error_percent"] = body.disk_space_error_percent
+    if "update_channel" in provided:
+        kwargs["update_channel"] = body.update_channel
 
     return _to_read(update_global_settings(session, **kwargs))  # type: ignore[arg-type]

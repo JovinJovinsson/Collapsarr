@@ -9,20 +9,25 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
-from collapsarr.database import create_engine_from_settings, create_session_factory, init_db
+from collapsarr.database import create_engine_from_settings, create_session_factory
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
+from collapsarr.migrations import upgrade_to_head
 from collapsarr.settings.models import (
     AUTH_METHOD_BASIC,
     AUTH_METHOD_FORMS,
     AUTH_REQUIRED_ENABLED,
     AUTH_REQUIRED_LOCAL_BYPASS,
+    UPDATE_CHANNEL_BETA,
+    UPDATE_CHANNEL_STABLE,
     GlobalSettings,
 )
 from collapsarr.settings.service import (
+    _default_update_channel,
     as_downmix_settings,
     get_global_settings,
     rotate_session_secret,
@@ -34,7 +39,7 @@ from collapsarr.settings.service import (
 def _fresh_session(settings: Settings) -> Session:
     """Build a schema-initialised session for a standalone Settings/database."""
     engine = create_engine_from_settings(settings)
-    init_db(engine)
+    upgrade_to_head(settings)
     return create_session_factory(engine)()
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,14 @@ def test_get_global_settings_defaults_match_the_prd(session: Session) -> None:
     assert settings.surround_bitrate_kbps == 448
     assert settings.concurrency_limit == 1
     assert settings.ui_auth_enabled is False
+
+
+def test_get_global_settings_backup_schedule_defaults(session: Session) -> None:
+    """COL-66: a fresh row defaults to a 7-day interval and 28-day retention."""
+    settings = get_global_settings(session)
+
+    assert settings.backup_interval_days == 7
+    assert settings.backup_retention_days == 28
 
 
 def test_get_global_settings_does_not_duplicate_the_row_across_calls(session: Session) -> None:
@@ -389,6 +402,157 @@ def test_update_global_settings_explicit_none_clears_bitrate_overrides(session: 
     cleared = update_global_settings(session, surround_bitrate_kbps=None)
 
     assert cleared.surround_bitrate_kbps is None
+
+
+# ---------------------------------------------------------------------------
+# Backup schedule (COL-66): interval + retention days.
+# ---------------------------------------------------------------------------
+
+
+def test_update_global_settings_updates_backup_interval_and_retention(session: Session) -> None:
+    updated = update_global_settings(
+        session, backup_interval_days=3, backup_retention_days=14
+    )
+
+    assert updated.backup_interval_days == 3
+    assert updated.backup_retention_days == 14
+
+
+def test_update_global_settings_omitting_backup_schedule_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, backup_interval_days=10, backup_retention_days=40)
+
+    unchanged = update_global_settings(session, concurrency_limit=2)
+
+    assert unchanged.backup_interval_days == 10
+    assert unchanged.backup_retention_days == 40
+
+
+def test_update_global_settings_backup_schedule_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, backup_interval_days=1, backup_retention_days=7)
+
+    reread = get_global_settings(session)
+
+    assert reread.backup_interval_days == 1
+    assert reread.backup_retention_days == 7
+
+
+# ---------------------------------------------------------------------------
+# Disk-space thresholds (COL-79): warning + error free-space percentages.
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_disk_space_threshold_defaults(session: Session) -> None:
+    """COL-79: a fresh row defaults to a 5% warning / 2% error threshold."""
+    settings = get_global_settings(session)
+
+    assert settings.disk_space_warning_percent == 5.0
+    assert settings.disk_space_error_percent == 2.0
+
+
+def test_update_global_settings_updates_disk_space_thresholds(session: Session) -> None:
+    updated = update_global_settings(
+        session, disk_space_warning_percent=10.0, disk_space_error_percent=3.5
+    )
+
+    assert updated.disk_space_warning_percent == 10.0
+    assert updated.disk_space_error_percent == 3.5
+
+
+def test_update_global_settings_omitting_disk_space_thresholds_leaves_them_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, disk_space_warning_percent=8.0, disk_space_error_percent=4.0)
+
+    unchanged = update_global_settings(session, concurrency_limit=2)
+
+    assert unchanged.disk_space_warning_percent == 8.0
+    assert unchanged.disk_space_error_percent == 4.0
+
+
+def test_update_global_settings_disk_space_thresholds_persist_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, disk_space_warning_percent=6.0, disk_space_error_percent=1.0)
+
+    reread = get_global_settings(session)
+
+    assert reread.disk_space_warning_percent == 6.0
+    assert reread.disk_space_error_percent == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Update channel (COL-88).
+# ---------------------------------------------------------------------------
+
+
+def test_default_update_channel_is_stable_for_a_plain_version() -> None:
+    assert _default_update_channel("0.1.0") == UPDATE_CHANNEL_STABLE
+
+
+def test_default_update_channel_is_beta_for_a_beta_build_version() -> None:
+    assert _default_update_channel("0.2.1.0007+beta") == UPDATE_CHANNEL_BETA
+
+
+def test_get_global_settings_defaults_update_channel_to_stable(session: Session) -> None:
+    settings = get_global_settings(session)
+
+    assert settings.update_channel == UPDATE_CHANNEL_STABLE
+
+
+def test_get_global_settings_defaults_update_channel_to_beta_for_a_beta_build(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """COL-88/COL-96: a fresh install running a ``+beta`` build auto-defaults to beta."""
+    monkeypatch.setattr("collapsarr.settings.service.__version__", "0.2.1.0007+beta")
+
+    row = get_global_settings(session=_fresh_session(settings))
+
+    assert row.update_channel == UPDATE_CHANNEL_BETA
+
+
+def test_update_global_settings_switches_the_update_channel(session: Session) -> None:
+    updated = update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    assert updated.update_channel == UPDATE_CHANNEL_BETA
+
+
+def test_update_global_settings_update_channel_is_switchable_back_to_stable(
+    session: Session,
+) -> None:
+    update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    updated = update_global_settings(session, update_channel=UPDATE_CHANNEL_STABLE)
+
+    assert updated.update_channel == UPDATE_CHANNEL_STABLE
+
+
+def test_update_global_settings_rejects_an_unknown_update_channel(session: Session) -> None:
+    with pytest.raises(ValueError, match="update_channel"):
+        update_global_settings(session, update_channel="nightly")
+
+
+def test_update_global_settings_omitting_update_channel_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.update_channel == UPDATE_CHANNEL_BETA
+
+
+def test_update_global_settings_update_channel_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, update_channel=UPDATE_CHANNEL_BETA)
+
+    reread = get_global_settings(session)
+
+    assert reread.update_channel == UPDATE_CHANNEL_BETA
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getStoredApiKey } from "../api/client";
@@ -20,10 +21,25 @@ const baseSettings: GlobalSettings = {
   ui_auth_enabled: false,
   auth_required: "local_bypass",
   auth_method: "forms",
+  backup_interval_days: 7,
+  backup_retention_days: 28,
+  disk_space_warning_percent: 5,
+  disk_space_error_percent: 2,
+  update_channel: "stable",
   api_key: "server-generated-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
 };
+
+/** GeneralSection renders a `Link` to the Updates page (COL-88), so every
+ * render needs a Router context -- mirrors `updateIndicator.test.tsx`. */
+function renderGeneralSection() {
+  return render(
+    <MemoryRouter>
+      <GeneralSection />
+    </MemoryRouter>
+  );
+}
 
 describe("GeneralSection", () => {
   beforeEach(() => {
@@ -37,7 +53,7 @@ describe("GeneralSection", () => {
 
   it("displays the server API key and current general settings from a mocked GET", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
-    render(<GeneralSection />);
+    renderGeneralSection();
 
     expect(await screen.findByLabelText(/server api key/i)).toHaveValue("server-generated-key");
     expect(screen.getByLabelText(/concurrency limit/i)).toHaveValue(2);
@@ -46,6 +62,58 @@ describe("GeneralSection", () => {
     expect(screen.getByRole("checkbox", { name: /require the api key/i })).not.toBeChecked();
     expect(screen.getByLabelText(/login requirement/i)).toHaveValue("local_bypass");
     expect(screen.getByLabelText(/sign-in method/i)).toHaveValue("forms");
+    expect(screen.getByLabelText(/warning threshold/i)).toHaveValue(5);
+    expect(screen.getByLabelText(/critical threshold/i)).toHaveValue(2);
+  });
+
+  it("saves the disk-space thresholds via PUT with the edited values", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const warningInput = await screen.findByLabelText(/warning threshold/i);
+    const errorInput = screen.getByLabelText(/critical threshold/i);
+    fireEvent.change(warningInput, { target: { value: "10" } });
+    fireEvent.change(errorInput, { target: { value: "3" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.disk_space_warning_percent).toBe(10);
+    expect(putBody.disk_space_error_percent).toBe(3);
+  });
+
+  it("validates the disk-space warning threshold before saving", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    const warningInput = await screen.findByLabelText(/warning threshold/i);
+    fireEvent.change(warningInput, { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(
+      await screen.findByText(/disk space warning threshold must be a percentage greater than 0/i),
+    ).toBeInTheDocument();
+  });
+
+  it("validates the disk-space critical threshold before saving", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    const errorInput = await screen.findByLabelText(/critical threshold/i);
+    fireEvent.change(errorInput, { target: { value: "150" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(
+      await screen.findByText(/disk space critical threshold must be a percentage greater than 0/i),
+    ).toBeInTheDocument();
   });
 
   it("saves the auth_method via PUT when switched to HTTP Basic", async () => {
@@ -58,7 +126,7 @@ describe("GeneralSection", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<GeneralSection />);
+    renderGeneralSection();
     const authMethodSelect = await screen.findByLabelText(/sign-in method/i);
     fireEvent.change(authMethodSelect, { target: { value: "basic" } });
     fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
@@ -79,7 +147,7 @@ describe("GeneralSection", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<GeneralSection />);
+    renderGeneralSection();
     const authRequiredSelect = await screen.findByLabelText(/login requirement/i);
     fireEvent.change(authRequiredSelect, { target: { value: "enabled" } });
     fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
@@ -90,9 +158,40 @@ describe("GeneralSection", () => {
     expect(putBody.auth_required).toBe("enabled");
   });
 
+  it("displays the current update channel from a mocked GET", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse({ ...baseSettings, update_channel: "beta" })),
+    );
+    renderGeneralSection();
+
+    expect(await screen.findByLabelText(/release channel/i)).toHaveValue("beta");
+  });
+
+  it("saves the update_channel via PUT when switched to beta", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const channelSelect = await screen.findByLabelText(/release channel/i);
+    fireEvent.change(channelSelect, { target: { value: "beta" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.update_channel).toBe("beta");
+  });
+
   it("saves the browser-stored API key to localStorage", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
-    render(<GeneralSection />);
+    renderGeneralSection();
 
     const browserKeyInput = await screen.findByLabelText(/this browser's stored key/i);
     fireEvent.change(browserKeyInput, { target: { value: "my-local-key" } });
@@ -103,7 +202,7 @@ describe("GeneralSection", () => {
 
   it("copies the server key into the browser-stored key with one click", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
-    render(<GeneralSection />);
+    renderGeneralSection();
 
     await screen.findByLabelText(/server api key/i);
     fireEvent.click(screen.getByRole("button", { name: /use server key/i }));
@@ -114,7 +213,7 @@ describe("GeneralSection", () => {
 
   it("validates concurrency limit before saving", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
-    render(<GeneralSection />);
+    renderGeneralSection();
 
     const concurrencyInput = await screen.findByLabelText(/concurrency limit/i);
     fireEvent.change(concurrencyInput, { target: { value: "0" } });
@@ -133,7 +232,7 @@ describe("GeneralSection", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<GeneralSection />);
+    renderGeneralSection();
     const concurrencyInput = await screen.findByLabelText(/concurrency limit/i);
     fireEvent.change(concurrencyInput, { target: { value: "4" } });
     fireEvent.click(screen.getByRole("checkbox", { name: /require the api key/i }));
@@ -155,7 +254,7 @@ describe("GeneralSection", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<GeneralSection />);
+    renderGeneralSection();
     const surroundBitrateInput = await screen.findByLabelText(/surround bitrate/i);
     fireEvent.change(surroundBitrateInput, { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
@@ -175,7 +274,7 @@ describe("GeneralSection", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<GeneralSection />);
+    renderGeneralSection();
     await screen.findByLabelText(/server api key/i);
     fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
 
@@ -184,7 +283,7 @@ describe("GeneralSection", () => {
 
   it("renders an error state when the initial load fails", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
-    render(<GeneralSection />);
+    renderGeneralSection();
 
     expect(await screen.findByText(/couldn't load settings: network down/i)).toBeInTheDocument();
   });
@@ -209,7 +308,7 @@ describe("GeneralSection credential controls (COL-55)", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<GeneralSection />);
+    renderGeneralSection();
     fireEvent.change(await screen.findByLabelText(/current password/i), {
       target: { value: "wrong password" },
     });
@@ -235,7 +334,7 @@ describe("GeneralSection credential controls (COL-55)", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<GeneralSection />);
+    renderGeneralSection();
     fireEvent.change(await screen.findByLabelText(/current password/i), {
       target: { value: "correct horse battery staple" },
     });
@@ -253,7 +352,7 @@ describe("GeneralSection credential controls (COL-55)", () => {
 
   it("requires the new password and confirmation to match before submitting", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
-    render(<GeneralSection />);
+    renderGeneralSection();
 
     fireEvent.change(await screen.findByLabelText(/current password/i), {
       target: { value: "correct horse battery staple" },
@@ -278,7 +377,7 @@ describe("GeneralSection credential controls (COL-55)", () => {
     const assign = vi.fn();
     vi.stubGlobal("location", { pathname: "/settings", assign });
 
-    render(<GeneralSection />);
+    renderGeneralSection();
     fireEvent.click(await screen.findByRole("button", { name: /log out everywhere/i }));
 
     await screen.findByRole("button", { name: /log out everywhere/i });
