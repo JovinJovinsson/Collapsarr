@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { InstancesProvider } from "../components/InstancesProvider";
 import { LibraryPage } from "../pages/LibraryPage";
 import type { LibraryTreeResponse, MovieLibraryTreeResponse } from "../types/library";
 import type { ArrInstance } from "../types/instances";
@@ -13,9 +14,11 @@ function jsonResponse(body: unknown, status = 200) {
 function renderLibraryPage(instanceId: number) {
   return render(
     <MemoryRouter initialEntries={[`/libraries/${instanceId}`]}>
-      <Routes>
-        <Route path="/libraries/:instanceId" element={<LibraryPage />} />
-      </Routes>
+      <InstancesProvider>
+        <Routes>
+          <Route path="/libraries/:instanceId" element={<LibraryPage />} />
+        </Routes>
+      </InstancesProvider>
     </MemoryRouter>,
   );
 }

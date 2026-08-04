@@ -1,15 +1,8 @@
-import { useEffect, useState } from "react";
 import { Navigate } from "react-router-dom";
 
 import { readLastVisitedLibraryInstanceId } from "../api/library";
-import { fetchInstances } from "../api/instances";
 import { LibraryIcon } from "../components/icons";
-import type { ArrInstance } from "../types/instances";
-
-type LoadState =
-  | { status: "loading" }
-  | { status: "error"; message: string }
-  | { status: "ready"; instances: ArrInstance[] };
+import { useInstances } from "../hooks/useInstances";
 
 /**
  * Landing target for the "Libraries" primary nav item (COL-100). Clicking
@@ -20,30 +13,13 @@ type LoadState =
  * successful load), or the first configured instance if none was recorded
  * yet. `LibraryPage` (mounted at `/libraries/:instanceId`) is what actually
  * renders the tree once a target instance id is known.
+ *
+ * Instance list comes from `useInstances()` (COL-100 code review), shared
+ * with `Sidebar`'s `LibraryNavSection` and `LibraryPage` via
+ * `InstancesProvider` in `AppShell` rather than fetched here independently.
  */
 export function LibrariesIndexPage() {
-  const [state, setState] = useState<LoadState>({ status: "loading" });
-
-  useEffect(() => {
-    let cancelled = false;
-
-    fetchInstances()
-      .then((instances) => {
-        if (!cancelled) setState({ status: "ready", instances });
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setState({
-            status: "error",
-            message: error instanceof Error ? error.message : "Unknown error.",
-          });
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const state = useInstances();
 
   if (state.status === "loading") {
     return (

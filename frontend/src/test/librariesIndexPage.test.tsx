@@ -3,6 +3,7 @@ import { MemoryRouter, Route, Routes, useParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { rememberVisitedLibraryInstance } from "../api/library";
+import { InstancesProvider } from "../components/InstancesProvider";
 import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import type { ArrInstance } from "../types/instances";
 
@@ -29,10 +30,12 @@ function LandingMarker() {
 function renderLibrariesIndex() {
   return render(
     <MemoryRouter initialEntries={["/libraries"]}>
-      <Routes>
-        <Route path="/libraries" element={<LibrariesIndexPage />} />
-        <Route path="/libraries/:instanceId" element={<LandingMarker />} />
-      </Routes>
+      <InstancesProvider>
+        <Routes>
+          <Route path="/libraries" element={<LibrariesIndexPage />} />
+          <Route path="/libraries/:instanceId" element={<LandingMarker />} />
+        </Routes>
+      </InstancesProvider>
     </MemoryRouter>,
   );
 }

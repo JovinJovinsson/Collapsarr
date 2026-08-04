@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Sidebar } from "../components/Sidebar";
+import { InstancesProvider } from "../components/InstancesProvider";
 import type { ArrInstance } from "../types/instances";
 
 function jsonResponse(body: unknown, status = 200) {
@@ -40,11 +41,17 @@ const radarr: ArrInstance = {
   base_url: "http://localhost:7878",
 };
 
-/** `Sidebar` only needs Router context -- `LibraryNavSection` reads `useLocation`. */
+/**
+ * `Sidebar` needs Router context (`LibraryNavSection` reads `useLocation`)
+ * plus `InstancesProvider` (COL-100 code review): `LibraryNavSection` reads
+ * the shared instance list via `useInstances()` rather than fetching its own.
+ */
 function renderSidebar(initialPath: string) {
   return render(
     <MemoryRouter initialEntries={[initialPath]}>
-      <Sidebar />
+      <InstancesProvider>
+        <Sidebar />
+      </InstancesProvider>
     </MemoryRouter>,
   );
 }

@@ -1,14 +1,7 @@
-import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 
-import { fetchInstances } from "../api/instances";
+import { useInstances } from "../hooks/useInstances";
 import type { NavItem } from "../routes/nav";
-import type { ArrInstance } from "../types/instances";
-
-type InstancesState =
-  | { status: "loading" }
-  | { status: "error" }
-  | { status: "ready"; instances: ArrInstance[] };
 
 /**
  * Sidebar rendering for the "Libraries" primary nav item (COL-100).
@@ -22,28 +15,17 @@ type InstancesState =
  * route is active (i.e. on select), collapsed otherwise. Sidebar nesting
  * stops here -- no Series/Season sub-tree in the sidebar itself; that lives
  * on the instance's own page (`LibraryPage`).
+ *
+ * Instance list comes from `useInstances()` (COL-100 code review), the
+ * `GET /api/instances` fetch shared with the Libraries pages via
+ * `InstancesProvider` in `AppShell` -- this section no longer fetches its
+ * own copy.
  */
 export function LibraryNavSection({ to, label, icon }: NavItem) {
   const location = useLocation();
   const expanded = location.pathname === to || location.pathname.startsWith(`${to}/`);
 
-  const [state, setState] = useState<InstancesState>({ status: "loading" });
-
-  useEffect(() => {
-    let cancelled = false;
-
-    fetchInstances()
-      .then((instances) => {
-        if (!cancelled) setState({ status: "ready", instances });
-      })
-      .catch(() => {
-        if (!cancelled) setState({ status: "error" });
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const state = useInstances();
 
   return (
     <li className="sidebar__nav-group">

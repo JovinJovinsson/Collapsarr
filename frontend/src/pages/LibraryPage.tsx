@@ -1,9 +1,9 @@
 import { Fragment, useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 
-import { fetchInstances } from "../api/instances";
 import { fetchLibraryTree, rememberVisitedLibraryInstance } from "../api/library";
 import { LibraryIcon } from "../components/icons";
+import { useInstances } from "../hooks/useInstances";
 import type { ArrInstance } from "../types/instances";
 import type { EpisodeNode, LibraryTree, MovieNode, SeasonNode, SeriesNode } from "../types/library";
 import { isMovieTree } from "../types/library";
@@ -12,11 +12,6 @@ type TreeLoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "ready"; tree: LibraryTree };
-
-type InstanceLoadState =
-  | { status: "loading" }
-  | { status: "error" }
-  | { status: "ready"; instance: ArrInstance | null };
 
 const TYPE_LABEL: Record<ArrInstance["type"], string> = { sonarr: "Sonarr", radarr: "Radarr" };
 
@@ -194,13 +189,19 @@ function MovieTable({ movies }: { movies: MovieNode[] }) {
  * On a successful load, records this instance as the last-visited one
  * (`rememberVisitedLibraryInstance`) so a later bare "Libraries" click
  * returns here.
+ *
+ * The instance's own metadata (name/type/base_url, for the page header)
+ * comes from `useInstances()` (COL-100 code review), shared with `Sidebar`'s
+ * `LibraryNavSection` and `LibrariesIndexPage` via `InstancesProvider` in
+ * `AppShell` -- this page no longer fetches its own copy of the full
+ * instance list just to look up one entry.
  */
 export function LibraryPage() {
   const { instanceId: instanceIdParam } = useParams<{ instanceId: string }>();
   const instanceId = Number(instanceIdParam);
 
   const [treeState, setTreeState] = useState<TreeLoadState>({ status: "loading" });
-  const [instanceState, setInstanceState] = useState<InstanceLoadState>({ status: "loading" });
+  const instancesState = useInstances();
 
   useEffect(() => {
     if (!Number.isInteger(instanceId)) {
@@ -230,27 +231,10 @@ export function LibraryPage() {
     };
   }, [instanceId]);
 
-  useEffect(() => {
-    let cancelled = false;
-
-    fetchInstances()
-      .then((instances) => {
-        if (cancelled) return;
-        setInstanceState({
-          status: "ready",
-          instance: instances.find((candidate) => candidate.id === instanceId) ?? null,
-        });
-      })
-      .catch(() => {
-        if (!cancelled) setInstanceState({ status: "error" });
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [instanceId]);
-
-  const instance = instanceState.status === "ready" ? instanceState.instance : null;
+  const instance =
+    instancesState.status === "ready"
+      ? (instancesState.instances.find((candidate) => candidate.id === instanceId) ?? null)
+      : null;
 
   return (
     <section className="view">
