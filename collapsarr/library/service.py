@@ -378,6 +378,117 @@ def _upsert_node(
     return node
 
 
+# --- incremental (webhook) upsert --------------------------------------------
+
+
+def upsert_series_episode_node(
+    session: Session,
+    *,
+    instance_id: int,
+    series_id: int,
+    series_title: str,
+    season_number: int,
+    episode_id: int,
+    episode_number: int,
+    episode_title: str,
+    has_file: bool = True,
+) -> LibraryNode:
+    """Upsert the Series > Season > Episode chain for one imported episode (COL-102).
+
+    The real-time, single-path counterpart to :func:`sync_library`'s
+    full-catalog Sonarr pass: a webhook import event
+    (:mod:`collapsarr.arr.webhooks`) carries exactly one episode's catalog
+    coordinates, and this upserts just its three-node ancestry
+    (Series > Season > Episode) so the Library mirror reflects the new file
+    immediately rather than only at the next periodic scan (ADR-0002).
+
+    Reuses :func:`_upsert_node`, so it inherits the same guarantees: existing
+    nodes are matched by ``node_key`` and updated in place with their
+    ``tracked_override`` preserved, a previously-hidden node reappearing is
+    un-hidden, and a brand-new node is created inheriting
+    (``tracked_override = None``). Unlike :func:`sync_library` it never
+    soft-hides -- a single import says nothing about which *other* nodes still
+    exist, so it only ever adds/updates the one chain. Returns the Episode
+    (leaf) node, which is what the Tracked-gate bridge (COL-101)
+    :func:`get_node_by_source_id` resolves back to.
+    """
+    existing = {node.node_key: node for node in list_nodes(session, instance_id)}
+
+    series_node = _upsert_node(
+        session,
+        existing,
+        instance_id=instance_id,
+        kind=LibraryNodeKind.SERIES,
+        node_key=make_node_key(LibraryNodeKind.SERIES, series_id=series_id),
+        parent_id=None,
+        sonarr_series_id=series_id,
+        title=series_title,
+    )
+    session.flush()
+
+    season_node = _upsert_node(
+        session,
+        existing,
+        instance_id=instance_id,
+        kind=LibraryNodeKind.SEASON,
+        node_key=make_node_key(
+            LibraryNodeKind.SEASON, series_id=series_id, season_number=season_number
+        ),
+        parent_id=series_node.id,
+        sonarr_series_id=series_id,
+        season_number=season_number,
+        title=f"Season {season_number}",
+    )
+    session.flush()
+
+    episode_node = _upsert_node(
+        session,
+        existing,
+        instance_id=instance_id,
+        kind=LibraryNodeKind.EPISODE,
+        node_key=make_node_key(LibraryNodeKind.EPISODE, episode_id=episode_id),
+        parent_id=season_node.id,
+        sonarr_series_id=series_id,
+        season_number=season_number,
+        episode_number=episode_number,
+        sonarr_episode_id=episode_id,
+        title=episode_title,
+        has_file=has_file,
+    )
+    session.commit()
+    return episode_node
+
+
+def upsert_movie_node(
+    session: Session,
+    *,
+    instance_id: int,
+    movie_id: int,
+    title: str,
+    has_file: bool = True,
+) -> LibraryNode:
+    """Upsert one Movie node from a Radarr import webhook (COL-102).
+
+    The flat Radarr counterpart to :func:`upsert_series_episode_node` -- a
+    Movie node has no ancestor level. Same non-soft-hiding, ``tracked_override``-
+    preserving :func:`_upsert_node` semantics; returns the Movie node.
+    """
+    existing = {node.node_key: node for node in list_nodes(session, instance_id)}
+    movie_node = _upsert_node(
+        session,
+        existing,
+        instance_id=instance_id,
+        kind=LibraryNodeKind.MOVIE,
+        node_key=make_node_key(LibraryNodeKind.MOVIE, movie_id=movie_id),
+        parent_id=None,
+        radarr_movie_id=movie_id,
+        title=title,
+        has_file=has_file,
+    )
+    session.commit()
+    return movie_node
+
+
 # --- Tracked write + cascade -------------------------------------------------
 
 

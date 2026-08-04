@@ -16,10 +16,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from . import __version__
+from .arr.models import ArrInstance, InstanceType
 from .arr.routes import router as arr_router
 from .arr.service import get_instance, list_path_mappings
 from .arr.webhooks import (
     OnFileReadyHook,
+    ResolvedWebhookFile,
     WebhookValidationError,
     default_on_file_ready_hook,
     parse_webhook_payload,
@@ -47,6 +49,7 @@ from .jobs.queue import JobQueue
 from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .library.routes import router as library_router
+from .library.service import upsert_movie_node, upsert_series_episode_node
 from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
@@ -56,6 +59,51 @@ from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
 from .update_check import UpdateCheckScheduler
 from .update_check.routes import router as update_checks_router
+
+
+def _sync_webhook_library_node(
+    session: Session, instance: ArrInstance, resolved: ResolvedWebhookFile
+) -> None:
+    """Upsert the Library node(s) a webhook import event names (COL-102).
+
+    Keeps the Library mirror (ADR-0002) current in real time -- the webhook
+    counterpart to the periodic scan's :meth:`~collapsarr.jobs.scheduler.
+    JobScheduler._sync_instance_library` full-catalog pass. Dispatches on the
+    sending instance's type and upserts just the affected node's ancestry
+    (Series > Season > Episode for Sonarr, a flat Movie for Radarr), so the
+    node -- and its resolved **Tracked** value -- exists before the file-ready
+    hook resolves it. ``has_file=True``: a ``Download`` import event fires only
+    once the file is actually present. A payload missing the ids needed to key
+    a node (e.g. a Sonarr event with no ``episodes`` array) is skipped rather
+    than keyed on ``None``; the file-ready hook still runs, and the Tracked
+    gate falls back to the global default when no node resolves.
+    """
+    if instance.type is InstanceType.SONARR:
+        if (
+            resolved.sonarr_series_id is None
+            or resolved.sonarr_episode_id is None
+            or resolved.season_number is None
+        ):
+            return
+        upsert_series_episode_node(
+            session,
+            instance_id=instance.id,
+            series_id=resolved.sonarr_series_id,
+            series_title=resolved.media_title,
+            season_number=resolved.season_number,
+            episode_id=resolved.sonarr_episode_id,
+            episode_number=resolved.episode_number if resolved.episode_number is not None else 0,
+            episode_title=resolved.episode_title if resolved.episode_title is not None else "",
+        )
+    elif instance.type is InstanceType.RADARR:
+        if resolved.radarr_movie_id is None:
+            return
+        upsert_movie_node(
+            session,
+            instance_id=instance.id,
+            movie_id=resolved.radarr_movie_id,
+            title=resolved.media_title,
+        )
 
 
 def create_app(
@@ -348,6 +396,10 @@ def create_app(
         if raw_file is not None:
             mappings = list_path_mappings(session, instance.id)
             resolved = resolve_webhook_file(instance, raw_file, mappings)
+            # Mirror the imported node into the Library (COL-102) *before* the
+            # file-ready hook runs, so the file's resolved Tracked value is
+            # already resolvable when the hook decides whether to auto-enqueue.
+            _sync_webhook_library_node(session, instance, resolved)
             hook: OnFileReadyHook = request.app.state.on_file_ready
             hook(resolved)
 

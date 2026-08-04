@@ -23,9 +23,10 @@ Two write paths, matching the ticket's first two acceptance criteria:
   flip a single ``(language, target)`` pair to ``processed`` directly,
   without needing a full rescan first.
 
-:func:`list_files_missing_targets` is the read path: "files missing at
-least one enabled target" -- the data source the future Wanted view
-(COL-28) reads from.
+:func:`list_files_missing_targets` is the read path: "**Tracked** files
+missing at least one enabled target" -- the data source the Wanted view
+(COL-28) reads from. Not-Tracked files are excluded from it (COL-102), so
+the Wanted view lists only what Collapsarr will act on automatically.
 """
 
 from __future__ import annotations
@@ -39,6 +40,9 @@ from sqlalchemy.orm import Session
 
 from collapsarr.downmix.probe import AudioStreamInfo
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget, detect_qualifying_targets
+from collapsarr.library.models import LibraryNode
+from collapsarr.library.service import get_node_by_source_id, list_nodes, resolve_tracked
+from collapsarr.settings.service import get_global_settings
 
 from .models import MediaTargetStatus, TrackedMediaFile, TrackedMediaTargetStatus
 
@@ -237,7 +241,7 @@ def record_target_processed(
 def list_files_missing_targets(
     session: Session, *, enabled_targets: frozenset[DownmixTarget]
 ) -> list[TrackedMediaFile]:
-    """Return every tracked file missing at least one of ``enabled_targets``.
+    """Return every **Tracked** file missing at least one of ``enabled_targets``.
 
     ``enabled_targets`` is taken explicitly (rather than re-derived from
     stored rows) so a settings change is reflected immediately without
@@ -246,6 +250,18 @@ def list_files_missing_targets(
     stale ``MISSING`` row for it still exists. Ordered by id (insertion
     order), matching the rest of the service layer; a file with multiple
     missing targets/languages appears once.
+
+    Files whose resolved **Tracked** value (``CONTEXT.md``) is ``False`` are
+    excluded even when they have a missing target (COL-102): the Wanted view
+    lists only files Collapsarr will act on automatically. Tracked resolves by
+    bridging each file's ``instance_id`` + ``sonarr_episode_id``/
+    ``radarr_movie_id`` (COL-101) to its
+    :class:`~collapsarr.library.models.LibraryNode` and walking the
+    ancestor-override chain (:func:`~collapsarr.library.service.resolve_tracked`)
+    down to ``GlobalSettings.default_tracked``. A file that can't be bridged
+    (no ``instance_id`` captured -- e.g. only ever manually triggered by bare
+    path) can't be proven Not-Tracked, so it is *kept*: the same graceful
+    degradation the Wanted endpoint's per-row bridge already applies.
     """
     stmt = (
         select(TrackedMediaFile)
@@ -257,4 +273,46 @@ def list_files_missing_targets(
         .order_by(TrackedMediaFile.id)
         .distinct()
     )
-    return list(session.scalars(stmt))
+    candidates = list(session.scalars(stmt))
+    if not candidates:
+        return candidates
+
+    default_tracked = get_global_settings(session).default_tracked
+    nodes_cache: dict[int, dict[int, LibraryNode]] = {}
+    return [
+        media
+        for media in candidates
+        if _resolves_tracked(session, media, default_tracked, nodes_cache)
+    ]
+
+
+def _resolves_tracked(
+    session: Session,
+    media: TrackedMediaFile,
+    default_tracked: bool,
+    nodes_cache: dict[int, dict[int, LibraryNode]],
+) -> bool:
+    """Whether ``media`` resolves to Tracked -- or can't be gated (so is kept).
+
+    Returns ``True`` (keep) when ``media`` has no ``instance_id`` to bridge on,
+    or when its bridged node resolves to Tracked; ``False`` (drop) only when a
+    definite Not-Tracked value resolves. ``nodes_cache`` memoizes each
+    instance's full node set across every candidate from that instance in one
+    call, so a Wanted list dominated by one instance doesn't refetch its nodes
+    per file (the same per-``instance_id`` cache the Wanted endpoint uses).
+    """
+    if media.instance_id is None:
+        return True
+    node = get_node_by_source_id(
+        session,
+        instance_id=media.instance_id,
+        sonarr_episode_id=media.sonarr_episode_id,
+        radarr_movie_id=media.radarr_movie_id,
+    )
+    if node is None:
+        return default_tracked
+    nodes_by_id = nodes_cache.get(media.instance_id)
+    if nodes_by_id is None:
+        nodes_by_id = {n.id: n for n in list_nodes(session, media.instance_id)}
+        nodes_cache[media.instance_id] = nodes_by_id
+    return resolve_tracked(node, nodes_by_id, default_tracked)

@@ -20,6 +20,7 @@ import httpx
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
+from collapsarr.arr.catalog import CatalogEpisode, CatalogSeries, SonarrCatalog
 from collapsarr.arr.files import MonitoredFile
 from collapsarr.arr.models import ArrInstance, InstanceType, RemotePathMapping
 from collapsarr.arr.webhooks import ResolvedWebhookFile
@@ -32,8 +33,10 @@ from collapsarr.jobs import scheduler as scheduler_module
 from collapsarr.jobs.history import record_job_history
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
 from collapsarr.jobs.scheduler import JobScheduler
+from collapsarr.library.service import set_tracked, upsert_series_episode_node
 from collapsarr.media.service import get_tracked_media
 from collapsarr.migrations import upgrade_to_head
+from collapsarr.settings.service import update_global_settings
 
 # A 5.1 stream: with default (Stereo) settings, Stereo (2ch < 6ch, not present)
 # qualifies -> enqueue.
@@ -661,3 +664,162 @@ def _wait_until(predicate: object, *, timeout: float) -> None:
             return
         time.sleep(0.02)
     raise AssertionError("condition not met within timeout")
+
+
+# ---------------------------------------------------------------------------
+# Tracked gate (COL-102): automatic enqueue paths never queue a Not-Tracked
+# file; a manual trigger still does.
+# ---------------------------------------------------------------------------
+
+
+def _seed_episode_node(
+    session_factory: sessionmaker[Session],
+    instance_id: int,
+    *,
+    episode_id: int = 101,
+    tracked: bool | None = None,
+) -> None:
+    """Upsert one Series>Season>Episode chain, optionally setting a Tracked override."""
+    with session_factory() as session:
+        node = upsert_series_episode_node(
+            session,
+            instance_id=instance_id,
+            series_id=1,
+            series_title="Show",
+            season_number=1,
+            episode_id=episode_id,
+            episode_number=1,
+            episode_title="Ep",
+        )
+        if tracked is not None:
+            set_tracked(session, node_id=node.id, tracked=tracked)
+
+
+def test_enqueue_file_skips_a_not_tracked_file_but_still_tracks_it(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    instance = _add_instance(session_factory)
+    _seed_episode_node(session_factory, instance.id, tracked=False)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+
+    assert job is None
+    assert scheduler._queue.list_jobs() == []
+    with session_factory() as session:
+        assert get_tracked_media(session, "/tv/a.mkv") is not None  # still tracked/mirrored
+
+
+def test_enqueue_file_enqueues_a_tracked_file(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    instance = _add_instance(session_factory)
+    _seed_episode_node(session_factory, instance.id, tracked=None)  # inherits default (True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+
+    assert job is not None
+
+
+def test_enqueue_file_respect_tracked_false_enqueues_a_not_tracked_file(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """The manual-trigger seam: respect_tracked=False bypasses the gate even with ids."""
+    instance = _add_instance(session_factory)
+    _seed_episode_node(session_factory, instance.id, tracked=False)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file(
+        "/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101, respect_tracked=False
+    )
+
+    assert job is not None
+
+
+def test_trigger_file_enqueues_even_for_a_not_tracked_file(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC6: an explicit manual trigger downmixes a Not-Tracked file."""
+    instance = _add_instance(session_factory)
+    _seed_episode_node(session_factory, instance.id, tracked=False)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.trigger_file("/tv/a.mkv")
+
+    assert job is not None
+
+
+def test_enqueue_file_falls_back_to_default_tracked_when_no_node_matches(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Ids present but no bridged node -> resolve to the global default_tracked."""
+    instance = _add_instance(session_factory)  # no library node seeded for episode 101
+    with session_factory() as session:
+        update_global_settings(session, default_tracked=False)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+
+    assert job is None  # default_tracked False -> Not Tracked -> skipped
+
+
+def test_enqueue_file_with_no_catalog_ids_is_never_gated(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A bare-path enqueue (no instance/episode id) can't be gated -> always proceeds."""
+    _add_instance(session_factory)
+    with session_factory() as session:
+        update_global_settings(session, default_tracked=False)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file("/tv/a.mkv")
+
+    assert job is not None
+
+
+def test_scan_once_skips_a_not_tracked_file(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3 (scan pass): a Not-Tracked monitored file is mirrored but never enqueued."""
+    instance = _add_instance(session_factory)
+    _seed_episode_node(session_factory, instance.id, episode_id=101, tracked=False)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id,
+                    media_title="Show",
+                    file_path="/tv/a.mkv",
+                    sonarr_episode_id=101,
+                )
+            ]
+        },
+    )
+    catalog = SonarrCatalog(
+        instance_id=instance.id,
+        series=(
+            CatalogSeries(
+                series_id=1,
+                title="Show",
+                season_numbers=(1,),
+                episodes=(CatalogEpisode(101, 1, 1, "Ep", has_file=True),),
+            ),
+        ),
+    )
+    scheduler = JobScheduler(
+        JobQueue(pipeline_runner=_stub_runner()),
+        session_factory,
+        settings,
+        probe=_probe_returning(_SURROUND),
+        catalog_fetch=lambda _instance: catalog,
+        now=lambda: _FIXED_NOW,
+    )
+
+    enqueued = scheduler.scan_once()
+
+    assert enqueued == []
+    assert scheduler._queue.list_jobs() == []
+    with session_factory() as session:
+        assert get_tracked_media(session, "/tv/a.mkv") is not None

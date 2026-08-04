@@ -28,6 +28,8 @@ from collapsarr.library.service import (
     resolve_tracked,
     set_tracked,
     sync_library,
+    upsert_movie_node,
+    upsert_series_episode_node,
 )
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
@@ -432,3 +434,136 @@ def test_get_node_by_source_id_returns_none_when_neither_id_given(session: Sessi
     sync_library(session, instance_id=instance.id, catalog=_catalog(instance.id))
 
     assert get_node_by_source_id(session, instance_id=instance.id) is None
+
+
+# --- incremental webhook upsert (COL-102) ------------------------------------
+
+
+def test_upsert_series_episode_node_creates_the_full_ancestry(session: Session) -> None:
+    """One webhook episode creates its Series > Season > Episode chain, linked."""
+    instance = _seed_instance(session)
+
+    episode = upsert_series_episode_node(
+        session,
+        instance_id=instance.id,
+        series_id=1,
+        series_title="Breaking Bad",
+        season_number=1,
+        episode_id=101,
+        episode_number=1,
+        episode_title="Pilot",
+    )
+
+    assert episode.kind is LibraryNodeKind.EPISODE
+    assert episode.sonarr_episode_id == 101
+    assert episode.has_file is True
+    series = _series(session, instance.id)
+    season = _season(session, instance.id, 1)
+    assert episode.parent_id == season.id
+    assert season.parent_id == series.id
+    assert series.parent_id is None
+    # Exactly the three nodes for this one episode -- no siblings invented.
+    assert len(list_nodes(session, instance.id)) == 3
+
+
+def test_upsert_series_episode_node_is_idempotent_and_preserves_override(
+    session: Session,
+) -> None:
+    """A repeat import updates in place and never clobbers a Tracked override."""
+    instance = _seed_instance(session)
+    upsert_series_episode_node(
+        session,
+        instance_id=instance.id,
+        series_id=1,
+        series_title="Breaking Bad",
+        season_number=1,
+        episode_id=101,
+        episode_number=1,
+        episode_title="Pilot",
+    )
+    # A user opts the series out of Tracked.
+    series = _series(session, instance.id)
+    set_tracked(session, node_id=series.id, tracked=False)
+
+    # A later upgrade webhook for the same episode re-upserts the chain.
+    upsert_series_episode_node(
+        session,
+        instance_id=instance.id,
+        series_id=1,
+        series_title="Breaking Bad",
+        season_number=1,
+        episode_id=101,
+        episode_number=1,
+        episode_title="Pilot (Remastered)",
+    )
+
+    assert len(list_nodes(session, instance.id)) == 3  # no duplicate rows
+    episode = _episode(session, instance.id, 101)
+    assert episode.title == "Pilot (Remastered)"  # updated in place
+    # The explicit Not-Tracked override the user set survives the re-upsert and
+    # the episode still resolves to it (cascade set it on the episode too).
+    nodes_by_id = {n.id: n for n in list_nodes(session, instance.id)}
+    default_tracked = get_global_settings(session).default_tracked
+    assert resolve_tracked(episode, nodes_by_id, default_tracked) is False
+
+
+def test_upsert_series_episode_node_un_hides_a_reappearing_node(session: Session) -> None:
+    """A soft-hidden node re-imported via webhook is un-hidden, override intact."""
+    instance = _seed_instance(session)
+    upsert_series_episode_node(
+        session,
+        instance_id=instance.id,
+        series_id=1,
+        series_title="Breaking Bad",
+        season_number=1,
+        episode_id=101,
+        episode_number=1,
+        episode_title="Pilot",
+    )
+    # A later scan with an empty catalog soft-hides the whole tree.
+    sync_library(session, instance_id=instance.id, catalog=SonarrCatalog(instance.id, series=()))
+    assert all(n.hidden for n in list_nodes(session, instance.id))
+
+    # A fresh import re-upserts and un-hides.
+    episode = upsert_series_episode_node(
+        session,
+        instance_id=instance.id,
+        series_id=1,
+        series_title="Breaking Bad",
+        season_number=1,
+        episode_id=101,
+        episode_number=1,
+        episode_title="Pilot",
+    )
+
+    assert episode.hidden is False
+    assert _series(session, instance.id).hidden is False
+
+
+def test_upsert_movie_node_creates_a_flat_movie(session: Session) -> None:
+    instance = _seed_instance(session, type_=InstanceType.RADARR)
+
+    movie = upsert_movie_node(
+        session, instance_id=instance.id, movie_id=1, title="Interstellar"
+    )
+
+    assert movie.kind is LibraryNodeKind.MOVIE
+    assert movie.parent_id is None
+    assert movie.radarr_movie_id == 1
+    assert movie.has_file is True
+    assert (
+        get_node_by_source_id(session, instance_id=instance.id, radarr_movie_id=1) is not None
+    )
+
+
+def test_upsert_movie_node_is_idempotent_and_preserves_override(session: Session) -> None:
+    instance = _seed_instance(session, type_=InstanceType.RADARR)
+    movie = upsert_movie_node(session, instance_id=instance.id, movie_id=1, title="Interstellar")
+    set_tracked(session, node_id=movie.id, tracked=False)
+
+    upsert_movie_node(session, instance_id=instance.id, movie_id=1, title="Interstellar (2014)")
+
+    nodes = list_nodes(session, instance.id)
+    assert len(nodes) == 1
+    assert nodes[0].title == "Interstellar (2014)"
+    assert nodes[0].tracked_override is False

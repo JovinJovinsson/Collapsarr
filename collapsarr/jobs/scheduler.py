@@ -103,8 +103,14 @@ from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_
 from collapsarr.downmix.targets import DownmixSettings, detect_qualifying_targets
 from collapsarr.jobs.history import list_job_history
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus
-from collapsarr.library.service import sync_library
+from collapsarr.library.service import (
+    get_node_by_source_id,
+    list_nodes,
+    resolve_tracked,
+    sync_library,
+)
 from collapsarr.media.service import upsert_tracked_media
+from collapsarr.settings.service import get_global_settings
 
 logger = logging.getLogger(__name__)
 
@@ -227,14 +233,28 @@ class JobScheduler:
         instance_id: int | None = None,
         sonarr_episode_id: int | None = None,
         radarr_movie_id: int | None = None,
+        respect_tracked: bool = True,
     ) -> Job | None:
         """Enqueue a downmix job for ``file_path`` unless it should be skipped.
 
         Returns the created :class:`~collapsarr.jobs.queue.Job`, or ``None`` when
-        the file is a duplicate (already queued / recently processed), has no
-        qualifying downmix target, or cannot be probed. ``session`` (when given)
-        is reused for the history-based dedup lookup and the tracked-media
-        upsert below; otherwise a short-lived one is opened.
+        the file is a duplicate (already queued / recently processed), resolves
+        to **Not Tracked** (``respect_tracked`` -- see below), has no qualifying
+        downmix target, or cannot be probed. ``session`` (when given) is reused
+        for the history-based dedup lookup and the tracked-media upsert below;
+        otherwise a short-lived one is opened.
+
+        ``respect_tracked`` (COL-102) gates the enqueue on the file's resolved
+        **Tracked** value (``CONTEXT.md``): when ``True`` (the automatic paths --
+        :meth:`on_file_ready`, :meth:`scan_once`) a file whose owning
+        :class:`~collapsarr.library.models.LibraryNode` resolves to Not Tracked
+        is *tracked* (its media row is still upserted, below) but never
+        auto-enqueued -- Tracked gates automatic behavior only. :meth:`trigger_file`
+        passes ``False`` so an explicit manual trigger still downmixes a
+        Not-Tracked file. The gate is a no-op when there is no catalog identity
+        to resolve (``instance_id`` / episode / movie id all absent, e.g. a
+        bare-path manual trigger): such a file can't be bridged to a node, so it
+        is treated as Tracked and proceeds -- exactly the pre-COL-102 behavior.
 
         ``settings`` overrides :attr:`_downmix_settings` for this call only --
         used by :meth:`trigger_file` (COL-23) to pass a per-call allow-list
@@ -289,6 +309,20 @@ class JobScheduler:
             radarr_movie_id=radarr_movie_id,
         )
 
+        # Tracked gate (COL-102): an automatic trigger never auto-enqueues a
+        # Not-Tracked file. Placed *after* _track_media so the file is still
+        # mirrored/tracked (it just isn't queued) and *before* the enqueue, so
+        # nothing about an already-queued/running job or produced tracks is
+        # touched -- Tracked only gates *future* automatic enqueueing.
+        if respect_tracked and not self._resolve_tracked(
+            session,
+            instance_id=instance_id,
+            sonarr_episode_id=sonarr_episode_id,
+            radarr_movie_id=radarr_movie_id,
+        ):
+            logger.info("skipping %s: resolved Not Tracked, not auto-enqueuing", path)
+            return None
+
         if not detect_qualifying_targets(streams, effective_settings):
             return None
 
@@ -338,6 +372,65 @@ class JobScheduler:
                 radarr_movie_id=radarr_movie_id,
             )
 
+    def _resolve_tracked(
+        self,
+        session: Session | None,
+        *,
+        instance_id: int | None,
+        sonarr_episode_id: int | None,
+        radarr_movie_id: int | None,
+    ) -> bool:
+        """Resolve the file's effective **Tracked** value for the auto-enqueue gate.
+
+        Returns ``True`` (proceed) when there is no catalog identity to gate on
+        -- an ``instance_id`` plus an episode *or* movie id is required to bridge
+        the file to its :class:`~collapsarr.library.models.LibraryNode`; without
+        one (a bare-path manual trigger) the file is treated as Tracked, the
+        pre-COL-102 behavior. With ids present but no matching node, falls back
+        to ``GlobalSettings.default_tracked`` -- the same fallback
+        :func:`~collapsarr.library.service.resolve_tracked` itself uses when
+        nothing in a node's ancestry is explicit. Mirrors :meth:`_is_duplicate`'s
+        session handling: reuses ``session`` when the caller has one open (the
+        scan), else opens a short-lived one (the webhook/manual paths).
+        """
+        if instance_id is None or (sonarr_episode_id is None and radarr_movie_id is None):
+            return True
+        if session is not None:
+            return self._resolve_tracked_in(
+                session,
+                instance_id=instance_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_movie_id=radarr_movie_id,
+            )
+        with self._session_factory() as owned_session:
+            return self._resolve_tracked_in(
+                owned_session,
+                instance_id=instance_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_movie_id=radarr_movie_id,
+            )
+
+    def _resolve_tracked_in(
+        self,
+        session: Session,
+        *,
+        instance_id: int,
+        sonarr_episode_id: int | None,
+        radarr_movie_id: int | None,
+    ) -> bool:
+        """Resolve Tracked for a file with catalog ids, within ``session``."""
+        default_tracked = get_global_settings(session).default_tracked
+        node = get_node_by_source_id(
+            session,
+            instance_id=instance_id,
+            sonarr_episode_id=sonarr_episode_id,
+            radarr_movie_id=radarr_movie_id,
+        )
+        if node is None:
+            return default_tracked
+        nodes_by_id = {n.id: n for n in list_nodes(session, instance_id)}
+        return resolve_tracked(node, nodes_by_id, default_tracked)
+
     def trigger_file(
         self,
         file_path: str | Path,
@@ -365,16 +458,21 @@ class JobScheduler:
           are unioned in just for this trigger; ``self._downmix_settings``
           itself, and every other trigger, are unaffected.
 
-        Still goes through the same dedup and qualifying-target detection as
-        the automatic triggers -- the acceptance criteria ask to bypass the
-        *language allow-list* specifically, not dedup or "does this file
+        Bypasses the **Tracked** gate (COL-102): a manual trigger is an
+        explicit user action, so it downmixes even a Not-Tracked file (Tracked
+        gates only *automatic* enqueueing -- ``CONTEXT.md``). It still goes
+        through the same dedup and qualifying-target detection as the automatic
+        triggers -- the acceptance criteria ask to bypass the *language
+        allow-list* (and Tracked) specifically, not dedup or "does this file
         actually need downmixing". Returns the created
         :class:`~collapsarr.jobs.queue.Job`, or ``None`` for the same reasons
         :meth:`enqueue_file` would (duplicate, unprobeable, or still no
         qualifying target even with the extra languages included).
         """
         settings = self._settings_with_extra_languages(extra_languages)
-        return self.enqueue_file(file_path, session=session, settings=settings)
+        return self.enqueue_file(
+            file_path, session=session, settings=settings, respect_tracked=False
+        )
 
     def _settings_with_extra_languages(
         self, extra_languages: Iterable[str] | None

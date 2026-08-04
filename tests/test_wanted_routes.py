@@ -176,9 +176,10 @@ def test_wanted_includes_the_resolved_tracked_bridge_when_it_resolves(
     assert isinstance(row["library_node_id"], int)
 
 
-def test_wanted_reflects_an_explicit_not_tracked_override(
+def test_wanted_excludes_a_file_marked_not_tracked(
     client: TestClient, session: Session
 ) -> None:
+    """AC2: a file whose node resolves Not-Tracked drops out of /api/wanted (COL-102)."""
     instance, episode_id = _seed_sonarr_instance_and_episode(session)
     update_global_settings(session, enabled_targets=ALL_TARGETS)
     upsert_tracked_media(
@@ -189,13 +190,17 @@ def test_wanted_reflects_an_explicit_not_tracked_override(
         instance_id=instance.id,
         sonarr_episode_id=episode_id,
     )
+    # While Tracked (the global default), it is wanted...
     response = client.get("/api/wanted", headers=_auth_headers(client))
+    assert [row["file_path"] for row in response.json()] == ["/media/pilot.mkv"]
     node_id = response.json()[0]["library_node_id"]
+
+    # ...but flipping its node to Not-Tracked removes it entirely (even though
+    # its MISSING target rows still exist).
     set_tracked(session, node_id=node_id, tracked=False)
 
     response = client.get("/api/wanted", headers=_auth_headers(client))
-
-    assert response.json()[0]["tracked"] is False
+    assert response.json() == []
 
 
 def test_wanted_tracked_fields_are_none_when_the_bridge_is_unresolved(
