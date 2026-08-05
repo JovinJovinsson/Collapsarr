@@ -296,6 +296,53 @@ def test_run_pending_automatically_persists_history_when_a_recorder_is_configure
     engine.dispose()
 
 
+# --- COL-108: a job is visible in history before it finishes --------------
+
+
+def test_enqueue_immediately_persists_a_pending_job(settings: Settings) -> None:
+    """A job is queryable in history the instant it's enqueued, before run_pending()."""
+    engine = create_engine_from_settings(settings)
+    upgrade_to_head(settings)
+    session_factory = create_session_factory(engine)
+
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(_SUCCESS),
+        history_recorder=make_history_recorder(session_factory),
+    )
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    with session_factory() as read_session:
+        rows = list_job_history(read_session)
+
+    assert len(rows) == 1
+    assert rows[0].job_id == str(job.id)
+    assert rows[0].status is JobStatus.PENDING
+    assert rows[0].started_at is None
+    assert rows[0].ended_at is None
+    engine.dispose()
+
+
+def test_run_pending_persists_a_running_row_before_the_job_completes(settings: Settings) -> None:
+    """The recorder observes RUNNING, not just terminal, as the job executes."""
+    engine = create_engine_from_settings(settings)
+    upgrade_to_head(settings)
+    session_factory = create_session_factory(engine)
+    real_recorder = make_history_recorder(session_factory)
+    seen_statuses: list[JobStatus] = []
+
+    def recorder(job: Job) -> None:
+        seen_statuses.append(job.status)
+        real_recorder(job)
+
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS), history_recorder=recorder)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    assert seen_statuses == [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCEEDED]
+    engine.dispose()
+
+
 def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> None:
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
