@@ -111,7 +111,25 @@ item can still be downmixed via an explicit manual trigger on its detail
 page; Tracked only gates *automatic* behavior. Resolves, in order, from the
 nearest explicit ancestor override down to the global `default_tracked`
 setting (itself defaulting to `true`) when nothing in a node's ancestry has
-been explicitly set.
+been explicitly set. This resolution only applies once a **Catalog
+Identity** has located a real Library Node — an identity that can't be
+resolved to any node at all is **unresolved**, not "resolved, Tracked=false",
+and automatic behavior (enqueue, Wanted-listing) is skipped for it rather
+than falling back to `default_tracked`.
+
+## Catalog Identity
+
+The `(ArrInstance, Sonarr episode id | Radarr movie id)` identity Collapsarr
+uses to bridge an Arr-side file/episode/movie — from a scan, webhook, or API
+request — to its owning **Library Node** and resolved **Tracked** value.
+Always carries an instance; carries at most one leaf id (Sonarr XOR Radarr,
+never both — rejected at construction, since an instance is one Arr type or
+the other, never mixed). A Catalog Identity with no leaf id at all is a
+legitimate state (a file/episode not yet matched to a node) and resolves as
+**unresolved**, not as "resolved, Tracked=false" — see Tracked's resolution
+note below. Resolution itself is a single call,
+`library.service.resolve_tracked_for_source`, replacing what had drifted
+into five independent reimplementations of the same bridge logic.
 
 ## Library
 
