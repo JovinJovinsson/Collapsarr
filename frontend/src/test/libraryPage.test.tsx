@@ -860,6 +860,101 @@ describe("LibraryPage (COL-100)", () => {
     expect(screen.queryByText(/the detail/i)).not.toBeInTheDocument();
   });
 
+  it("'Select all' adds every currently-rendered Series/Season/Episode node to the selection (COL-109)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: twoSeriesTree }));
+    renderLibraryPage(1);
+
+    await screen.findByRole("button", { name: /breaking bad/i });
+    fireEvent.click(screen.getByRole("button", { name: /select all/i }));
+
+    // twoSeriesTree: "Breaking Bad" (series + season + 2 episodes) plus
+    // "Better Call Saul" (series + season + 1 episode) = 7 rows total, even
+    // though neither series is expanded (COL-109: "currently-rendered" means
+    // "post filter", not "currently visible in the DOM").
+    expect(await screen.findByText(/7 rows selected/i)).toBeInTheDocument();
+
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    expect(await screen.findByRole("checkbox", { name: /select breaking bad$/i })).toBeChecked();
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+    expect(
+      await screen.findByRole("checkbox", { name: /select breaking bad s1e1 pilot/i }),
+    ).toBeChecked();
+  });
+
+  it("'Select all' composes with an existing selection and survives a later filter change (COL-109)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: twoSeriesTree }));
+    renderLibraryPage(1);
+
+    // A row selected before "Select all" is run...
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select better call saul$/i }));
+    expect(await screen.findByText(/1 row selected/i)).toBeInTheDocument();
+
+    // Narrow to just "Breaking Bad" via search, then select all of what's
+    // currently shown -- "Better Call Saul"'s prior selection must survive
+    // even though it's not part of this "Select all" pass.
+    fireEvent.change(screen.getByRole("searchbox", { name: /search titles/i }), {
+      target: { value: "Breaking Bad" },
+    });
+    await screen.findByRole("button", { name: /breaking bad/i });
+    fireEvent.click(screen.getByRole("button", { name: /select all/i }));
+
+    // "Breaking Bad" + its 1 season + its 2 episodes (4) plus the
+    // pre-existing "Better Call Saul" selection (1) = 5.
+    expect(await screen.findByText(/5 rows selected/i)).toBeInTheDocument();
+
+    // Clearing the search doesn't retroactively prune anything either.
+    fireEvent.change(screen.getByRole("searchbox", { name: /search titles/i }), { target: { value: "" } });
+    expect(await screen.findByText(/5 rows selected/i)).toBeInTheDocument();
+    expect(
+      await screen.findByRole("checkbox", { name: /select better call saul$/i }),
+    ).toBeChecked();
+  });
+
+  it("'Select all' selection also survives changing the Tracked filter afterward (COL-109)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: mixedTrackedTree }));
+    renderLibraryPage(1);
+
+    await screen.findByRole("button", { name: /breaking bad/i });
+    fireEvent.change(screen.getByRole("combobox", { name: /tracked filter/i }), {
+      target: { value: "tracked" },
+    });
+    await screen.findByRole("button", { name: /breaking bad/i });
+    fireEvent.click(screen.getByRole("button", { name: /select all/i }));
+
+    // "Breaking Bad" is the only series resolving Tracked here: series +
+    // season + 2 episodes = 4.
+    expect(await screen.findByText(/4 rows selected/i)).toBeInTheDocument();
+
+    // Switching to "Not Tracked" hides "Breaking Bad" entirely (it resolves
+    // Tracked) -- its selection must persist even while it's off-screen.
+    fireEvent.change(screen.getByRole("combobox", { name: /tracked filter/i }), {
+      target: { value: "not-tracked" },
+    });
+    await screen.findByRole("button", { name: /better call saul/i });
+    expect(screen.queryByRole("button", { name: /^breaking bad$/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/4 rows selected/i)).toBeInTheDocument();
+
+    // Back to "All": "Breaking Bad" reappears, still checked.
+    fireEvent.change(screen.getByRole("combobox", { name: /tracked filter/i }), {
+      target: { value: "all" },
+    });
+    expect(
+      await screen.findByRole("checkbox", { name: /select breaking bad$/i }),
+    ).toBeChecked();
+  });
+
+  it("'Select all' adds every currently-rendered Movie row to the selection (COL-109)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [radarrInstance], tree: movieTree }));
+    renderLibraryPage(2);
+
+    await screen.findByText("Interstellar");
+    fireEvent.click(screen.getByRole("button", { name: /select all/i }));
+
+    expect(await screen.findByText(/2 rows selected/i)).toBeInTheDocument();
+    expect(await screen.findByRole("checkbox", { name: /select interstellar/i })).toBeChecked();
+    expect(await screen.findByRole("checkbox", { name: /select dune: part two/i })).toBeChecked();
+  });
+
   it("keeps a filtered-out row's cross-level selection intact rather than dropping it (COL-103/COL-104)", async () => {
     vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: twoSeriesTree }));
     renderLibraryPage(1);
