@@ -119,15 +119,17 @@ a caller Collapsarr considers "local". The **Login requirement** setting
 | **Disabled for local addresses** (`local_bypass`, default) | A caller connecting from a loopback (`127.0.0.1`/`::1`) or private-range (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, etc.) address reaches the UI and API with no setup and no login. Anyone connecting from a routable/public address still has to authenticate normally. |
 | **Always required** (`enabled`) | Every caller is challenged, regardless of address. |
 
-**Reverse-proxy configuration:** if Collapsarr sits behind a reverse proxy
-(nginx, Traefik, Cloudflare Tunnel, etc.), by default every request's direct
-peer is the proxy itself — meaning requests from any real client are classified
-by their network distance from the proxy, not the client. This breaks
-`local_bypass` mode (the default Login requirement), where local clients should
-skip authentication: the proxy's own address is usually private/loopback, so
-**every** client (including public internet) appears local and bypasses login.
-It also corrupts the session cookie's `Secure` flag, which should reflect the
-real client's connection scheme, not Collapsarr's local connection to the proxy.
+### Reverse-proxy configuration
+
+If Collapsarr sits behind a reverse proxy (nginx, Traefik, Cloudflare Tunnel,
+etc.), by default every request's direct peer is the proxy itself — meaning
+requests from any real client are classified by their network distance from
+the proxy, not the client. This breaks `local_bypass` mode (the default Login
+requirement), where local clients should skip authentication: the proxy's own
+address is usually private/loopback, so **every** client (including public
+internet) appears local and bypasses login. It also corrupts the session
+cookie's `Secure` flag, which should reflect the real client's connection
+scheme, not Collapsarr's local connection to the proxy.
 
 **Configure trusted proxies to fix this:** Set `COLLAPSARR_TRUSTED_PROXIES` to
 a comma-separated list of IP addresses or CIDR blocks identifying your
@@ -137,16 +139,18 @@ Collapsarr trusts that proxy's `X-Forwarded-For` and `X-Forwarded-Proto`
 headers to classify the real client address and scheme, fixing both issues
 above. An unparseable entry fails fast at startup.
 
-This uses a **single-hop trust model only** — when the direct peer is on the
-allowlist, the *rightmost* `X-Forwarded-For` and `X-Forwarded-Proto` entries
-(the trusted proxy's own view of its immediate client) are used. There is no
-support for multi-hop proxy chains; an install behind multiple reverse proxies
-must normalize those headers before they reach Collapsarr.
+**Single-hop trust only:** when the direct peer is on the allowlist, the
+*rightmost* `X-Forwarded-For` and `X-Forwarded-Proto` entries (the trusted
+proxy's own view of its immediate client) are used. There is no support for
+multi-hop proxy chains; an install behind multiple reverse proxies must
+normalize those headers before they reach Collapsarr.
 
 **If you have not configured a trusted proxy**, the old workaround still
-applies: set the Login requirement to "Always required"
-(`COLLAPSARR_AUTH_REQUIRED=enabled`) to force authentication regardless of
-the apparent client address.
+applies: use Settings → General (or the API endpoint `PUT /api/settings`)
+to set the Login requirement to "Always required" (`auth_required: "enabled"`)
+to force authentication regardless of the apparent client address. This
+runtime setting persists across restarts and applies to all subsequent
+requests.
 
 **Headless deploys — seeding a credential without the setup page:** a
 declarative/automated deploy (Docker Compose, Ansible, etc.) has no human
