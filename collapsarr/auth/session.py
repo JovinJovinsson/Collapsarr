@@ -17,8 +17,10 @@ cannot express:
 * **Per-response cookie lifetime and Secure flag.** A "remember me" login yields
   a long-lived (:data:`REMEMBER_MAX_AGE`) cookie; an unchecked login yields a
   browser-session cookie (no ``Max-Age``). The ``Secure`` attribute is set only
-  when the request arrived over TLS (direct HTTPS or an ``X-Forwarded-Proto:
-  https`` from a reverse proxy). Vanilla ``SessionMiddleware`` fixes both at
+  when the request arrived over TLS -- direct HTTPS, or an
+  ``X-Forwarded-Proto: https`` from a reverse proxy on the
+  ``COLLAPSARR_TRUSTED_PROXIES`` allowlist (:func:`collapsarr.auth.trust.
+  resolve_scheme`, COL-114). Vanilla ``SessionMiddleware`` fixes both at
   construction.
 
 The ``local_bypass`` required-mode (COL-51) and the Basic auth method (COL-52)
@@ -41,6 +43,7 @@ from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..settings.service import get_global_settings
+from .trust import resolve_scheme
 
 SESSION_COOKIE = "collapsarr_session"
 """Name of the signed session cookie."""
@@ -89,11 +92,16 @@ def _security_flags(secure: bool) -> str:
 
 
 def _is_secure(connection: HTTPConnection) -> bool:
-    """Whether the request arrived over TLS (direct or via a trusted proxy header)."""
-    if connection.scope.get("scheme") == "https":
-        return True
-    forwarded = connection.headers.get("x-forwarded-proto", "")
-    return forwarded.split(",")[0].strip().lower() == "https"
+    """Whether the request arrived over TLS.
+
+    Delegates to :func:`collapsarr.auth.trust.resolve_scheme` (COL-112/
+    COL-114): the direct ASGI scheme, unless the direct peer is on the
+    ``COLLAPSARR_TRUSTED_PROXIES`` allowlist, in which case that proxy's
+    ``X-Forwarded-Proto`` is honoured instead. With no allowlist configured
+    (the default), an ``X-Forwarded-Proto`` header from any source no longer
+    has any effect -- only the direct scheme does.
+    """
+    return resolve_scheme(connection) == "https"
 
 
 def sync_cached_secret(app: object, secret: str) -> None:

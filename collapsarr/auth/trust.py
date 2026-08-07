@@ -17,18 +17,25 @@ no support for walking back through a multi-proxy chain -- an install behind
 more than one hop of reverse proxy must terminate/normalise those headers
 before they reach Collapsarr.
 
-This module makes **no behavior change on its own** -- nothing in the
-request path calls it yet. It exists to unblock two consuming slices:
-``local_bypass`` classification (:func:`collapsarr.auth.enforcement._client_is_local`,
-COL-113) and the session cookie's ``Secure`` flag
-(:func:`collapsarr.auth.session._is_secure`, COL-114). Both of those read the
-direct peer/scheme unconditionally today; neither is touched here.
+Both consuming slices are now wired: ``local_bypass`` classification
+(:func:`collapsarr.auth.enforcement._client_is_local`, COL-113) calls
+:func:`resolve_client_address`, and the session cookie's ``Secure`` flag
+(:func:`collapsarr.auth.session._is_secure`, COL-114) calls
+:func:`resolve_scheme`.
 
 Both header-suppliable values are only trusted when the *direct TCP peer* --
 the address the ASGI server actually accepted the connection from, never a
 header -- is in the ``COLLAPSARR_TRUSTED_PROXIES`` allowlist. A caller cannot
 forge its way onto the allowlist by sending a header: the header is only
 consulted after the connection's own peer address has already qualified.
+
+Both public functions take a :class:`~starlette.requests.HTTPConnection`
+rather than a FastAPI/Starlette ``Request`` -- ``Request`` *is* an
+``HTTPConnection`` (a strict subclass), so every existing call site passing a
+``Request`` keeps working unchanged; the wider parameter type is what lets
+:func:`collapsarr.auth.session._is_secure` call :func:`resolve_scheme` from
+raw ASGI middleware, where only an ``HTTPConnection`` (no request body) is
+available.
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ from __future__ import annotations
 import ipaddress
 from functools import lru_cache
 
-from fastapi import Request
+from starlette.requests import HTTPConnection
 
 from ..config import Settings
 
@@ -92,20 +99,20 @@ def _cached_networks(raw: str) -> tuple[IpNetwork, ...]:
     return tuple(parse_trusted_proxies(raw))
 
 
-def _peer_host(request: Request) -> str | None:
+def _peer_host(connection: HTTPConnection) -> str | None:
     """The literal address the ASGI server accepted this connection from."""
-    client = request.client
+    client = connection.client
     return client.host if client is not None else None
 
 
-def _is_trusted_peer(request: Request) -> bool:
-    """Whether the request's direct TCP peer is on the trusted-proxy allowlist.
+def _is_trusted_peer(connection: HTTPConnection) -> bool:
+    """Whether the connection's direct TCP peer is on the trusted-proxy allowlist.
 
-    Reads only ``request.client`` -- never a header -- so this check itself
-    cannot be spoofed; only a peer that actually qualifies gets its
+    Reads only ``connection.client`` -- never a header -- so this check
+    itself cannot be spoofed; only a peer that actually qualifies gets its
     forwarded headers consulted at all.
     """
-    host = _peer_host(request)
+    host = _peer_host(connection)
     if host is None:
         return False
     try:
@@ -114,29 +121,29 @@ def _is_trusted_peer(request: Request) -> bool:
         # Not a literal IP (seen in some non-network test harnesses) --
         # treat conservatively as untrusted.
         return False
-    settings: Settings = request.app.state.settings
+    settings: Settings = connection.app.state.settings
     networks = _cached_networks(settings.trusted_proxies)
     return any(address in network for network in networks)
 
 
-def resolve_client_address(request: Request) -> str | None:
-    """The real client address for ``request``.
+def resolve_client_address(connection: HTTPConnection) -> str | None:
+    """The real client address for ``connection``.
 
     Returns the direct peer's address, unconditionally, unless that peer is
     on the ``COLLAPSARR_TRUSTED_PROXIES`` allowlist -- in which case the
     rightmost ``X-Forwarded-For`` entry (the hop nearest Collapsarr, i.e.
     the trusted proxy's own view of its immediate client) is returned
     instead. ``None`` only when there is no direct peer to fall back to
-    (mirrors ``request.client`` being ``None``).
+    (mirrors ``connection.client`` being ``None``).
 
     An untrusted peer's ``X-Forwarded-For`` header, however present or
     well-formed, is never consulted -- it is exactly as forgeable as any
     other client-supplied header.
     """
-    peer_host = _peer_host(request)
-    if not _is_trusted_peer(request):
+    peer_host = _peer_host(connection)
+    if not _is_trusted_peer(connection):
         return peer_host
-    forwarded = request.headers.get(X_FORWARDED_FOR)
+    forwarded = connection.headers.get(X_FORWARDED_FOR)
     if forwarded:
         rightmost = forwarded.rsplit(",", 1)[-1].strip()
         if rightmost:
@@ -144,8 +151,8 @@ def resolve_client_address(request: Request) -> str | None:
     return peer_host
 
 
-def resolve_scheme(request: Request) -> str:
-    """The real request scheme for ``request``.
+def resolve_scheme(connection: HTTPConnection) -> str:
+    """The real request scheme for ``connection``.
 
     Returns the direct ASGI scheme, unconditionally, unless the direct peer
     is on the ``COLLAPSARR_TRUSTED_PROXIES`` allowlist -- in which case
@@ -155,10 +162,10 @@ def resolve_scheme(request: Request) -> str:
     ``X-Forwarded-For`` handling (the value the trusted peer itself
     attached, not whatever an untrusted upstream hop may have claimed).
     """
-    direct_scheme = str(request.scope.get("scheme", _DEFAULT_SCHEME))
-    if not _is_trusted_peer(request):
+    direct_scheme = str(connection.scope.get("scheme", _DEFAULT_SCHEME))
+    if not _is_trusted_peer(connection):
         return direct_scheme
-    forwarded = request.headers.get(X_FORWARDED_PROTO)
+    forwarded = connection.headers.get(X_FORWARDED_PROTO)
     if forwarded:
         candidate = forwarded.rsplit(",", 1)[-1].strip()
         if candidate:

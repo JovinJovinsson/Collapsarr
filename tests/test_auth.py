@@ -472,6 +472,88 @@ def test_local_bypass_ignores_forwarded_for_from_an_untrusted_local_peer(
         )
 
 
+# --- session cookie Secure flag + trusted-proxy resolution (COL-114) ---------
+#
+# ``_is_secure`` (collapsarr.auth.session) now resolves the scheme through
+# ``resolve_scheme`` (collapsarr.auth.trust, COL-112) instead of trusting
+# ``X-Forwarded-Proto`` from any source. With no ``COLLAPSARR_TRUSTED_PROXIES``
+# configured, that header no longer has any effect at all -- only the direct
+# ASGI scheme does. Once the direct peer is on the allowlist, that proxy's
+# ``X-Forwarded-Proto`` is honoured; an untrusted peer's is still ignored,
+# exactly the same forgeability rule COL-113 applied to ``X-Forwarded-For``.
+
+
+@contextmanager
+def _client_for_peer_and_scheme(
+    settings: Settings, host: str, *, scheme: str = "http"
+) -> Iterator[TestClient]:
+    """Like ``_client_for_peer`` but also controls the ASGI scheme TestClient
+    reports: a ``https://testserver`` base URL makes ``request.scope["scheme"]
+    == "https"``, so direct-HTTPS cases can be exercised alongside a chosen
+    peer address."""
+    app = create_app(settings=settings)
+    with TestClient(
+        app,
+        base_url=f"{scheme}://testserver",
+        client=(host, 51234),
+        follow_redirects=False,
+    ) as test_client:
+        yield test_client
+
+
+def _login_set_cookie(test_client: TestClient, **headers: str) -> str:
+    """Seed a credential, log in, and return the ``Set-Cookie`` header value."""
+    _seed_credential(test_client)
+    login = test_client.post(
+        "/api/auth/login",
+        json={"username": USERNAME, "password": PASSWORD},
+        headers=headers,
+    )
+    assert login.status_code == 200
+    return str(login.headers["set-cookie"])
+
+
+def test_secure_flag_absent_over_plain_http_with_no_trusted_proxies(
+    settings: Settings,
+) -> None:
+    with _client_for_peer_and_scheme(settings, PUBLIC_HOST) as test_client:
+        assert "secure" not in _login_set_cookie(test_client).lower()
+
+
+def test_secure_flag_ignores_forwarded_proto_with_no_trusted_proxies(
+    settings: Settings,
+) -> None:
+    """Closes the pre-COL-114 gap: X-Forwarded-Proto from any source used to
+    be trusted unconditionally, regardless of any allowlist."""
+    with _client_for_peer_and_scheme(settings, PUBLIC_HOST) as test_client:
+        cookie = _login_set_cookie(test_client, **{"X-Forwarded-Proto": "https"})
+        assert "secure" not in cookie.lower()
+
+
+def test_secure_flag_set_for_forwarded_proto_from_a_trusted_proxy(tmp_path: Path) -> None:
+    settings = _settings_with_trusted_proxies(tmp_path, f"{TRUSTED_PROXY_HOST}/32")
+    with _client_for_peer_and_scheme(settings, TRUSTED_PROXY_HOST) as test_client:
+        cookie = _login_set_cookie(test_client, **{"X-Forwarded-Proto": "https"})
+        assert "secure" in cookie.lower()
+
+
+def test_secure_flag_absent_for_spoofed_forwarded_proto_from_an_untrusted_peer(
+    tmp_path: Path,
+) -> None:
+    """A peer not on the allowlist cannot force Secure via a forged header,
+    even while the direct connection is plain HTTP."""
+    settings = _settings_with_trusted_proxies(tmp_path, f"{TRUSTED_PROXY_HOST}/32")
+    with _client_for_peer_and_scheme(settings, PUBLIC_HOST) as test_client:
+        cookie = _login_set_cookie(test_client, **{"X-Forwarded-Proto": "https"})
+        assert "secure" not in cookie.lower()
+
+
+def test_secure_flag_set_for_direct_https_regardless_of_allowlist(tmp_path: Path) -> None:
+    settings = _settings_with_trusted_proxies(tmp_path, "")
+    with _client_for_peer_and_scheme(settings, PUBLIC_HOST, scheme="https") as test_client:
+        assert "secure" in _login_set_cookie(test_client).lower()
+
+
 # --- Basic auth method (COL-52) ------------------------------------------------
 #
 # Same credential core as Forms (verified via ``verify_auth_password``), a
