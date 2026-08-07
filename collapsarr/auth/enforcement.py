@@ -36,13 +36,18 @@ mode. This makes a LAN/localhost self-hoster's install frictionless (no
 setup, no login, no API key) while any routable-address client -- including
 one pretending to be local -- must still authenticate.
 
-Classification (:func:`_client_is_local`) reads only the literal peer address
-the ASGI server accepted the connection from (``request.client``) -- it never
-parses ``X-Forwarded-For`` or any other client-suppliable header, which any
-caller could forge. The consequence: behind a reverse proxy, the proxy's own
-address is what gets classified, not its upstream client's -- an install
-behind a reverse proxy should set ``auth_required="enabled"`` until a later
-ticket adds trusted-proxy support (see the README's Authentication section).
+Classification (:func:`_client_is_local`) resolves the address via
+:func:`collapsarr.auth.trust.resolve_client_address` (COL-112/COL-113), not
+the raw ASGI peer: by default (no ``COLLAPSARR_TRUSTED_PROXIES`` configured)
+that is exactly the literal peer address the server accepted the connection
+from, same as before -- ``X-Forwarded-For`` is never consulted. Once an
+install lists its reverse proxy's address in ``COLLAPSARR_TRUSTED_PROXIES``,
+a request whose *direct* peer is that trusted proxy is classified on the
+rightmost ``X-Forwarded-For`` entry instead (the proxy's own view of its
+immediate client), so the real upstream client -- not the proxy -- is what
+determines local-vs-routable. A peer that is not on the allowlist is still
+classified by its own direct address, and any ``X-Forwarded-For`` it presents
+is ignored -- exactly as forgeable, and as ignored, as before.
 
 The Basic auth method (COL-52) slots in at the browser-route branch below:
 when ``auth_method="basic"``, an unauthenticated browser request gets a ``401``
@@ -68,6 +73,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from ..settings.models import AUTH_METHOD_BASIC, AUTH_REQUIRED_LOCAL_BYPASS
 from ..settings.service import get_global_settings, verify_auth_password
 from .session import is_authenticated, log_in
+from .trust import resolve_client_address
 
 API_KEY_HEADER = "X-Api-Key"
 """Request header carrying the API key (Sonarr/Radarr convention)."""
@@ -128,22 +134,22 @@ def _basic_challenge() -> Response:
 
 
 def _client_is_local(request: Request) -> bool:
-    """Whether the request's direct TCP peer is loopback or a private-range address.
+    """Whether the request's resolved client address is loopback or private-range.
 
-    Reads ``request.client`` -- the literal address the ASGI server accepted
-    the connection from -- and nothing else. In particular this deliberately
-    does **not** consult ``X-Forwarded-For`` (or any other header): those are
-    supplied by the client and trivially spoofable, so trusting them here
-    would let any external caller claim to be local and bypass auth entirely.
-    The tradeoff (documented in the module docstring and the README) is that
-    an install behind a reverse proxy sees the proxy's own peer address, not
-    its upstream client's -- trusted-proxy support is a later stub.
+    The address comes from :func:`~collapsarr.auth.trust.resolve_client_address`
+    (COL-112), not straight from ``request.client``: with no trusted proxy
+    configured (the default) that is the same literal peer address the ASGI
+    server accepted the connection from, so behavior is unchanged. Only when
+    the *direct* peer is on the ``COLLAPSARR_TRUSTED_PROXIES`` allowlist does
+    the resolved address instead reflect the rightmost ``X-Forwarded-For``
+    entry -- an untrusted peer's forwarded header is never consulted, so it
+    cannot spoof its way into a local classification.
     """
-    client = request.client
-    if client is None:
+    address_str = resolve_client_address(request)
+    if address_str is None:
         return False
     try:
-        address = ipaddress.ip_address(client.host)
+        address = ipaddress.ip_address(address_str)
     except ValueError:
         # Not a literal IP address (seen in some non-network test harnesses) --
         # treat conservatively as not local.
