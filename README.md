@@ -119,16 +119,34 @@ a caller Collapsarr considers "local". The **Login requirement** setting
 | **Disabled for local addresses** (`local_bypass`, default) | A caller connecting from a loopback (`127.0.0.1`/`::1`) or private-range (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, etc.) address reaches the UI and API with no setup and no login. Anyone connecting from a routable/public address still has to authenticate normally. |
 | **Always required** (`enabled`) | Every caller is challenged, regardless of address. |
 
-**Reverse-proxy limitation:** local-address classification looks only at the
-*direct* TCP connection Collapsarr accepted — never an `X-Forwarded-For` (or
-similar) header, since that's supplied by the client and trivially spoofable.
-If Collapsarr sits behind a reverse proxy (nginx, Traefik, Cloudflare Tunnel,
-etc.), every request's direct peer is the proxy itself, which usually *is*
-local — meaning **every** client, including ones out on the internet, would
-be classified as local and skip authentication entirely. **If you run
-Collapsarr behind a reverse proxy, set the Login requirement to "Always
-required" (`auth_required=enabled`)** until a future release adds
-trusted-proxy support (a stubbed-out capability today).
+**Reverse-proxy configuration:** if Collapsarr sits behind a reverse proxy
+(nginx, Traefik, Cloudflare Tunnel, etc.), by default every request's direct
+peer is the proxy itself — meaning requests from any real client are classified
+by their network distance from the proxy, not the client. This breaks
+`local_bypass` mode (the default Login requirement), where local clients should
+skip authentication: the proxy's own address is usually private/loopback, so
+**every** client (including public internet) appears local and bypasses login.
+It also corrupts the session cookie's `Secure` flag, which should reflect the
+real client's connection scheme, not Collapsarr's local connection to the proxy.
+
+**Configure trusted proxies to fix this:** Set `COLLAPSARR_TRUSTED_PROXIES` to
+a comma-separated list of IP addresses or CIDR blocks identifying your
+reverse proxy(ies), e.g. `COLLAPSARR_TRUSTED_PROXIES=192.168.1.100` or
+`COLLAPSARR_TRUSTED_PROXIES=10.0.0.0/8,192.168.1.100`. Once configured,
+Collapsarr trusts that proxy's `X-Forwarded-For` and `X-Forwarded-Proto`
+headers to classify the real client address and scheme, fixing both issues
+above. An unparseable entry fails fast at startup.
+
+This uses a **single-hop trust model only** — when the direct peer is on the
+allowlist, the *rightmost* `X-Forwarded-For` and `X-Forwarded-Proto` entries
+(the trusted proxy's own view of its immediate client) are used. There is no
+support for multi-hop proxy chains; an install behind multiple reverse proxies
+must normalize those headers before they reach Collapsarr.
+
+**If you have not configured a trusted proxy**, the old workaround still
+applies: set the Login requirement to "Always required"
+(`COLLAPSARR_AUTH_REQUIRED=enabled`) to force authentication regardless of
+the apparent client address.
 
 **Headless deploys — seeding a credential without the setup page:** a
 declarative/automated deploy (Docker Compose, Ansible, etc.) has no human
@@ -184,6 +202,7 @@ directory. See [`.env.example`](.env.example).
 | `COLLAPSARR_HOST` | `0.0.0.0` | API server bind address. |
 | `COLLAPSARR_PORT` | `8282` | API server bind port. |
 | `COLLAPSARR_LOG_LEVEL` | `INFO` | Log level. |
+| `COLLAPSARR_TRUSTED_PROXIES` | *(empty)* | Comma-separated list of IP addresses and/or CIDR blocks (e.g. `192.168.1.100,10.0.0.0/8`) identifying reverse proxies to trust for `X-Forwarded-For` and `X-Forwarded-Proto` headers. When the direct TCP peer is in this allowlist, Collapsarr uses those headers to determine the real client address and request scheme. See [Reverse-proxy configuration](#reverse-proxy-configuration). An unparseable entry fails fast at startup. |
 | `COLLAPSARR_AUTH_USERNAME` | *(unset)* | First-boot credential seed: UI username. Set together with `COLLAPSARR_AUTH_PASSWORD` — see [Authentication](#authentication). |
 | `COLLAPSARR_AUTH_PASSWORD` | *(unset)* | First-boot credential seed: UI password. Hashed before being persisted; never stored or logged in plaintext. |
 | `COLLAPSARR_AUTH_METHOD` | *(unset — `forms`)* | Optional, only applied when the seed credential above is actually seeded: `forms` or `basic`. |
