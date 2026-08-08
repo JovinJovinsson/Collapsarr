@@ -7,12 +7,13 @@ temporary stand-in directory so they pass in a plain source checkout.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from collapsarr.frontend import mount_frontend
+from collapsarr.frontend import _inject_url_base, mount_frontend
 
 # A realistic Vite-style built document: a <head>/</head> pair and the app
 # bundle loaded as a module <script>. The url_base injection lands the runtime
@@ -121,6 +122,31 @@ def test_url_base_injected_on_spa_fallback(tmp_path: Path) -> None:
     resp = client.get("/libraries/42")
     assert resp.status_code == 200
     assert f'{_RUNTIME_GLOBAL} = "/collapsarr";' in resp.text
+
+
+def test_inject_url_base_escapes_hostile_value() -> None:
+    """A url_base with quotes/angle brackets cannot break out of the script.
+
+    ``_normalize_url_base`` only enforces the leading/trailing slash, so an
+    operator-configured value may contain ``"`` or ``</script>``. Such a value
+    must be encoded as a valid JS string literal that stays inside the injected
+    ``<script>`` tag (COL-118 review must-fix).
+    """
+    hostile = '/foo"bar</script><script>alert(1)</script>'
+    out = _inject_url_base(_INDEX_HTML, hostile)
+
+    # None of the hostile ``</script>``/``<script>`` payload survives literally:
+    # every ``<`` was escaped, so nothing could terminate the injected tag.
+    assert "</script><script>alert" not in out
+    assert '"bar</script>' not in out
+    assert "<script>alert(1)" not in out
+
+    # The emitted literal parses back to exactly the original value: extract the
+    # assignment ``= <literal>;`` and round-trip it (``<`` -> ``<``).
+    marker = f"{_RUNTIME_GLOBAL} = "
+    start = out.index(marker) + len(marker)
+    end = out.index(";</script>", start)
+    assert json.loads(out[start:end]) == hostile
 
 
 def test_index_unchanged_without_url_base(tmp_path: Path) -> None:

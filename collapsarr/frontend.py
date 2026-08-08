@@ -25,6 +25,7 @@ as it is on disk, exactly as before this change.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -53,11 +54,17 @@ def _inject_url_base(html: str, url_base: str) -> str:
     hoists the module bundle into ``<head>``, so this lands the classic inline
     global ahead of it in source order); falls back to just before ``</head>``,
     then to prepending, so a document shaped differently still gets the global.
-    ``url_base`` is a server-validated path prefix (leading slash, no trailing
-    slash -- see ``Settings._normalize_url_base``), not user input, so it is
-    embedded directly.
+
+    ``url_base`` comes from operator configuration (``Settings.url_base``), not
+    an end user, but ``_normalize_url_base`` only enforces the leading/trailing
+    slash -- it does not reject ``"``, ``<`` or ``</script>``. So the value is
+    encoded as a JS string literal with ``json.dumps`` (correct quoting and
+    escaping) and every ``<`` is further escaped to ``\\u003c`` so a stray
+    ``</script>`` cannot terminate the surrounding ``<script>`` tag. The result
+    is always a valid JS string that stays inside the tag.
     """
-    script = f'<script>window.__COLLAPSARR_URL_BASE__ = "{url_base}";</script>'
+    literal = json.dumps(url_base).replace("<", "\\u003c")
+    script = f"<script>window.__COLLAPSARR_URL_BASE__ = {literal};</script>"
     lowered = html.lower()
     script_open = lowered.find("<script")
     if script_open != -1:
