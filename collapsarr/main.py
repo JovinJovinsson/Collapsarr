@@ -59,6 +59,7 @@ from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
 from .update_check import UpdateCheckScheduler
 from .update_check.routes import router as update_checks_router
+from .url_base import UrlBaseMiddleware
 
 
 def _sync_webhook_library_node(
@@ -288,6 +289,16 @@ def create_app(
     # reads it. Both supersede the old opt-in api_key_middleware (COL-26).
     app.middleware("http")(enforce_auth_middleware)
     app.add_middleware(SessionMiddleware)
+
+    # URL base (COL-116): strips a configured COLLAPSARR_URL_BASE prefix from
+    # the incoming path and sets ASGI root_path, so a reverse proxy can pass
+    # the full external path straight through with no rewrite rule (ADR-0004).
+    # Registered *last* here, which -- per Starlette's add_middleware, which
+    # inserts each new middleware at the front of the stack -- makes it the
+    # *outermost* layer, running before both the session and enforcement
+    # middleware above see the request (they need the already-stripped path/
+    # already-set root_path). A no-op pass-through when url_base is unset.
+    app.add_middleware(UrlBaseMiddleware, url_base=resolved_settings.url_base)
 
     # Forms auth endpoints: /api/auth/{status,setup,login,logout} (COL-50).
     app.include_router(auth_router)

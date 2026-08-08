@@ -23,6 +23,7 @@ Environment variable                Default                    Description
 ``COLLAPSARR_AUTH_METHOD``           *(unset)*                  Seed only: forms or basic.
 ``COLLAPSARR_AUTH_REQUIRED``         *(unset)*                  Seed only: enabled or local_bypass.
 ``COLLAPSARR_TRUSTED_PROXIES``       *(empty)*                  Trusted reverse-proxy allowlist.
+``COLLAPSARR_URL_BASE``              *(empty)*                  Reverse-proxy subpath prefix.
 ==================================  =========================  =======================
 
 ``COLLAPSARR_AUTH_USERNAME``/``COLLAPSARR_AUTH_PASSWORD`` (COL-53) are a
@@ -42,6 +43,18 @@ headers are ignored wherever they matter. An unparseable entry raises at
 ``Settings`` construction (fail-fast) rather than being silently dropped. See
 :mod:`collapsarr.auth.trust` for the allowlist parsing and the
 ``resolve_client_address``/``resolve_scheme`` functions that consume it.
+
+``COLLAPSARR_URL_BASE`` (COL-116) is a reverse-proxy subpath prefix (e.g.
+``/collapsarr``), matching Radarr's "Url Base" parity target. Empty by
+default -- no prefix, every route serves at the root exactly as today. When
+set, a request to ``<url_base>/...`` is stripped and routed as ``/...``, and
+the unprefixed form (e.g. a Docker healthcheck hitting ``/health`` directly)
+still resolves unchanged -- both keep working, per
+``docs/adr/0004-url-base-strip-middleware-not-root-path-flag.md``. A value
+missing its leading slash raises at ``Settings`` construction (fail-fast); a
+trailing slash is stripped automatically (normalized, not rejected). See
+:class:`collapsarr.url_base.UrlBaseMiddleware` for the strip-prefix ASGI
+middleware that consumes this setting.
 
 ``data_dir`` defaults to ``platformdirs.user_data_dir("collapsarr")`` — e.g.
 ``~/.local/share/collapsarr`` on Linux, native per-OS locations elsewhere —
@@ -176,6 +189,17 @@ class Settings(BaseSettings):
             "functions that consume it."
         ),
     )
+    url_base: str = Field(
+        default="",
+        description=(
+            "Reverse-proxy subpath prefix (COL-116), e.g. '/collapsarr'. "
+            "Default empty -- no prefix, routes serve at the root as today. "
+            "When set, requests to <url_base>/... are stripped and routed "
+            "as /...; the unprefixed form still resolves unchanged. See "
+            "collapsarr.url_base.UrlBaseMiddleware and "
+            "docs/adr/0004-url-base-strip-middleware-not-root-path-flag.md."
+        ),
+    )
 
     @model_validator(mode="after")
     def _require_auth_seed_pair(self) -> Settings:
@@ -224,6 +248,26 @@ class Settings(BaseSettings):
         from .auth.trust import parse_trusted_proxies
 
         parse_trusted_proxies(self.trusted_proxies)
+        return self
+
+    @model_validator(mode="after")
+    def _normalize_url_base(self) -> Settings:
+        """Validate and normalize ``COLLAPSARR_URL_BASE`` (COL-116).
+
+        A configured value missing its leading slash is almost certainly a
+        misconfiguration -- :class:`~collapsarr.url_base.UrlBaseMiddleware`'s
+        prefix match assumes one -- so it raises here, at startup, rather
+        than silently never matching any request. A trailing slash is
+        stripped automatically (e.g. ``/collapsarr/`` -> ``/collapsarr``) so
+        the middleware's prefix match doesn't need to special-case it.
+        """
+        if self.url_base:
+            if not self.url_base.startswith("/"):
+                raise ValueError(
+                    "COLLAPSARR_URL_BASE must start with a leading slash, "
+                    "e.g. '/collapsarr'."
+                )
+            self.url_base = self.url_base.rstrip("/")
         return self
 
     @property
