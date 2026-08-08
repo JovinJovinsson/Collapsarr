@@ -419,7 +419,7 @@ def create_app(
     # Serve the bundled single-page frontend (COL-40). Registered last so the
     # catch-all SPA mount at "/" does not shadow the API/health routes above.
     # No-op in a source checkout without a built frontend (API stays usable).
-    mount_frontend(app)
+    mount_frontend(app, url_base=resolved_settings.url_base)
 
     return app
 
