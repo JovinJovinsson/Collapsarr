@@ -172,6 +172,65 @@ is already set; that requires clearing the existing `auth_username`/
 `auth_password_hash` first (e.g. directly in the database) so the instance
 has no credential again, at which point re-seeding (or `/setup`) applies.
 
+**Mounting Collapsarr at a subpath (`COLLAPSARR_URL_BASE`):** if you're
+routing several apps through one reverse proxy and want Collapsarr to live
+under a subpath (e.g. `https://example.com/collapsarr/`) instead of its own
+(sub)domain, set `COLLAPSARR_URL_BASE=/collapsarr`. Collapsarr expects the
+proxy to forward the request **exactly as received — no path-rewrite/strip
+rule needed**: it recognizes and strips its own configured prefix internally
+(the same pattern ASP.NET Core's `UsePathBase` implements), so a plain
+pass-through proxy config "just works". This is a worked example combining
+it with the trusted-proxies configuration above:
+
+```nginx
+# /etc/nginx/conf.d/collapsarr.conf
+server {
+    listen 443 ssl;
+    server_name example.com;
+
+    location /collapsarr/ {
+        proxy_pass http://127.0.0.1:8282;   # no path after host:port --
+                                             # nginx forwards the full
+                                             # /collapsarr/... URI unchanged,
+                                             # no rewrite rule needed
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+```bash
+# .env, or the compose `environment:` block
+COLLAPSARR_URL_BASE=/collapsarr
+COLLAPSARR_TRUSTED_PROXIES=127.0.0.1   # nginx's address -- see above
+```
+
+With this configuration:
+
+- A browser request to `https://example.com/collapsarr/wanted` arrives at
+  Collapsarr as `/collapsarr/wanted` (nginx forwarded it unmodified);
+  Collapsarr strips the `/collapsarr` prefix internally and routes it as
+  `/wanted`, exactly like an unprefixed install.
+- A request that bypasses the proxy entirely — e.g. a Docker healthcheck
+  hitting `http://localhost:8282/health` directly — still resolves: only
+  paths that actually start with the configured prefix are stripped;
+  anything else passes through unchanged.
+- Redirects (to `/setup`, `/login`) and the session cookie's `path`
+  attribute are both re-prefixed with `/collapsarr`, so the browser is sent
+  to — and the cookie is scoped to — `/collapsarr/login`, never the bare
+  `/login` (which the proxy isn't even routing to Collapsarr).
+- The served page picks up the configured prefix at runtime and prefixes its
+  own API calls and client-side navigation, so the UI behaves the same as an
+  unprefixed install — links, redirects, and API requests all resolve under
+  `/collapsarr`.
+
+A value missing its leading slash fails fast at startup; a trailing slash is
+stripped automatically. See [Configuration](#configuration) and
+`docs/adr/0004-url-base-strip-middleware-not-root-path-flag.md` for the
+design rationale.
+
 ## Development
 
 ```bash
@@ -207,6 +266,7 @@ directory. See [`.env.example`](.env.example).
 | `COLLAPSARR_PORT` | `8282` | API server bind port. |
 | `COLLAPSARR_LOG_LEVEL` | `INFO` | Log level. |
 | `COLLAPSARR_TRUSTED_PROXIES` | *(empty)* | Comma-separated list of IP addresses and/or CIDR blocks (e.g. `192.168.1.100,10.0.0.0/8`) identifying reverse proxies to trust for `X-Forwarded-For` and `X-Forwarded-Proto` headers. When the direct TCP peer is in this allowlist, Collapsarr uses those headers to determine the real client address and request scheme. See [Reverse-proxy configuration](#reverse-proxy-configuration). An unparseable entry fails fast at startup. |
+| `COLLAPSARR_URL_BASE` | *(empty)* | Reverse-proxy subpath prefix (e.g. `/collapsarr`) for mounting Collapsarr under a subpath instead of its own (sub)domain. Empty by default — no prefix, routes serve at the root as today. The reverse proxy needs no rewrite rule; Collapsarr strips its own configured prefix internally. See [Reverse-proxy configuration](#reverse-proxy-configuration). A value missing its leading slash fails fast at startup; a trailing slash is stripped automatically. |
 | `COLLAPSARR_AUTH_USERNAME` | *(unset)* | First-boot credential seed: UI username. Set together with `COLLAPSARR_AUTH_PASSWORD` — see [Authentication](#authentication). |
 | `COLLAPSARR_AUTH_PASSWORD` | *(unset)* | First-boot credential seed: UI password. Hashed before being persisted; never stored or logged in plaintext. |
 | `COLLAPSARR_AUTH_METHOD` | *(unset — `forms`)* | Optional, only applied when the seed credential above is actually seeded: `forms` or `basic`. |
