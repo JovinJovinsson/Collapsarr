@@ -72,6 +72,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from ..settings.models import AUTH_METHOD_BASIC, AUTH_REQUIRED_LOCAL_BYPASS
 from ..settings.service import get_global_settings, verify_auth_password
+from ..url_base import external_path
 from .session import is_authenticated, log_in
 from .trust import resolve_client_address
 
@@ -121,6 +122,17 @@ def _parse_basic_credentials(request: Request) -> tuple[str, str] | None:
     if not separator:
         return None
     return username, password
+
+
+def _prefixed_redirect(url_base: str, path: str) -> RedirectResponse:
+    """A gate ``RedirectResponse`` to ``path``, with ``url_base`` re-added (COL-117).
+
+    Every gate redirect below goes through this instead of building
+    ``RedirectResponse`` directly, so the ``Location`` header is always the
+    correct external URL for a browser behind a reverse proxy -- see
+    :func:`collapsarr.url_base.external_path`.
+    """
+    return RedirectResponse(url=external_path(url_base, path), status_code=_REDIRECT_STATUS)
 
 
 def _basic_challenge() -> Response:
@@ -185,6 +197,14 @@ async def enforce_auth_middleware(
     ):
         return await call_next(request)
 
+    # Re-added to any redirect Location header below (COL-117): by the time
+    # this middleware runs, UrlBaseMiddleware (COL-116) has already stripped
+    # the configured prefix from `path`, but a Location header is an
+    # outbound URL sent to the browser, which needs the full external path
+    # -- prefix included. Empty when unconfigured, so redirects stay
+    # unprefixed exactly as before.
+    url_base: str = request.app.state.settings.url_base
+
     session_factory = request.app.state.session_factory
     with session_factory() as session:
         settings = get_global_settings(session)
@@ -218,16 +238,16 @@ async def enforce_auth_middleware(
         # First-run gate: only the setup page is reachable.
         if path == SETUP_PATH:
             return await call_next(request)
-        return RedirectResponse(url=SETUP_PATH, status_code=_REDIRECT_STATUS)
+        return _prefixed_redirect(url_base, SETUP_PATH)
     assert auth_username is not None  # credential_set is True past this point
 
     if path == SETUP_PATH:
         # Credential already exists -- setup is done.
         if authed:
-            return RedirectResponse(url=APP_ROOT, status_code=_REDIRECT_STATUS)
+            return _prefixed_redirect(url_base, APP_ROOT)
         if auth_method == AUTH_METHOD_BASIC:
             return _basic_challenge()
-        return RedirectResponse(url=LOGIN_PATH, status_code=_REDIRECT_STATUS)
+        return _prefixed_redirect(url_base, LOGIN_PATH)
 
     if auth_method == AUTH_METHOD_BASIC:
         # No Forms /login page under this method -- every other browser route
@@ -250,9 +270,9 @@ async def enforce_auth_middleware(
 
     if path == LOGIN_PATH:
         if authed:
-            return RedirectResponse(url=APP_ROOT, status_code=_REDIRECT_STATUS)
+            return _prefixed_redirect(url_base, APP_ROOT)
         return await call_next(request)
 
     if authed:
         return await call_next(request)
-    return RedirectResponse(url=LOGIN_PATH, status_code=_REDIRECT_STATUS)
+    return _prefixed_redirect(url_base, LOGIN_PATH)
