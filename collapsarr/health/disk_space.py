@@ -168,6 +168,26 @@ def _to_results(
     ]
 
 
+def get_disk_usage(
+    data_dir: str, disk_usage: Callable[[str], DiskUsage] | None = None
+) -> DiskUsage:
+    """Return the raw :class:`DiskUsage` reading (total/free bytes) for ``data_dir``.
+
+    Exposes the same probe :func:`make_disk_space_check_run`'s returned
+    callable reads percentages from, so a caller that wants the raw byte
+    counts -- rather than a warning/error
+    :class:`~collapsarr.health.result.HealthCheckResult` pair -- doesn't need
+    to re-invoke :func:`shutil.disk_usage` itself. The About-panel endpoint
+    (``GET /api/system/info``, :mod:`collapsarr.system.info`, COL-123) is the
+    first such caller: it reuses this to report ``disk.free_bytes``/
+    ``disk.total_bytes`` off the exact same reading -- and the exact same
+    ``disk_usage`` test-injection seam -- the health check itself uses,
+    instead of a second, independent filesystem probe.
+    """
+    probe = disk_usage or _default_disk_usage
+    return probe(data_dir)
+
+
 def make_disk_space_check_run(
     disk_usage: Callable[[str], DiskUsage] | None = None,
 ) -> Callable[[HealthCheckContext], Sequence[HealthCheckResult]]:
@@ -184,15 +204,15 @@ def make_disk_space_check_run(
     ``disk_space_error_percent`` off the persisted
     :class:`~collapsarr.settings.models.GlobalSettings` row fresh on every
     call (via ``context.session``), and probes
-    ``context.settings.data_dir`` fresh on every call -- so both the
-    thresholds and the measurement are always current-tick, never cached.
+    ``context.settings.data_dir`` fresh on every call (via
+    :func:`get_disk_usage`) -- so both the thresholds and the measurement are
+    always current-tick, never cached.
     """
-    probe = disk_usage or _default_disk_usage
 
     def run(context: HealthCheckContext) -> Sequence[HealthCheckResult]:
         global_settings = get_global_settings(context.session)
         data_dir = context.settings.data_dir
-        usage = probe(data_dir)
+        usage = get_disk_usage(data_dir, disk_usage)
         percent = free_space_percent(usage)
         return _to_results(
             percent,
@@ -211,5 +231,6 @@ __all__ = [
     "DISK_SPACE_WARNING_CODE",
     "DiskUsage",
     "free_space_percent",
+    "get_disk_usage",
     "make_disk_space_check_run",
 ]

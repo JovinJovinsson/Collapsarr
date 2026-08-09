@@ -192,6 +192,23 @@ class JobScheduler:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_scan_at: datetime | None = None
+
+    @property
+    def last_scan_at(self) -> datetime | None:
+        """UTC timestamp the most recent :meth:`scan_once` run started, or ``None`` (COL-122).
+
+        ``None`` until the first scan (manual or periodic) actually runs --
+        there is no persisted store for this, only an in-memory marker stamped
+        at the top of :meth:`scan_once`, so it resets on every process
+        restart same as the periodic loop's own ``time.monotonic()``-based
+        "next scan" bookkeeping. Exists so ``GET /api/system/tasks``
+        (:mod:`collapsarr.system.tasks`) can compute the Library Scan
+        Scheduled Task's next-run time the same way the other three
+        schedulers already expose theirs from their own existing state (see
+        ``docs/adr/0005-system-tasks-endpoint-not-shared-scheduler.md``).
+        """
+        return self._last_scan_at
 
     # -- Enqueue path (shared by webhook + scan) ----------------------------
 
@@ -547,7 +564,13 @@ class JobScheduler:
         fetch failure for one instance -- for either pass -- is logged and
         skipped rather than aborting the whole scan, so one unreachable
         Sonarr/Radarr doesn't stop the others (or the other pass) from running.
+
+        Stamps :attr:`last_scan_at` (COL-122) at the very start, before any
+        instance is synced -- so it reflects when this pass *started*, and is
+        set even if the pass later fails partway through fetching some
+        instance's catalog/files.
         """
+        self._last_scan_at = self._now()
         enqueued: list[Job] = []
         with self._session_factory() as session:
             instances = list_instances(session)

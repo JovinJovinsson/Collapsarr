@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Sidebar } from "../components/Sidebar";
+import { HealthProvider } from "../components/HealthProvider";
 import { InstancesProvider } from "../components/InstancesProvider";
 import type { ArrInstance } from "../types/instances";
 
@@ -10,9 +11,16 @@ function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
 }
 
+/**
+ * `Sidebar` also reads the shared `GET /health` state via `useHealth()`
+ * (COL-124 code review), so every render needs a `/health` response too --
+ * the version footer is incidental to these tests, so an "ok" stub with no
+ * warnings keeps them focused on the Libraries nav behaviour under test.
+ */
 function mockInstancesApi(instances: ArrInstance[]) {
   const fetchMock = vi.fn(async (url: string) => {
     if (url === "/api/instances") return jsonResponse(instances);
+    if (url === "/health") return jsonResponse({ status: "ok", version: "0.1.0", warnings: [] });
     throw new Error(`Unhandled request in test mock: GET ${url}`);
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -45,13 +53,17 @@ const radarr: ArrInstance = {
  * `Sidebar` needs Router context (`LibraryNavSection` reads `useLocation`)
  * plus `InstancesProvider` (COL-100 code review): `LibraryNavSection` reads
  * the shared instance list via `useInstances()` rather than fetching its own.
+ * Also needs `HealthProvider` (COL-124 code review): `Sidebar`'s version
+ * footer reads the shared `GET /health` state via `useHealth()`.
  */
 function renderSidebar(initialPath: string) {
   return render(
     <MemoryRouter initialEntries={[initialPath]}>
-      <InstancesProvider>
-        <Sidebar />
-      </InstancesProvider>
+      <HealthProvider>
+        <InstancesProvider>
+          <Sidebar />
+        </InstancesProvider>
+      </HealthProvider>
     </MemoryRouter>,
   );
 }

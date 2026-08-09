@@ -1,7 +1,5 @@
-import { useEffect, useState } from "react";
-
-import { fetchHealth } from "../api/health";
-import type { HealthStatus, HealthWarning } from "../types/health";
+import { useHealth } from "../hooks/useHealth";
+import type { HealthWarning } from "../types/health";
 import { ErrorIcon, WarningIcon } from "./icons";
 
 /** Icon per severity -- error gets the octagon, warning the triangle (COL-76). */
@@ -11,8 +9,8 @@ const SEVERITY_ICON: Record<HealthWarning["severity"], typeof WarningIcon> = {
 };
 
 /**
- * App-wide health warning banner (COL-38). Fetches `GET /health` once on
- * mount and, when the app reports itself "degraded" (one or more registered
+ * App-wide health warning banner (COL-38). Reads the shared `GET /health`
+ * state and, when the app reports itself "degraded" (one or more registered
  * checks currently failing, `collapsarr/health/`), renders a persistent
  * banner above every view -- rendered in `AppShell` so it's visible
  * regardless of which page the user is on. Renders nothing when the app is
@@ -26,27 +24,24 @@ const SEVERITY_ICON: Record<HealthWarning["severity"], typeof WarningIcon> = {
  * or how severe each one was. A single mixed-severity list still renders as
  * one banner (not one per severity) so it stays a single glance-able summary;
  * only the per-row icon/colour differs.
+ *
+ * COL-124 code review: reads the shared `GET /health` state from
+ * `HealthProvider` via `useHealth()` instead of fetching its own copy --
+ * `Sidebar`'s version footer reads the same shared state, so the app makes
+ * that request once rather than twice.
  */
 export function HealthBanner() {
-  const [health, setHealth] = useState<HealthStatus | null>(null);
+  const state = useHealth();
 
-  useEffect(() => {
-    let cancelled = false;
-    fetchHealth()
-      .then((result) => {
-        if (!cancelled) {
-          setHealth(result);
-        }
-      })
-      .catch(() => {
-        // Best-effort: see the docstring above.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  if (state.status !== "ready") {
+    // Renders nothing while the fetch hasn't resolved yet, or if it failed
+    // (a transient network hiccup shouldn't itself read as an alarming
+    // health warning) -- see the docstring above.
+    return null;
+  }
+  const { health } = state;
 
-  if (!health || health.status !== "degraded" || health.warnings.length === 0) {
+  if (health.status !== "degraded" || health.warnings.length === 0) {
     return null;
   }
 

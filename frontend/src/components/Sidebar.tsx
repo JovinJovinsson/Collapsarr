@@ -4,6 +4,7 @@ import { NavLink, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
 
 import { logout } from "../api/auth";
+import { useHealth } from "../hooks/useHealth";
 import { LIBRARIES_PATH, navItems, systemNavItems } from "../routes/nav";
 import type { NavItem } from "../routes/nav";
 import { LibraryNavSection } from "./LibraryNavSection";
@@ -28,6 +29,16 @@ function NavLinkItem({ to, label, icon }: NavItem): ReactNode {
 export function Sidebar() {
   const navigate = useNavigate();
   const [loggingOut, setLoggingOut] = useState(false);
+
+  // Shared `GET /health` state from `HealthProvider` (COL-124 code review) --
+  // `HealthBanner` reads the same state, so the app makes that request once
+  // rather than each consumer re-fetching independently. `version` stays
+  // `null` while the fetch hasn't resolved yet, so the footer renders
+  // nothing rather than flashing "Unknown" during normal load; "Unknown" is
+  // reserved for an actual fetch failure.
+  const health = useHealth();
+  const version =
+    health.status === "ready" ? health.health.version : health.status === "error" ? "Unknown" : null;
 
   async function handleLogout() {
     setLoggingOut(true);
@@ -82,7 +93,7 @@ export function Sidebar() {
         >
           {loggingOut ? "Signing out…" : "Sign out"}
         </button>
-        <span className="sidebar__version">v0.1.0</span>
+        {version && <span className="sidebar__version">{version}</span>}
       </div>
     </nav>
   );
