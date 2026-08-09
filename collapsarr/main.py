@@ -51,6 +51,7 @@ from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .library.routes import router as library_router
 from .library.service import upsert_movie_node, upsert_series_episode_node
+from .logging_setup import configure_logging
 from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
@@ -167,6 +168,15 @@ def create_app(
     :class:`~collapsarr.system.probe.DefaultSystemProbe`.
     """
     resolved_settings = settings or get_settings()
+
+    # Logging infrastructure (COL-128): a stdout + rotating-file handler pair
+    # on the `collapsarr` logger, with secret redaction (ADR 0006). Configured
+    # here -- before the lifespan below runs -- so startup-time logging (the
+    # restore swap, Alembic migrations, scheduler bring-up) is captured too,
+    # not just requests served after boot. Idempotent, so each call (once per
+    # `create_app()`; tests build a fresh app per test with its own tmp_path
+    # Settings) replaces rather than accumulates handlers.
+    configure_logging(resolved_settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:

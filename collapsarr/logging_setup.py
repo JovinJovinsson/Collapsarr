@@ -1,0 +1,175 @@
+"""Logging infrastructure: rotating file + stdout, with secret redaction (COL-128).
+
+:func:`configure_logging` attaches two handlers to the ``collapsarr`` named
+logger -- the common parent every module's ``logging.getLogger(__name__)``
+reports to (``collapsarr.arr.catalog``, ``collapsarr.backup.scheduler``, ...):
+
+* A :class:`~logging.StreamHandler` to stdout, so ``docker logs``/journald
+  capture keeps working exactly as before this ticket.
+* A :class:`~logging.handlers.RotatingFileHandler` writing to
+  ``<data_dir>/logs/collapsarr.log`` (created on startup the same way
+  :func:`collapsarr.backup.service.ensure_backup_dirs` creates
+  ``<data_dir>/backups``), 1 MB per file. ``backupCount`` is 51 when the
+  resolved level is DEBUG, 6 otherwise (INFO/WARNING/ERROR) -- mirroring
+  Radarr/Sonarr's own Info-vs-Debug/Trace retention split, adapted to
+  Python's four-level set.
+
+``collapsarr``'s ``propagate`` is set ``False``, so the true Python root
+logger -- and therefore third-party libraries like ``httpx``/``sqlalchemy``
+that log through it -- is left untouched.
+
+Both handlers share one :class:`~logging.Filter` (see :class:`_RedactionFilter`)
+that scrubs known secret shapes out of every record before either handler
+formats it: Arr ``apikey=`` query-string values, the token segment of
+Discord/webhook notifier URLs, and ``Authorization:`` header values. See
+``docs/adr/0006-log-redaction-regex-scrub-not-call-site-audit.md`` for why a
+regex-scrubbing filter was chosen over auditing every call site -- it is
+best-effort, not a guarantee, and a novel secret shape needs a new pattern
+added below.
+
+``configure_logging`` is idempotent: it clears any handlers/filters already on
+the ``collapsarr`` logger before adding new ones. Tests build a fresh
+:class:`~fastapi.FastAPI` app per test via ``create_app()`` with an isolated
+``tmp_path``-based :class:`~collapsarr.config.Settings` (see
+``tests/conftest.py``), and ``create_app()`` calls this on every build -- so a
+process running many tests back to back must never leak a handler pointing at
+a previous test's (by-then-deleted) ``tmp_path``, nor fan a single log line
+out across every previous test's log file.
+"""
+
+from __future__ import annotations
+
+import logging
+import logging.handlers
+import re
+import sys
+from pathlib import Path
+
+from .config import Settings
+
+#: The common parent logger every module's ``logging.getLogger(__name__)``
+#: reports to (``collapsarr.arr.catalog`` etc. are children of this).
+LOGGER_NAME = "collapsarr"
+
+#: Fixed replacement for every redacted secret (ADR 0006).
+_MASK = "***"
+
+_MAX_BYTES = 1_000_000  # 1 MB per log file, per the ticket's AC.
+_BACKUP_COUNT_DEBUG = 51
+_BACKUP_COUNT_DEFAULT = 6
+
+_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+# --- Redaction patterns (ADR 0006) ------------------------------------------
+# Regex-scrub known secret shapes rather than auditing every call site. Each
+# pattern captures the prefix it wants to keep (for readability/debuggability)
+# in group 1 and redacts only the secret portion.
+
+#: Sonarr/Radarr's own API convention: ``?apikey=<key>`` (or ``&apikey=``) in
+#: a query string, frequently embedded verbatim in an httpx.HTTPError message.
+_APIKEY_QUERY_RE = re.compile(r"(apikey=)[^&\s]+", re.IGNORECASE)
+
+#: The token segment of a Discord (or Discord-shaped generic) webhook URL,
+#: e.g. ``https://discord.com/api/webhooks/123456789012345678/<token>``.
+#: Collapsarr's own generic ``webhook_url``/``discord_webhook_url`` notifier
+#: config (collapsarr/notify) carries the same "opaque token after a numeric
+#: id, under a /webhooks/ path" exposure shape.
+_WEBHOOK_TOKEN_RE = re.compile(
+    r"(https?://\S+/webhooks/\d+/)\S+",
+    re.IGNORECASE,
+)
+
+#: An ``Authorization:`` header value, e.g. ``Authorization: Bearer <token>``.
+#: Redacts the whole value (to end of line) rather than just the scheme, since
+#: the credential-bearing portion varies by scheme (Bearer/Basic/etc.).
+_AUTH_HEADER_RE = re.compile(r"(authorization:\s*).+$", re.IGNORECASE | re.MULTILINE)
+
+_REDACTION_PATTERNS = (_APIKEY_QUERY_RE, _WEBHOOK_TOKEN_RE, _AUTH_HEADER_RE)
+
+
+def _redact(message: str) -> str:
+    """Scrub every known secret shape out of ``message`` (ADR 0006)."""
+    for pattern in _REDACTION_PATTERNS:
+        message = pattern.sub(rf"\1{_MASK}", message)
+    return message
+
+
+class _RedactionFilter(logging.Filter):
+    """Scrub known secret shapes from every ``collapsarr`` log record.
+
+    The *same instance* is attached to both handlers below, so the identical
+    scrub rules apply to the stdout stream and the rotating file -- one place
+    to extend, not two (ADR 0006). Deliberately attached per-handler rather
+    than to the ``collapsarr`` logger itself: almost every real log call
+    originates on a *child* logger (``collapsarr.arr.catalog`` etc.), and
+    Python's ``logging`` module only runs a ``Logger``'s own filters for
+    records that originate at that exact logger -- propagated records from
+    children skip straight to each ancestor's *handlers* (``Handler.filter``
+    runs there), never back through the ancestor ``Logger.filter``. A filter
+    on the logger object would therefore silently never see the vast majority
+    of ``collapsarr`` log traffic.
+
+    Rewrites ``record.msg`` to the already-%-formatted, already-redacted
+    string and clears ``record.args`` so a handler's later
+    ``record.getMessage()`` call doesn't try to re-apply ``%`` formatting.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact(record.getMessage())
+        record.args = ()
+        return True
+
+
+def _resolved_level(settings: Settings) -> int:
+    """Resolve ``settings.log_level`` to a numeric level, defaulting to INFO."""
+    level = logging.getLevelName(settings.log_level.upper())
+    return level if isinstance(level, int) else logging.INFO
+
+
+def _backup_count_for(level: int) -> int:
+    """51 backups at DEBUG, 6 otherwise -- see module docstring."""
+    return _BACKUP_COUNT_DEBUG if level <= logging.DEBUG else _BACKUP_COUNT_DEFAULT
+
+
+def logs_dir(settings: Settings) -> Path:
+    """Return the ``<data_dir>/logs`` directory (not created here)."""
+    return Path(settings.data_dir).expanduser() / "logs"
+
+
+def configure_logging(settings: Settings) -> None:
+    """Attach a stdout + rotating-file handler pair to the ``collapsarr`` logger.
+
+    Idempotent: clears any handlers/filters already on the logger first, so
+    repeated calls (once per ``create_app()``) never accumulate duplicate
+    handlers or leak output across a previous call's ``data_dir``/log file.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    for existing_filter in list(logger.filters):
+        logger.removeFilter(existing_filter)
+
+    level = _resolved_level(settings)
+    logger.setLevel(level)
+    logger.propagate = False
+
+    formatter = logging.Formatter(_FORMAT)
+    redaction_filter = _RedactionFilter()
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    stream_handler.addFilter(redaction_filter)
+    logger.addHandler(stream_handler)
+
+    target_dir = logs_dir(settings)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.handlers.RotatingFileHandler(
+        target_dir / "collapsarr.log",
+        maxBytes=_MAX_BYTES,
+        backupCount=_backup_count_for(level),
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.addFilter(redaction_filter)
+    logger.addHandler(file_handler)
