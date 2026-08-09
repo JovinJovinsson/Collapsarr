@@ -152,3 +152,14 @@ A single entry in a **Library**'s tree: a Series, Season, or Episode
 (Sonarr) or a Movie (Radarr), identified by Sonarr/Radarr's own object IDs
 rather than parsed from on-disk folder paths. The unit both **Tracked**
 status and its cascade/inheritance rules apply to.
+
+## Scheduled Task
+
+A named, recurring background activity owned by one of Collapsarr's
+scheduler classes (library scan, health checks, backups, update check),
+surfaced on the `/system/tasks` page with its cadence and next-run time
+plus a manual "Run now" trigger. Distinct from a **Job** (an individual
+downmix work item queued and drained by `JobQueue`/`JobScheduler`) — a
+Scheduled Task is the recurring *activity*, not a unit of work it produces.
+The library-scan Scheduled Task, for example, is what *enqueues* Jobs; it
+is not one itself.
