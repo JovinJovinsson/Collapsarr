@@ -57,6 +57,7 @@ from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
+from .system.tasks import router as tasks_router
 from .update_check import UpdateCheckScheduler
 from .update_check.routes import router as update_checks_router
 from .url_base import UrlBaseMiddleware
@@ -282,6 +283,15 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.on_file_ready = on_file_ready or default_on_file_ready_hook
 
+    # Exposed for GET /api/system/tasks (COL-122) to tell whether a Scheduled
+    # Task's computed next-run time is actually meaningful: the health/update
+    # check schedulers are wired unconditionally below regardless of this
+    # flag (their first tick always runs synchronously so /health is
+    # accurate at startup), so their presence on app.state can't answer
+    # "is the periodic background loop running" the way it can for the
+    # job/backup schedulers, which are only wired when this flag is set.
+    app.state.enable_scheduler = enable_scheduler
+
     # Auth (COL-50): first-run setup + Forms login gate the whole UI behind a
     # signed-cookie session; /api still accepts the API key. The enforcement
     # middleware is added first (inner) and the session middleware last (outer)
@@ -341,6 +351,14 @@ def create_app(
     # exposes the singleton state COL-86's scheduler keeps warm, driving the
     # System > Updates page and the app-wide "update available" indicator.
     app.include_router(update_checks_router)
+
+    # Scheduled Task registry GET /api/system/tasks (COL-122): aggregates the
+    # four background schedulers above into one list with cadence/next-run,
+    # driving the System > Tasks page. Reads each scheduler's existing state
+    # directly rather than a shared abstraction (ADR-0005) -- registered last
+    # among the /api/system routers since it depends on state every one of
+    # them already establishes.
+    app.include_router(tasks_router)
 
     @app.get("/health", tags=["system"])
     def health(session: Session = Depends(get_session)) -> dict[str, object]:

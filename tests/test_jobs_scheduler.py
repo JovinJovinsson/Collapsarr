@@ -356,6 +356,30 @@ def test_scan_once_enqueues_qualifying_files_and_resolves_paths(
     assert enqueued[0].file_path == Path("/mnt/media/tv/a.mkv")
 
 
+def test_last_scan_at_is_none_before_the_first_scan(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """COL-122: ``last_scan_at`` starts unset so ``GET /api/system/tasks`` can
+    report the Library Scan Scheduled Task as never having run yet."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    assert scheduler.last_scan_at is None
+
+
+def test_scan_once_stamps_last_scan_at_with_the_scheduler_clock(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """COL-122: ``last_scan_at`` is stamped at the start of every
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.scan_once` run, from the
+    injectable clock (not real wall-clock time) -- no configured instances are
+    needed since the stamp happens before the per-instance loop runs."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    scheduler.scan_once()
+
+    assert scheduler.last_scan_at == _FIXED_NOW
+
+
 def test_scan_once_persists_the_library_node_bridge_ids(
     settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:

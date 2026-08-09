@@ -6,6 +6,7 @@ import {
   HealthIcon,
   LibraryIcon,
   SettingsIcon,
+  TasksIcon,
   UpdateIcon,
   WantedIcon,
 } from "../components/icons";
@@ -14,6 +15,7 @@ import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
 import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { SettingsPage } from "../pages/SettingsPage";
+import { TasksPage } from "../pages/TasksPage";
 import { UpdatesPage } from "../pages/UpdatesPage";
 import { WantedPage } from "../pages/WantedPage";
 
@@ -50,12 +52,15 @@ export const navItems: NavItem[] = [
  * The **System** nav area (COL-63): operational, install-level views separate
  * from the media workflow above. Backups was its first page; COL-76 adds
  * Health, listing every registered health check's current state; COL-87 adds
- * Updates, comparing the running version against the latest release. Rendered
- * as its own labelled section in the sidebar and wired under `/system/*` in
- * the router, both from this single list.
+ * Updates, comparing the running version against the latest release; COL-122
+ * adds Tasks, the Scheduled Task registry aggregating all four background
+ * schedulers. Rendered as its own labelled section in the sidebar and wired
+ * under `/system/*` in the router, both from this single list. Tasks is
+ * appended last here -- COL-126 handles reordering it to lead the section.
  */
 export const systemNavItems: NavItem[] = [
   { to: "/system/backups", label: "Backups", icon: <BackupIcon />, element: <BackupsPage /> },
   { to: "/system/health", label: "Health", icon: <HealthIcon />, element: <HealthChecksPage /> },
   { to: "/system/updates", label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
+  { to: "/system/tasks", label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
 ];
