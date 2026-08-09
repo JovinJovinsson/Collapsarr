@@ -2,8 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
-import { AppShell } from "../components/AppShell";
-import { TasksPage } from "../pages/TasksPage";
+import { routes } from "../routes/router";
 import { systemNavItems } from "../routes/nav";
 
 // Mock fetch for pages that fetch on mount
@@ -16,24 +15,32 @@ vi.stubGlobal(
   }),
 );
 
+// Rendering the real router (below) means the bare `/system` route's
+// `<Navigate>` actually runs a client-side navigation through react-router's
+// data router, which builds an internal `Request` for every transition (even
+// with no loaders). Vitest's jsdom environment substitutes its own
+// AbortController/AbortSignal implementation for the global one so DOM code
+// gets spec-accurate behaviour, but Node's built-in `Request` only accepts a
+// signal it recognises as *its own* AbortSignal, so that internal `new
+// Request(url, { signal })` throws under jsdom. Stub `Request` with a
+// minimal, non-validating constructor here so the real navigation can
+// actually run in this test environment; nothing in these tests depends on
+// `Request`'s real fetch semantics.
+vi.stubGlobal(
+  "Request",
+  class TestRequest {
+    constructor(input: unknown, init: RequestInit = {}) {
+      Object.assign(this, { url: String(input), ...init });
+    }
+  },
+);
+
+// Uses the real production `routes` (from routes/router.tsx) rather than a
+// hand-rolled fixture, so this exercises the actual `<Navigate>` the app
+// ships for the bare /system route (COL-126 code review) -- if that redirect
+// target ever changes or is removed, these tests fail for real.
 function renderWithSystemNav(path: string) {
-  const router = createMemoryRouter(
-    [
-      {
-        path: "/",
-        element: <AppShell />,
-        children: [
-          // Bare /system redirects to /system/tasks (COL-126)
-          { path: "system", element: <TasksPage /> },
-          ...systemNavItems.map(({ to, element }) => ({
-            path: to.replace("/", ""),
-            element,
-          })),
-        ],
-      },
-    ],
-    { initialEntries: [path] },
-  );
+  const router = createMemoryRouter(routes, { initialEntries: [path] });
   return render(<RouterProvider router={router} />);
 }
 
@@ -51,12 +58,13 @@ describe("System navigation (COL-126)", () => {
     const nav = await screen.findByRole("navigation", { name: /primary/i });
     const links = within(nav).getAllByRole("link");
 
-    // Find the system nav items (Tasks, Backups, Health, Status, Updates) among all nav links
-    // Primary nav has: Wanted, Libraries, Activity, Settings (4 links)
-    // System nav has: Tasks, Backups, Health, Status, Updates (5 links)
-    // Total: 9 links
-    // The system nav items should be in order starting from index 4
-    const systemLinks = links.slice(4, 9);
+    // Scope to the System nav links by href (against systemNavItems' own `to`
+    // values) rather than a fixed positional slice, so this doesn't assume
+    // exactly how many links precede System -- e.g. LibraryNavSection
+    // rendering extra sub-links wouldn't shift a hardcoded offset out from
+    // under this assertion (COL-126 code review).
+    const systemHrefs = new Set(systemNavItems.map((item) => item.to));
+    const systemLinks = links.filter((link) => systemHrefs.has(link.getAttribute("href") ?? ""));
     expect(systemLinks).toHaveLength(5);
     expect(systemLinks[0]).toHaveTextContent("Tasks");
     expect(systemLinks[1]).toHaveTextContent("Backups");
