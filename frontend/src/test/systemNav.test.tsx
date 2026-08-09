@@ -44,9 +44,9 @@ function renderWithSystemNav(path: string) {
   return render(<RouterProvider router={router} />);
 }
 
-describe("System navigation (COL-126)", () => {
-  it("orders systemNavItems as Tasks, Backups, Health, Status, Updates", () => {
-    const expectedOrder = ["Tasks", "Backups", "Health", "Status", "Updates"];
+describe("System navigation (COL-126, COL-131)", () => {
+  it("orders systemNavItems as Tasks, Backups, Health, Status, Updates, Logs", () => {
+    const expectedOrder = ["Tasks", "Backups", "Health", "Status", "Updates", "Logs"];
     const actualOrder = systemNavItems.map((item) => item.label);
 
     expect(actualOrder).toEqual(expectedOrder);
@@ -65,12 +65,13 @@ describe("System navigation (COL-126)", () => {
     // under this assertion (COL-126 code review).
     const systemHrefs = new Set(systemNavItems.map((item) => item.to));
     const systemLinks = links.filter((link) => systemHrefs.has(link.getAttribute("href") ?? ""));
-    expect(systemLinks).toHaveLength(5);
+    expect(systemLinks).toHaveLength(6);
     expect(systemLinks[0]).toHaveTextContent("Tasks");
     expect(systemLinks[1]).toHaveTextContent("Backups");
     expect(systemLinks[2]).toHaveTextContent("Health");
     expect(systemLinks[3]).toHaveTextContent("Status");
     expect(systemLinks[4]).toHaveTextContent("Updates");
+    expect(systemLinks[5]).toHaveTextContent("Logs");
   });
 
   it("/system redirects to /system/tasks by default", async () => {

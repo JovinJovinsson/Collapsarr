@@ -1872,6 +1872,71 @@ a {
   border-radius: var(--radius-sm);
 }
 
+/* ---- Logs page (COL-131) ------------------------------------------------ */
+
+.logs-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.logs-filters__select {
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-md);
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+}
+
+.logs-filters__select:focus {
+  outline: none;
+  border-color: var(--c-accent);
+}
+
+.logs-table {
+  table-layout: fixed;
+}
+
+.logs-table__level {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+}
+
+.logs-table__level--debug {
+  color: var(--c-text-muted);
+  background: var(--c-border);
+}
+
+.logs-table__level--info {
+  color: var(--c-accent);
+  background: var(--c-accent-tint);
+}
+
+.logs-table__level--warning {
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+}
+
+.logs-table__level--error,
+.logs-table__level--critical {
+  color: var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.logs-table__line {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition-duration: 0.01ms !important;

@@ -69,6 +69,12 @@ _MAX_BYTES = 1_000_000  # 1 MB per log file, per the ticket's AC.
 _BACKUP_COUNT_DEBUG = 51
 _BACKUP_COUNT_DEFAULT = 6
 
+#: Filename of the current (not-yet-rotated) log file within :func:`logs_dir`.
+#: Exported so :mod:`collapsarr.system.logs` (COL-131) can locate the exact
+#: same file this module's :class:`~logging.handlers.RotatingFileHandler`
+#: writes, without duplicating the literal.
+LOG_FILENAME = "collapsarr.log"
+
 _FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
 _env_level: int = logging.INFO
@@ -166,6 +172,19 @@ def logs_dir(settings: Settings) -> Path:
     return Path(settings.data_dir).expanduser() / "logs"
 
 
+def current_log_path(settings: Settings) -> Path:
+    """Return the path to the *current* (not-yet-rotated) log file.
+
+    Same file :func:`configure_logging`'s :class:`~logging.handlers.
+    RotatingFileHandler` writes to -- COL-131's tail-read endpoint
+    (:mod:`collapsarr.system.logs`) reads this path fresh per request rather
+    than holding a handle, so it naturally tolerates a rotation happening
+    mid-request (the handler renames this path to a numbered backup and
+    reopens a fresh file at it).
+    """
+    return logs_dir(settings) / LOG_FILENAME
+
+
 def configure_logging(settings: Settings) -> None:
     """Attach a stdout + rotating-file handler pair to the ``collapsarr`` logger.
 
@@ -198,7 +217,7 @@ def configure_logging(settings: Settings) -> None:
     target_dir = logs_dir(settings)
     target_dir.mkdir(parents=True, exist_ok=True)
     file_handler = logging.handlers.RotatingFileHandler(
-        target_dir / "collapsarr.log",
+        current_log_path(settings),
         maxBytes=_MAX_BYTES,
         backupCount=_backup_count_for(level),
     )

@@ -61,6 +61,7 @@ from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
 from .settings.service import get_global_settings
 from .system.info import router as info_router
+from .system.logs import router as logs_router
 from .system.probe import DefaultSystemProbe, SystemProbe
 from .system.tasks import router as tasks_router
 from .update_check import UpdateCheckScheduler
@@ -427,6 +428,16 @@ def create_app(
     # architectural split; both are thin /api/system aggregation views over
     # existing state (docs/adr/0005-system-tasks-endpoint-not-shared-scheduler.md).
     app.include_router(info_router)
+
+    # Tail-read GET /api/system/logs (COL-131): the most recent lines of the
+    # current rotating log file COL-128's configure_logging() writes to
+    # (collapsarr/logging_setup.py), with an offset to page further back and a
+    # minimum-severity level filter, driving the new System > Logs page. Reads
+    # the file fresh per request (see collapsarr/system/logs.py's module
+    # docstring for why) rather than depending on any app.state the other
+    # /api/system routers above establish, so registration order relative to
+    # them doesn't matter -- kept last simply to group with its siblings.
+    app.include_router(logs_router)
 
     @app.get("/health", tags=["system"])
     def health(session: Session = Depends(get_session)) -> dict[str, object]:
