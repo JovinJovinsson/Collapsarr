@@ -37,13 +37,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..backup.scheduler import BackupScheduler
 from ..backup.service import BACKUP_SCHEDULED, list_backups
 from ..config import Settings
+from ..database import get_session
 from ..health.scheduler import INTERVAL_SECONDS as HEALTH_CHECK_INTERVAL_SECONDS
 from ..health.service import list_health_check_states
 from ..jobs.scheduler import JobScheduler
@@ -219,20 +220,21 @@ def _update_check_task(request: Request, session: Session) -> ScheduledTaskRead:
 
 
 @router.get("/tasks", response_model=list[ScheduledTaskRead])
-def list_tasks_endpoint(request: Request) -> list[ScheduledTaskRead]:
+def list_tasks_endpoint(
+    request: Request, session: Session = Depends(get_session)
+) -> list[ScheduledTaskRead]:
     """List every Scheduled Task with its cadence, next/last run, and enabled state.
 
     Fixed order: Library scan, Health checks, Backups, Update check -- matches
     the order the ticket/ADR describe the four schedulers in, giving the
     frontend table a stable row order across requests.
     """
-    with request.app.state.session_factory() as session:
-        return [
-            _library_scan_task(request),
-            _health_checks_task(request, session),
-            _backups_task(request, session),
-            _update_check_task(request, session),
-        ]
+    return [
+        _library_scan_task(request),
+        _health_checks_task(request, session),
+        _backups_task(request, session),
+        _update_check_task(request, session),
+    ]
 
 
 __all__ = ["ScheduledTaskRead", "router"]
