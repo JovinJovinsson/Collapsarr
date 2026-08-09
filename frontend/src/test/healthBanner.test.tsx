@@ -2,10 +2,23 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HealthBanner } from "../components/HealthBanner";
+import { HealthProvider } from "../components/HealthProvider";
 import type { HealthStatus } from "../types/health";
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
+}
+
+/**
+ * `HealthBanner` reads the shared `GET /health` state via `useHealth()`
+ * (COL-124 code review), so it must be rendered beneath `HealthProvider`.
+ */
+function renderBanner() {
+  return render(
+    <HealthProvider>
+      <HealthBanner />
+    </HealthProvider>,
+  );
 }
 
 const okHealth: HealthStatus = { status: "ok", version: "0.1.0", warnings: [] };
@@ -38,16 +51,16 @@ describe("HealthBanner", () => {
   it("renders nothing when the app reports ok", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(okHealth));
     vi.stubGlobal("fetch", fetchMock);
-    const { container } = render(<HealthBanner />);
+    const { container } = renderBanner();
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/health", expect.anything()));
-    expect(container).toBeEmptyDOMElement();
+    await waitFor(() => expect(container).toBeEmptyDOMElement());
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("shows a warning banner when the app reports degraded (FFmpeg missing)", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(degradedHealth)));
-    render(<HealthBanner />);
+    renderBanner();
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(/ffmpeg executable 'ffmpeg' was not found on path/i);
@@ -55,7 +68,7 @@ describe("HealthBanner", () => {
 
   it("visually distinguishes warning- from error-severity entries when several checks fail at once (COL-76)", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(mixedSeverityHealth)));
-    render(<HealthBanner />);
+    renderBanner();
 
     const alert = await screen.findByRole("alert");
     const messages = alert.querySelectorAll(".health-banner__message");
@@ -76,9 +89,9 @@ describe("HealthBanner", () => {
   it("renders nothing when the health fetch fails", async () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error("network down"));
     vi.stubGlobal("fetch", fetchMock);
-    const { container } = render(<HealthBanner />);
+    const { container } = renderBanner();
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/health", expect.anything()));
-    expect(container).toBeEmptyDOMElement();
+    await waitFor(() => expect(container).toBeEmptyDOMElement());
   });
 });

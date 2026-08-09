@@ -1,6 +1,7 @@
 import { Outlet } from "react-router-dom";
 
 import { HealthBanner } from "./HealthBanner";
+import { HealthProvider } from "./HealthProvider";
 import { InstancesProvider } from "./InstancesProvider";
 import { OnboardingPanel } from "./OnboardingPanel";
 import { Sidebar } from "./Sidebar";
@@ -29,19 +30,26 @@ import { UpdateIndicator } from "./UpdateIndicator";
  * `LibraryPage`) all read via `useInstances()`, so mounting it here -- above
  * both -- means the whole app makes that request once instead of each
  * consumer re-fetching independently.
+ *
+ * `HealthProvider` (COL-124 code review) wraps the same subtree for the same
+ * reason: it's the shared `GET /health` fetch that `HealthBanner` and
+ * `Sidebar`'s version footer both read via `useHealth()`, so the app makes
+ * that request once instead of each consumer re-fetching independently.
  */
 export function AppShell() {
   return (
-    <InstancesProvider>
-      <div className="app-shell">
-        <Sidebar />
-        <main className="app-shell__content" id="main-content">
-          <HealthBanner />
-          <UpdateIndicator />
-          <OnboardingPanel />
-          <Outlet />
-        </main>
-      </div>
-    </InstancesProvider>
+    <HealthProvider>
+      <InstancesProvider>
+        <div className="app-shell">
+          <Sidebar />
+          <main className="app-shell__content" id="main-content">
+            <HealthBanner />
+            <UpdateIndicator />
+            <OnboardingPanel />
+            <Outlet />
+          </main>
+        </div>
+      </InstancesProvider>
+    </HealthProvider>
   );
 }
