@@ -1793,6 +1793,85 @@ a {
   overflow-wrap: anywhere;
 }
 
+/* ---- Status page: Health summary & More Info (COL-125) ----------------- */
+
+.status-page__sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+.status-health-clear {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  color: var(--c-success);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.status-health-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin: 0;
+}
+
+.status-health-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+}
+
+.status-health-row__icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.status-health-row__icon--warning {
+  color: var(--c-warning);
+}
+
+.status-health-row__icon--error {
+  color: var(--c-danger);
+}
+
+.status-health-row__code {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-health-row__message {
+  color: var(--c-text-muted);
+}
+
+.status-links {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.status-links a {
+  color: var(--c-accent);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.status-links a:hover {
+  color: var(--c-accent-hover);
+  text-decoration: underline;
+}
+
+.status-links a:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition-duration: 0.01ms !important;
