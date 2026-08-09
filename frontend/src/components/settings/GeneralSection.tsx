@@ -24,12 +24,19 @@ interface GeneralFormValues {
   diskSpaceWarningPercent: string;
   diskSpaceErrorPercent: string;
   defaultTracked: boolean;
-  logLevel: LogLevel;
+  /**
+   * `null` represents "no override" (COL-130 AC2: defer to
+   * `COLLAPSARR_LOG_LEVEL` at boot) as a first-class form value -- it must
+   * survive an unrelated General-settings save undisturbed, so this is never
+   * defaulted to a concrete level the way the other fields are.
+   */
+  logLevel: LogLevel | null;
 }
 
-/** Shown when `GlobalSettings.log_level` is `null` (no override set yet) -- matches
- * `COLLAPSARR_LOG_LEVEL`'s own documented default (COL-130). */
-const DEFAULT_LOG_LEVEL: LogLevel = "INFO";
+/** `<select>` value for the "no override" option (COL-130 AC2/AC5) -- HTML
+ * select values are always strings, so `null` needs a string sentinel that's
+ * mapped back to `null` on change and never collides with a real `LogLevel`. */
+const LOG_LEVEL_DEFAULT_OPTION = "__default__";
 
 /** Validates the general-settings form; returns an error message, or `null` when valid. */
 function validateGeneralForm(form: GeneralFormValues): string | null {
@@ -84,7 +91,7 @@ export function GeneralSection() {
     diskSpaceWarningPercent: "5",
     diskSpaceErrorPercent: "2",
     defaultTracked: true,
-    logLevel: DEFAULT_LOG_LEVEL,
+    logLevel: null,
   });
 
   const [saving, setSaving] = useState(false);
@@ -122,7 +129,7 @@ export function GeneralSection() {
           diskSpaceWarningPercent: String(settings.disk_space_warning_percent),
           diskSpaceErrorPercent: String(settings.disk_space_error_percent),
           defaultTracked: settings.default_tracked,
-          logLevel: settings.log_level ?? DEFAULT_LOG_LEVEL,
+          logLevel: settings.log_level,
         });
         setState({ status: "ready" });
       })
@@ -172,7 +179,7 @@ export function GeneralSection() {
         diskSpaceWarningPercent: String(updated.disk_space_warning_percent),
         diskSpaceErrorPercent: String(updated.disk_space_error_percent),
         defaultTracked: updated.default_tracked,
-        logLevel: updated.log_level ?? DEFAULT_LOG_LEVEL,
+        logLevel: updated.log_level,
       });
       setSavedAt(Date.now());
     } catch (err: unknown) {
@@ -409,11 +416,16 @@ export function GeneralSection() {
               <label htmlFor="log-level">Level</label>
               <select
                 id="log-level"
-                value={form.logLevel}
-                onChange={(event) =>
-                  setForm({ ...form, logLevel: event.target.value as typeof form.logLevel })
-                }
+                value={form.logLevel ?? LOG_LEVEL_DEFAULT_OPTION}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setForm({
+                    ...form,
+                    logLevel: value === LOG_LEVEL_DEFAULT_OPTION ? null : (value as LogLevel),
+                  });
+                }}
               >
+                <option value={LOG_LEVEL_DEFAULT_OPTION}>Default (env)</option>
                 <option value="DEBUG">Debug</option>
                 <option value="INFO">Info</option>
                 <option value="WARNING">Warning</option>
@@ -422,8 +434,9 @@ export function GeneralSection() {
               <p className="form-hint">
                 Applies immediately, without a restart, and persists across restarts. Controls
                 both what&apos;s logged and how many rotated log files are kept (more at{" "}
-                <strong>Debug</strong>). Defaults to the <code>COLLAPSARR_LOG_LEVEL</code>{" "}
-                environment setting (<strong>Info</strong>) until changed here.
+                <strong>Debug</strong>). <strong>Default (env)</strong> (the initial state) defers
+                to the <code>COLLAPSARR_LOG_LEVEL</code> environment setting at boot; pick it again
+                here to clear a previously-set override.
               </p>
             </div>
           </div>

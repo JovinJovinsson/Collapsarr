@@ -191,11 +191,11 @@ describe("GeneralSection", () => {
     expect(putBody.update_channel).toBe("beta");
   });
 
-  it("displays Info as the default log level when unset from a mocked GET", async () => {
+  it("displays Default (env) as the log level when unset from a mocked GET", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
     renderGeneralSection();
 
-    expect(await screen.findByLabelText(/^level$/i)).toHaveValue("INFO");
+    expect(await screen.findByLabelText(/^level$/i)).toHaveValue("__default__");
   });
 
   it("displays a previously-set log level from a mocked GET", async () => {
@@ -227,6 +227,50 @@ describe("GeneralSection", () => {
     const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
     const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
     expect(putBody.log_level).toBe("WARNING");
+  });
+
+  it("regression (COL-130 must-fix): an unrelated field save leaves an unset log_level as null in the PUT body, instead of pinning it to a concrete default", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings)); // log_level: null
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const concurrencyInput = await screen.findByLabelText(/concurrency limit/i);
+    fireEvent.change(concurrencyInput, { target: { value: "4" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.concurrency_limit).toBe(4);
+    expect(putBody.log_level).toBeNull();
+  });
+
+  it("clears a previously-set log_level override by selecting Default (env)", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse({ ...baseSettings, log_level: "DEBUG" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const logLevelSelect = await screen.findByLabelText(/^level$/i);
+    expect(logLevelSelect).toHaveValue("DEBUG");
+    fireEvent.change(logLevelSelect, { target: { value: "__default__" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.log_level).toBeNull();
   });
 
   it("saves the browser-stored API key to localStorage", async () => {
