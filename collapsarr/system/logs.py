@@ -1,23 +1,42 @@
-"""GET /api/system/logs -- tail-read of the current log file (COL-131).
+"""``/api/system/logs`` -- tail-read, file listing, download, and clear (COL-131/132).
 
-A thin, read-only ``/api/system`` view -- same shape as
+A thin, read-only-plus-housekeeping ``/api/system`` view -- same shape as
 :mod:`collapsarr.system.tasks` (COL-122) / :mod:`collapsarr.system.info`
-(COL-123) -- over the *current* rotating log file COL-128's
-:func:`~collapsarr.logging_setup.configure_logging` writes to
-(:func:`~collapsarr.logging_setup.current_log_path`). Only the current file is
-read here -- rotated backups (``collapsarr.log.1``, ``.2``, ...) are out of
-scope for this ticket.
+(COL-123) -- over COL-128's rotating log files under
+:func:`~collapsarr.logging_setup.logs_dir` (the *current* file at
+:func:`~collapsarr.logging_setup.current_log_path`, plus rotated backups
+``collapsarr.log.1``, ``.2``, ...).
 
-Endpoint:
+Endpoints:
 
-* ``GET /api/system/logs`` -- the most recent ``~200`` lines of the current
-  log file by default, oldest first / newest last (matching how a terminal
-  ``tail`` reads), with an ``offset`` query parameter to page further back and
-  a ``level`` query parameter applying *minimum-severity* filtering (e.g.
-  ``level=WARNING`` returns WARNING and ERROR lines), filtered while scanning
-  the file server-side -- never by post-filtering an already-fetched window.
+* ``GET /api/system/logs`` (COL-131) -- the most recent ``~200`` lines of the
+  *current* log file by default, oldest first / newest last (matching how a
+  terminal ``tail`` reads), with an ``offset`` query parameter to page further
+  back and a ``level`` query parameter applying *minimum-severity* filtering
+  (e.g. ``level=WARNING`` returns WARNING and ERROR lines), filtered while
+  scanning the file server-side -- never by post-filtering an already-fetched
+  window. Only the current file is read here -- rotated backups are out of
+  scope for this endpoint (see the listing/download endpoints below for
+  those).
+* ``GET /api/system/logs/files`` (COL-132) -- every file under
+  :func:`~collapsarr.logging_setup.logs_dir` (current + rotated), sorted by
+  modification time descending, with name/size/last-written metadata.
+* ``GET /api/system/logs/files/{name}/download`` (COL-132) -- streams one log
+  file off disk as a plain-text download, mirroring
+  ``GET /api/system/backup/{id}/download`` (:mod:`collapsarr.backup.routes`)
+  exactly: auth-gated (inherited from the ``/api/system/*`` middleware, no
+  extra wiring), streams straight off disk with no separate asset directory,
+  ``404`` on an unresolvable ``name`` rather than distinguishing why (see
+  :func:`_resolve_log_file_path`).
+* ``DELETE /api/system/logs`` (COL-132) -- deletes every file under
+  ``logs_dir`` and recreates an empty current file, via
+  :func:`~collapsarr.logging_setup.clear_logs` -- delete-and-recreate, not
+  truncate-in-place, so it can't corrupt a handler mid-write. See that
+  function's docstring for how it keeps the live
+  :class:`~logging.handlers.RotatingFileHandler` writing correctly
+  immediately afterward.
 
-Rotation race (ticket AC): :class:`~logging.handlers.RotatingFileHandler`
+Rotation race (COL-131 ticket AC): :class:`~logging.handlers.RotatingFileHandler`
 closes, renames, and reopens the current file entirely outside any lock this
 process could take. This module never holds a long-lived file handle --
 :func:`_read_log_lines` opens the file fresh on every call and briefly retries
@@ -32,14 +51,16 @@ from __future__ import annotations
 import logging
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..config import Settings
-from ..logging_setup import current_log_path
+from ..logging_setup import clear_logs, current_log_path, logs_dir
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -115,6 +136,26 @@ class LogsRead(BaseModel):
 
     entries: list[LogEntryRead]
     next_offset: int | None
+
+
+class LogFileRead(BaseModel):
+    """One file under ``logs/`` -- the current file or a rotated backup.
+
+    ``name`` is the bare filename (``collapsarr.log``, ``collapsarr.log.1``,
+    ...) -- the id the download endpoint's ``{name}`` path segment expects,
+    same shape as :class:`~collapsarr.backup.routes.BackupRead`'s ``id`` for
+    backups.
+    """
+
+    name: str
+    size: int
+    modified_at: datetime
+
+
+class LogFileListRead(BaseModel):
+    """Response shape for ``GET /api/system/logs/files``."""
+
+    files: list[LogFileRead]
 
 
 # --- helpers -------------------------------------------------------------
@@ -213,6 +254,49 @@ def _paginate(
     return window, next_offset
 
 
+def _file_info(entry: Path) -> LogFileRead:
+    stat = entry.stat()
+    return LogFileRead(
+        name=entry.name,
+        size=stat.st_size,
+        modified_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
+    )
+
+
+def _list_log_files(settings: Settings) -> list[LogFileRead]:
+    """List every file under ``logs_dir`` (current + rotated), newest first.
+
+    Mirrors :func:`collapsarr.backup.service.list_backups`'s shape. The
+    directory may not exist yet on a fresh install that hasn't logged
+    anything -- treated the same as empty, not an error.
+    """
+    directory = logs_dir(settings)
+    if not directory.is_dir():
+        return []
+    files = [_file_info(entry) for entry in directory.iterdir() if entry.is_file()]
+    files.sort(key=lambda info: info.modified_at, reverse=True)
+    return files
+
+
+def _resolve_log_file_path(settings: Settings, name: str) -> Path | None:
+    """Resolve a :class:`LogFileRead` ``name`` back to its path under ``logs_dir``.
+
+    Mirrors :func:`collapsarr.backup.service.resolve_backup_path`'s shape,
+    minus the fixed filename glob (rotated log names vary with
+    ``backupCount``, unlike the fixed backup-archive naming). ``None`` (never
+    an exception) covers every way ``name`` can fail to name a real file:
+    empty, ``.``/``..``, an embedded path separator (rules out traversal such
+    as ``../../etc/passwd``), or no such file directly inside ``logs_dir``.
+    The download route maps every ``None`` uniformly to a ``404``.
+    """
+    if name in ("", ".", "..") or "/" in name or "\\" in name:
+        return None
+    candidate = logs_dir(settings) / name
+    if candidate.name != name or not candidate.is_file():
+        return None
+    return candidate
+
+
 # --- endpoints ---------------------------------------------------------------
 
 
@@ -240,4 +324,50 @@ def get_logs_endpoint(
     )
 
 
-__all__ = ["DEFAULT_LIMIT", "LogEntryRead", "LogLevelFilter", "LogsRead", "router"]
+@router.delete("/logs", status_code=204)
+def clear_logs_endpoint(request: Request) -> None:
+    """Delete every log file and recreate an empty current file (COL-132).
+
+    Delete-and-recreate rather than truncate-in-place, so a truncate racing a
+    handler mid-write can't corrupt a record -- see
+    :func:`~collapsarr.logging_setup.clear_logs` for how it also keeps the
+    live ``RotatingFileHandler`` writing correctly to the recreated file
+    immediately afterward.
+    """
+    settings: Settings = request.app.state.settings
+    clear_logs(settings)
+
+
+@router.get("/logs/files", response_model=LogFileListRead)
+def list_log_files_endpoint(request: Request) -> LogFileListRead:
+    """List every file under ``logs/`` (current + rotated), newest first."""
+    settings: Settings = request.app.state.settings
+    return LogFileListRead(files=_list_log_files(settings))
+
+
+@router.get("/logs/files/{name}/download")
+def download_log_file_endpoint(name: str, request: Request) -> FileResponse:
+    """Stream one log file off disk as a plain-text download.
+
+    Mirrors ``GET /api/system/backup/{id}/download`` exactly (COL-64): auth
+    inherited from the ``/api/system/*`` middleware, streamed straight off
+    disk with no separate asset directory. ``name`` resolves via
+    :func:`_resolve_log_file_path`, which never raises -- an
+    unknown/invalid/path-traversal name maps uniformly to a ``404``.
+    """
+    settings: Settings = request.app.state.settings
+    path = _resolve_log_file_path(settings, name)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"No log file named {name!r}")
+    return FileResponse(path, media_type="text/plain", filename=path.name)
+
+
+__all__ = [
+    "DEFAULT_LIMIT",
+    "LogEntryRead",
+    "LogFileListRead",
+    "LogFileRead",
+    "LogLevelFilter",
+    "LogsRead",
+    "router",
+]

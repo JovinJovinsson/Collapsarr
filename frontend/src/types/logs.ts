@@ -47,3 +47,22 @@ export interface LogsResponse {
   /** Pass as the next request's `offset` to page further back under the same `level` filter; `null` once there's nothing further back. */
   next_offset: number | null;
 }
+
+/**
+ * One file under `logs/` -- the current file or a rotated backup
+ * (`collapsarr.log`, `collapsarr.log.1`, ...), as returned by
+ * `GET /api/system/logs/files` (COL-132, `collapsarr/system/logs.py::LogFileRead`).
+ */
+export interface LogFile {
+  /** Bare filename -- the id the download endpoint's `{name}` path segment expects. */
+  name: string;
+  /** File size in bytes. */
+  size: number;
+  /** ISO-8601 UTC last-modified timestamp; displayed in local time. */
+  modified_at: string;
+}
+
+/** `GET /api/system/logs/files` response (COL-132), newest first. */
+export interface LogFileList {
+  files: LogFile[];
+}

@@ -226,6 +226,78 @@ def configure_logging(settings: Settings) -> None:
     logger.addHandler(file_handler)
 
 
+def _clear_directory(directory: Path) -> None:
+    """Delete every regular file directly inside ``directory`` and recreate it.
+
+    Shared by both branches of :func:`clear_logs` so the delete-then-mkdir
+    step isn't duplicated between the "handler attached" and "no handler"
+    paths.
+    """
+    if directory.is_dir():
+        for entry in directory.iterdir():
+            if entry.is_file():
+                entry.unlink()
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+def clear_logs(settings: Settings) -> None:
+    """Delete every file under ``logs_dir`` and recreate an empty current file (COL-132).
+
+    Delete-and-recreate, not truncate-in-place, so a truncate racing a handler
+    mid-write can never corrupt a record. The subtlety is keeping the live
+    :class:`~logging.handlers.RotatingFileHandler` already attached to the
+    ``collapsarr`` logger (by a prior :func:`configure_logging` call) working
+    *immediately* afterward: a naive unlink-then-mkdir would leave the handler
+    holding an open file descriptor into the now-deleted, directory-invisible
+    inode -- every subsequent write would silently vanish into it rather than
+    the recreated file, until the process restarts or the next size-based
+    rollover happens to call :meth:`~logging.handlers.RotatingFileHandler.
+    doRollover` and reopen.
+
+    Instead: acquire the handler's own lock first (a :class:`threading.RLock`,
+    so its own internal ``close()``/``emit()`` locking nests safely) so the
+    whole clear -- close, delete, recreate, reopen -- is atomic against a
+    concurrent log write from another thread; ``close()`` flushes and closes
+    the stream (without deleting the file itself; it also sets the handler's
+    internal ``_closed`` flag, but that's harmless here -- ``FileHandler.emit``
+    only ever consults it when ``self.stream is None``, and the stream is
+    reassigned below before this function returns, so ``emit`` never observes
+    ``stream is None``); every file in ``logs_dir`` is then deleted and the
+    directory recreated; and the handler's stream is eagerly reassigned via
+    :meth:`~logging.FileHandler._open` -- the same private-method technique
+    :meth:`~logging.handlers.RotatingFileHandler.doRollover` itself uses after
+    a rename -- so the current file exists, empty, before this returns, and
+    the very next record this process emits lands in it. If no
+    ``RotatingFileHandler`` is attached at all (e.g. :func:`configure_logging`
+    was never called), the files are still deleted and an empty current file
+    is created directly -- unguarded by any lock, since there is no handler
+    whose concurrent writes it would need to serialize against.
+    """
+    directory = logs_dir(settings)
+    logger = logging.getLogger(LOGGER_NAME)
+    file_handler = next(
+        (
+            handler
+            for handler in logger.handlers
+            if isinstance(handler, logging.handlers.RotatingFileHandler)
+        ),
+        None,
+    )
+
+    if file_handler is None:
+        _clear_directory(directory)
+        current_log_path(settings).touch()
+        return
+
+    file_handler.acquire()
+    try:
+        file_handler.close()
+        _clear_directory(directory)
+        file_handler.stream = file_handler._open()  # noqa: SLF001 -- mirrors doRollover's own technique
+    finally:
+        file_handler.release()
+
+
 def apply_log_level(level_name: str | None) -> None:
     """Apply ``level_name`` to the ``collapsarr`` logger live (COL-130).
 

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 
-import { fetchLogs } from "../api/logs";
+import { clearLogs, downloadLogFile, fetchLogFiles, fetchLogs } from "../api/logs";
 import { LogsIcon } from "../components/icons";
-import type { LogLevelFilter, LogsResponse } from "../types/logs";
+import type { LogFile, LogLevelFilter, LogsResponse } from "../types/logs";
+import { formatBytes } from "../utils/format";
 
 const LEVEL_OPTIONS: LogLevelFilter[] = ["DEBUG", "INFO", "WARNING", "ERROR"];
 
@@ -16,6 +17,11 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ready"; entries: LogsResponse["entries"]; nextOffset: number | null };
 
+type FileListState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; files: LogFile[] };
+
 /**
  * Builds the "ready" state from a fetched page, optionally prepending it
  * before entries already on screen (COL-131 code review: shared by the
@@ -26,11 +32,20 @@ function toReadyState(page: LogsResponse, existingEntries: ReadyState["entries"]
   return { status: "ready", entries: [...page.entries, ...existingEntries], nextOffset: page.next_offset };
 }
 
+/** Formats an ISO timestamp in the viewer's local time, or the raw value if unparseable. */
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
 /**
- * The System → Logs view (COL-131): a tail window of the *current* rotating
- * log file (`<data_dir>/logs/collapsarr.log`, COL-128) -- the most recent
- * ~200 lines by default, newest last -- sourced from `GET /api/system/logs`
- * (`fetchLogs`, `collapsarr/system/logs.py`).
+ * The System → Logs view (COL-131/COL-132).
+ *
+ * The first section is a tail window of the *current* rotating log file
+ * (`<data_dir>/logs/collapsarr.log`, COL-128) -- the most recent ~200 lines by
+ * default, newest last -- sourced from `GET /api/system/logs` (`fetchLogs`,
+ * `collapsarr/system/logs.py`).
  *
  * The minimum-severity `level` filter is applied server-side (re-fetches on
  * change, replacing the current window rather than filtering client-side),
@@ -39,6 +54,15 @@ function toReadyState(page: LogsResponse, existingEntries: ReadyState["entries"]
  * re-fetches the current tail window, and "Load older" pages further back
  * through the file (via the response's `next_offset`), prepending onto the
  * entries already shown rather than replacing them.
+ *
+ * COL-132 adds a second "Log files" section: every file under `logs/`
+ * (current + rotated), fetched independently via `GET /api/system/logs/files`
+ * (`fetchLogFiles`), mirroring `BackupsPage`'s list+download pattern -- a
+ * per-row "Download" action (`downloadLogFile`, same blob/object-URL flow as
+ * `downloadBackup`) and a page-level "Clear logs" action gated behind an
+ * inline confirmation (it deletes every log file, current and rotated).
+ * A successful clear re-fetches both the file list and the tail window, since
+ * the current file it was showing has just been recreated empty.
  */
 export function LogsPage() {
   const [level, setLevel] = useState<LogLevelFilter | typeof ALL_LEVELS>(ALL_LEVELS);
@@ -46,6 +70,12 @@ export function LogsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  const [fileListState, setFileListState] = useState<FileListState>({ status: "loading" });
+  const [downloadingName, setDownloadingName] = useState<string | null>(null);
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [filesError, setFilesError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -69,6 +99,39 @@ export function LogsPage() {
       cancelled = true;
     };
   }, [level]);
+
+  async function loadFiles() {
+    try {
+      const list = await fetchLogFiles();
+      setFileListState({ status: "ready", files: list.files });
+    } catch (error: unknown) {
+      setFileListState({
+        status: "error",
+        message: error instanceof Error ? error.message : "Unknown error.",
+      });
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchLogFiles()
+      .then((list) => {
+        if (!cancelled) {
+          setFileListState({ status: "ready", files: list.files });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setFileListState({
+            status: "error",
+            message: error instanceof Error ? error.message : "Unknown error.",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -96,6 +159,34 @@ export function LogsPage() {
       setActionError(error instanceof Error ? error.message : "Failed to load older log lines.");
     } finally {
       setLoadingOlder(false);
+    }
+  }
+
+  async function handleDownloadFile(file: LogFile) {
+    setDownloadingName(file.name);
+    setFilesError(null);
+    try {
+      await downloadLogFile(file);
+    } catch (error: unknown) {
+      setFilesError(error instanceof Error ? error.message : "Failed to download log file.");
+    } finally {
+      setDownloadingName(null);
+    }
+  }
+
+  async function handleConfirmClear() {
+    setClearing(true);
+    setFilesError(null);
+    try {
+      await clearLogs();
+      setConfirmingClear(false);
+      // The current file was just deleted and recreated empty -- refresh
+      // both the file list and the tail window so neither shows stale data.
+      await Promise.all([loadFiles(), handleRefresh()]);
+    } catch (error: unknown) {
+      setFilesError(error instanceof Error ? error.message : "Failed to clear logs.");
+    } finally {
+      setClearing(false);
     }
   }
 
@@ -210,6 +301,114 @@ export function LogsPage() {
               {loadingOlder ? "Loading…" : canLoadOlder ? "Load older" : "No older lines"}
             </button>
           </div>
+        </div>
+      )}
+
+      <header className="view__header view__header--row">
+        <div>
+          <h2 className="view__title">Log files</h2>
+          <p className="view__summary">
+            Every file under <code>logs/</code> — the current file and rotated backups.
+          </p>
+        </div>
+        {!confirmingClear && (
+          <div className="view__actions">
+            <button
+              type="button"
+              className="btn btn--danger"
+              onClick={() => setConfirmingClear(true)}
+              disabled={clearing}
+            >
+              Clear logs
+            </button>
+          </div>
+        )}
+      </header>
+
+      {confirmingClear && (
+        <div className="panel view__confirm" role="status">
+          <p>
+            Delete every log file — the current file and every rotated backup — and start a
+            fresh, empty log? This can&apos;t be undone.
+          </p>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="btn btn--danger"
+              onClick={handleConfirmClear}
+              disabled={clearing}
+            >
+              {clearing ? "Clearing…" : "Confirm clear"}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={() => setConfirmingClear(false)}
+              disabled={clearing}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {filesError && <p className="view__error">{filesError}</p>}
+
+      {fileListState.status === "loading" && (
+        <div className="panel panel--empty">
+          <p className="panel__message">Loading log files…</p>
+        </div>
+      )}
+
+      {fileListState.status === "error" && (
+        <div className="panel panel--empty">
+          <span className="panel__icon" aria-hidden>
+            <LogsIcon width={28} height={28} />
+          </span>
+          <p className="panel__message">Couldn&apos;t load log files: {fileListState.message}</p>
+        </div>
+      )}
+
+      {fileListState.status === "ready" && fileListState.files.length === 0 && (
+        <div className="panel panel--empty">
+          <span className="panel__icon" aria-hidden>
+            <LogsIcon width={28} height={28} />
+          </span>
+          <p className="panel__message">No log files yet.</p>
+        </div>
+      )}
+
+      {fileListState.status === "ready" && fileListState.files.length > 0 && (
+        <div className="panel">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">Size</th>
+                <th scope="col">Last written</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {fileListState.files.map((file) => (
+                <tr key={file.name}>
+                  <td>{file.name}</td>
+                  <td>{formatBytes(file.size)}</td>
+                  <td>{formatTimestamp(file.modified_at)}</td>
+                  <td className="data-table__actions">
+                    <button
+                      type="button"
+                      className="btn btn--secondary btn--sm"
+                      onClick={() => handleDownloadFile(file)}
+                      disabled={downloadingName === file.name}
+                    >
+                      {downloadingName === file.name ? "Downloading…" : "Download"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </section>

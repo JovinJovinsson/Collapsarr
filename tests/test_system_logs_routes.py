@@ -1,4 +1,4 @@
-"""Contract tests for the tail-read log endpoint (COL-131).
+"""Contract tests for the ``/api/system/logs`` endpoints (COL-131/COL-132).
 
 Covers ``GET /api/system/logs``: the auth gate, the default ~200-line tail
 window (newest last), the ``offset`` parameter paging further back, the
@@ -6,10 +6,17 @@ window (newest last), the ``offset`` parameter paging further back, the
 multi-line record's continuation lines staying with their header), and the
 rotation race the ticket AC calls out explicitly -- reading the file fresh per
 request and tolerating a transient missing file.
+
+Also covers COL-132's three additions: ``GET /api/system/logs/files``
+(listing), ``GET /api/system/logs/files/{name}/download`` (per-file
+download), and ``DELETE /api/system/logs`` (clear).
 """
 
 from __future__ import annotations
 
+import logging
+import os
+import shutil
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -43,6 +50,18 @@ def _line(level: str, index: int) -> str:
 # --------------------------------------------------------------------------- #
 def test_endpoint_requires_authentication(client: TestClient) -> None:
     assert client.get("/api/system/logs").status_code == 401
+
+
+def test_files_endpoint_requires_authentication(client: TestClient) -> None:
+    assert client.get("/api/system/logs/files").status_code == 401
+
+
+def test_download_endpoint_requires_authentication(client: TestClient) -> None:
+    assert client.get("/api/system/logs/files/collapsarr.log/download").status_code == 401
+
+
+def test_clear_endpoint_requires_authentication(client: TestClient) -> None:
+    assert client.delete("/api/system/logs").status_code == 401
 
 
 # --------------------------------------------------------------------------- #
@@ -207,3 +226,157 @@ def test_reads_from_the_same_path_configure_logging_writes_to(
     response = client.get("/api/system/logs", headers=headers)
 
     assert response.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/system/logs/files -- file listing (COL-132)
+# --------------------------------------------------------------------------- #
+def test_file_listing_reflects_exactly_what_is_on_disk(
+    client: TestClient, settings: Settings
+) -> None:
+    current = _write_log_lines(settings, [_line("INFO", 0)])
+    rotated = current.parent / "collapsarr.log.1"
+    rotated.write_text("rotated content\n", encoding="utf-8")
+    headers = _auth_headers(client)
+
+    response = client.get("/api/system/logs/files", headers=headers)
+
+    assert response.status_code == 200
+    files = response.json()["files"]
+    names = {entry["name"] for entry in files}
+    assert names == {"collapsarr.log", "collapsarr.log.1"}
+    by_name = {entry["name"]: entry for entry in files}
+    assert by_name["collapsarr.log"]["size"] == current.stat().st_size
+    assert by_name["collapsarr.log.1"]["size"] == rotated.stat().st_size
+
+
+def test_file_listing_is_sorted_by_modified_time_descending(
+    client: TestClient, settings: Settings
+) -> None:
+    current = _write_log_lines(settings, [_line("INFO", 0)])
+    rotated = current.parent / "collapsarr.log.1"
+    rotated.write_text("older\n", encoding="utf-8")
+    old_time = current.stat().st_mtime - 100
+    os.utime(rotated, (old_time, old_time))
+    headers = _auth_headers(client)
+
+    response = client.get("/api/system/logs/files", headers=headers)
+
+    names = [entry["name"] for entry in response.json()["files"]]
+    assert names == ["collapsarr.log", "collapsarr.log.1"]
+
+
+def test_file_listing_is_empty_when_the_logs_dir_does_not_exist(
+    client: TestClient, settings: Settings
+) -> None:
+    shutil.rmtree(logs_dir(settings))
+    headers = _auth_headers(client)
+
+    response = client.get("/api/system/logs/files", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {"files": []}
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/system/logs/files/{name}/download -- per-file download (COL-132)
+# --------------------------------------------------------------------------- #
+def test_download_streams_the_current_file(client: TestClient, settings: Settings) -> None:
+    current = _write_log_lines(settings, [_line("INFO", 0), _line("INFO", 1)])
+    headers = _auth_headers(client)
+
+    response = client.get("/api/system/logs/files/collapsarr.log/download", headers=headers)
+
+    assert response.status_code == 200
+    assert response.content == current.read_bytes()
+
+
+def test_download_streams_a_rotated_file(client: TestClient, settings: Settings) -> None:
+    _write_log_lines(settings, [_line("INFO", 0)])
+    rotated = logs_dir(settings) / "collapsarr.log.1"
+    rotated.write_text("rotated bytes\n", encoding="utf-8")
+    headers = _auth_headers(client)
+
+    response = client.get("/api/system/logs/files/collapsarr.log.1/download", headers=headers)
+
+    assert response.status_code == 200
+    assert response.content == rotated.read_bytes()
+
+
+def test_download_404s_for_an_unknown_name(client: TestClient, settings: Settings) -> None:
+    _write_log_lines(settings, [_line("INFO", 0)])
+    headers = _auth_headers(client)
+
+    response = client.get(
+        "/api/system/logs/files/does-not-exist.log/download", headers=headers
+    )
+
+    assert response.status_code == 404
+
+
+def test_download_404s_for_a_path_traversal_attempt(
+    client: TestClient, settings: Settings
+) -> None:
+    _write_log_lines(settings, [_line("INFO", 0)])
+    headers = _auth_headers(client)
+
+    response = client.get(
+        "/api/system/logs/files/..%2F..%2Fetc%2Fpasswd/download", headers=headers
+    )
+
+    assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# DELETE /api/system/logs -- clear (COL-132)
+# --------------------------------------------------------------------------- #
+def test_clear_empties_the_directory_down_to_one_empty_current_file(
+    client: TestClient, settings: Settings
+) -> None:
+    current = _write_log_lines(settings, [_line("INFO", 0)])
+    (current.parent / "collapsarr.log.1").write_text("rotated\n", encoding="utf-8")
+    headers = _auth_headers(client)
+
+    response = client.delete("/api/system/logs", headers=headers)
+
+    assert response.status_code == 204
+    assert [entry.name for entry in logs_dir(settings).iterdir()] == ["collapsarr.log"]
+    assert current_log_path(settings).read_text(encoding="utf-8") == ""
+
+
+def test_clear_then_the_tail_endpoint_reports_an_empty_log(
+    client: TestClient, settings: Settings
+) -> None:
+    _write_log_lines(settings, [_line("INFO", 0)])
+    headers = _auth_headers(client)
+
+    client.delete("/api/system/logs", headers=headers)
+    response = client.get("/api/system/logs", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {"entries": [], "next_offset": None}
+
+
+def test_clear_via_the_route_keeps_the_live_app_logger_writing_afterward(
+    client: TestClient, settings: Settings
+) -> None:
+    """Integration-level companion to ``tests/test_logging_setup.py``'s
+    unit-level proof of the same AC ("logging keeps working immediately
+    afterward"): that test calls ``clear_logs`` directly against a
+    directly-constructed handler; this one drives the clear through the real
+    HTTP route on the app the ``client`` fixture boots (whose startup
+    lifespan is what attached the ``RotatingFileHandler`` in the first
+    place), then logs through the same process-global ``collapsarr`` logger
+    and reads the result back off disk -- proving the route -> clear_logs
+    path, not just the function called in isolation.
+    """
+    _write_log_lines(settings, [_line("INFO", 0)])
+    headers = _auth_headers(client)
+
+    response = client.delete("/api/system/logs", headers=headers)
+    assert response.status_code == 204
+
+    logging.getLogger("collapsarr.some.module").info("after clear via route")
+
+    content = current_log_path(settings).read_text(encoding="utf-8")
+    assert "after clear via route" in content

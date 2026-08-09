@@ -12,7 +12,14 @@ from fastapi.testclient import TestClient
 
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
-from collapsarr.logging_setup import LOGGER_NAME, apply_log_level, configure_logging, logs_dir
+from collapsarr.logging_setup import (
+    LOGGER_NAME,
+    apply_log_level,
+    clear_logs,
+    configure_logging,
+    current_log_path,
+    logs_dir,
+)
 from collapsarr.main import create_app
 from collapsarr.migrations import upgrade_to_head
 from collapsarr.settings.service import update_global_settings
@@ -298,3 +305,68 @@ def test_unset_log_level_leaves_the_env_default_at_boot(settings: Settings) -> N
     with TestClient(app):
         logger = logging.getLogger(LOGGER_NAME)
         assert logger.level == logging.INFO
+
+
+# ---------------------------------------------------------------------------
+# clear_logs (COL-132).
+# ---------------------------------------------------------------------------
+
+
+def test_clear_logs_deletes_every_file_and_recreates_an_empty_current_file(
+    settings: Settings,
+) -> None:
+    configure_logging(settings)
+    directory = logs_dir(settings)
+    current_log_path(settings).write_text("some existing content\n", encoding="utf-8")
+    (directory / "collapsarr.log.1").write_text("rotated content\n", encoding="utf-8")
+    (directory / "collapsarr.log.2").write_text("older rotated content\n", encoding="utf-8")
+
+    clear_logs(settings)
+
+    assert [entry.name for entry in directory.iterdir()] == ["collapsarr.log"]
+    assert current_log_path(settings).read_text(encoding="utf-8") == ""
+
+
+def test_clear_logs_without_a_configured_handler_still_recreates_an_empty_file(
+    settings: Settings,
+) -> None:
+    """No ``RotatingFileHandler`` attached to the ``collapsarr`` logger (e.g.
+    ``configure_logging`` was never called for this process/settings).
+    ``clear_logs`` must not raise, and still leaves an empty current file
+    behind. Explicitly strips any handler the shared ``collapsarr`` logger
+    might be carrying over from an earlier test in this module (the
+    ``_reset_collapsarr_logger`` fixture restores each test's *starting*
+    snapshot afterward, not an empty logger, so state can otherwise leak
+    between tests within a session)."""
+    logger = logging.getLogger(LOGGER_NAME)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    directory = logs_dir(settings)
+    directory.mkdir(parents=True)
+    (directory / "collapsarr.log").write_text("stale\n", encoding="utf-8")
+
+    clear_logs(settings)
+
+    assert [entry.name for entry in directory.iterdir()] == ["collapsarr.log"]
+    assert current_log_path(settings).read_text(encoding="utf-8") == ""
+
+
+def test_clear_logs_keeps_the_live_handler_writing_to_the_recreated_file(
+    settings: Settings,
+) -> None:
+    """AC-critical: the very next line this process logs after ``clear_logs``
+    must land in the recreated (on-disk, directory-visible) current file --
+    not silently vanish into the deleted-but-still-open inode the handler held
+    before the clear."""
+    configure_logging(settings)
+    logger = logging.getLogger("collapsarr.some.module")
+    logger.info("before the clear")
+
+    clear_logs(settings)
+    logger.info("after the clear")
+
+    content = current_log_path(settings).read_text(encoding="utf-8")
+    assert "before the clear" not in content
+    assert "after the clear" in content

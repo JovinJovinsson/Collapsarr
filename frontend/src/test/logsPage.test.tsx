@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LogsPage } from "../pages/LogsPage";
-import type { LogsResponse } from "../types/logs";
+import type { LogFileList, LogsResponse } from "../types/logs";
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
@@ -16,24 +16,67 @@ const initialPage: LogsResponse = {
   next_offset: 2,
 };
 
+const emptyFileList: LogFileList = { files: [] };
+const oneFileList: LogFileList = {
+  files: [{ name: "collapsarr.log", size: 2048, modified_at: "2026-08-09T12:00:00Z" }],
+};
+
+/**
+ * Routes a mocked `fetch` by URL/method: the tail-window `GET /api/system/logs`
+ * vs. the file-listing `GET /api/system/logs/files` vs. `DELETE /api/system/logs`
+ * vs. a per-file download. `LogsPage` fires the tail-window and file-listing
+ * requests independently on mount (two separate effects), so tests route by
+ * URL rather than relying on call order (mirrors `backupsPage.test.tsx`'s
+ * `stubFetch` helper).
+ */
+function stubFetch(options: {
+  logsPage?: LogsResponse;
+  files?: LogFileList;
+  onDelete?: () => { ok: boolean; status: number; json: () => Promise<unknown> };
+  onDownload?: (name: string) => { ok: boolean; status: number; blob: () => Promise<Blob> };
+}) {
+  const { logsPage = initialPage, files = emptyFileList, onDelete, onDownload } = options;
+
+  const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    const method = init?.method ?? "GET";
+    if (url === "/api/system/logs" && method === "DELETE") {
+      return Promise.resolve(onDelete ? onDelete() : { ok: true, status: 204, json: () => Promise.resolve(null) });
+    }
+    const downloadMatch = /^\/api\/system\/logs\/files\/([^/]+)\/download$/.exec(url);
+    if (downloadMatch && onDownload) {
+      return Promise.resolve(onDownload(downloadMatch[1]));
+    }
+    if (url === "/api/system/logs/files") {
+      return Promise.resolve(jsonResponse(files));
+    }
+    if (url.startsWith("/api/system/logs")) {
+      return Promise.resolve(jsonResponse(logsPage));
+    }
+    return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("LogsPage", () => {
   it("renders the current tail window on mount", async () => {
-    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(initialPage));
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch({});
 
     render(<LogsPage />);
 
     await waitFor(() => expect(screen.getByText(/started/)).toBeInTheDocument());
     expect(screen.getByText(/low disk/)).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/system/logs", expect.anything());
   });
 
   it("shows an error state when the initial load fails", async () => {
-    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ detail: "boom" }, 500));
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/system/logs/files") return Promise.resolve(jsonResponse(emptyFileList));
+      return Promise.resolve(jsonResponse({ detail: "boom" }, 500));
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<LogsPage />);
@@ -42,8 +85,7 @@ describe("LogsPage", () => {
   });
 
   it("shows an empty state when the file has no matching lines", async () => {
-    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ entries: [], next_offset: null }));
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch({ logsPage: { entries: [], next_offset: null } });
 
     render(<LogsPage />);
 
@@ -51,15 +93,14 @@ describe("LogsPage", () => {
   });
 
   it("re-fetches with the selected minimum-severity level", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(jsonResponse(initialPage)) // initial GET on mount
-      .mockResolvedValueOnce(
-        jsonResponse({
-          entries: [initialPage.entries[1]],
-          next_offset: null,
-        })
-      ); // GET after selecting WARNING
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/system/logs/files") return Promise.resolve(jsonResponse(emptyFileList));
+      if (url === "/api/system/logs?level=WARNING") {
+        return Promise.resolve(jsonResponse({ entries: [initialPage.entries[1]], next_offset: null }));
+      }
+      if (url === "/api/system/logs") return Promise.resolve(jsonResponse(initialPage));
+      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<LogsPage />);
@@ -68,8 +109,9 @@ describe("LogsPage", () => {
 
     fireEvent.change(screen.getByLabelText(/minimum severity/i), { target: { value: "WARNING" } });
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/system/logs?level=WARNING", expect.anything());
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([url]) => url === "/api/system/logs?level=WARNING")).toBe(true)
+    );
     await waitFor(() => expect(screen.queryByText(/started/)).not.toBeInTheDocument());
     expect(screen.getByText(/low disk/)).toBeInTheDocument();
   });
@@ -82,10 +124,16 @@ describe("LogsPage", () => {
       ],
       next_offset: 3,
     };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(jsonResponse(initialPage))
-      .mockResolvedValueOnce(jsonResponse(refreshedPage));
+    let refreshed = false;
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/system/logs/files") return Promise.resolve(jsonResponse(emptyFileList));
+      if (url === "/api/system/logs") {
+        const page = refreshed ? refreshedPage : initialPage;
+        refreshed = true;
+        return Promise.resolve(jsonResponse(page));
+      }
+      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<LogsPage />);
@@ -95,7 +143,6 @@ describe("LogsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
     await waitFor(() => expect(screen.getByText(/boom/)).toBeInTheDocument());
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/system/logs", expect.anything());
   });
 
   it("load older pages further back and prepends the older entries", async () => {
@@ -105,10 +152,12 @@ describe("LogsPage", () => {
       ],
       next_offset: null,
     };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(jsonResponse(initialPage)) // initial GET
-      .mockResolvedValueOnce(jsonResponse(olderPage)); // GET with offset
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/system/logs/files") return Promise.resolve(jsonResponse(emptyFileList));
+      if (url === "/api/system/logs?offset=2") return Promise.resolve(jsonResponse(olderPage));
+      if (url === "/api/system/logs") return Promise.resolve(jsonResponse(initialPage));
+      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<LogsPage />);
@@ -118,7 +167,6 @@ describe("LogsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Load older" }));
 
     await waitFor(() => expect(screen.getByText(/boot/)).toBeInTheDocument());
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/system/logs?offset=2", expect.anything());
     // Older entries are prepended, and the previously-shown lines remain.
     expect(screen.getByText(/started/)).toBeInTheDocument();
     expect(screen.getByText(/low disk/)).toBeInTheDocument();
@@ -147,10 +195,12 @@ describe("LogsPage", () => {
       ],
       next_offset: null,
     };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(jsonResponse(initialPage)) // initial GET, line_number 1 & 2
-      .mockResolvedValueOnce(jsonResponse(olderPageAfterRotation)); // Load older, also line_number 1 & 2
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/system/logs/files") return Promise.resolve(jsonResponse(emptyFileList));
+      if (url === "/api/system/logs?offset=2") return Promise.resolve(jsonResponse(olderPageAfterRotation));
+      if (url === "/api/system/logs") return Promise.resolve(jsonResponse(initialPage));
+      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
+    });
     vi.stubGlobal("fetch", fetchMock);
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -175,5 +225,136 @@ describe("LogsPage", () => {
     expect(hasKeyWarning).toBe(false);
 
     consoleErrorSpy.mockRestore();
+  });
+
+  // --- Log files section (COL-132) ------------------------------------------
+
+  it("renders the file list from a mocked GET /api/system/logs/files", async () => {
+    stubFetch({ files: oneFileList });
+
+    render(<LogsPage />);
+
+    expect(await screen.findByText("collapsarr.log")).toBeInTheDocument();
+    expect(screen.getByText("2.0 KB")).toBeInTheDocument();
+  });
+
+  it("shows an empty state when there are no log files", async () => {
+    stubFetch({ files: emptyFileList });
+
+    render(<LogsPage />);
+
+    expect(await screen.findByText(/no log files yet/i)).toBeInTheDocument();
+  });
+
+  it("downloads a log file via the per-row Download action", async () => {
+    const blob = new Blob(["fake log bytes"], { type: "text/plain" });
+    const fetchMock = stubFetch({
+      files: oneFileList,
+      onDownload: () => ({ ok: true, status: 200, blob: () => Promise.resolve(blob) }),
+    });
+
+    const createObjectURL = vi.fn().mockReturnValue("blob:mock-url");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { value: createObjectURL, configurable: true });
+    Object.defineProperty(URL, "revokeObjectURL", { value: revokeObjectURL, configurable: true });
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+
+    try {
+      render(<LogsPage />);
+      fireEvent.click(await screen.findByRole("button", { name: /^download$/i }));
+
+      await waitFor(() => expect(clickSpy).toHaveBeenCalledTimes(1));
+      expect(createObjectURL).toHaveBeenCalledWith(blob);
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
+      const downloadCall = fetchMock.mock.calls.find(([url]) => (url as string).endsWith("/download"));
+      expect(downloadCall?.[0]).toBe("/api/system/logs/files/collapsarr.log/download");
+    } finally {
+      delete (URL as { createObjectURL?: unknown }).createObjectURL;
+      delete (URL as { revokeObjectURL?: unknown }).revokeObjectURL;
+      clickSpy.mockRestore();
+    }
+  });
+
+  it("clear logs requires confirmation before calling DELETE", async () => {
+    const fetchMock = stubFetch({ files: oneFileList });
+
+    render(<LogsPage />);
+    await screen.findByText("collapsarr.log");
+
+    fireEvent.click(screen.getByRole("button", { name: /clear logs/i }));
+
+    expect(screen.getByText(/delete every log file/i)).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "DELETE")
+    ).toBe(false);
+  });
+
+  it("cancels a pending clear without calling DELETE", async () => {
+    const fetchMock = stubFetch({ files: oneFileList });
+
+    render(<LogsPage />);
+    await screen.findByText("collapsarr.log");
+
+    fireEvent.click(screen.getByRole("button", { name: /clear logs/i }));
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+
+    expect(screen.queryByText(/delete every log file/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /clear logs/i })).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "DELETE")
+    ).toBe(false);
+  });
+
+  it("clears logs after confirming, then refreshes the file list and tail window", async () => {
+    let cleared = false;
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (url === "/api/system/logs" && method === "DELETE") {
+        cleared = true;
+        return Promise.resolve({ ok: true, status: 204, json: () => Promise.resolve(null) });
+      }
+      if (url === "/api/system/logs/files") {
+        return Promise.resolve(jsonResponse(cleared ? emptyFileList : oneFileList));
+      }
+      if (url === "/api/system/logs") {
+        return Promise.resolve(jsonResponse(cleared ? { entries: [], next_offset: null } : initialPage));
+      }
+      return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<LogsPage />);
+    await screen.findByText("collapsarr.log");
+    await screen.findByText(/started/);
+
+    fireEvent.click(screen.getByRole("button", { name: /clear logs/i }));
+    fireEvent.click(screen.getByRole("button", { name: /confirm clear/i }));
+
+    await waitFor(() => expect(screen.getByText(/no log files yet/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/log file is empty/i)).toBeInTheDocument());
+    const deleteCall = fetchMock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "DELETE"
+    );
+    expect(deleteCall?.[0]).toBe("/api/system/logs");
+  });
+
+  it("surfaces an error when clearing logs fails", async () => {
+    const fetchMock = stubFetch({
+      files: oneFileList,
+      onDelete: () => jsonResponse({ detail: "disk error" }, 500),
+    });
+
+    render(<LogsPage />);
+    await screen.findByText("collapsarr.log");
+
+    fireEvent.click(screen.getByRole("button", { name: /clear logs/i }));
+    fireEvent.click(screen.getByRole("button", { name: /confirm clear/i }));
+
+    expect(await screen.findByText("disk error")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "DELETE")).toBe(
+      true
+    );
+    // The file is still listed -- the failed clear didn't remove it optimistically.
+    expect(screen.getByText("collapsarr.log")).toBeInTheDocument();
   });
 });
