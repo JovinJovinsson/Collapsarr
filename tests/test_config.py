@@ -138,6 +138,38 @@ def test_auth_seed_method_rejects_an_invalid_value() -> None:
         )
 
 
+def test_trusted_proxies_defaults_to_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No COLLAPSARR_TRUSTED_PROXIES set -- default is empty (no trust, COL-112)."""
+    monkeypatch.delenv("COLLAPSARR_TRUSTED_PROXIES", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.trusted_proxies == ""
+
+
+def test_trusted_proxies_env_override_accepts_a_comma_separated_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """COLLAPSARR_TRUSTED_PROXIES parses a comma-separated IP/CIDR list (COL-112)."""
+    monkeypatch.setenv("COLLAPSARR_TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.1")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.trusted_proxies == "10.0.0.0/8, 192.168.1.1"
+
+
+def test_trusted_proxies_rejects_an_unparseable_entry() -> None:
+    """A malformed COLLAPSARR_TRUSTED_PROXIES entry fails fast at construction,
+    not silently -- see collapsarr.auth.trust.parse_trusted_proxies (COL-112)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, trusted_proxies="not-an-ip")
+
+
+def test_trusted_proxies_rejects_one_bad_entry_among_good_ones() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, trusted_proxies="10.0.0.0/8,definitely-not-an-ip")
+
+
 def test_database_path_override_takes_precedence_over_data_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -149,6 +181,37 @@ def test_database_path_override_takes_precedence_over_data_dir(
     settings = Settings(_env_file=None)
 
     assert settings.database_path == str(explicit_path)
+
+
+def test_url_base_defaults_to_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No COLLAPSARR_URL_BASE set -- default is empty (no prefix, COL-116)."""
+    monkeypatch.delenv("COLLAPSARR_URL_BASE", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.url_base == ""
+
+
+def test_url_base_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """COLLAPSARR_URL_BASE is read from the environment (COL-116)."""
+    monkeypatch.setenv("COLLAPSARR_URL_BASE", "/collapsarr")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.url_base == "/collapsarr"
+
+
+def test_url_base_strips_trailing_slash() -> None:
+    """A trailing slash is normalized away, not rejected (COL-116)."""
+    settings = Settings(_env_file=None, url_base="/collapsarr/")
+
+    assert settings.url_base == "/collapsarr"
+
+
+def test_url_base_rejects_missing_leading_slash() -> None:
+    """A url_base missing its leading slash fails fast at construction (COL-116)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, url_base="collapsarr")
 
 
 def test_boots_with_zero_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

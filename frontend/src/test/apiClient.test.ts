@@ -52,6 +52,60 @@ describe("apiFetch / stored API key", () => {
   });
 });
 
+describe("apiFetch / url_base prefixing (COL-118)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("prefixes an absolute-rooted request path with the runtime url_base", async () => {
+    vi.stubGlobal("window", { __COLLAPSARR_URL_BASE__: "/collapsarr" });
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await apiFetch("/api/wanted");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/collapsarr/api/wanted");
+  });
+
+  it("leaves the request path unchanged when no url_base is configured", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await apiFetch("/api/wanted");
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/wanted");
+  });
+
+  it("prefixes non-/api absolute-rooted paths (e.g. /health) too", async () => {
+    vi.stubGlobal("window", { __COLLAPSARR_URL_BASE__: "/collapsarr" });
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await apiFetch("/health");
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/collapsarr/health");
+  });
+
+  it("redirects to the prefixed /login on a 401 when url_base is set", async () => {
+    vi.stubGlobal("window", { __COLLAPSARR_URL_BASE__: "/collapsarr" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: false, status: 401, json: () => Promise.resolve({}) }),
+    );
+    const assign = vi.fn();
+    vi.stubGlobal("location", { pathname: "/collapsarr/wanted", assign });
+
+    await apiFetch("/api/wanted");
+
+    expect(assign).toHaveBeenCalledWith("/collapsarr/login");
+  });
+});
+
 describe("apiFetch / 401 redirect (COL-54)", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
