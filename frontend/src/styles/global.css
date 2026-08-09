@@ -1750,6 +1750,49 @@ a {
   padding: 0 var(--sp-1);
 }
 
+/* ---- Status page (COL-123) ---------------------------------------------
+   The About panel's definition list -- structurally the same shape as
+   .update-panel__grid/.update-panel__row (Updates page), but its own class
+   names since this grid has no status-row/changelog/instructions siblings. */
+
+.status-panel {
+  padding: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.status-panel__title {
+  font-size: var(--fs-sm);
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--c-text-muted);
+}
+
+.status-panel__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--sp-4);
+  margin: 0;
+}
+
+.status-panel__row dt {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--sp-1);
+}
+
+.status-panel__row dd {
+  margin: 0;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition-duration: 0.01ms !important;

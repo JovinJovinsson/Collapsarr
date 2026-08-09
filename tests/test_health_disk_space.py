@@ -33,6 +33,7 @@ from collapsarr.health import (
     HealthCheckContext,
     default_health_checks,
     free_space_percent,
+    get_disk_usage,
     make_disk_space_check_run,
 )
 from collapsarr.settings.service import update_global_settings
@@ -179,3 +180,22 @@ def test_registered_with_default_health_checks() -> None:
     names = [check.name for check in default_health_checks()]
 
     assert DISK_SPACE_CHECK_NAME in names
+
+
+# --- get_disk_usage (raw byte counts, reused by GET /api/system/info) ------------
+
+
+def test_get_disk_usage_returns_the_injected_reading() -> None:
+    """COL-123: the raw free/total byte counts are exposed for reuse, off the
+    same injected probe -- not a second, real ``shutil.disk_usage`` call."""
+    usage = get_disk_usage("/some/data/dir", lambda _path: _usage_for_percent(10.0, total=5000))
+
+    assert usage.total == 5000
+    assert usage.free == 500
+
+
+def test_get_disk_usage_defaults_to_the_real_shutil_disk_usage_probe(settings: Settings) -> None:
+    """No injected probe: reads the real filesystem backing ``settings.data_dir``."""
+    usage = get_disk_usage(settings.data_dir)
+
+    assert usage.total > 0

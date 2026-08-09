@@ -7,6 +7,7 @@ routes together. A module-level ``app`` is provided for ASGI servers
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -57,6 +58,8 @@ from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
+from .system.info import router as info_router
+from .system.probe import DefaultSystemProbe, SystemProbe
 from .system.tasks import router as tasks_router
 from .update_check import UpdateCheckScheduler
 from .update_check.routes import router as update_checks_router
@@ -118,6 +121,7 @@ def create_app(
     arr_transport: httpx.BaseTransport | None = None,
     disk_usage: Callable[[str], DiskUsage] | None = None,
     update_check_transport: httpx.BaseTransport | None = None,
+    system_probe: SystemProbe | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -156,12 +160,25 @@ def create_app(
     ``settings.data_dir``. ``update_check_transport`` (COL-86) is forwarded to
     the Update Check scheduler's GitHub Releases fetch (tests inject an
     ``httpx.MockTransport``; production leaves it ``None`` for a real network
-    call).
+    call). ``system_probe`` (COL-123) overrides the About panel's Python
+    version / OS platform / FFmpeg version probe (see
+    :class:`~collapsarr.system.probe.SystemProbe`); production leaves it
+    ``None`` for the real, ``platform``/subprocess-backed
+    :class:`~collapsarr.system.probe.DefaultSystemProbe`.
     """
     resolved_settings = settings or get_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Process start stamp (COL-123): taken first, before any startup work
+        # below (restore swap, migrations, engine/scheduler setup) -- so
+        # `uptime_seconds` (GET /api/system/info) measures from genuine
+        # lifespan/process start rather than undercounting by however long
+        # that startup sequence takes. A `time.monotonic()` stamp rather than
+        # wall-clock time, so a system clock adjustment (NTP sync, DST) can't
+        # produce a negative or jumping uptime later.
+        app.state.process_start_monotonic = time.monotonic()
+
         # Boot-time staged swap (COL-70): before the engine connects and before
         # the schema upgrade below, apply a pending database restore if one is
         # marked -- take a safety backup of the current DB, swap the staged file
@@ -263,6 +280,23 @@ def create_app(
         update_check_scheduler.run_once()
         if enable_scheduler:
             update_check_scheduler.start(run_immediately=False)
+
+        # About-panel system info (COL-123): the injectable Python-version/
+        # OS-platform/FFmpeg-version probe (collapsarr.system.probe.SystemProbe)
+        # backing GET /api/system/info. FFmpeg version alone requires a
+        # subprocess call (`ffmpeg -version`), so -- unlike Python version/OS
+        # platform, which are cheap stdlib reads taken fresh on every request --
+        # it is probed exactly once here, at startup, and cached on
+        # `app.state.ffmpeg_version`: it cannot change without a process
+        # restart. `app.state.disk_usage` re-exposes this factory's own
+        # `disk_usage` override so the info endpoint reads free/total bytes off
+        # the identical injected probe the disk-space health check uses in
+        # tests, rather than a second, real `shutil.disk_usage` call.
+        resolved_system_probe = system_probe or DefaultSystemProbe()
+        app.state.system_probe = resolved_system_probe
+        app.state.disk_usage = disk_usage
+        app.state.ffmpeg_version = resolved_system_probe.ffmpeg_version()
+
         try:
             yield
         finally:
@@ -359,6 +393,16 @@ def create_app(
     # among the /api/system routers since it depends on state every one of
     # them already establishes.
     app.include_router(tasks_router)
+
+    # About-panel system-info GET /api/system/info (COL-123): environment/
+    # runtime facts (versions, OS, DB engine/schema revision, data paths,
+    # uptime, timezone, disk usage) driving the new Status page. Kept in its
+    # own module (collapsarr/system/info.py), separate from
+    # collapsarr/system/tasks.py, purely so the two tickets can land commits
+    # on the same Epic branch without touching the same file -- not a deeper
+    # architectural split; both are thin /api/system aggregation views over
+    # existing state (docs/adr/0005-system-tasks-endpoint-not-shared-scheduler.md).
+    app.include_router(info_router)
 
     @app.get("/health", tags=["system"])
     def health(session: Session = Depends(get_session)) -> dict[str, object]:

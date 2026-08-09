@@ -128,6 +128,18 @@ export function TasksIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Status: an info circle — the Status page's About panel (COL-123), distinct
+// from Health's pulse-in-cross, Update's tray, and Tasks' checklist.
+export function StatusIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 11v5.5" />
+      <circle cx="12" cy="8" r="0.75" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 // Wordmark glyph: converging channels funneling into two bars, echoing the
 // downmix concept. Placeholder mark only — final logo lands in COL-9.
 export function BrandMark(props: SVGProps<SVGSVGElement>) {

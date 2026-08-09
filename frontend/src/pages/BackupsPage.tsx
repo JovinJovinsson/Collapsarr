@@ -12,25 +12,13 @@ import {
 import { fetchSettings, updateSettings } from "../api/settings";
 import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
+import { formatBytes } from "../utils/format";
 
 /** Formats an ISO timestamp in the viewer's local time, or the raw value if unparseable. */
 function formatTimestamp(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
-}
-
-/** Human-readable byte size (e.g. `1.4 MB`). */
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let size = bytes / 1024;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(1)} ${units[unit]}`;
 }
 
 const TYPE_LABEL: Record<Backup["type"], string> = {
@@ -479,7 +467,7 @@ export function BackupsPage() {
                 <tr key={backup.id}>
                   <td>{backup.name}</td>
                   <td>{TYPE_LABEL[backup.type] ?? backup.type}</td>
-                  <td>{formatSize(backup.size)}</td>
+                  <td>{formatBytes(backup.size)}</td>
                   <td>{formatTimestamp(backup.created_at)}</td>
                   <td className="data-table__actions">
                     <button
