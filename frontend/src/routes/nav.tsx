@@ -58,13 +58,14 @@ export const navItems: NavItem[] = [
  * adds Tasks, the Scheduled Task registry aggregating all four background
  * schedulers; COL-123 adds Status, an "About" panel of runtime/environment
  * facts. Rendered as its own labelled section in the sidebar and wired under
- * `/system/*` in the router, both from this single list. Tasks/Status are
- * appended last here -- COL-126 handles reordering Tasks to lead the section.
+ * `/system/*` in the router, both from this single list. COL-126 reorders to
+ * match Bazarr's own System sub-nav ordering: Tasks, Backups, Health, Status,
+ * Updates.
  */
 export const systemNavItems: NavItem[] = [
+  { to: "/system/tasks", label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
   { to: "/system/backups", label: "Backups", icon: <BackupIcon />, element: <BackupsPage /> },
   { to: "/system/health", label: "Health", icon: <HealthIcon />, element: <HealthChecksPage /> },
-  { to: "/system/updates", label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
-  { to: "/system/tasks", label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
   { to: "/system/status", label: "Status", icon: <StatusIcon />, element: <StatusPage /> },
+  { to: "/system/updates", label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
 ];
