@@ -57,6 +57,17 @@ unrecognised value is rejected with a ``422`` before it reaches the service
 layer, which validates it again independently (see
 :func:`collapsarr.settings.service.update_global_settings`) for callers that
 bypass this HTTP layer.
+
+``log_level`` (COL-130) is also read/write here -- ``DEBUG``/``INFO``/
+``WARNING``/``ERROR``, or ``null`` -- the runtime override for the
+``collapsarr`` logger surfaced in Settings -> General's log-level dropdown.
+Like ``language_allow_list``, ``null`` is a meaningful, sendable value (clears
+a persisted override back to deferring to ``COLLAPSARR_LOG_LEVEL``); omitting
+the field leaves it untouched. Unlike every other field here,
+``update_settings_endpoint`` calls
+:func:`collapsarr.logging_setup.apply_log_level` after persisting it, so the
+change is live on the ``collapsarr`` logger immediately, not just on the
+Update Check scheduler's/disk-space check's next tick.
 """
 
 from __future__ import annotations
@@ -70,6 +81,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_session
 from ..downmix.targets import DownmixTarget
+from ..logging_setup import apply_log_level
 from .models import GlobalSettings
 from .service import as_downmix_settings, get_global_settings, update_global_settings
 
@@ -91,6 +103,11 @@ UpdateChannelMode = Literal["stable", "beta"]
 :data:`collapsarr.settings.models.UPDATE_CHANNEL_STABLE` /
 :data:`~collapsarr.settings.models.UPDATE_CHANNEL_BETA` -- spelled out as
 literals for the same reason as :data:`AuthRequiredMode`."""
+
+LogLevelMode = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+"""The four levels settable from Settings -> General's log-level dropdown
+(COL-130), matching :data:`collapsarr.settings.models.LOG_LEVELS` -- spelled
+out as literals for the same reason as :data:`AuthRequiredMode`."""
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -121,6 +138,7 @@ class SettingsRead(BaseModel):
     disk_space_error_percent: float
     update_channel: UpdateChannelMode
     default_tracked: bool
+    log_level: LogLevelMode | None
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -131,8 +149,8 @@ class SettingsUpdate(BaseModel):
 
     ``enabled_targets`` and ``language_allow_list`` accept JSON arrays. Sending
     an explicit ``null`` for ``language_allow_list``/``stereo_bitrate_kbps``/
-    ``surround_bitrate_kbps`` clears the stored override; omitting the field
-    leaves it untouched.
+    ``surround_bitrate_kbps``/``log_level`` clears the stored override;
+    omitting the field leaves it untouched.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -153,6 +171,7 @@ class SettingsUpdate(BaseModel):
     disk_space_error_percent: float | None = Field(default=None, gt=0, le=100)
     update_channel: UpdateChannelMode | None = None
     default_tracked: bool | None = None
+    log_level: LogLevelMode | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -184,6 +203,7 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         disk_space_error_percent=settings.disk_space_error_percent,
         update_channel=settings.update_channel,
         default_tracked=settings.default_tracked,
+        log_level=settings.log_level,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -205,8 +225,10 @@ def update_settings_endpoint(
 ) -> SettingsRead:
     """Update the provided settings fields and return the full row.
 
-    Only fields present in the request body are changed; the three
-    nullable-domain fields treat an explicit ``null`` as "clear this override".
+    Only fields present in the request body are changed; the nullable-domain
+    fields treat an explicit ``null`` as "clear this override". A provided
+    ``log_level`` is additionally applied live to the running ``collapsarr``
+    logger (:func:`collapsarr.logging_setup.apply_log_level`) once persisted.
     """
     provided = body.model_fields_set
     kwargs: dict[str, object] = {}
@@ -248,5 +270,10 @@ def update_settings_endpoint(
         kwargs["update_channel"] = body.update_channel
     if "default_tracked" in provided:
         kwargs["default_tracked"] = body.default_tracked
+    if "log_level" in provided:
+        kwargs["log_level"] = body.log_level
 
-    return _to_read(update_global_settings(session, **kwargs))  # type: ignore[arg-type]
+    updated = update_global_settings(session, **kwargs)  # type: ignore[arg-type]
+    if "log_level" in provided:
+        apply_log_level(updated.log_level)
+    return _to_read(updated)

@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import { changePassword, logoutEverywhere } from "../../api/auth";
 import { getStoredApiKey, redirectToLogin, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
-import type { AuthMethod, AuthRequiredMode, UpdateChannel } from "../../types/settings";
+import type { AuthMethod, AuthRequiredMode, LogLevel, UpdateChannel } from "../../types/settings";
 
 type LoadState =
   | { status: "loading" }
@@ -24,7 +24,12 @@ interface GeneralFormValues {
   diskSpaceWarningPercent: string;
   diskSpaceErrorPercent: string;
   defaultTracked: boolean;
+  logLevel: LogLevel;
 }
+
+/** Shown when `GlobalSettings.log_level` is `null` (no override set yet) -- matches
+ * `COLLAPSARR_LOG_LEVEL`'s own documented default (COL-130). */
+const DEFAULT_LOG_LEVEL: LogLevel = "INFO";
 
 /** Validates the general-settings form; returns an error message, or `null` when valid. */
 function validateGeneralForm(form: GeneralFormValues): string | null {
@@ -79,6 +84,7 @@ export function GeneralSection() {
     diskSpaceWarningPercent: "5",
     diskSpaceErrorPercent: "2",
     defaultTracked: true,
+    logLevel: DEFAULT_LOG_LEVEL,
   });
 
   const [saving, setSaving] = useState(false);
@@ -116,6 +122,7 @@ export function GeneralSection() {
           diskSpaceWarningPercent: String(settings.disk_space_warning_percent),
           diskSpaceErrorPercent: String(settings.disk_space_error_percent),
           defaultTracked: settings.default_tracked,
+          logLevel: settings.log_level ?? DEFAULT_LOG_LEVEL,
         });
         setState({ status: "ready" });
       })
@@ -148,6 +155,7 @@ export function GeneralSection() {
         disk_space_warning_percent: Number(form.diskSpaceWarningPercent),
         disk_space_error_percent: Number(form.diskSpaceErrorPercent),
         default_tracked: form.defaultTracked,
+        log_level: form.logLevel,
       });
       setServerApiKey(updated.api_key);
       setForm({
@@ -164,6 +172,7 @@ export function GeneralSection() {
         diskSpaceWarningPercent: String(updated.disk_space_warning_percent),
         diskSpaceErrorPercent: String(updated.disk_space_error_percent),
         defaultTracked: updated.default_tracked,
+        logLevel: updated.log_level ?? DEFAULT_LOG_LEVEL,
       });
       setSavedAt(Date.now());
     } catch (err: unknown) {
@@ -390,6 +399,31 @@ export function GeneralSection() {
                 <strong>Beta</strong> checks for the latest pre-release build instead -- may be
                 less stable, intended for early testing. See the{" "}
                 <Link to="/system/updates">Updates page</Link> for the current comparison result.
+              </p>
+            </div>
+          </div>
+
+          <div className="panel settings-form">
+            <h3 className="settings-form__subtitle">Log level</h3>
+            <div className="form-field form-field--narrow">
+              <label htmlFor="log-level">Level</label>
+              <select
+                id="log-level"
+                value={form.logLevel}
+                onChange={(event) =>
+                  setForm({ ...form, logLevel: event.target.value as typeof form.logLevel })
+                }
+              >
+                <option value="DEBUG">Debug</option>
+                <option value="INFO">Info</option>
+                <option value="WARNING">Warning</option>
+                <option value="ERROR">Error</option>
+              </select>
+              <p className="form-hint">
+                Applies immediately, without a restart, and persists across restarts. Controls
+                both what&apos;s logged and how many rotated log files are kept (more at{" "}
+                <strong>Debug</strong>). Defaults to the <code>COLLAPSARR_LOG_LEVEL</code>{" "}
+                environment setting (<strong>Info</strong>) until changed here.
               </p>
             </div>
           </div>

@@ -8,10 +8,14 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from collapsarr.config import Settings
-from collapsarr.logging_setup import LOGGER_NAME, configure_logging, logs_dir
+from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.logging_setup import LOGGER_NAME, apply_log_level, configure_logging, logs_dir
 from collapsarr.main import create_app
+from collapsarr.migrations import upgrade_to_head
+from collapsarr.settings.service import update_global_settings
 
 
 @pytest.fixture(autouse=True)
@@ -211,3 +215,86 @@ def test_create_app_configures_logging_with_its_own_settings(settings: Settings)
         h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)
     )
     assert Path(file_handler.baseFilename) == logs_dir(settings) / "collapsarr.log"
+
+
+# ---------------------------------------------------------------------------
+# apply_log_level / runtime GlobalSettings.log_level control (COL-130).
+# ---------------------------------------------------------------------------
+
+
+def test_apply_log_level_updates_level_and_backup_count_live(settings: Settings) -> None:
+    configure_logging(settings)  # env-configured floor: INFO
+
+    apply_log_level("DEBUG")
+
+    logger = logging.getLogger(LOGGER_NAME)
+    assert logger.level == logging.DEBUG
+    file_handler = next(
+        h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)
+    )
+    assert file_handler.backupCount == 51
+
+    apply_log_level("WARNING")
+
+    assert logger.level == logging.WARNING
+    assert file_handler.backupCount == 6
+
+
+def test_apply_log_level_does_not_duplicate_handlers(settings: Settings) -> None:
+    configure_logging(settings)
+
+    apply_log_level("DEBUG")
+    apply_log_level("ERROR")
+
+    logger = logging.getLogger(LOGGER_NAME)
+    file_handlers = [
+        h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)
+    ]
+    assert len(file_handlers) == 1
+
+
+def test_apply_log_level_none_falls_back_to_the_env_configured_level(settings: Settings) -> None:
+    debug_settings = settings.model_copy(update={"log_level": "DEBUG"})
+    configure_logging(debug_settings)
+
+    apply_log_level("ERROR")
+    logger = logging.getLogger(LOGGER_NAME)
+    assert logger.level == logging.ERROR
+
+    apply_log_level(None)
+
+    assert logger.level == logging.DEBUG  # back to the env-resolved floor
+
+
+def test_persisted_log_level_overrides_the_env_default_at_boot(settings: Settings) -> None:
+    """COL-130 AC: a value set before startup wins over ``COLLAPSARR_LOG_LEVEL``.
+
+    ``settings.log_level`` is left at its default (``INFO``), so this proves
+    the DB-persisted override -- not the env setting -- decides the level,
+    modelling a restart after a previous session set ``log_level`` via the
+    API.
+    """
+    upgrade_to_head(settings)
+    engine = create_engine_from_settings(settings)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        update_global_settings(session, log_level="DEBUG")
+    engine.dispose()
+
+    app = create_app(settings=settings)
+    with TestClient(app):
+        logger = logging.getLogger(LOGGER_NAME)
+        assert logger.level == logging.DEBUG
+        file_handler = next(
+            h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)
+        )
+        assert file_handler.backupCount == 51
+
+
+def test_unset_log_level_leaves_the_env_default_at_boot(settings: Settings) -> None:
+    """COL-130 AC: ``None`` (never set via the API) resolves to ``COLLAPSARR_LOG_LEVEL``."""
+    app = create_app(settings=settings)  # settings.log_level defaults to "INFO"
+
+    with TestClient(app):
+        logger = logging.getLogger(LOGGER_NAME)
+        assert logger.level == logging.INFO

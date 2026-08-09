@@ -27,6 +27,7 @@ const baseSettings: GlobalSettings = {
   disk_space_error_percent: 2,
   update_channel: "stable",
   default_tracked: true,
+  log_level: null,
   api_key: "server-generated-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
@@ -188,6 +189,44 @@ describe("GeneralSection", () => {
     const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
     const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
     expect(putBody.update_channel).toBe("beta");
+  });
+
+  it("displays Info as the default log level when unset from a mocked GET", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    expect(await screen.findByLabelText(/^level$/i)).toHaveValue("INFO");
+  });
+
+  it("displays a previously-set log level from a mocked GET", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse({ ...baseSettings, log_level: "DEBUG" })),
+    );
+    renderGeneralSection();
+
+    expect(await screen.findByLabelText(/^level$/i)).toHaveValue("DEBUG");
+  });
+
+  it("saves the log_level via PUT when switched to Warning", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const logLevelSelect = await screen.findByLabelText(/^level$/i);
+    fireEvent.change(logLevelSelect, { target: { value: "WARNING" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.log_level).toBe("WARNING");
   });
 
   it("saves the browser-stored API key to localStorage", async () => {

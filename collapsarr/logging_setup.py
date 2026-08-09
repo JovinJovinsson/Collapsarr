@@ -35,6 +35,17 @@ the ``collapsarr`` logger before adding new ones. Tests build a fresh
 process running many tests back to back must never leak a handler pointing at
 a previous test's (by-then-deleted) ``tmp_path``, nor fan a single log line
 out across every previous test's log file.
+
+:func:`apply_log_level` (COL-130) is the lighter-weight runtime counterpart:
+given a level name (or ``None``), it updates the existing logger's effective
+level and the existing rotating file handler's ``backupCount`` in place --
+unlike :func:`configure_logging`, it never touches ``data_dir`` or rebuilds
+handlers, so it needs no :class:`~collapsarr.config.Settings` at all. It backs
+the ``GlobalSettings.log_level`` Settings -> General dropdown: a change made
+through ``PUT /api/settings`` (:mod:`collapsarr.settings.routes`) takes effect
+immediately, with no restart, and a value left unset (``None``) resolves to
+whatever level :func:`configure_logging` most recently derived from
+``COLLAPSARR_LOG_LEVEL`` (tracked in :data:`_env_level`).
 """
 
 from __future__ import annotations
@@ -59,6 +70,15 @@ _BACKUP_COUNT_DEBUG = 51
 _BACKUP_COUNT_DEFAULT = 6
 
 _FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+_env_level: int = logging.INFO
+"""The level :func:`configure_logging` most recently resolved from
+``COLLAPSARR_LOG_LEVEL`` (env) -- the floor :func:`apply_log_level` falls back
+to when the DB-persisted ``GlobalSettings.log_level`` override (COL-130) is
+``None``. Module-level rather than threaded through every call site, matching
+how the ``collapsarr`` logger itself is process-global mutable state (there is
+only one ``logging.getLogger("collapsarr")``, same caveat as documented above
+for handlers/filters)."""
 
 # --- Redaction patterns (ADR 0006) ------------------------------------------
 # Regex-scrub known secret shapes rather than auditing every call site. Each
@@ -120,10 +140,20 @@ class _RedactionFilter(logging.Filter):
         return True
 
 
-def _resolved_level(settings: Settings) -> int:
-    """Resolve ``settings.log_level`` to a numeric level, defaulting to INFO."""
-    level = logging.getLevelName(settings.log_level.upper())
+def _level_from_name(name: str) -> int:
+    """Resolve a level name (``"DEBUG"``, ``"info"``, ...) to its numeric level.
+
+    Falls back to ``INFO`` for anything :func:`logging.getLevelName` doesn't
+    recognise as a level, matching :func:`_resolved_level`'s previous inline
+    behaviour.
+    """
+    level = logging.getLevelName(name.upper())
     return level if isinstance(level, int) else logging.INFO
+
+
+def _resolved_level(settings: Settings) -> int:
+    """Resolve ``settings.log_level`` (env-sourced) to a numeric level."""
+    return _level_from_name(settings.log_level)
 
 
 def _backup_count_for(level: int) -> int:
@@ -152,6 +182,8 @@ def configure_logging(settings: Settings) -> None:
         logger.removeFilter(existing_filter)
 
     level = _resolved_level(settings)
+    global _env_level
+    _env_level = level
     logger.setLevel(level)
     logger.propagate = False
 
@@ -173,3 +205,31 @@ def configure_logging(settings: Settings) -> None:
     file_handler.setFormatter(formatter)
     file_handler.addFilter(redaction_filter)
     logger.addHandler(file_handler)
+
+
+def apply_log_level(level_name: str | None) -> None:
+    """Apply ``level_name`` to the ``collapsarr`` logger live (COL-130).
+
+    Updates the logger's effective level and, if a
+    :class:`~logging.handlers.RotatingFileHandler` is already attached (added
+    by a prior :func:`configure_logging` call), its ``backupCount`` (51 at
+    DEBUG, 6 otherwise -- see module docstring) to match. ``None`` -- the
+    ``GlobalSettings.log_level`` Settings -> General dropdown's unset state --
+    falls back to :data:`_env_level`, the most recent
+    ``COLLAPSARR_LOG_LEVEL``-resolved level :func:`configure_logging` recorded
+    at boot, so clearing a persisted override reverts live too, not only on
+    the next restart.
+
+    Deliberately lighter than :func:`configure_logging`: it only ever adjusts
+    the *existing* logger/handlers in place, never rebuilds them, so it needs
+    no :class:`~collapsarr.config.Settings` (no ``data_dir``/log-file-path
+    knowledge is needed for a level-only change) and is safe to call from a
+    request handler with nothing more than the level name just persisted.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    level = _level_from_name(level_name) if level_name is not None else _env_level
+    logger.setLevel(level)
+    backup_count = _backup_count_for(level)
+    for handler in logger.handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            handler.backupCount = backup_count

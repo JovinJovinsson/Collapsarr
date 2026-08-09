@@ -51,7 +51,7 @@ from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .library.routes import router as library_router
 from .library.service import upsert_movie_node, upsert_series_episode_node
-from .logging_setup import configure_logging
+from .logging_setup import apply_log_level, configure_logging
 from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
@@ -59,6 +59,7 @@ from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
+from .settings.service import get_global_settings
 from .system.info import router as info_router
 from .system.probe import DefaultSystemProbe, SystemProbe
 from .system.tasks import router as tasks_router
@@ -211,6 +212,19 @@ def create_app(
         app.state.engine = engine
         session_factory = create_session_factory(engine)
         app.state.session_factory = session_factory
+
+        # Runtime log-level control (COL-130): a persisted `GlobalSettings.
+        # log_level` override, applied now that the database is available --
+        # `configure_logging` above already set the `collapsarr` logger to
+        # the env-sourced `COLLAPSARR_LOG_LEVEL` floor before this lifespan
+        # even started (no DB access that early). Left `None` (the default,
+        # and every fresh install's starting state) is a no-op: that env
+        # floor stands. A previously-set level survives a restart because
+        # this re-applies it every boot, not just the first time it's set.
+        with session_factory() as log_level_session:
+            persisted_log_level = get_global_settings(log_level_session).log_level
+        if persisted_log_level is not None:
+            apply_log_level(persisted_log_level)
 
         # Environment-seeded UI credential for headless deploys (COL-53): if
         # COLLAPSARR_AUTH_USERNAME/PASSWORD are set and no credential exists

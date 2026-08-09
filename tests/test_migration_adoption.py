@@ -221,6 +221,7 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "disk_space_error_percent"),
     ("global_settings", "update_channel"),
     ("global_settings", "default_tracked"),
+    ("global_settings", "log_level"),
     ("tracked_media_files", "instance_id"),
     ("tracked_media_files", "sonarr_episode_id"),
     ("tracked_media_files", "radarr_movie_id"),
