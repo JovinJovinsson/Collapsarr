@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 
 import type { ReactNode } from "react";
 
 import { logout } from "../api/auth";
+import { fetchHealth } from "../api/health";
 import { LIBRARIES_PATH, navItems, systemNavItems } from "../routes/nav";
 import type { NavItem } from "../routes/nav";
 import { LibraryNavSection } from "./LibraryNavSection";
@@ -28,6 +29,18 @@ function NavLinkItem({ to, label, icon }: NavItem): ReactNode {
 export function Sidebar() {
   const navigate = useNavigate();
   const [loggingOut, setLoggingOut] = useState(false);
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchHealth()
+      .then((health) => {
+        setVersion(health.version);
+      })
+      .catch(() => {
+        // Silently fail; the footer will display "Unknown" or be empty
+        setVersion(null);
+      });
+  }, []);
 
   async function handleLogout() {
     setLoggingOut(true);
@@ -82,7 +95,7 @@ export function Sidebar() {
         >
           {loggingOut ? "Signing out…" : "Sign out"}
         </button>
-        <span className="sidebar__version">v0.1.0</span>
+        <span className="sidebar__version">{version || "Unknown"}</span>
       </div>
     </nav>
   );

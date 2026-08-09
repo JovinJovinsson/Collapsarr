@@ -44,3 +44,43 @@ describe("Sidebar sign-out (COL-50)", () => {
     );
   });
 });
+
+describe("Sidebar version display (COL-124)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("displays the app version fetched from GET /health", async () => {
+    const fetchMock = vi.fn().mockImplementation((url) => {
+      if (url === "/health") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            status: "ok",
+            version: "v1.2.3",
+            warnings: [],
+          }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderSidebar();
+
+    expect(await screen.findByText("v1.2.3")).toBeInTheDocument();
+  });
+
+  it("displays 'Unknown' when the health fetch fails", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("Network error"));
+    vi.stubGlobal("fetch", fetchMock);
+    renderSidebar();
+
+    // The "Unknown" text should appear (displayed when version is null)
+    expect(await screen.findByText("Unknown")).toBeInTheDocument();
+  });
+});
