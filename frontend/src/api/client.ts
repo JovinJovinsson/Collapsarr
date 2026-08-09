@@ -23,6 +23,8 @@
  * of a view stuck rendering a fetch error.
  */
 
+import { prefixPath } from "../runtime/urlBase";
+
 const API_KEY_STORAGE_KEY = "collapsarr.apiKey";
 const API_KEY_HEADER = "X-Api-Key";
 const LOGIN_PATH = "/login";
@@ -62,7 +64,7 @@ export function setStoredApiKey(key: string): void {
  */
 export function redirectToLogin(): void {
   try {
-    globalThis.location?.assign(LOGIN_PATH);
+    globalThis.location?.assign(prefixPath(LOGIN_PATH));
   } catch {
     // Navigation isn't available in some environments (e.g. certain test
     // harnesses) -- best effort only.
@@ -91,7 +93,10 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
   if (apiKey) {
     headers.set(API_KEY_HEADER, apiKey);
   }
-  const response = await fetch(path, { ...init, headers });
+  // Re-add the reverse-proxy subpath (COL-118) so the request resolves under
+  // the prefix the app is mounted at. The 401/auth-flow checks below still use
+  // the caller's original `path`, which is what those semantics key on.
+  const response = await fetch(prefixPath(path), { ...init, headers });
   if (response.status === 401 && !path.startsWith(AUTH_API_PREFIX)) {
     redirectToLogin();
   }

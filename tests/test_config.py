@@ -183,6 +183,37 @@ def test_database_path_override_takes_precedence_over_data_dir(
     assert settings.database_path == str(explicit_path)
 
 
+def test_url_base_defaults_to_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No COLLAPSARR_URL_BASE set -- default is empty (no prefix, COL-116)."""
+    monkeypatch.delenv("COLLAPSARR_URL_BASE", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.url_base == ""
+
+
+def test_url_base_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """COLLAPSARR_URL_BASE is read from the environment (COL-116)."""
+    monkeypatch.setenv("COLLAPSARR_URL_BASE", "/collapsarr")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.url_base == "/collapsarr"
+
+
+def test_url_base_strips_trailing_slash() -> None:
+    """A trailing slash is normalized away, not rejected (COL-116)."""
+    settings = Settings(_env_file=None, url_base="/collapsarr/")
+
+    assert settings.url_base == "/collapsarr"
+
+
+def test_url_base_rejects_missing_leading_slash() -> None:
+    """A url_base missing its leading slash fails fast at construction (COL-116)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, url_base="collapsarr")
+
+
 def test_boots_with_zero_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The app starts with no COLLAPSARR_* environment set and creates its DB.
 

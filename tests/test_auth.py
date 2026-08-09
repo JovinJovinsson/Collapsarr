@@ -46,6 +46,8 @@ PRIVATE_HOST = "192.168.1.50"
 PUBLIC_HOST = "8.8.8.8"  # a real, globally-routable address (Google Public DNS)
 TRUSTED_PROXY_HOST = "10.0.0.1"
 
+URL_BASE = "/collapsarr"
+
 
 @pytest.fixture
 def noredirect_client(settings: Settings) -> Iterator[TestClient]:
@@ -805,3 +807,161 @@ def test_logout_everywhere_leaves_the_credential_itself_unchanged(
         "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
     )
     assert relogin.status_code == 200
+
+
+# --- COLLAPSARR_URL_BASE reflected in redirects and cookie path (COL-117) -----
+#
+# UrlBaseMiddleware (COL-116) strips the configured prefix from the request
+# path before enforce_auth_middleware/SessionMiddleware see it, so these
+# tests send the *prefixed* path (as a reverse proxy would forward it) and
+# assert the outbound Location/Set-Cookie headers carry the prefix back --
+# the reverse of that inbound strip. Mirrors the settings-builder +
+# client-builder split used above for the trusted-proxy tests
+# (``_settings_with_trusted_proxies`` / ``_client_for_peer``).
+
+
+def _settings_with_url_base(tmp_path: Path, url_base: str) -> Settings:
+    """A ``Settings`` instance like the ``settings`` fixture's, but with
+    ``COLLAPSARR_URL_BASE`` set (COL-116) -- for tests that need the
+    configured prefix reflected in outbound redirect/cookie headers (COL-117)."""
+    db_path = tmp_path / "collapsarr.db"
+    return Settings(database_path=str(db_path), data_dir=str(tmp_path), url_base=url_base)
+
+
+@contextmanager
+def _url_base_client(settings: Settings) -> Iterator[TestClient]:
+    """A no-follow-redirects TestClient built from ``settings`` (typically from
+    ``_settings_with_url_base``), so the gate's ``303``/``Location`` and
+    ``Set-Cookie`` headers are observable."""
+    app = create_app(settings=settings)
+    with TestClient(app, follow_redirects=False) as test_client:
+        yield test_client
+
+
+def test_first_run_gate_redirect_carries_url_base_prefix(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        response = test_client.get(f"{URL_BASE}{UI_ROUTE}")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"{URL_BASE}/setup"
+
+
+def test_unauthenticated_login_redirect_carries_url_base_prefix(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+
+        response = test_client.get(f"{URL_BASE}{UI_ROUTE}")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"{URL_BASE}/login"
+
+
+def test_post_login_root_redirect_carries_url_base_prefix(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+        login = test_client.post(
+            f"{URL_BASE}/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+        )
+        assert login.status_code == 200
+
+        # Already authenticated: visiting /login itself bounces to the app root.
+        response = test_client.get(f"{URL_BASE}/login")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"{URL_BASE}/"
+
+
+def test_authenticated_setup_root_redirect_carries_url_base_prefix(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+        login = test_client.post(
+            f"{URL_BASE}/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+        )
+        assert login.status_code == 200
+
+        # Already authenticated: visiting /setup itself bounces to the app root.
+        response = test_client.get(f"{URL_BASE}/setup")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"{URL_BASE}/"
+
+
+def test_authenticated_setup_root_redirect_is_unprefixed_without_url_base(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    """No ``url_base`` configured: byte-for-byte identical to today."""
+    _set_credential(session)
+    noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+
+    response = noredirect_client.get("/setup")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+
+def test_authenticated_login_root_redirect_is_unprefixed_without_url_base(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    """No ``url_base`` configured: byte-for-byte identical to today."""
+    _set_credential(session)
+    noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+
+    response = noredirect_client.get("/login")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+
+def test_session_cookie_path_scoped_to_url_base_on_login(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+
+        login = test_client.post(
+            f"{URL_BASE}/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+        )
+
+        assert f"path={URL_BASE}/;" in login.headers["set-cookie"]
+
+
+def test_session_cookie_path_scoped_to_url_base_on_logout(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+        test_client.post(
+            f"{URL_BASE}/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+        )
+
+        logout = test_client.post(f"{URL_BASE}/api/auth/logout")
+
+        assert logout.status_code == 200
+        assert f"path={URL_BASE}/;" in logout.headers["set-cookie"]
+
+
+def test_setup_redirect_is_unprefixed_without_url_base(
+    noredirect_client: TestClient,
+) -> None:
+    """No ``url_base`` configured: byte-for-byte identical to today."""
+    response = noredirect_client.get(UI_ROUTE)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup"
+
+
+def test_session_cookie_path_defaults_to_root_without_url_base(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    """No ``url_base`` configured: cookie path stays the unscoped root."""
+    _set_credential(session)
+
+    login = noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+
+    assert "path=/;" in login.headers["set-cookie"]
+
+    logout = noredirect_client.post("/api/auth/logout")
+
+    assert "path=/;" in logout.headers["set-cookie"]
