@@ -180,8 +180,14 @@ export function LogsPage() {
               </tr>
             </thead>
             <tbody>
-              {state.entries.map((entry) => (
-                <tr key={entry.line_number}>
+              {state.entries.map((entry, index) => (
+                // `line_number` is only unique within a single response (COL-131 review:
+                // the backend re-reads the file fresh per request, so a rotation between
+                // "Refresh"/"Load older" calls can reuse a low line_number for different
+                // content). `entries` here is always a fresh concatenation built by
+                // `toReadyState` -- never reordered or spliced in place -- so the render
+                // index is stable and collision-free for this list.
+                <tr key={index}>
                   <td>
                     {entry.level && (
                       <span className={`logs-table__level logs-table__level--${entry.level.toLowerCase()}`}>
