@@ -51,12 +51,12 @@ from collapsarr.migrations import (
 )
 
 #: Columns a post-baseline migration adds (COL-66's backup schedule knobs,
-#: COL-79's disk-space thresholds, COL-101's Library-node bridge ids) --
-#: dropped after ``create_all`` below by :func:`_create_unversioned_db`,
-#: mirroring the same de-evolving idiom in ``test_migration_adoption.py``.
-#: Without this, ``create_all`` (which always builds from the *current*
-#: ``Base.metadata``) leaves these columns already present, so the migration
-#: that's supposed to add them fails.
+#: COL-79's disk-space thresholds, COL-101's Library-node bridge ids, COL-151's
+#: Preferred Default Audio setting) -- dropped after ``create_all`` below by
+#: :func:`_create_unversioned_db`, mirroring the same de-evolving idiom in
+#: ``test_migration_adoption.py``. Without this, ``create_all`` (which always
+#: builds from the *current* ``Base.metadata``) leaves these columns already
+#: present, so the migration that's supposed to add them fails.
 _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_interval_days"),
     ("global_settings", "backup_retention_days"),
@@ -65,6 +65,9 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "update_channel"),
     ("global_settings", "default_tracked"),
     ("global_settings", "log_level"),
+    ("global_settings", "default_audio_language"),
+    ("global_settings", "default_audio_channel_tier"),
+    ("global_settings", "auto_set_default_audio"),
     ("tracked_media_files", "sonarr_episode_id"),
     ("tracked_media_files", "radarr_movie_id"),
 )

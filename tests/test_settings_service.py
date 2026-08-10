@@ -607,6 +607,100 @@ def test_update_global_settings_log_level_persists_across_a_fresh_read(session: 
 
 
 # ---------------------------------------------------------------------------
+# Preferred Default Audio (COL-151).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_default_audio_preference_to_unset(
+    session: Session,
+) -> None:
+    """A fresh row has no Preferred Default Audio configured, and the
+    auto-set toggle is off."""
+    settings = get_global_settings(session)
+
+    assert settings.default_audio_language is None
+    assert settings.default_audio_channel_tier is None
+    assert settings.auto_set_default_audio is False
+
+
+def test_update_global_settings_sets_the_default_audio_preference(session: Session) -> None:
+    updated = update_global_settings(
+        session,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+        auto_set_default_audio=True,
+    )
+
+    assert updated.default_audio_language == "eng"
+    assert updated.default_audio_channel_tier == "5.1"
+    assert updated.auto_set_default_audio is True
+
+
+def test_update_global_settings_omitting_default_audio_preference_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(
+        session,
+        default_audio_language="jpn",
+        default_audio_channel_tier=DownmixTarget.STEREO,
+        auto_set_default_audio=True,
+    )
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.default_audio_language == "jpn"
+    assert unchanged.default_audio_channel_tier == "stereo"
+    assert unchanged.auto_set_default_audio is True
+
+
+def test_update_global_settings_explicit_none_clears_default_audio_language(
+    session: Session,
+) -> None:
+    update_global_settings(session, default_audio_language="eng")
+
+    cleared = update_global_settings(session, default_audio_language=None)
+
+    assert cleared.default_audio_language is None
+
+
+def test_update_global_settings_explicit_none_clears_default_audio_channel_tier(
+    session: Session,
+) -> None:
+    update_global_settings(session, default_audio_channel_tier=DownmixTarget.TWO_POINT_ONE)
+
+    cleared = update_global_settings(session, default_audio_channel_tier=None)
+
+    assert cleared.default_audio_channel_tier is None
+
+
+def test_update_global_settings_default_audio_preference_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(
+        session,
+        default_audio_language="fre",
+        default_audio_channel_tier=DownmixTarget.STEREO,
+        auto_set_default_audio=True,
+    )
+
+    reread = get_global_settings(session)
+
+    assert reread.default_audio_language == "fre"
+    assert reread.default_audio_channel_tier == "stereo"
+    assert reread.auto_set_default_audio is True
+
+
+def test_update_global_settings_auto_set_default_audio_is_switchable_back_off(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_set_default_audio=True)
+
+    updated = update_global_settings(session, auto_set_default_audio=False)
+
+    assert updated.auto_set_default_audio is False
+
+
+# ---------------------------------------------------------------------------
 # Adapting to DownmixSettings.
 # ---------------------------------------------------------------------------
 
