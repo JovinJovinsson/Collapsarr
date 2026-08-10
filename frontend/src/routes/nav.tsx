@@ -19,6 +19,7 @@ import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { LogsPage } from "../pages/LogsPage";
 import { SettingsConnectPage } from "../pages/SettingsConnectPage";
 import { SettingsGeneralPage } from "../pages/SettingsGeneralPage";
+import { SettingsLoggingPage } from "../pages/SettingsLoggingPage";
 import { SettingsRadarrPage } from "../pages/SettingsRadarrPage";
 import { SettingsSchedulerPage } from "../pages/SettingsSchedulerPage";
 import { SettingsSonarrPage } from "../pages/SettingsSonarrPage";
@@ -76,6 +77,9 @@ export const SETTINGS_CONNECT_PATH = `${SETTINGS_PATH}/connect`;
 /** Path of the Settings sub-nav's Scheduler entry (COL-146). */
 export const SETTINGS_SCHEDULER_PATH = `${SETTINGS_PATH}/scheduler`;
 
+/** Path of the Settings sub-nav's Logging entry (COL-147). */
+export const SETTINGS_LOGGING_PATH = `${SETTINGS_PATH}/logging`;
+
 export interface NavItem {
   to: string;
   label: string;
@@ -125,20 +129,21 @@ export const systemNavItems: NavItem[] = [
 ];
 
 /**
- * The **Settings** sub-nav (COL-139/COL-142/COL-143/COL-144/COL-146): mirrors
- * `systemNavItems`' shape, splitting the old composed `SettingsPage` into
- * Bazarr-style dedicated pages one at a time. General (COL-142) was the
+ * The **Settings** sub-nav (COL-139/COL-142/COL-143/COL-144/COL-146/COL-147):
+ * mirrors `systemNavItems`' shape, splitting the old composed `SettingsPage`
+ * into Bazarr-style dedicated pages one at a time. General (COL-142) was the
  * first migrated page; Targets and Connect (COL-143) were the second and
  * third; Sonarr and Radarr (COL-144) split the old combined Sonarr/Radarr
  * instances table into two type-scoped pages (`SettingsSonarrPage`/
  * `SettingsRadarrPage`, both rendering `InstancesSection` fixed to one
- * `type`). Scheduler (COL-146, Phase 2) is the sixth: it moves the editable
- * "Backup schedule" panel off `BackupsPage` and adds a read-only cadence
- * readout for the other three periodic tasks. This is the current order:
- * General, Sonarr, Radarr, Targets, Connect, Scheduler -- the old composed
- * `SettingsPage` and its `/settings` route are gone; a bare `/settings`
- * redirects to `SETTINGS_GENERAL_PATH` instead (wired in `router.tsx`,
- * mirroring the bare `/system` redirect).
+ * `type`). Scheduler (COL-146, Phase 2) moves the editable "Backup schedule"
+ * panel off `BackupsPage` and adds a read-only cadence readout for the other
+ * three periodic tasks. Logging (COL-147) is the seventh and last: it moves
+ * the `log_level` runtime-override control off `GeneralSection` onto its own
+ * page. This is the final order: General, Sonarr, Radarr, Targets, Connect,
+ * Scheduler, Logging -- the old composed `SettingsPage` and its `/settings`
+ * route are gone; a bare `/settings` redirects to `SETTINGS_GENERAL_PATH`
+ * instead (wired in `router.tsx`, mirroring the bare `/system` redirect).
  */
 export const settingsNavItems: NavItem[] = [
   { to: SETTINGS_GENERAL_PATH, label: "General", icon: <SettingsIcon />, element: <SettingsGeneralPage /> },
@@ -147,4 +152,5 @@ export const settingsNavItems: NavItem[] = [
   { to: SETTINGS_TARGETS_PATH, label: "Targets", icon: <SettingsIcon />, element: <SettingsTargetsPage /> },
   { to: SETTINGS_CONNECT_PATH, label: "Connect", icon: <SettingsIcon />, element: <SettingsConnectPage /> },
   { to: SETTINGS_SCHEDULER_PATH, label: "Scheduler", icon: <SettingsIcon />, element: <SettingsSchedulerPage /> },
+  { to: SETTINGS_LOGGING_PATH, label: "Logging", icon: <SettingsIcon />, element: <SettingsLoggingPage /> },
 ];

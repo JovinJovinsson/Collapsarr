@@ -6,7 +6,7 @@
 /**
  * The four minimum-severity filter values, matching
  * `collapsarr.system.logs.LogLevelFilter` (the same four levels Settings ->
- * General's log-level dropdown exposes, `types/settings.ts`'s `LogLevel`).
+ * Logging's log-level dropdown exposes, `types/settings.ts`'s `LogLevel`).
  */
 export type LogLevelFilter = "DEBUG" | "INFO" | "WARNING" | "ERROR";
 
