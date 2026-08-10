@@ -131,7 +131,7 @@ class TrackedMediaFile(Base):
     #: (:attr:`~collapsarr.downmix.probe.AudioStreamInfo.channel_layout`,
     #: e.g. ``"5.1"``, ``"stereo"``, or the ``"<channels>ch"`` fallback) --
     #: paired with :attr:`current_default_language` to render the Library
-    #: page's current Default Audio Track column (e.g. "Danish · 5.1").
+    #: page's current Default Audio Track column (e.g. "Dan · 5.1").
     #: ``NULL`` under the exact same conditions as
     #: :attr:`current_default_language` -- the two are always written or left
     #: ``NULL`` together, never independently.

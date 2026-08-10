@@ -60,9 +60,11 @@ def _current_default_stream(streams: Sequence[AudioStreamInfo]) -> AudioStreamIn
     predates COL-150-aware tooling, or whose encoder never wrote a
     ``disposition`` block at all) -- both render as "unknown" on the Library
     page. On the rare malformed file reporting *more than one* default
-    stream, the lowest-index one wins, matching the tie-break convention
-    :func:`~collapsarr.downmix.default_audio._best_available` already uses
-    elsewhere in this package.
+    stream, the lowest-index one wins -- picking a single deterministic
+    winner is what matters here (there's no channel-count signal to prefer
+    one over another the way :func:`~collapsarr.downmix.default_audio._best_available`
+    does elsewhere in this package), so this only reuses index as its sole
+    tie-break, not that function's full ``(-channels, index)`` ordering.
     """
     defaults = [stream for stream in streams if stream.is_default]
     if not defaults:

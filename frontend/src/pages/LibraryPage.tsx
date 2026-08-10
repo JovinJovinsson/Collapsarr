@@ -52,7 +52,7 @@ function capitalizeFirst(value: string): string {
 
 /**
  * Formats a current Default Audio Track snapshot (COL-154) for display, e.g.
- * "Danish · 5.1". Both halves come straight from the probed ffprobe metadata
+ * "Dan · 5.1". Both halves come straight from the probed ffprobe metadata
  * (a language tag, e.g. "dan", and a channel layout, e.g. "5.1"/"stereo") --
  * only capitalized, not translated into a full language name, since the
  * backend doesn't carry one.

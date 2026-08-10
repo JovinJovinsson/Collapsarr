@@ -29,10 +29,15 @@ from sqlalchemy.orm import Session
 from ..arr.models import InstanceType
 from ..arr.service import get_instance
 from ..database import get_session
-from ..media.models import TrackedMediaFile
-from ..media.service import list_tracked_media_by_instance
 from .models import LibraryNode, LibraryNodeKind
-from .service import LibraryNodeNotFoundError, build_movie_tree, build_tree, get_node, set_tracked
+from .service import (
+    LibraryNodeNotFoundError,
+    TreeDefaultTrack,
+    build_movie_tree,
+    build_tree,
+    get_node,
+    set_tracked,
+)
 
 router = APIRouter(prefix="/api", tags=["library"])
 
@@ -43,10 +48,10 @@ router = APIRouter(prefix="/api", tags=["library"])
 class CurrentDefaultTrack(BaseModel):
     """A file-bearing leaf node's current Default Audio Track snapshot (COL-154).
 
-    Mirrors :class:`~collapsarr.media.models.TrackedMediaFile`'s
-    ``current_default_language``/``current_default_channel_layout`` columns,
-    refreshed at every existing probe call site (scan, webhook import, manual
-    trigger). Rendered by the Library page as e.g. "Danish · 5.1".
+    The wire-response mirror of :class:`~collapsarr.library.service.TreeDefaultTrack`,
+    which already carries the doc for what these two fields mean and where
+    ``None``/each field comes from. Rendered by the Library page as e.g.
+    "Dan · 5.1".
     """
 
     language: str
@@ -162,22 +167,19 @@ class BulkTrackedUpdateResponse(BaseModel):
 # --- endpoints ---------------------------------------------------------------
 
 
-def _current_default_track(media: TrackedMediaFile | None) -> CurrentDefaultTrack | None:
-    """Adapt a bridged :class:`~collapsarr.media.models.TrackedMediaFile`'s snapshot columns.
+def _to_current_default_track(track: TreeDefaultTrack | None) -> CurrentDefaultTrack | None:
+    """Wrap a resolved :class:`~collapsarr.library.service.TreeDefaultTrack` for the response.
 
-    ``None`` when there is no bridged row at all (never probed/scanned via a
-    call site that captured this node's catalog ids), or when the row exists
-    but its snapshot columns are themselves ``NULL`` (never probed since
-    COL-154 shipped, or no stream reports the disposition flag) -- both are
-    the same "unknown" outcome from the Library page's point of view.
+    The enrichment itself -- the tracked-media bulk fetch and the dict-by-id
+    lookup -- lives in :func:`~collapsarr.library.service.build_tree`/
+    :func:`~collapsarr.library.service.build_movie_tree` (COL-154), the same
+    place Tracked resolution lives; this is just the response-schema copy,
+    mirroring how every other field on :class:`EpisodeNode`/:class:`MovieNode`
+    below is copied off its ``Tree*`` counterpart.
     """
-    if media is None or media.current_default_language is None:
+    if track is None:
         return None
-    assert media.current_default_channel_layout is not None  # written together, see the model
-    return CurrentDefaultTrack(
-        language=media.current_default_language,
-        channel_layout=media.current_default_channel_layout,
-    )
+    return CurrentDefaultTrack(language=track.language, channel_layout=track.channel_layout)
 
 
 @router.get(
@@ -195,25 +197,16 @@ def get_library_tree_endpoint(
     ``instance_id`` exists.
 
     Each Episode/Movie leaf also carries its current-default-track snapshot
-    (COL-154), bridged from :mod:`collapsarr.media.service`'s tracked-media
-    rows the same way Tracked resolution bridges the other direction: one
-    bulk fetch of every tracked-media row for this instance
-    (:func:`~collapsarr.media.service.list_tracked_media_by_instance`), keyed
-    by the same ``sonarr_episode_id``/``radarr_movie_id`` this tree already
-    carries, rather than a per-node query.
+    (COL-154), already resolved onto the tree by
+    :func:`~collapsarr.library.service.build_tree`/
+    :func:`~collapsarr.library.service.build_movie_tree` the same way they
+    resolve Tracked -- this endpoint only copies it onto the response schema.
     """
     instance = get_instance(session, instance_id)
     if instance is None:
         raise HTTPException(status_code=404, detail=f"No arr instance with id={instance_id}")
 
-    tracked_media = list_tracked_media_by_instance(session, instance_id)
-
     if instance.type is InstanceType.RADARR:
-        media_by_movie_id = {
-            media.radarr_movie_id: media
-            for media in tracked_media
-            if media.radarr_movie_id is not None
-        }
         movie_tree = build_movie_tree(session, instance_id)
         return MovieLibraryTreeResponse(
             instance_id=movie_tree.instance_id,
@@ -224,19 +217,12 @@ def get_library_tree_endpoint(
                     title=movie.title,
                     has_file=movie.has_file,
                     tracked=movie.tracked,
-                    current_default_track=_current_default_track(
-                        media_by_movie_id.get(movie.radarr_movie_id)
-                    ),
+                    current_default_track=_to_current_default_track(movie.current_default_track),
                 )
                 for movie in movie_tree.movies
             ],
         )
 
-    media_by_episode_id = {
-        media.sonarr_episode_id: media
-        for media in tracked_media
-        if media.sonarr_episode_id is not None
-    }
     tree = build_tree(session, instance_id)
     return LibraryTreeResponse(
         instance_id=tree.instance_id,
@@ -260,8 +246,8 @@ def get_library_tree_endpoint(
                                 title=episode.title,
                                 has_file=episode.has_file,
                                 tracked=episode.tracked,
-                                current_default_track=_current_default_track(
-                                    media_by_episode_id.get(episode.sonarr_episode_id)
+                                current_default_track=_to_current_default_track(
+                                    episode.current_default_track
                                 ),
                             )
                             for episode in season.episodes
