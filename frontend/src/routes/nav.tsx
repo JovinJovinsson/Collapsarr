@@ -17,7 +17,11 @@ import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
 import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { LogsPage } from "../pages/LogsPage";
-import { SettingsPage } from "../pages/SettingsPage";
+import { SettingsConnectPage } from "../pages/SettingsConnectPage";
+import { SettingsGeneralPage } from "../pages/SettingsGeneralPage";
+import { SettingsRadarrPage } from "../pages/SettingsRadarrPage";
+import { SettingsSonarrPage } from "../pages/SettingsSonarrPage";
+import { SettingsTargetsPage } from "../pages/SettingsTargetsPage";
 import { StatusPage } from "../pages/StatusPage";
 import { TasksPage } from "../pages/TasksPage";
 import { UpdatesPage } from "../pages/UpdatesPage";
@@ -32,6 +36,42 @@ import { WantedPage } from "../pages/WantedPage";
  */
 export const LIBRARIES_PATH = "/libraries";
 
+/**
+ * Base path of the "System" nav group (COL-63) -- `Sidebar` (COL-141) and
+ * `router.tsx` both need it: the former as `NavSection`'s `to` (its default
+ * link + the expand-on-select base path), the latter for the bare `/system`
+ * redirect wired alongside `systemNavItems`' own routes.
+ */
+export const SYSTEM_PATH = "/system";
+
+/**
+ * Base path of the "Settings" nav group. Now that every section has migrated
+ * off the old composed `SettingsPage` (COL-142/COL-143/COL-144), this behaves
+ * exactly like `SYSTEM_PATH`: a bare route that redirects to the sub-nav's
+ * first entry (wired in `router.tsx`), and the `NavSection` `to`/expand base
+ * both Sidebar and this module use -- no more of the narrower
+ * `SETTINGS_GENERAL_PATH`-as-`to` workaround COL-142/COL-143 needed while the
+ * old page still lived at this path. Kept as a constant, mirroring
+ * `LIBRARIES_PATH`/`SYSTEM_PATH`, so `Sidebar`, `router.tsx`, and this
+ * module's own `settingsNavItems` below can't drift on the literal string.
+ */
+export const SETTINGS_PATH = "/settings";
+
+/** Path of the Settings sub-nav's General entry (COL-142). */
+export const SETTINGS_GENERAL_PATH = `${SETTINGS_PATH}/general`;
+
+/** Path of the Settings sub-nav's Sonarr entry (COL-144). */
+export const SETTINGS_SONARR_PATH = `${SETTINGS_PATH}/sonarr`;
+
+/** Path of the Settings sub-nav's Radarr entry (COL-144). */
+export const SETTINGS_RADARR_PATH = `${SETTINGS_PATH}/radarr`;
+
+/** Path of the Settings sub-nav's Targets entry (COL-143). */
+export const SETTINGS_TARGETS_PATH = `${SETTINGS_PATH}/targets`;
+
+/** Path of the Settings sub-nav's Connect entry (COL-143). */
+export const SETTINGS_CONNECT_PATH = `${SETTINGS_PATH}/connect`;
+
 export interface NavItem {
   to: string;
   label: string;
@@ -44,12 +84,17 @@ export interface NavItem {
  * definitions) and the sidebar (links) read from this, so adding a view is a
  * one-line change here. Kept in its own module to avoid a router <-> sidebar
  * import cycle.
+ *
+ * Settings isn't listed here (COL-144): like System, it's an expandable
+ * `NavSection` group rather than a single destination/page component, so
+ * `Sidebar` renders it directly (mirroring how System is rendered) and
+ * `router.tsx` wires its bare-path redirect + `settingsNavItems` explicitly
+ * rather than through this array.
  */
 export const navItems: NavItem[] = [
   { to: "/wanted", label: "Wanted", icon: <WantedIcon />, element: <WantedPage /> },
   { to: LIBRARIES_PATH, label: "Libraries", icon: <LibraryIcon />, element: <LibrariesIndexPage /> },
   { to: "/activity", label: "Activity", icon: <ActivityIcon />, element: <ActivityPage /> },
-  { to: "/settings", label: "Settings", icon: <SettingsIcon />, element: <SettingsPage /> },
 ];
 
 /**
@@ -67,10 +112,32 @@ export const navItems: NavItem[] = [
  * above.
  */
 export const systemNavItems: NavItem[] = [
-  { to: "/system/tasks", label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
-  { to: "/system/backups", label: "Backups", icon: <BackupIcon />, element: <BackupsPage /> },
-  { to: "/system/health", label: "Health", icon: <HealthIcon />, element: <HealthChecksPage /> },
-  { to: "/system/status", label: "Status", icon: <StatusIcon />, element: <StatusPage /> },
-  { to: "/system/updates", label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
-  { to: "/system/logs", label: "Logs", icon: <LogsIcon />, element: <LogsPage /> },
+  { to: `${SYSTEM_PATH}/tasks`, label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
+  { to: `${SYSTEM_PATH}/backups`, label: "Backups", icon: <BackupIcon />, element: <BackupsPage /> },
+  { to: `${SYSTEM_PATH}/health`, label: "Health", icon: <HealthIcon />, element: <HealthChecksPage /> },
+  { to: `${SYSTEM_PATH}/status`, label: "Status", icon: <StatusIcon />, element: <StatusPage /> },
+  { to: `${SYSTEM_PATH}/updates`, label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
+  { to: `${SYSTEM_PATH}/logs`, label: "Logs", icon: <LogsIcon />, element: <LogsPage /> },
+];
+
+/**
+ * The **Settings** sub-nav (COL-139/COL-142/COL-143/COL-144): mirrors
+ * `systemNavItems`' shape, splitting the old composed `SettingsPage` into
+ * Bazarr-style dedicated pages one at a time. General (COL-142) was the
+ * first migrated page; Targets and Connect (COL-143) were the second and
+ * third; Sonarr and Radarr (COL-144) are the last two, splitting the old
+ * combined Sonarr/Radarr instances table into two type-scoped pages
+ * (`SettingsSonarrPage`/`SettingsRadarrPage`, both rendering
+ * `InstancesSection` fixed to one `type`). This is the full Phase-1 order:
+ * General, Sonarr, Radarr, Targets, Connect -- the old composed
+ * `SettingsPage` and its `/settings` route are gone; a bare `/settings`
+ * redirects to `SETTINGS_GENERAL_PATH` instead (wired in `router.tsx`,
+ * mirroring the bare `/system` redirect).
+ */
+export const settingsNavItems: NavItem[] = [
+  { to: SETTINGS_GENERAL_PATH, label: "General", icon: <SettingsIcon />, element: <SettingsGeneralPage /> },
+  { to: SETTINGS_SONARR_PATH, label: "Sonarr", icon: <SettingsIcon />, element: <SettingsSonarrPage /> },
+  { to: SETTINGS_RADARR_PATH, label: "Radarr", icon: <SettingsIcon />, element: <SettingsRadarrPage /> },
+  { to: SETTINGS_TARGETS_PATH, label: "Targets", icon: <SettingsIcon />, element: <SettingsTargetsPage /> },
+  { to: SETTINGS_CONNECT_PATH, label: "Connect", icon: <SettingsIcon />, element: <SettingsConnectPage /> },
 ];

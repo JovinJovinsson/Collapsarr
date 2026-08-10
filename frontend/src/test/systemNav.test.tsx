@@ -83,4 +83,27 @@ describe("System navigation (COL-126, COL-131)", () => {
       expect(screen.getByRole("heading", { name: /tasks/i })).toBeInTheDocument();
     });
   });
+
+  // COL-141: System renders through the shared `NavSection`, which expands
+  // (sub-items visible) only while a route under its base path (/system) is
+  // active -- analogous to librariesNav.test.tsx's collapsed/expanded
+  // assertions for `LibraryNavSection`'s fixed-list counterpart.
+  it("is collapsed (no System sub-items) while a different section is active", async () => {
+    renderWithSystemNav("/wanted");
+
+    const nav = await screen.findByRole("navigation", { name: /primary/i });
+    expect(within(nav).getByRole("link", { name: "System" })).toBeInTheDocument();
+    for (const item of systemNavItems) {
+      expect(within(nav).queryByRole("link", { name: item.label })).not.toBeInTheDocument();
+    }
+  });
+
+  it("expands to list every System sub-item under any /system/* route", async () => {
+    renderWithSystemNav("/system/health");
+
+    const nav = await screen.findByRole("navigation", { name: /primary/i });
+    for (const item of systemNavItems) {
+      expect(await within(nav).findByRole("link", { name: item.label })).toBeInTheDocument();
+    }
+  });
 });

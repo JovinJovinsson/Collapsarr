@@ -5,9 +5,11 @@ import type { ReactNode } from "react";
 
 import { logout } from "../api/auth";
 import { useHealth } from "../hooks/useHealth";
-import { LIBRARIES_PATH, navItems, systemNavItems } from "../routes/nav";
+import { LIBRARIES_PATH, navItems, SETTINGS_PATH, settingsNavItems, SYSTEM_PATH, systemNavItems } from "../routes/nav";
 import type { NavItem } from "../routes/nav";
+import { SettingsIcon } from "./icons";
 import { LibraryNavSection } from "./LibraryNavSection";
+import { NavSection } from "./NavSection";
 
 /** Renders one nav link; shared by the primary and System sections. */
 function NavLinkItem({ to, label, icon }: NavItem): ReactNode {
@@ -64,24 +66,33 @@ export function Sidebar() {
       </div>
 
       <ul className="sidebar__nav">
-        {navItems.map((item) =>
+        {navItems.map((item) => {
           // Libraries (COL-100) has one sub-item per configured ArrInstance
           // rather than a static destination, so it renders through its own
           // expandable section instead of the plain NavLinkItem every other
           // primary nav item uses.
-          item.to === LIBRARIES_PATH ? (
-            <LibraryNavSection key={item.to} {...item} />
-          ) : (
-            <NavLinkItem key={item.to} {...item} />
-          ),
-        )}
+          if (item.to === LIBRARIES_PATH) return <LibraryNavSection key={item.to} {...item} />;
 
-        <li className="sidebar__section" aria-hidden>
-          System
-        </li>
-        {systemNavItems.map((item) => (
-          <NavLinkItem key={item.to} {...item} />
-        ))}
+          return <NavLinkItem key={item.to} {...item} />;
+        })}
+
+        {/* Settings (COL-142/COL-144): expands only while a /settings/*
+            route is active. Once every section had migrated off the old
+            composed SettingsPage (COL-144), SETTINGS_PATH itself became a
+            bare redirect (router.tsx) rather than a distinct page, so `to`
+            can be the group's own base path -- same as System below -- and
+            isn't part of `navItems` for the same reason System isn't. */}
+        <NavSection to={SETTINGS_PATH} label="Settings" icon={<SettingsIcon />} items={settingsNavItems} />
+
+        {/* System (COL-63): expands only while a /system/* route is active
+            (COL-141), rather than always-visible like the primary items
+            above -- System's own pages/routes/order are unchanged. */}
+        <NavSection
+          to={SYSTEM_PATH}
+          label="System"
+          items={systemNavItems}
+          className="sidebar__nav-group--system"
+        />
       </ul>
 
       <div className="sidebar__footer">
