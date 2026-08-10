@@ -194,6 +194,7 @@ class JobScheduler:
         self._thread: threading.Thread | None = None
         self._last_scan_at: datetime | None = None
         self._not_tracked_logged: dict[Path, datetime] = {}
+        self._bridge_missing_logged: dict[Path, datetime] = {}
         self._not_tracked_log_lock = threading.Lock()
 
     @property
@@ -338,6 +339,7 @@ class JobScheduler:
             instance_id=instance_id,
             sonarr_episode_id=sonarr_episode_id,
             radarr_movie_id=radarr_movie_id,
+            path=path,
         ):
             if self._should_log_not_tracked(path):
                 logger.info("skipping %s: resolved Not Tracked, not auto-enqueuing", path)
@@ -399,6 +401,7 @@ class JobScheduler:
         instance_id: int | None,
         sonarr_episode_id: int | None,
         radarr_movie_id: int | None,
+        path: Path | None = None,
     ) -> bool:
         """Resolve the file's effective **Tracked** value for the auto-enqueue gate.
 
@@ -409,7 +412,10 @@ class JobScheduler:
         pre-COL-102 behavior. With ids present but no matching node, falls back
         to ``GlobalSettings.default_tracked`` -- the same fallback
         :func:`~collapsarr.library.service.resolve_tracked` itself uses when
-        nothing in a node's ancestry is explicit. Mirrors :meth:`_is_duplicate`'s
+        nothing in a node's ancestry is explicit; this fallback is logged (COL-134)
+        via ``path`` (when the caller has one) so it's diagnosable from server
+        logs whether a file shown/skipped this way is genuinely Tracked or the
+        bridge simply couldn't find a node. Mirrors :meth:`_is_duplicate`'s
         session handling: reuses ``session`` when the caller has one open (the
         scan), else opens a short-lived one (the webhook/manual paths).
         """
@@ -421,6 +427,7 @@ class JobScheduler:
                 instance_id=instance_id,
                 sonarr_episode_id=sonarr_episode_id,
                 radarr_movie_id=radarr_movie_id,
+                path=path,
             )
         with self._session_factory() as owned_session:
             return self._resolve_tracked_in(
@@ -428,6 +435,7 @@ class JobScheduler:
                 instance_id=instance_id,
                 sonarr_episode_id=sonarr_episode_id,
                 radarr_movie_id=radarr_movie_id,
+                path=path,
             )
 
     def _resolve_tracked_in(
@@ -437,6 +445,7 @@ class JobScheduler:
         instance_id: int,
         sonarr_episode_id: int | None,
         radarr_movie_id: int | None,
+        path: Path | None = None,
     ) -> bool:
         """Resolve Tracked for a file with catalog ids, within ``session``."""
         default_tracked = get_global_settings(session).default_tracked
@@ -447,6 +456,17 @@ class JobScheduler:
             radarr_movie_id=radarr_movie_id,
         )
         if node is None:
+            if path is None or self._should_log_bridge_missing(path):
+                logger.warning(
+                    "tracked bridge: no LibraryNode for instance_id=%s "
+                    "sonarr_episode_id=%s radarr_movie_id=%s (%s) -- "
+                    "falling back to default_tracked=%s",
+                    instance_id,
+                    sonarr_episode_id,
+                    radarr_movie_id,
+                    path,
+                    default_tracked,
+                )
             return default_tracked
         nodes_by_id = {n.id: n for n in list_nodes(session, instance_id)}
         return resolve_tracked(node, nodes_by_id, default_tracked)
@@ -520,22 +540,34 @@ class JobScheduler:
             for job in self._queue.list_jobs()
         )
 
-    def _should_log_not_tracked(self, path: Path) -> bool:
-        """Whether to log ``path``'s Not-Tracked skip now, or suppress a repeat (COL-135).
+    def _should_log_once(self, cache: dict[Path, datetime], path: Path) -> bool:
+        """Whether to log ``path`` now against ``cache``, or suppress a repeat.
 
         Logged once per file, then suppressed until :attr:`_dedup_window`
         elapses -- the same window :meth:`_is_recently_processed` uses --
-        so a persistently Not-Tracked file doesn't spam one identical line
-        per scan forever, while a scan interval later a fresh line still
-        confirms it's still true (rather than going silent permanently).
+        so a persistently-recurring condition doesn't spam one identical
+        line per scan forever, while a scan interval later a fresh line
+        still confirms it's still true (rather than going silent
+        permanently). ``cache`` lets callers track distinct log conditions
+        (COL-135's Not-Tracked skip, COL-134's bridge-missing fallback)
+        independently -- one firing never suppresses the other for the
+        same file.
         """
         now = self._now()
         with self._not_tracked_log_lock:
-            last = self._not_tracked_logged.get(path)
+            last = cache.get(path)
             if last is not None and now - last < self._dedup_window:
                 return False
-            self._not_tracked_logged[path] = now
+            cache[path] = now
             return True
+
+    def _should_log_not_tracked(self, path: Path) -> bool:
+        """Whether to log ``path``'s Not-Tracked skip now (COL-135)."""
+        return self._should_log_once(self._not_tracked_logged, path)
+
+    def _should_log_bridge_missing(self, path: Path) -> bool:
+        """Whether to log ``path``'s bridge-missing fallback now (COL-134)."""
+        return self._should_log_once(self._bridge_missing_logged, path)
 
     def _is_recently_processed(self, path: Path, session: Session) -> bool:
         """Whether a terminal history row for ``path`` falls inside the dedup window."""

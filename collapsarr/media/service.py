@@ -31,6 +31,7 @@ the Wanted view lists only what Collapsarr will act on automatically.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
@@ -45,6 +46,8 @@ from collapsarr.library.service import get_node_by_source_id, list_nodes, resolv
 from collapsarr.settings.service import get_global_settings
 
 from .models import MediaTargetStatus, TrackedMediaFile, TrackedMediaTargetStatus
+
+logger = logging.getLogger(__name__)
 
 
 def _channels_by_language(streams: Sequence[AudioStreamInfo]) -> dict[str, set[int]]:
@@ -310,6 +313,16 @@ def _resolves_tracked(
         radarr_movie_id=media.radarr_movie_id,
     )
     if node is None:
+        logger.warning(
+            "Wanted tracked bridge: no LibraryNode for instance_id=%s "
+            "sonarr_episode_id=%s radarr_movie_id=%s (%s) -- "
+            "falling back to default_tracked=%s (COL-134)",
+            media.instance_id,
+            media.sonarr_episode_id,
+            media.radarr_movie_id,
+            media.file_path,
+            default_tracked,
+        )
         return default_tracked
     nodes_by_id = nodes_cache.get(media.instance_id)
     if nodes_by_id is None:

@@ -780,6 +780,51 @@ def test_enqueue_file_logs_not_tracked_skip_again_after_dedup_window(
     assert "resolved Not Tracked" in caplog.text
 
 
+def test_enqueue_file_warns_when_the_bridge_node_is_missing(
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """COL-134: ids present but no LibraryNode was ever synced -- bridge can't resolve."""
+    caplog.set_level(logging.WARNING, logger="collapsarr.jobs.scheduler")
+    instance = _add_instance(session_factory)  # no _seed_episode_node -- no matching node exists
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+
+    assert job is not None  # falls back to default_tracked (True), so it still proceeds
+    assert "no LibraryNode" in caplog.text
+
+
+def test_enqueue_file_warns_about_a_missing_bridge_node_once_per_dedup_window(
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """COL-134: the bridge-missing warning is rate-limited the same as COL-135's skip log.
+
+    Sets ``default_tracked=False`` so the fallback resolves Not-Tracked and
+    the file is skipped rather than enqueued -- otherwise the second call
+    would short-circuit on the ordinary queue-dedup check before ever
+    reaching the tracked gate this test means to exercise (mirrors how
+    COL-135's own rate-limit test needs a Not-Tracked file for the same
+    reason).
+    """
+    caplog.set_level(logging.WARNING, logger="collapsarr.jobs.scheduler")
+    instance = _add_instance(session_factory)
+    with session_factory() as session:
+        update_global_settings(session, default_tracked=False)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+    assert job is None
+    assert "no LibraryNode" in caplog.text
+
+    caplog.clear()
+    scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+    assert "no LibraryNode" not in caplog.text
+
+
 def test_enqueue_file_enqueues_a_tracked_file(
     settings: Settings, session_factory: sessionmaker[Session]
 ) -> None:
