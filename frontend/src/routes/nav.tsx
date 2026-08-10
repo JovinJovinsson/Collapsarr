@@ -5,6 +5,7 @@ import {
   BackupIcon,
   HealthIcon,
   LibraryIcon,
+  LogsIcon,
   SettingsIcon,
   StatusIcon,
   TasksIcon,
@@ -15,6 +16,7 @@ import { ActivityPage } from "../pages/ActivityPage";
 import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
 import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
+import { LogsPage } from "../pages/LogsPage";
 import { SettingsPage } from "../pages/SettingsPage";
 import { StatusPage } from "../pages/StatusPage";
 import { TasksPage } from "../pages/TasksPage";
@@ -60,7 +62,9 @@ export const navItems: NavItem[] = [
  * facts. Rendered as its own labelled section in the sidebar and wired under
  * `/system/*` in the router, both from this single list. COL-126 reorders to
  * match Bazarr's own System sub-nav ordering: Tasks, Backups, Health, Status,
- * Updates.
+ * Updates. COL-131 adds Logs, a tail view of the current rotating log file
+ * (COL-128), appended as the last entry rather than folded into the reorder
+ * above.
  */
 export const systemNavItems: NavItem[] = [
   { to: "/system/tasks", label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
@@ -68,4 +72,5 @@ export const systemNavItems: NavItem[] = [
   { to: "/system/health", label: "Health", icon: <HealthIcon />, element: <HealthChecksPage /> },
   { to: "/system/status", label: "Status", icon: <StatusIcon />, element: <StatusPage /> },
   { to: "/system/updates", label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
+  { to: "/system/logs", label: "Logs", icon: <LogsIcon />, element: <LogsPage /> },
 ];

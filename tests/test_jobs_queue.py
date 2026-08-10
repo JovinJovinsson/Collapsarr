@@ -9,6 +9,7 @@ itself (that's COL-19's, already covered by ``test_downmix_pipeline.py``).
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -325,4 +326,85 @@ def test_no_failure_notifier_configured_is_a_noop() -> None:
 
     queue.run_pending()
 
+    assert job.status is JobStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Job lifecycle logging (COL-129): INFO on start/success, ERROR on a crash.
+# ---------------------------------------------------------------------------
+
+
+def test_run_job_logs_info_on_start_with_job_id_file_path_and_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    settings = DownmixSettings(enabled_targets=frozenset({DownmixTarget.FIVE_POINT_ONE}))
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        job = queue.enqueue("/media/movie.mkv", settings)
+        queue.run_pending()
+
+    start_records = [
+        r for r in caplog.records if r.levelno == logging.INFO and "started" in r.message
+    ]
+    assert len(start_records) == 1
+    message = start_records[0].message
+    assert str(job.id) in message
+    assert "/media/movie.mkv" in message
+    assert "5.1" in message
+
+
+def test_run_job_logs_info_on_successful_completion(caplog: pytest.LogCaptureFixture) -> None:
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+        queue.run_pending()
+
+    completion_records = [
+        r for r in caplog.records if r.levelno == logging.INFO and "completed" in r.message
+    ]
+    assert len(completion_records) == 1
+    assert str(job.id) in completion_records[0].message
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_run_job_does_not_log_completion_info_for_a_failed_job(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A job that fails via a returned PipelineResult isn't double-logged here --
+    the pipeline itself already logs its own WARNING/ERROR for that outcome."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_FAILED))
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        queue.enqueue("/media/movie.mkv", DownmixSettings())
+        queue.run_pending()
+
+    completion_records = [
+        r for r in caplog.records if r.levelno == logging.INFO and "completed" in r.message
+    ]
+    assert completion_records == []
+
+
+def test_run_job_logs_error_when_the_runner_raises_unexpectedly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def raising_runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        raise RuntimeError("boom")
+
+    queue = JobQueue(pipeline_runner=raising_runner)
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+        queue.run_pending()
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert str(job.id) in errors[0].message
+    # logger.exception() carries the traceback via exc_info (so "boom" and the
+    # RuntimeError show up in the formatted output/exc_text), not folded into
+    # the plain message -- matching this repo's existing bare-except convention.
+    assert errors[0].exc_info is not None
+    assert errors[0].exc_info[1] is not None
+    assert str(errors[0].exc_info[1]) == "boom"
     assert job.status is JobStatus.FAILED

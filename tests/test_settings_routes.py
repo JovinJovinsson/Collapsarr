@@ -9,10 +9,14 @@ Covers request/response shape and the API-key-required behaviour (COL-26) for
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from collapsarr.logging_setup import LOGGER_NAME
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
 
@@ -45,6 +49,7 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["disk_space_warning_percent"] == 5.0  # COL-79 default
     assert body["disk_space_error_percent"] == 2.0  # COL-79 default
     assert body["update_channel"] == "stable"  # COL-88 default
+    assert body["log_level"] is None  # COL-130: unset, falls back to env at boot
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -319,6 +324,82 @@ def test_put_settings_leaves_update_channel_untouched_when_omitted(client: TestC
     body = client.get("/api/settings", headers=_auth_headers(client)).json()
     assert body["update_channel"] == "beta"
     assert body["concurrency_limit"] == 3
+
+
+# --- log level (COL-130) --------------------------------------------------------
+
+
+def test_put_settings_switches_log_level(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"log_level": "DEBUG"},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["log_level"] == "DEBUG"
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["log_level"] == "DEBUG"
+
+
+def test_put_settings_rejects_an_unknown_log_level(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"log_level": "TRACE"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+def test_put_settings_leaves_log_level_untouched_when_omitted(client: TestClient) -> None:
+    client.put("/api/settings", json={"log_level": "DEBUG"}, headers=_auth_headers(client))
+
+    client.put("/api/settings", json={"concurrency_limit": 3}, headers=_auth_headers(client))
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["log_level"] == "DEBUG"
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_explicit_null_log_level_clears_the_override(client: TestClient) -> None:
+    client.put("/api/settings", json={"log_level": "DEBUG"}, headers=_auth_headers(client))
+
+    response = client.put(
+        "/api/settings",
+        json={"log_level": None},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["log_level"] is None
+
+
+def test_put_settings_log_level_applies_live_without_restart(client: TestClient) -> None:
+    """COL-130 AC: the change reaches the running logger/handler immediately."""
+    response = client.put(
+        "/api/settings",
+        json={"log_level": "DEBUG"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 200, response.text
+
+    logger = logging.getLogger(LOGGER_NAME)
+    assert logger.level == logging.DEBUG
+    file_handler = next(
+        h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)
+    )
+    assert file_handler.backupCount == 51
+
+    back_to_info = client.put(
+        "/api/settings",
+        json={"log_level": "WARNING"},
+        headers=_auth_headers(client),
+    )
+    assert back_to_info.status_code == 200, back_to_info.text
+    assert logger.level == logging.WARNING
+    assert file_handler.backupCount == 6
 
 
 # --- auth-required behaviour ---------------------------------------------------

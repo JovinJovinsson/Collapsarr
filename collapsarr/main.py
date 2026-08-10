@@ -51,6 +51,7 @@ from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .library.routes import router as library_router
 from .library.service import upsert_movie_node, upsert_series_episode_node
+from .logging_setup import apply_log_level, configure_logging
 from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
@@ -58,7 +59,9 @@ from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
+from .settings.service import get_global_settings
 from .system.info import router as info_router
+from .system.logs import router as logs_router
 from .system.probe import DefaultSystemProbe, SystemProbe
 from .system.tasks import router as tasks_router
 from .update_check import UpdateCheckScheduler
@@ -168,6 +171,15 @@ def create_app(
     """
     resolved_settings = settings or get_settings()
 
+    # Logging infrastructure (COL-128): a stdout + rotating-file handler pair
+    # on the `collapsarr` logger, with secret redaction (ADR 0006). Configured
+    # here -- before the lifespan below runs -- so startup-time logging (the
+    # restore swap, Alembic migrations, scheduler bring-up) is captured too,
+    # not just requests served after boot. Idempotent, so each call (once per
+    # `create_app()`; tests build a fresh app per test with its own tmp_path
+    # Settings) replaces rather than accumulates handlers.
+    configure_logging(resolved_settings)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Process start stamp (COL-123): taken first, before any startup work
@@ -201,6 +213,19 @@ def create_app(
         app.state.engine = engine
         session_factory = create_session_factory(engine)
         app.state.session_factory = session_factory
+
+        # Runtime log-level control (COL-130): a persisted `GlobalSettings.
+        # log_level` override, applied now that the database is available --
+        # `configure_logging` above already set the `collapsarr` logger to
+        # the env-sourced `COLLAPSARR_LOG_LEVEL` floor before this lifespan
+        # even started (no DB access that early). Left `None` (the default,
+        # and every fresh install's starting state) is a no-op: that env
+        # floor stands. A previously-set level survives a restart because
+        # this re-applies it every boot, not just the first time it's set.
+        with session_factory() as log_level_session:
+            persisted_log_level = get_global_settings(log_level_session).log_level
+        if persisted_log_level is not None:
+            apply_log_level(persisted_log_level)
 
         # Environment-seeded UI credential for headless deploys (COL-53): if
         # COLLAPSARR_AUTH_USERNAME/PASSWORD are set and no credential exists
@@ -403,6 +428,16 @@ def create_app(
     # architectural split; both are thin /api/system aggregation views over
     # existing state (docs/adr/0005-system-tasks-endpoint-not-shared-scheduler.md).
     app.include_router(info_router)
+
+    # Tail-read GET /api/system/logs (COL-131): the most recent lines of the
+    # current rotating log file COL-128's configure_logging() writes to
+    # (collapsarr/logging_setup.py), with an offset to page further back and a
+    # minimum-severity level filter, driving the new System > Logs page. Reads
+    # the file fresh per request (see collapsarr/system/logs.py's module
+    # docstring for why) rather than depending on any app.state the other
+    # /api/system routers above establish, so registration order relative to
+    # them doesn't matter -- kept last simply to group with its siblings.
+    app.include_router(logs_router)
 
     @app.get("/health", tags=["system"])
     def health(session: Session = Depends(get_session)) -> dict[str, object]:

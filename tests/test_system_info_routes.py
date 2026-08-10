@@ -176,12 +176,20 @@ def test_db_schema_revision_is_read_live_not_the_packaged_head(settings: Setting
         headers = _auth_headers(test_client)
 
         config = build_alembic_config(settings)
-        head_revision = ScriptDirectory.from_config(config).get_current_head()
+        script = ScriptDirectory.from_config(config)
+        head_revision = script.get_current_head()
+        assert head_revision is not None
+        prior_revision = script.get_revision(head_revision).down_revision
+        assert isinstance(prior_revision, str)
 
         # The app's own lifespan already migrated this DB to head; stamping
-        # it one revision behind proves the endpoint reads the DB's live
-        # alembic_version rather than always reporting the packaged head.
-        command.downgrade(config, "-1")
+        # (not a real ``downgrade``, which would run the head migration's
+        # ``downgrade()`` DDL and could drop a column a live request depends
+        # on, e.g. a GlobalSettings column the auth middleware's next query
+        # selects) it one revision behind proves the endpoint reads the DB's
+        # live alembic_version rather than always reporting the packaged
+        # head -- the schema itself is irrelevant to this assertion.
+        command.stamp(config, prior_revision)
 
         body = test_client.get("/api/system/info", headers=headers).json()
 

@@ -52,10 +52,22 @@ and :meth:`JobQueue.from_settings` sources it from
 :class:`~collapsarr.config.Settings`'s ``job_max_concurrency`` (env
 ``COLLAPSARR_JOB_MAX_CONCURRENCY``), which is the closest thing this repo has
 to a Settings store today.
+
+:meth:`JobQueue._run_job` also logs the job lifecycle (COL-129), via a
+module logger -- so it lands in the rotating log file COL-128 wires up: an
+``INFO`` line when the job starts (job id, file path, enabled targets) and
+another when it completes successfully. The pipeline itself
+(:mod:`collapsarr.downmix.pipeline`) already logs ``WARNING``/``ERROR`` for
+its own non-success outcomes, so this module logs an ``ERROR`` of its own
+only for the one failure shape only it can observe -- ``pipeline_runner``
+raising unexpectedly rather than returning a :class:`~collapsarr.downmix.
+pipeline.PipelineResult` -- to avoid a duplicate log line for the common
+case where the pipeline already reported its own failure.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -70,11 +82,18 @@ from collapsarr.config import Settings, get_settings
 from collapsarr.downmix.pipeline import PipelineResult, run_downmix_pipeline
 from collapsarr.downmix.targets import DownmixSettings
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MAX_CONCURRENCY = 1
 
 #: Signature every pipeline runner (real or injected-for-tests) must match:
 #: ``(file_path, settings, **pipeline_kwargs) -> PipelineResult``.
 PipelineRunner = Callable[..., PipelineResult]
+
+
+def _enabled_targets_for_log(settings: DownmixSettings) -> str:
+    """Render ``settings.enabled_targets`` for a log line, in a stable order."""
+    return ",".join(sorted(target.value for target in settings.enabled_targets))
 
 
 class JobStatus(Enum):
@@ -401,6 +420,12 @@ class JobQueue:
             job.status = JobStatus.RUNNING
             job.started_at = datetime.now(UTC)
         self._record_history(job)
+        logger.info(
+            "job %s started: file=%s targets=%s",
+            job.id,
+            job.file_path,
+            _enabled_targets_for_log(job.settings),
+        )
 
         try:
             result = self._pipeline_runner(job.file_path, job.settings, **self._pipeline_kwargs)
@@ -409,6 +434,7 @@ class JobQueue:
                 job.error = exc
                 job.status = JobStatus.FAILED
                 job.ended_at = datetime.now(UTC)
+            logger.exception("job %s failed with an unexpected error", job.id)
             self._record_history(job)
             self._record_tracked_media(job)
             self._notify_failure(job)
@@ -418,6 +444,8 @@ class JobQueue:
             job.result = result
             job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
             job.ended_at = datetime.now(UTC)
+        if job.status is JobStatus.SUCCEEDED:
+            logger.info("job %s completed: file=%s -- %s", job.id, job.file_path, result.detail)
         self._record_history(job)
         self._record_tracked_media(job)
         self._notify_failure(job)

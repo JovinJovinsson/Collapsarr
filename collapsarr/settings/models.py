@@ -99,6 +99,17 @@ get_global_settings` at creation time, which overrides it with ``"beta"``
 when the running build is itself a beta build (COL-88) -- see
 :data:`BETA_LOCAL_SEGMENT_PREFIX`."""
 
+LOG_LEVEL_DEBUG = "DEBUG"
+LOG_LEVEL_INFO = "INFO"
+LOG_LEVEL_WARNING = "WARNING"
+LOG_LEVEL_ERROR = "ERROR"
+LOG_LEVELS = (LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_WARNING, LOG_LEVEL_ERROR)
+"""The four levels settable from Settings -> General's log-level dropdown
+(COL-130), matching Python's own level names (excluding ``CRITICAL``/
+``NOTSET``, which the dropdown doesn't expose). Validated against by
+:func:`collapsarr.settings.service.update_global_settings`, same treatment as
+:data:`UPDATE_CHANNEL_STABLE`/:data:`UPDATE_CHANNEL_BETA` above."""
+
 BETA_LOCAL_SEGMENT_PREFIX = "+beta"
 """The bare PEP 440 local-version marker a beta build carries in its running
 ``collapsarr.__version__`` (COL-96) -- e.g. ``"0.2.1.0007+beta"``, stamped by
@@ -213,6 +224,28 @@ class GlobalSettings(Base):
     DB-level constraint forcing the error threshold below the warning
     threshold, matching how ``backup_interval_days``/``backup_retention_days``
     also carry no cross-field constraint.
+
+    ``log_level`` (COL-130) is ``DEBUG``|``INFO``|``WARNING``|``ERROR``, or
+    ``None`` -- unlike every other field on this row, ``None`` is a
+    *meaningful* value, not just "not migrated yet": it means "no override,
+    fall back to the ``COLLAPSARR_LOG_LEVEL`` environment setting" (default
+    ``INFO``), resolved once at boot by
+    :func:`collapsarr.logging_setup.configure_logging`. Nullable at the DB
+    level with no ``server_default`` -- an existing install's row is
+    backfilled to ``NULL`` (not a concrete level) by the additive migration,
+    which is exactly the "still deferring to the env setting" behaviour it
+    already had. Validated against :data:`LOG_LEVELS` by
+    :func:`collapsarr.settings.service.update_global_settings`, same
+    treatment as ``update_channel`` above. A write here (through ``PUT
+    /api/settings``) is applied live to the ``collapsarr`` logger's effective
+    level and rotating file handler's ``backupCount`` by
+    :func:`collapsarr.logging_setup.apply_log_level` -- called from
+    :mod:`collapsarr.settings.routes`, mirroring how
+    :func:`rotate_session_secret`'s caller pushes the fresh secret into the
+    running process's cached copy -- and a persisted level survives a
+    restart, re-applied once the database is available during
+    :func:`collapsarr.main.create_app`'s lifespan (after the env-sourced boot
+    floor from ``configure_logging`` above has already run).
     """
 
     __tablename__ = "global_settings"
@@ -294,6 +327,8 @@ class GlobalSettings(Base):
         default=DEFAULT_TRACKED,
         server_default=text("1"),
     )
+
+    log_level: Mapped[str | None] = mapped_column(String(10), nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)

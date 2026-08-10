@@ -283,25 +283,28 @@ def test_older_restored_db_is_migrated_forward(settings: Settings, tmp_path: Pat
 # Defensive aborts -> current DB untouched, marker cleared, boots normally
 # --------------------------------------------------------------------------- #
 def test_missing_staged_file_aborts_and_leaves_current_untouched(
-    settings: Settings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    settings: Settings, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _current_db_with(settings, "CURRENT")
     write_restore_marker(settings, tmp_path / "does_not_exist.db")
 
     app = create_app(settings=settings)
-    with caplog.at_level("ERROR"):
-        with TestClient(app) as client:
-            assert client.get("/health").status_code == 200
-            assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
 
-    assert "RESTORE ABORTED" in caplog.text
+    # configure_logging (COL-128) wires the `collapsarr` logger's own stdout
+    # handler with propagate=False, so this asserts against captured stdout
+    # rather than caplog (which hooks the root logger, and would otherwise
+    # lose these records the moment create_app() reconfigures the handlers).
+    assert "RESTORE ABORTED" in capsys.readouterr().out
     assert not restore_marker_path(settings).exists()
     # Nothing was swapped, so no safety backup was taken.
     assert list_backups(settings) == []
 
 
 def test_non_sqlite_staged_file_aborts(
-    settings: Settings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    settings: Settings, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _current_db_with(settings, "CURRENT")
     staged = tmp_path / "not-a-db.txt"
@@ -309,19 +312,18 @@ def test_non_sqlite_staged_file_aborts(
     write_restore_marker(settings, staged)
 
     app = create_app(settings=settings)
-    with caplog.at_level("ERROR"):
-        with TestClient(app) as client:
-            assert client.get("/health").status_code == 200
-            assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
 
-    assert "RESTORE ABORTED" in caplog.text
+    assert "RESTORE ABORTED" in capsys.readouterr().out
     assert not restore_marker_path(settings).exists()
     assert staged.exists()  # a rejected staged file is not consumed
     assert list_backups(settings) == []
 
 
 def test_newer_revision_staged_file_aborts_and_leaves_current_untouched(
-    settings: Settings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    settings: Settings, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Boot-time version guard (COL-72): a staged file at an unknown (newer)
     revision is defensively aborted -- current DB untouched, marker cleared,
@@ -333,14 +335,14 @@ def test_newer_revision_staged_file_aborts_and_leaves_current_untouched(
     write_restore_marker(settings, staged)
 
     app = create_app(settings=settings)
-    with caplog.at_level("ERROR"):
-        with TestClient(app) as client:
-            assert client.get("/health").status_code == 200
-            # The live database still serves CURRENT -- the newer DB was never swapped in.
-            assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        # The live database still serves CURRENT -- the newer DB was never swapped in.
+        assert _instance_names(Path(settings.database_path)) == ["CURRENT"]
 
-    assert "RESTORE ABORTED" in caplog.text
-    assert "newer version" in caplog.text.lower()
+    out = capsys.readouterr().out
+    assert "RESTORE ABORTED" in out
+    assert "newer version" in out.lower()
     assert not restore_marker_path(settings).exists()
     assert staged.exists()  # a rejected staged file is not consumed
     # Nothing was swapped, so no safety backup was taken.

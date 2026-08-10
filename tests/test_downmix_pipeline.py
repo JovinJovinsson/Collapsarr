@@ -16,6 +16,7 @@ Two layers, mirroring the rest of the downmix-engine test suite:
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from collections.abc import Mapping
@@ -386,3 +387,132 @@ def test_pipeline_passes_ffprobe_ffmpeg_paths_and_timeouts_through(tmp_path: Pat
     assert calls[0][0] == "/opt/homebrew/bin/ffprobe"
     assert calls[1][0] == "/opt/homebrew/bin/ffmpeg"
     assert calls[2][0] == "/opt/homebrew/bin/ffprobe"
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle logging (COL-129): WARNING for skip/degraded, ERROR for failures.
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_logs_a_warning_for_nothing_to_do(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "tags": {"language": "eng"},
+            }
+        ]
+    }
+    runner = _fake_runner(original_path=original, audio_payload=payload)
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.NOTHING_TO_DO
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "nothing to do" in warnings[0].message
+    assert str(original) in warnings[0].message
+
+
+def test_pipeline_logs_an_error_with_truncated_stderr_for_a_remux_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    huge_stderr = "x" * 3000 + "THE_REAL_ERROR_AT_THE_END"
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_STEREO_ENG_PAYLOAD,
+        ffmpeg_returncode=1,
+        ffmpeg_stderr=huge_stderr,
+    )
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.REMUX_FAILED
+    # The untruncated stderr is still carried on the result for job history.
+    assert result.remux_result is not None
+    assert result.remux_result.stderr == huge_stderr
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    logged_message = errors[0].message
+    assert "THE_REAL_ERROR_AT_THE_END" in logged_message
+    # The log line is bounded -- it must not contain the full 3000-char run of
+    # 'x' verbatim (only its last ~2000-char tail), so one bad conversion
+    # can't dominate the rotation window.
+    assert "x" * 3000 not in logged_message
+
+
+def test_pipeline_logs_an_error_for_a_probe_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    runner = _fake_runner(
+        original_path=original, audio_payload=_STEREO_ENG_PAYLOAD, probe_audio_returncode=1
+    )
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.PROBE_FAILED
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert str(original) in errors[0].message
+
+
+def test_pipeline_logs_an_error_for_an_apply_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """APPLY_FAILED still leaves the job with no output produced -- ERROR, like the
+    other ``success=False`` outcomes, not WARNING (only NOTHING_TO_DO gets that)."""
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_STEREO_ENG_PAYLOAD,
+        original_summary=(10.0, 1),
+        temp_summary=(15.0, 2),  # duration drifted far past tolerance
+    )
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.APPLY_FAILED
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "duration mismatch" in errors[0].message
+
+
+def test_pipeline_logs_an_error_when_apply_validation_probing_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other APPLY_FAILED shape: a post-remux ffprobe failure during validation."""
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_STEREO_ENG_PAYLOAD,
+        media_summary_returncode=1,
+    )
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.APPLY_FAILED
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert str(original) in errors[0].message

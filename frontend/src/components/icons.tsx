@@ -140,6 +140,18 @@ export function StatusIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Logs: a document with horizontal rule lines — the current-log tail view
+// (COL-131), distinct from Tasks' checklist and Status' info circle.
+export function LogsIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <path d="M6.5 3.5h8l4 4v13a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1Z" />
+      <path d="M14 3.5v4h4" />
+      <path d="M8.5 12h7M8.5 15h7M8.5 18h4" />
+    </svg>
+  );
+}
+
 // Wordmark glyph: converging channels funneling into two bars, echoing the
 // downmix concept. Placeholder mark only — final logo lands in COL-9.
 export function BrandMark(props: SVGProps<SVGSVGElement>) {

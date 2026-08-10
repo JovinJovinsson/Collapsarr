@@ -27,6 +27,7 @@ const settings: GlobalSettings = {
   disk_space_error_percent: 2,
   update_channel: "stable",
   default_tracked: true,
+  log_level: null,
   api_key: "onboarding-server-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
