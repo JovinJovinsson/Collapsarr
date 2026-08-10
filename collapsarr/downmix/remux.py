@@ -133,12 +133,25 @@ def build_remux_command(
     :func:`~collapsarr.downmix.default_audio.resolve_default_audio_output_index`.
 
     Raises:
-        ValueError: ``qualifying_targets`` is empty, or one of its entries'
-            language has no matching stream in ``streams`` — both indicate
-            mismatched inputs (this file's own probe/detect output should
-            never produce either), not an ffmpeg runtime failure; or
-            ``default_audio_index`` falls outside the output audio layout.
+        ValueError: ``qualifying_targets`` is empty *and* ``default_audio_index``
+            is ``None`` — with no new tracks to add and no disposition change
+            to make, there is nothing at all for this remux to do (this is the
+            one case ``qualifying_targets`` may legitimately be empty: a
+            disposition-only remux — see
+            :func:`~collapsarr.downmix.default_audio_pipeline.run_default_audio_pipeline`
+            — passes an empty sequence with a real ``default_audio_index``, and
+            that combination is deliberately allowed through); or one of
+            ``qualifying_targets``'s entries has a language with no matching
+            stream in ``streams`` — mismatched inputs (this file's own
+            probe/detect output should never produce this), not an ffmpeg
+            runtime failure; or ``default_audio_index`` falls outside the
+            output audio layout.
     """
+    if not qualifying_targets and default_audio_index is None:
+        raise ValueError(
+            "qualifying_targets must not be empty when default_audio_index is "
+            "None — nothing to remux"
+        )
     sources = _resolve_sources(streams, qualifying_targets)
     total_audio_streams = len(streams) + len(sources)
     if default_audio_index is not None and not 0 <= default_audio_index < total_audio_streams:
@@ -315,10 +328,12 @@ def _resolve_sources(
     stream (ties broken toward the lowest stream index), matching
     :func:`~collapsarr.downmix.targets.detect_qualifying_targets`'s
     guarantee that every qualifying target has fewer channels than that.
-    """
-    if not qualifying_targets:
-        raise ValueError("qualifying_targets must not be empty — nothing to remux")
 
+    An empty ``qualifying_targets`` is valid here — it simply resolves to no
+    sources — the "empty is meaningless" guard lives in
+    :func:`build_remux_command`, which also knows about ``default_audio_index``
+    and so can tell a genuinely-empty request apart from a disposition-only one.
+    """
     resolved: list[tuple[QualifyingTarget, AudioStreamInfo]] = []
     for target in qualifying_targets:
         candidates = [s for s in streams if s.language == target.language]

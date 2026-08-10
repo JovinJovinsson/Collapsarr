@@ -379,6 +379,26 @@ def test_build_remux_command_raises_for_empty_qualifying_targets() -> None:
         build_remux_command("in.mkv", "out.mkv", streams, [], DownmixSettings())
 
 
+def test_build_remux_command_allows_empty_targets_when_default_audio_index_is_set() -> None:
+    """Disposition-only remux (COL-153): empty targets is legitimate with a real index."""
+    streams = [
+        _stream(index=0, channels=6, language="eng", codec="ac3"),
+        _stream(index=1, channels=2, language="fre", codec="aac"),
+    ]
+
+    command = build_remux_command(
+        "in.mkv", "out.mkv", streams, [], DownmixSettings(), default_audio_index=1
+    )
+
+    # Only the blanket `-map 0` -- no per-target `-map 0:<index>`, no `-c:a:N`
+    # codec overrides -- every stream is stream-copied, none re-encoded.
+    map_indices = [command[i + 1] for i, arg in enumerate(command) if arg == "-map"]
+    assert map_indices == ["0"]
+    assert not any(arg.startswith("-c:a:") for arg in command)
+    assert command[command.index("-disposition:a:0") + 1] == "0"
+    assert command[command.index("-disposition:a:1") + 1] == "default"
+
+
 def test_build_remux_command_raises_when_no_stream_matches_targets_language() -> None:
     streams = [_stream(index=0, channels=6, language="eng")]
     targets = [QualifyingTarget(language="fre", target=DownmixTarget.STEREO)]
@@ -497,6 +517,23 @@ def test_run_remux_raises_value_error_without_creating_temp_file_for_empty_targe
         run_remux(source, [], [], DownmixSettings())
 
     assert list(tmp_path.iterdir()) == [source]
+
+
+def test_run_remux_succeeds_with_empty_targets_when_default_audio_index_is_set(
+    tmp_path: Path,
+) -> None:
+    """Disposition-only remux (COL-153): empty targets + a real index is not an error."""
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"")
+    streams = [_stream(index=0, channels=6, language="eng")]
+    _, runner = _stub_runner(returncode=0)
+
+    result = run_remux(
+        source, streams, [], DownmixSettings(), default_audio_index=0, runner=runner  # type: ignore[arg-type]
+    )
+
+    assert result.success is True
+    assert result.temp_file_path is not None
 
 
 def test_run_remux_raises_value_error_without_creating_temp_file_for_unmatched_language(
