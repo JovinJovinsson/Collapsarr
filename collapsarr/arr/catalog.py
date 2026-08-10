@@ -44,16 +44,34 @@ fixture responses instead of making real network calls.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import httpx
 
 from .models import ArrInstance, InstanceType
 
+logger = logging.getLogger(__name__)
+
 _SERIES_PATH = "/api/v3/series"
 _EPISODE_PATH = "/api/v3/episode"
 _MOVIE_PATH = "/api/v3/movie"
 _DEFAULT_TIMEOUT = 10.0
+
+
+class MalformedCatalogResponse(Exception):
+    """Raised when a catalog endpoint returns HTTP 200 with an unexpected JSON shape (COL-136).
+
+    A non-list body where a list is documented (an error page, a wrapped
+    ``{"error": ...}`` shape, API version drift) previously slipped past
+    ``raise_for_status()`` and was silently coerced into an empty catalog --
+    which then flowed into :func:`~collapsarr.library.service.sync_library`
+    and soft-hid every previously-synced node for the instance, indistinguishable
+    from "the instance genuinely has nothing." Raising here instead lets the
+    scan-loop caller (:class:`~collapsarr.jobs.scheduler.JobScheduler`) catch
+    this the same way it already catches ``httpx.HTTPError`` -- log a warning
+    and skip the sync entirely, never touching the Library mirror.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +139,9 @@ def fetch_sonarr_catalog(
             swallowed -- an empty catalog would be indistinguishable from a
             wiped-out instance, and the scan must not soft-hide the whole
             library on a transient fetch failure.
+        MalformedCatalogResponse: on an HTTP 200 whose body isn't the
+            documented list shape (COL-136) -- same rationale as above; a
+            malformed-but-200 response is not a legitimate empty catalog.
     """
     if instance.type is not InstanceType.SONARR:
         raise ValueError(
@@ -141,7 +162,16 @@ def fetch_sonarr_catalog(
         series_response.raise_for_status()
         series_list = series_response.json()
         if not isinstance(series_list, list):
-            return SonarrCatalog(instance_id=instance.id, series=())
+            logger.warning(
+                "Sonarr catalog fetch: instance_id=%s %s returned HTTP 200 with a "
+                "non-list body (%s) (COL-136)",
+                instance.id,
+                _SERIES_PATH,
+                type(series_list).__name__,
+            )
+            raise MalformedCatalogResponse(
+                f"{_SERIES_PATH} returned a non-list body: {type(series_list).__name__}"
+            )
 
         for series in series_list:
             if not isinstance(series, dict):
@@ -157,7 +187,9 @@ def fetch_sonarr_catalog(
                 headers=headers,
             )
             episodes_response.raise_for_status()
-            episodes = _parse_episodes(episodes_response.json())
+            episodes = _parse_episodes(
+                episodes_response.json(), instance_id=instance.id, series_id=series_id
+            )
 
             season_numbers = _collect_season_numbers(series.get("seasons"), episodes)
             series_out.append(
@@ -172,10 +204,23 @@ def fetch_sonarr_catalog(
     return SonarrCatalog(instance_id=instance.id, series=tuple(series_out))
 
 
-def _parse_episodes(payload: object) -> tuple[CatalogEpisode, ...]:
+def _parse_episodes(
+    payload: object, *, instance_id: int, series_id: int
+) -> tuple[CatalogEpisode, ...]:
     """Normalize a Sonarr ``/episode`` response into :class:`CatalogEpisode` DTOs."""
     if not isinstance(payload, list):
-        return ()
+        logger.warning(
+            "Sonarr catalog fetch: instance_id=%s %s?seriesId=%s returned HTTP 200 "
+            "with a non-list body (%s) (COL-136)",
+            instance_id,
+            _EPISODE_PATH,
+            series_id,
+            type(payload).__name__,
+        )
+        raise MalformedCatalogResponse(
+            f"{_EPISODE_PATH}?seriesId={series_id} returned a non-list body: "
+            f"{type(payload).__name__}"
+        )
 
     episodes: list[CatalogEpisode] = []
     for episode in payload:
@@ -235,6 +280,8 @@ def fetch_radarr_catalog(
         ValueError: if ``instance`` is not a Radarr instance.
         httpx.HTTPError: on a network failure or a non-2xx response. Not
             swallowed -- see :func:`fetch_sonarr_catalog` for the rationale.
+        MalformedCatalogResponse: on an HTTP 200 whose body isn't the
+            documented list shape (COL-136) -- see :func:`fetch_sonarr_catalog`.
     """
     if instance.type is not InstanceType.RADARR:
         raise ValueError(
@@ -254,13 +301,24 @@ def fetch_radarr_catalog(
         response.raise_for_status()
         payload = response.json()
 
-    return RadarrCatalog(instance_id=instance.id, movies=_parse_movies(payload))
+    return RadarrCatalog(
+        instance_id=instance.id, movies=_parse_movies(payload, instance_id=instance.id)
+    )
 
 
-def _parse_movies(payload: object) -> tuple[CatalogMovie, ...]:
+def _parse_movies(payload: object, *, instance_id: int) -> tuple[CatalogMovie, ...]:
     """Normalize a Radarr ``/movie`` response into :class:`CatalogMovie` DTOs."""
     if not isinstance(payload, list):
-        return ()
+        logger.warning(
+            "Radarr catalog fetch: instance_id=%s %s returned HTTP 200 with a "
+            "non-list body (%s) (COL-136)",
+            instance_id,
+            _MOVIE_PATH,
+            type(payload).__name__,
+        )
+        raise MalformedCatalogResponse(
+            f"{_MOVIE_PATH} returned a non-list body: {type(payload).__name__}"
+        )
 
     movies: list[CatalogMovie] = []
     for movie in payload:

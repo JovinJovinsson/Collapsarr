@@ -89,6 +89,7 @@ import httpx
 from sqlalchemy.orm import Session, sessionmaker
 
 from collapsarr.arr.catalog import (
+    MalformedCatalogResponse,
     RadarrCatalog,
     SonarrCatalog,
     fetch_radarr_catalog,
@@ -666,9 +667,13 @@ class JobScheduler:
         Radarr instance's full movie catalog via :attr:`_radarr_catalog_fetch`
         -- both then upserted through the same
         :func:`~collapsarr.library.service.sync_library` entry point. A
-        catalog-fetch failure is logged and swallowed so it never aborts the
-        scan -- crucially, ``sync_library`` is *not* called on a failed fetch,
-        so a transient outage never soft-hides the whole mirror.
+        catalog-fetch failure -- a network/HTTP-status failure
+        (``httpx.HTTPError``) or an HTTP 200 with an unexpected body shape
+        (:class:`~collapsarr.arr.catalog.MalformedCatalogResponse`, COL-136)
+        -- is logged and swallowed so it never aborts the scan. Crucially,
+        ``sync_library`` is *not* called on either failure, so neither a
+        transient outage nor a malformed-but-200 response ever soft-hides
+        the whole mirror.
         """
         catalog: SonarrCatalog | RadarrCatalog
         try:
@@ -678,7 +683,7 @@ class JobScheduler:
                 catalog = self._radarr_catalog_fetch(instance)
             else:  # pragma: no cover - InstanceType has exactly two members
                 return
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, MalformedCatalogResponse) as exc:
             logger.warning(
                 "scan: failed to fetch catalog from instance %r (id=%s): %s",
                 instance.name,
