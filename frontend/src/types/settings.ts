@@ -34,6 +34,14 @@ export type AuthMethod = "forms" | "basic";
  */
 export type UpdateChannel = "stable" | "beta";
 
+/**
+ * Runtime override for the `collapsarr` logger (COL-130,
+ * `collapsarr.settings.models.LOG_LEVELS`). `null` means "no override, fall
+ * back to the `COLLAPSARR_LOG_LEVEL` environment setting at boot" (default
+ * `"INFO"`); a concrete value takes effect immediately, without a restart.
+ */
+export type LogLevel = "DEBUG" | "INFO" | "WARNING" | "ERROR";
+
 /** The persisted global settings row, decoded to its JSON response shape. */
 export interface GlobalSettings {
   enabled_targets: DownmixTarget[];
@@ -63,6 +71,18 @@ export interface GlobalSettings {
   disk_space_error_percent: number;
   /** Which GitHub Release stream the Update Check compares against (COL-88). Default `"stable"`. */
   update_channel: UpdateChannel;
+  /**
+   * Default Tracked setting for newly-discovered library items (COL-98).
+   * When a Library node has no explicit ancestor override, its Tracked value
+   * resolves to this instance-wide default. Default `true`.
+   */
+  default_tracked: boolean;
+  /**
+   * Runtime log-level override for the `collapsarr` logger (COL-130).
+   * `null` when unset -- the level is then whatever `COLLAPSARR_LOG_LEVEL`
+   * resolved to at boot.
+   */
+  log_level: LogLevel | null;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -92,4 +112,6 @@ export interface GlobalSettingsUpdateInput {
   disk_space_warning_percent?: number;
   disk_space_error_percent?: number;
   update_channel?: UpdateChannel;
+  default_tracked?: boolean;
+  log_level?: LogLevel | null;
 }

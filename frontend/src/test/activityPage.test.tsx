@@ -144,4 +144,77 @@ describe("ActivityPage", () => {
 
     expect(await screen.findByText(/failed to load job history \(500\)/i)).toBeInTheDocument();
   });
+
+  it("shows a short error inline with no 'Show more' action", async () => {
+    mockFetchResolved(historyResponse);
+    render(<ActivityPage />);
+
+    const failedRow = (await screen.findByText("Show.S01E01")).closest("tr");
+    expect(within(failedRow as HTMLElement).getByText("ffmpeg exited with an error")).toBeInTheDocument();
+    expect(within(failedRow as HTMLElement).queryByText(/show more/i)).not.toBeInTheDocument();
+  });
+
+  it("truncates a huge error with a 'Show more' modal showing the full text", async () => {
+    const hugeError = "ffmpeg stderr: ".repeat(20).trim();
+    mockFetchResolved([
+      { ...historyResponse[1], id: 3, file_path: "/media/tv/Big/Big.S01E01.mkv", error_text: hugeError },
+    ]);
+    render(<ActivityPage />);
+
+    const row = (await screen.findByText("Big.S01E01")).closest("tr");
+    expect(within(row as HTMLElement).getByRole("button", { name: /show more/i })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(within(row as HTMLElement).getByRole("button", { name: /show more/i }));
+
+    const dialog = await screen.findByRole("dialog", { name: /big/i });
+    expect(within(dialog).getByText(hugeError)).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the most recently queued job at the top of the list (COL-108)", async () => {
+    mockFetchResolved(historyResponse);
+    render(<ActivityPage />);
+
+    await screen.findByText("Interstellar");
+
+    const titles = screen
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => row.querySelector(".activity-table__title")?.textContent);
+    expect(titles).toEqual(["Show.S01E01", "Interstellar"]);
+  });
+
+  it("shows a still-pending job (no timestamps yet) at the top of the list", async () => {
+    mockFetchResolved([
+      ...historyResponse,
+      {
+        id: 3,
+        job_id: "33333333-3333-3333-3333-333333333333",
+        file_path: "/media/tv/Newest/Newest.S01E01.mkv",
+        status: "pending",
+        started_at: null,
+        ended_at: null,
+        exit_code: null,
+        error_text: null,
+        target: null,
+        language: null,
+        created_at: "2026-07-12T00:00:00Z",
+        updated_at: "2026-07-12T00:00:00Z",
+      },
+    ]);
+    render(<ActivityPage />);
+
+    const pendingTitle = await screen.findByText("Newest.S01E01");
+    const pendingRow = pendingTitle.closest("tr");
+    expect(pendingRow).not.toBeNull();
+    const scoped = within(pendingRow as HTMLElement);
+    expect(scoped.getByText("Pending")).toBeInTheDocument();
+    expect(scoped.getAllByText("—").length).toBeGreaterThan(0);
+
+    const rows = screen.getAllByRole("row").slice(1);
+    expect(within(rows[0]).getByText("Newest.S01E01")).toBeInTheDocument();
+  });
 });

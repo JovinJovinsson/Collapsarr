@@ -22,6 +22,8 @@ from collapsarr.settings.models import (
     AUTH_METHOD_FORMS,
     AUTH_REQUIRED_ENABLED,
     AUTH_REQUIRED_LOCAL_BYPASS,
+    LOG_LEVEL_DEBUG,
+    LOG_LEVEL_INFO,
     UPDATE_CHANNEL_BETA,
     UPDATE_CHANNEL_STABLE,
     GlobalSettings,
@@ -553,6 +555,55 @@ def test_update_global_settings_update_channel_persists_across_a_fresh_read(
     reread = get_global_settings(session)
 
     assert reread.update_channel == UPDATE_CHANNEL_BETA
+
+
+# ---------------------------------------------------------------------------
+# Log level (COL-130).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_log_level_to_none(session: Session) -> None:
+    """A fresh row's ``log_level`` is unset -- boot falls back to the env setting."""
+    settings = get_global_settings(session)
+
+    assert settings.log_level is None
+
+
+def test_update_global_settings_sets_the_log_level(session: Session) -> None:
+    updated = update_global_settings(session, log_level=LOG_LEVEL_DEBUG)
+
+    assert updated.log_level == LOG_LEVEL_DEBUG
+
+
+def test_update_global_settings_rejects_an_unknown_log_level(session: Session) -> None:
+    with pytest.raises(ValueError, match="log_level"):
+        update_global_settings(session, log_level="TRACE")
+
+
+def test_update_global_settings_omitting_log_level_leaves_it_untouched(session: Session) -> None:
+    update_global_settings(session, log_level=LOG_LEVEL_DEBUG)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.log_level == LOG_LEVEL_DEBUG
+
+
+def test_update_global_settings_log_level_explicit_none_clears_the_override(
+    session: Session,
+) -> None:
+    update_global_settings(session, log_level=LOG_LEVEL_DEBUG)
+
+    cleared = update_global_settings(session, log_level=None)
+
+    assert cleared.log_level is None
+
+
+def test_update_global_settings_log_level_persists_across_a_fresh_read(session: Session) -> None:
+    update_global_settings(session, log_level=LOG_LEVEL_INFO)
+
+    reread = get_global_settings(session)
+
+    assert reread.log_level == LOG_LEVEL_INFO
 
 
 # ---------------------------------------------------------------------------

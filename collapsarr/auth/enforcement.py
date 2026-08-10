@@ -36,13 +36,18 @@ mode. This makes a LAN/localhost self-hoster's install frictionless (no
 setup, no login, no API key) while any routable-address client -- including
 one pretending to be local -- must still authenticate.
 
-Classification (:func:`_client_is_local`) reads only the literal peer address
-the ASGI server accepted the connection from (``request.client``) -- it never
-parses ``X-Forwarded-For`` or any other client-suppliable header, which any
-caller could forge. The consequence: behind a reverse proxy, the proxy's own
-address is what gets classified, not its upstream client's -- an install
-behind a reverse proxy should set ``auth_required="enabled"`` until a later
-ticket adds trusted-proxy support (see the README's Authentication section).
+Classification (:func:`_client_is_local`) resolves the address via
+:func:`collapsarr.auth.trust.resolve_client_address` (COL-112/COL-113), not
+the raw ASGI peer: by default (no ``COLLAPSARR_TRUSTED_PROXIES`` configured)
+that is exactly the literal peer address the server accepted the connection
+from, same as before -- ``X-Forwarded-For`` is never consulted. Once an
+install lists its reverse proxy's address in ``COLLAPSARR_TRUSTED_PROXIES``,
+a request whose *direct* peer is that trusted proxy is classified on the
+rightmost ``X-Forwarded-For`` entry instead (the proxy's own view of its
+immediate client), so the real upstream client -- not the proxy -- is what
+determines local-vs-routable. A peer that is not on the allowlist is still
+classified by its own direct address, and any ``X-Forwarded-For`` it presents
+is ignored -- exactly as forgeable, and as ignored, as before.
 
 The Basic auth method (COL-52) slots in at the browser-route branch below:
 when ``auth_method="basic"``, an unauthenticated browser request gets a ``401``
@@ -67,7 +72,9 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from ..settings.models import AUTH_METHOD_BASIC, AUTH_REQUIRED_LOCAL_BYPASS
 from ..settings.service import get_global_settings, verify_auth_password
+from ..url_base import external_path
 from .session import is_authenticated, log_in
+from .trust import resolve_client_address
 
 API_KEY_HEADER = "X-Api-Key"
 """Request header carrying the API key (Sonarr/Radarr convention)."""
@@ -117,6 +124,17 @@ def _parse_basic_credentials(request: Request) -> tuple[str, str] | None:
     return username, password
 
 
+def _prefixed_redirect(url_base: str, path: str) -> RedirectResponse:
+    """A gate ``RedirectResponse`` to ``path``, with ``url_base`` re-added (COL-117).
+
+    Every gate redirect below goes through this instead of building
+    ``RedirectResponse`` directly, so the ``Location`` header is always the
+    correct external URL for a browser behind a reverse proxy -- see
+    :func:`collapsarr.url_base.external_path`.
+    """
+    return RedirectResponse(url=external_path(url_base, path), status_code=_REDIRECT_STATUS)
+
+
 def _basic_challenge() -> Response:
     """The ``401`` + ``WWW-Authenticate: Basic`` response for an
     unauthenticated request under the Basic auth method (COL-52)."""
@@ -128,22 +146,22 @@ def _basic_challenge() -> Response:
 
 
 def _client_is_local(request: Request) -> bool:
-    """Whether the request's direct TCP peer is loopback or a private-range address.
+    """Whether the request's resolved client address is loopback or private-range.
 
-    Reads ``request.client`` -- the literal address the ASGI server accepted
-    the connection from -- and nothing else. In particular this deliberately
-    does **not** consult ``X-Forwarded-For`` (or any other header): those are
-    supplied by the client and trivially spoofable, so trusting them here
-    would let any external caller claim to be local and bypass auth entirely.
-    The tradeoff (documented in the module docstring and the README) is that
-    an install behind a reverse proxy sees the proxy's own peer address, not
-    its upstream client's -- trusted-proxy support is a later stub.
+    The address comes from :func:`~collapsarr.auth.trust.resolve_client_address`
+    (COL-112), not straight from ``request.client``: with no trusted proxy
+    configured (the default) that is the same literal peer address the ASGI
+    server accepted the connection from, so behavior is unchanged. Only when
+    the *direct* peer is on the ``COLLAPSARR_TRUSTED_PROXIES`` allowlist does
+    the resolved address instead reflect the rightmost ``X-Forwarded-For``
+    entry -- an untrusted peer's forwarded header is never consulted, so it
+    cannot spoof its way into a local classification.
     """
-    client = request.client
-    if client is None:
+    address_str = resolve_client_address(request)
+    if address_str is None:
         return False
     try:
-        address = ipaddress.ip_address(client.host)
+        address = ipaddress.ip_address(address_str)
     except ValueError:
         # Not a literal IP address (seen in some non-network test harnesses) --
         # treat conservatively as not local.
@@ -179,6 +197,14 @@ async def enforce_auth_middleware(
     ):
         return await call_next(request)
 
+    # Re-added to any redirect Location header below (COL-117): by the time
+    # this middleware runs, UrlBaseMiddleware (COL-116) has already stripped
+    # the configured prefix from `path`, but a Location header is an
+    # outbound URL sent to the browser, which needs the full external path
+    # -- prefix included. Empty when unconfigured, so redirects stay
+    # unprefixed exactly as before.
+    url_base: str = request.app.state.settings.url_base
+
     session_factory = request.app.state.session_factory
     with session_factory() as session:
         settings = get_global_settings(session)
@@ -212,16 +238,16 @@ async def enforce_auth_middleware(
         # First-run gate: only the setup page is reachable.
         if path == SETUP_PATH:
             return await call_next(request)
-        return RedirectResponse(url=SETUP_PATH, status_code=_REDIRECT_STATUS)
+        return _prefixed_redirect(url_base, SETUP_PATH)
     assert auth_username is not None  # credential_set is True past this point
 
     if path == SETUP_PATH:
         # Credential already exists -- setup is done.
         if authed:
-            return RedirectResponse(url=APP_ROOT, status_code=_REDIRECT_STATUS)
+            return _prefixed_redirect(url_base, APP_ROOT)
         if auth_method == AUTH_METHOD_BASIC:
             return _basic_challenge()
-        return RedirectResponse(url=LOGIN_PATH, status_code=_REDIRECT_STATUS)
+        return _prefixed_redirect(url_base, LOGIN_PATH)
 
     if auth_method == AUTH_METHOD_BASIC:
         # No Forms /login page under this method -- every other browser route
@@ -244,9 +270,9 @@ async def enforce_auth_middleware(
 
     if path == LOGIN_PATH:
         if authed:
-            return RedirectResponse(url=APP_ROOT, status_code=_REDIRECT_STATUS)
+            return _prefixed_redirect(url_base, APP_ROOT)
         return await call_next(request)
 
     if authed:
         return await call_next(request)
-    return RedirectResponse(url=LOGIN_PATH, status_code=_REDIRECT_STATUS)
+    return _prefixed_redirect(url_base, LOGIN_PATH)

@@ -77,6 +77,7 @@ from .disk_space import (
     DISK_SPACE_WARNING_CODE,
     DiskUsage,
     free_space_percent,
+    get_disk_usage,
     make_disk_space_check_run,
 )
 from .failed_jobs import (
@@ -169,6 +170,7 @@ __all__ = [
     "default_health_checks",
     "dismiss_health_check",
     "free_space_percent",
+    "get_disk_usage",
     "list_failing_checks",
     "list_health_check_states",
     "make_arr_connectivity_check_run",

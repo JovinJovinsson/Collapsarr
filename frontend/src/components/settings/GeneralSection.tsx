@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import { changePassword, logoutEverywhere } from "../../api/auth";
 import { getStoredApiKey, redirectToLogin, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
-import type { AuthMethod, AuthRequiredMode, UpdateChannel } from "../../types/settings";
+import type { AuthMethod, AuthRequiredMode, LogLevel, UpdateChannel } from "../../types/settings";
 
 type LoadState =
   | { status: "loading" }
@@ -23,7 +23,20 @@ interface GeneralFormValues {
   surroundBitrateKbps: string;
   diskSpaceWarningPercent: string;
   diskSpaceErrorPercent: string;
+  defaultTracked: boolean;
+  /**
+   * `null` represents "no override" (COL-130 AC2: defer to
+   * `COLLAPSARR_LOG_LEVEL` at boot) as a first-class form value -- it must
+   * survive an unrelated General-settings save undisturbed, so this is never
+   * defaulted to a concrete level the way the other fields are.
+   */
+  logLevel: LogLevel | null;
 }
+
+/** `<select>` value for the "no override" option (COL-130 AC2/AC5) -- HTML
+ * select values are always strings, so `null` needs a string sentinel that's
+ * mapped back to `null` on change and never collides with a real `LogLevel`. */
+const LOG_LEVEL_DEFAULT_OPTION = "__default__";
 
 /** Validates the general-settings form; returns an error message, or `null` when valid. */
 function validateGeneralForm(form: GeneralFormValues): string | null {
@@ -77,6 +90,8 @@ export function GeneralSection() {
     surroundBitrateKbps: "",
     diskSpaceWarningPercent: "5",
     diskSpaceErrorPercent: "2",
+    defaultTracked: true,
+    logLevel: null,
   });
 
   const [saving, setSaving] = useState(false);
@@ -113,6 +128,8 @@ export function GeneralSection() {
             settings.surround_bitrate_kbps === null ? "" : String(settings.surround_bitrate_kbps),
           diskSpaceWarningPercent: String(settings.disk_space_warning_percent),
           diskSpaceErrorPercent: String(settings.disk_space_error_percent),
+          defaultTracked: settings.default_tracked,
+          logLevel: settings.log_level,
         });
         setState({ status: "ready" });
       })
@@ -144,6 +161,8 @@ export function GeneralSection() {
           form.surroundBitrateKbps.trim() === "" ? null : Number(form.surroundBitrateKbps),
         disk_space_warning_percent: Number(form.diskSpaceWarningPercent),
         disk_space_error_percent: Number(form.diskSpaceErrorPercent),
+        default_tracked: form.defaultTracked,
+        log_level: form.logLevel,
       });
       setServerApiKey(updated.api_key);
       setForm({
@@ -159,6 +178,8 @@ export function GeneralSection() {
           updated.surround_bitrate_kbps === null ? "" : String(updated.surround_bitrate_kbps),
         diskSpaceWarningPercent: String(updated.disk_space_warning_percent),
         diskSpaceErrorPercent: String(updated.disk_space_error_percent),
+        defaultTracked: updated.default_tracked,
+        logLevel: updated.log_level,
       });
       setSavedAt(Date.now());
     } catch (err: unknown) {
@@ -344,6 +365,15 @@ export function GeneralSection() {
               Require the API key for UI requests
             </label>
 
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={form.defaultTracked}
+                onChange={(event) => setForm({ ...form, defaultTracked: event.target.checked })}
+              />
+              Default Tracked for new library items
+            </label>
+
             <div className="form-field form-field--narrow">
               <label htmlFor="concurrency-limit">Concurrency limit</label>
               <input
@@ -376,6 +406,37 @@ export function GeneralSection() {
                 <strong>Beta</strong> checks for the latest pre-release build instead -- may be
                 less stable, intended for early testing. See the{" "}
                 <Link to="/system/updates">Updates page</Link> for the current comparison result.
+              </p>
+            </div>
+          </div>
+
+          <div className="panel settings-form">
+            <h3 className="settings-form__subtitle">Log level</h3>
+            <div className="form-field form-field--narrow">
+              <label htmlFor="log-level">Level</label>
+              <select
+                id="log-level"
+                value={form.logLevel ?? LOG_LEVEL_DEFAULT_OPTION}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setForm({
+                    ...form,
+                    logLevel: value === LOG_LEVEL_DEFAULT_OPTION ? null : (value as LogLevel),
+                  });
+                }}
+              >
+                <option value={LOG_LEVEL_DEFAULT_OPTION}>Default (env)</option>
+                <option value="DEBUG">Debug</option>
+                <option value="INFO">Info</option>
+                <option value="WARNING">Warning</option>
+                <option value="ERROR">Error</option>
+              </select>
+              <p className="form-hint">
+                Applies immediately, without a restart, and persists across restarts. Controls
+                both what&apos;s logged and how many rotated log files are kept (more at{" "}
+                <strong>Debug</strong>). <strong>Default (env)</strong> (the initial state) defers
+                to the <code>COLLAPSARR_LOG_LEVEL</code> environment setting at boot; pick it again
+                here to clear a previously-set override.
               </p>
             </div>
           </div>

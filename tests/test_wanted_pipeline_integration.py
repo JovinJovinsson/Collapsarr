@@ -26,6 +26,7 @@ acceptance criteria are stated in terms of -- rather than inspecting mocks.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from collapsarr.arr.models import ArrInstance, InstanceType
 from collapsarr.config import Settings
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.probe import AudioStreamInfo
@@ -40,8 +42,20 @@ from collapsarr.downmix.targets import DownmixSettings, DownmixTarget, Qualifyin
 from collapsarr.jobs.queue import JobQueue, JobStatus, PipelineRunner
 from collapsarr.jobs.scheduler import JobScheduler, ProbeFn
 from collapsarr.jobs.tracked_media import make_tracked_media_recorder
-from collapsarr.media.service import get_tracked_media, list_files_missing_targets
+from collapsarr.library.service import (
+    get_node_by_source_id,
+    set_tracked,
+    upsert_series_episode_node,
+)
+from collapsarr.media.models import MediaTargetStatus
+from collapsarr.media.service import (
+    get_tracked_media,
+    list_files_missing_targets,
+    list_target_statuses,
+)
 from collapsarr.settings.service import get_global_settings
+
+_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "arr"
 
 # A 5.1 stream: with the default (Stereo-only) settings, Stereo (2ch < 6ch,
 # not present) qualifies as a missing target.
@@ -221,4 +235,425 @@ def test_a_successful_downmix_job_removes_the_file_from_wanted_without_a_rescan(
     assert ran[0].status is JobStatus.SUCCEEDED
     # No further scan/enqueue_file call happens here -- the job-completion
     # hook alone must be what clears the file from the wanted-list.
+    assert _wanted_paths(client) == set()
+
+
+# ---------------------------------------------------------------------------
+# COL-102: the Tracked flag governs the live auto-enqueue + Wanted pipeline,
+# and webhooks keep the Library mirror current. These extend the pattern above
+# (real scheduler + queue + tracked_media_recorder, stubbing only the
+# ffmpeg/ffprobe boundary) with a seeded ArrInstance + Library node so a file's
+# resolved Tracked value is exercised end to end.
+# ---------------------------------------------------------------------------
+
+_IMPORT_PATH = "/tv/Breaking Bad/Season 01/Breaking Bad - S01E01 - Pilot.mkv"
+
+
+def _sonarr_import_payload() -> dict[str, object]:
+    payload = json.loads((_FIXTURES_DIR / "sonarr_webhook_on_import.json").read_text())
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _seed_sonarr_episode(
+    session_factory: sessionmaker[Session],
+    *,
+    tracked: bool | None,
+    episode_id: int = 101,
+) -> int:
+    """Seed a Sonarr instance + one Library episode; return the instance id.
+
+    ``tracked`` sets an explicit override on the series (cascading to the
+    episode); ``None`` leaves it inheriting the global default (Tracked).
+    """
+    with session_factory() as session:
+        instance = ArrInstance(
+            name="Sonarr", type=InstanceType.SONARR, base_url="http://sonarr.local", api_key="k"
+        )
+        session.add(instance)
+        session.commit()
+        session.refresh(instance)
+        node = upsert_series_episode_node(
+            session,
+            instance_id=instance.id,
+            series_id=1,
+            series_title="Breaking Bad",
+            season_number=1,
+            episode_id=episode_id,
+            episode_number=1,
+            episode_title="Pilot",
+        )
+        if tracked is not None:
+            set_tracked(session, node_id=node.id, tracked=tracked)
+        return instance.id
+
+
+def _seed_bare_sonarr_instance(session_factory: sessionmaker[Session]) -> int:
+    with session_factory() as session:
+        instance = ArrInstance(
+            name="Sonarr", type=InstanceType.SONARR, base_url="http://sonarr.local", api_key="k"
+        )
+        session.add(instance)
+        session.commit()
+        session.refresh(instance)
+        return instance.id
+
+
+# --- AC2 + AC3: a Not-Tracked discovered file is neither enqueued nor Wanted ---
+
+
+def test_a_not_tracked_discovered_file_is_neither_enqueued_nor_wanted(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=False)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        "/media/pilot.mkv", instance_id=instance_id, sonarr_episode_id=101
+    )
+
+    assert job is None  # AC3: automatic enqueue is gated by Tracked
+    # AC2: the file is still tracked (a MISSING row exists) but excluded from Wanted.
+    with session_factory() as session:
+        assert get_tracked_media(session, "/media/pilot.mkv") is not None
+    assert _wanted_paths(client) == set()
+
+
+def test_a_tracked_discovered_file_is_enqueued_and_wanted(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)  # inherits default (True)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        "/media/pilot.mkv", instance_id=instance_id, sonarr_episode_id=101
+    )
+
+    assert job is not None
+    assert _wanted_paths(client) == {"/media/pilot.mkv"}
+
+
+# --- AC4: flipping Not-Tracked never cancels an already-queued/running job ------
+
+
+def test_flipping_not_tracked_does_not_cancel_an_already_queued_job(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)
+    added = QualifyingTarget(language="eng", target=DownmixTarget.STEREO)
+    scheduler, queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_stub_adding(added),
+    )
+
+    job = scheduler.enqueue_file(
+        "/media/pilot.mkv", instance_id=instance_id, sonarr_episode_id=101
+    )
+    assert job is not None
+    assert job.status is JobStatus.PENDING
+
+    # The user flips the episode Not-Tracked while its job sits queued.
+    with session_factory() as session:
+        node = get_node_by_source_id(session, instance_id=instance_id, sonarr_episode_id=101)
+        assert node is not None
+        set_tracked(session, node_id=node.id, tracked=False)
+
+    # The already-queued job is untouched -- not cancelled/removed -- and still
+    # runs to completion. Tracked only gates *future* automatic enqueueing.
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.PENDING  # type: ignore[union-attr]
+    ran = queue.run_pending()
+    assert [j.id for j in ran] == [job.id]
+    assert ran[0].status is JobStatus.SUCCEEDED
+
+
+def test_flipping_not_tracked_does_not_cancel_a_running_job(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)
+    scheduler, queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        "/media/pilot.mkv", instance_id=instance_id, sonarr_episode_id=101
+    )
+    assert job is not None
+    job.status = JobStatus.RUNNING  # simulate a worker having picked it up
+
+    with session_factory() as session:
+        node = get_node_by_source_id(session, instance_id=instance_id, sonarr_episode_id=101)
+        assert node is not None
+        set_tracked(session, node_id=node.id, tracked=False)
+
+    # The in-flight job is neither removed from the queue nor reverted.
+    assert queue.get_job(job.id) is job
+    assert queue.get_job(job.id).status is JobStatus.RUNNING  # type: ignore[union-attr]
+
+
+# --- AC5: already-produced downmix tracks survive a flip to Not-Tracked ---------
+
+
+def test_flipping_not_tracked_leaves_already_produced_tracks_untouched(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)
+    added = QualifyingTarget(language="eng", target=DownmixTarget.STEREO)
+    scheduler, queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_stub_adding(added),
+    )
+
+    scheduler.enqueue_file("/media/pilot.mkv", instance_id=instance_id, sonarr_episode_id=101)
+    queue.run_pending()
+
+    with session_factory() as session:
+        produced_before = {
+            s.target
+            for s in list_target_statuses(session, "/media/pilot.mkv")
+            if s.status is MediaTargetStatus.PROCESSED
+        }
+    assert DownmixTarget.STEREO in produced_before  # the job added the stereo track
+
+    with session_factory() as session:
+        node = get_node_by_source_id(session, instance_id=instance_id, sonarr_episode_id=101)
+        assert node is not None
+        set_tracked(session, node_id=node.id, tracked=False)
+
+    # Flipping Not-Tracked must not retroactively remove/alter produced tracks.
+    with session_factory() as session:
+        produced_after = {
+            s.target
+            for s in list_target_statuses(session, "/media/pilot.mkv")
+            if s.status is MediaTargetStatus.PROCESSED
+        }
+    assert produced_after == produced_before
+
+
+# --- AC6: the manual trigger endpoint still works on a Not-Tracked file ---------
+
+
+def test_manual_trigger_endpoint_downmixes_a_not_tracked_file(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    _seed_sonarr_episode(session_factory, tracked=False)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+    # Wire the scheduler so POST /api/jobs/trigger resolves it (the client
+    # fixture builds the app without enable_scheduler).
+    app.state.job_scheduler = scheduler
+
+    response = client.post(
+        "/api/jobs/trigger",
+        json={"file_path": "/media/pilot.mkv"},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is True
+    assert body["job"]["file_path"] == "/media/pilot.mkv"
+
+
+# --- AC1 + AC7: the webhook path, end to end through the real HTTP API ----------
+
+
+def test_webhook_import_upserts_the_node_and_a_tracked_file_reaches_wanted(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_bare_sonarr_instance(session_factory)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+    # Override the app's file-ready hook so the webhook auto-enqueues for real.
+    app.state.on_file_ready = scheduler.on_file_ready
+
+    response = client.post(
+        f"/api/webhook/arr/{instance_id}",
+        json=_sonarr_import_payload(),
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    # AC1: the import upserted the Library node(s) via the real HTTP webhook.
+    with session_factory() as session:
+        node = get_node_by_source_id(session, instance_id=instance_id, sonarr_episode_id=101)
+        assert node is not None
+    # AC7: Tracked by default -> the file flows through to /api/wanted.
+    assert _wanted_paths(client) == {_IMPORT_PATH}
+
+
+def test_webhook_import_of_a_not_tracked_episode_is_not_enqueued_or_wanted(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=False, episode_id=101)
+    scheduler, queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+    app.state.on_file_ready = scheduler.on_file_ready
+
+    response = client.post(
+        f"/api/webhook/arr/{instance_id}",
+        json=_sonarr_import_payload(),
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert queue.list_jobs() == []  # AC3: the webhook pass did not enqueue
+    assert _wanted_paths(client) == set()  # AC2
+
+
+# ---------------------------------------------------------------------------
+# COL-97: flipping an already-Wanted file's node to Not-Tracked must remove it
+# from /api/wanted immediately, without a rescan -- exercised at every layer
+# a real "untrack" action can come from (direct service call, a Series-level
+# cascade onto an already-discovered episode, and the actual HTTP endpoint the
+# frontend calls).
+# ---------------------------------------------------------------------------
+
+
+def test_untracking_an_already_wanted_file_removes_it_from_wanted(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)  # inherits default (True)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        _IMPORT_PATH, instance_id=instance_id, sonarr_episode_id=101
+    )
+    assert job is not None
+    assert _wanted_paths(client) == {_IMPORT_PATH}
+
+    with session_factory() as session:
+        node = get_node_by_source_id(session, instance_id=instance_id, sonarr_episode_id=101)
+        assert node is not None
+        set_tracked(session, node_id=node.id, tracked=False)
+
+    assert _wanted_paths(client) == set()
+
+
+def test_untracking_a_series_cascades_and_removes_its_wanted_episode(
+    settings: Settings, client: TestClient
+) -> None:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        _IMPORT_PATH, instance_id=instance_id, sonarr_episode_id=101
+    )
+    assert job is not None
+    assert _wanted_paths(client) == {_IMPORT_PATH}
+
+    with session_factory() as session:
+        episode_node = get_node_by_source_id(
+            session, instance_id=instance_id, sonarr_episode_id=101
+        )
+        assert episode_node is not None
+        season_node = session.get(type(episode_node), episode_node.parent_id)
+        assert season_node is not None
+        set_tracked(session, node_id=season_node.parent_id, tracked=False)  # the series
+
+    assert _wanted_paths(client) == set()
+
+
+def test_untracking_via_the_http_endpoint_removes_it_from_wanted(
+    settings: Settings, client: TestClient
+) -> None:
+    """Exercises the real path the frontend's `TrackedToggleButton` drives."""
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_sonarr_episode(session_factory, tracked=None)
+    scheduler, _queue = _wire(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND),
+        pipeline_runner=_pipeline_runner_returning(_NOTHING_TO_DO),
+    )
+
+    job = scheduler.enqueue_file(
+        _IMPORT_PATH, instance_id=instance_id, sonarr_episode_id=101
+    )
+    assert job is not None
+    assert _wanted_paths(client) == {_IMPORT_PATH}
+
+    with session_factory() as session:
+        node = get_node_by_source_id(session, instance_id=instance_id, sonarr_episode_id=101)
+        assert node is not None
+        node_id = node.id
+
+    response = client.post(
+        "/api/library/tracked",
+        json={"references": [{"node_type": "episode", "node_id": node_id}], "tracked": False},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 200, response.text
+
     assert _wanted_paths(client) == set()

@@ -37,6 +37,19 @@ Settings-page write path (:mod:`collapsarr.settings.routes`) also restricts
 the field to a ``Literal`` at the API boundary, but this is the single
 service-layer guard every other caller (env-seeding, scripts, tests) goes
 through too.
+
+``log_level`` (COL-130) follows ``language_allow_list``'s nullable-clearable
+convention (the :data:`_UNSET` sentinel), not ``update_channel``'s: an
+explicit ``None`` clears a persisted override back to "defer to
+``COLLAPSARR_LOG_LEVEL``", while omitting the argument leaves whatever is
+already stored untouched. A non-``None`` value is validated against
+:data:`~collapsarr.settings.models.LOG_LEVELS`, raising :class:`ValueError`
+otherwise -- same guard shape as ``update_channel``. This function only
+*persists* the value; applying it live to the running ``collapsarr`` logger
+is the caller's job (:func:`collapsarr.settings.routes.update_settings_endpoint`
+calls :func:`collapsarr.logging_setup.apply_log_level`), mirroring how
+:func:`rotate_session_secret`'s caller pushes the fresh secret into the
+running process's own cached copy.
 """
 
 from __future__ import annotations
@@ -48,6 +61,7 @@ from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 
 from .models import (
     BETA_LOCAL_SEGMENT_PREFIX,
+    LOG_LEVELS,
     SETTINGS_ID,
     UPDATE_CHANNEL_BETA,
     UPDATE_CHANNEL_STABLE,
@@ -162,6 +176,8 @@ def update_global_settings(
     disk_space_warning_percent: float | None = None,
     disk_space_error_percent: float | None = None,
     update_channel: str | None = None,
+    default_tracked: bool | None = None,
+    log_level: str | None | _Unset = _UNSET,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -198,6 +214,23 @@ def update_global_settings(
     can persist an invalid channel. The Update Check scheduler reads this
     live from the row on every tick, so a change here takes effect on the
     next tick with no restart.
+
+    ``default_tracked`` (COL-98) follows the same "only change what's passed"
+    rule as every other boolean field here. It is the instance-wide fallback
+    a Library node's Tracked value resolves to when nothing in its ancestry
+    carries an explicit override (see
+    :func:`collapsarr.library.service.resolve_tracked`); the Settings-page
+    toggle exposing it is a later ticket.
+
+    ``log_level`` (COL-130) uses the :data:`_UNSET` sentinel, like
+    ``language_allow_list``: passing ``None`` explicitly clears a persisted
+    override (falling back to ``COLLAPSARR_LOG_LEVEL`` at the next boot, and
+    live immediately -- see :func:`collapsarr.logging_setup.apply_log_level`),
+    while omitting the argument leaves the stored value untouched. A
+    non-``None`` value is validated against
+    :data:`~collapsarr.settings.models.LOG_LEVELS`, raising
+    :class:`ValueError` otherwise. This function only persists the value --
+    it does not itself touch the running logger; see the module docstring.
     """
     settings = get_global_settings(session)
 
@@ -240,6 +273,12 @@ def update_global_settings(
                 f"{UPDATE_CHANNEL_STABLE!r}/{UPDATE_CHANNEL_BETA!r}; got {update_channel!r}"
             )
         settings.update_channel = update_channel
+    if default_tracked is not None:
+        settings.default_tracked = default_tracked
+    if not isinstance(log_level, _Unset):
+        if log_level is not None and log_level not in LOG_LEVELS:
+            raise ValueError(f"log_level must be one of {LOG_LEVELS!r}; got {log_level!r}")
+        settings.log_level = log_level
 
     session.commit()
     session.refresh(settings)

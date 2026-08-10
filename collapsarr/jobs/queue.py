@@ -10,10 +10,13 @@ queue: :meth:`JobQueue.enqueue` a file plus its target/language context (a
 Each job's execution invokes the pipeline synchronously in a worker thread
 and captures whatever it returns (or, as a safety net, whatever it raises)
 onto the :class:`Job` itself -- ``status`` plus ``result``/``error``. When a
-``history_recorder`` is configured (see :class:`JobQueue`), that same
-worker thread calls it once the job reaches a terminal status, so every job
-run is persisted (COL-21, :mod:`collapsarr.jobs.history`) without the
-caller having to remember to do it. Likewise, when a ``failure_notifier`` is
+``history_recorder`` is configured (see :class:`JobQueue`), it is called at
+every lifecycle stage -- immediately on :meth:`JobQueue.enqueue` (``PENDING``),
+again as the worker thread picks the job up (``RUNNING``), and again once it
+reaches a terminal status -- so every job is visible in job history (COL-21,
+:mod:`collapsarr.jobs.history`) from the moment it's queued, not only once it
+finishes (COL-108), without the caller having to remember to call it itself.
+Likewise, when a ``failure_notifier`` is
 configured, that same worker thread calls it -- but only for a job that
 reached ``FAILED`` -- so a downmix failure fans out to the configured
 notifiers (COL-37, :mod:`collapsarr.jobs.failure_notify`) without the
@@ -49,10 +52,22 @@ and :meth:`JobQueue.from_settings` sources it from
 :class:`~collapsarr.config.Settings`'s ``job_max_concurrency`` (env
 ``COLLAPSARR_JOB_MAX_CONCURRENCY``), which is the closest thing this repo has
 to a Settings store today.
+
+:meth:`JobQueue._run_job` also logs the job lifecycle (COL-129), via a
+module logger -- so it lands in the rotating log file COL-128 wires up: an
+``INFO`` line when the job starts (job id, file path, enabled targets) and
+another when it completes successfully. The pipeline itself
+(:mod:`collapsarr.downmix.pipeline`) already logs ``WARNING``/``ERROR`` for
+its own non-success outcomes, so this module logs an ``ERROR`` of its own
+only for the one failure shape only it can observe -- ``pipeline_runner``
+raising unexpectedly rather than returning a :class:`~collapsarr.downmix.
+pipeline.PipelineResult` -- to avoid a duplicate log line for the common
+case where the pipeline already reported its own failure.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -67,11 +82,18 @@ from collapsarr.config import Settings, get_settings
 from collapsarr.downmix.pipeline import PipelineResult, run_downmix_pipeline
 from collapsarr.downmix.targets import DownmixSettings
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MAX_CONCURRENCY = 1
 
 #: Signature every pipeline runner (real or injected-for-tests) must match:
 #: ``(file_path, settings, **pipeline_kwargs) -> PipelineResult``.
 PipelineRunner = Callable[..., PipelineResult]
+
+
+def _enabled_targets_for_log(settings: DownmixSettings) -> str:
+    """Render ``settings.enabled_targets`` for a log line, in a stable order."""
+    return ",".join(sorted(target.value for target in settings.enabled_targets))
 
 
 class JobStatus(Enum):
@@ -116,8 +138,9 @@ class Job:
     ended_at: datetime | None = None
 
 
-#: Signature a ``history_recorder`` must match: takes the just-terminated
-#: ``Job`` and persists it (see :func:`collapsarr.jobs.history.make_history_recorder`).
+#: Signature a ``history_recorder`` must match: takes ``Job`` at its current
+#: lifecycle stage (``PENDING``/``RUNNING``/terminal) and persists it (see
+#: :func:`collapsarr.jobs.history.make_history_recorder`).
 HistoryRecorder = Callable[[Job], None]
 
 #: Signature a ``failure_notifier`` must match: takes the just-terminated
@@ -155,9 +178,13 @@ class JobQueue:
     worker loop is left for a future scheduler ticket to build on top of
     this primitive.
 
-    ``history_recorder``, when set, is called with each :class:`Job` from
-    the same worker thread that ran it, right after it reaches a terminal
-    status (``SUCCEEDED``/``FAILED``) -- see :func:`collapsarr.jobs.history.
+    ``history_recorder``, when set, is called with each :class:`Job` three
+    times over its lifecycle: immediately on :meth:`enqueue` (``PENDING``,
+    from whichever thread called ``enqueue``), then from the worker thread
+    that runs it as it transitions to ``RUNNING``, and again right after it
+    reaches a terminal status (``SUCCEEDED``/``FAILED``) -- so a job is
+    visible in job history the instant it's queued, not only once it
+    finishes (COL-108). See :func:`collapsarr.jobs.history.
     make_history_recorder` for the constructor that builds one bound to a
     real DB session factory. Since :meth:`run_pending` runs jobs across a
     :class:`~concurrent.futures.ThreadPoolExecutor` (up to ``max_concurrency``
@@ -325,11 +352,15 @@ class JobQueue:
         """Add a file + its target/language context to the queue as a new job.
 
         Returns the created :class:`Job` (status ``PENDING``) immediately;
-        it is not run until a subsequent :meth:`run_pending` call.
+        it is not run until a subsequent :meth:`run_pending` call. Persisted
+        via ``history_recorder`` (if configured) right away, so a job shows up
+        in job history -- and so the Activity view -- the instant it's
+        queued, rather than only once it finishes (COL-108).
         """
         job = Job(file_path=Path(file_path), settings=settings)
         with self._lock:
             self._jobs[job.id] = job
+        self._record_history(job)
         return job
 
     def get_job(self, job_id: UUID) -> Job | None:
@@ -372,20 +403,29 @@ class JobQueue:
     def _run_job(self, job: Job) -> None:
         """Execute one job's pipeline run, record its outcome, and persist/notify.
 
-        Runs entirely on the calling (worker) thread. Once ``job`` reaches
-        its terminal status (``SUCCEEDED``/``FAILED``), ``self._history_recorder``
-        (if configured) is called with it, followed by ``self._record_tracked_media``
-        (a no-op unless the job actually ``SUCCEEDED`` and a
-        ``tracked_media_recorder`` is configured, COL-95) and
-        ``self._notify_failure`` (a no-op unless the job actually ``FAILED``
-        and a ``failure_notifier`` is configured) -- all outside ``self._lock``,
-        since by that point only this thread ever touches this particular
-        ``job`` (each job is submitted to the executor exactly once), so
-        there is nothing left to race against.
+        Runs entirely on the calling (worker) thread. ``self._history_recorder``
+        (if configured) is called once as ``job`` transitions to ``RUNNING``
+        (COL-108 -- so an in-progress job is already visible in job history,
+        not only once it finishes) and again once it reaches its terminal
+        status (``SUCCEEDED``/``FAILED``), which is also when
+        ``self._record_tracked_media`` (a no-op unless the job actually
+        ``SUCCEEDED`` and a ``tracked_media_recorder`` is configured, COL-95)
+        and ``self._notify_failure`` (a no-op unless the job actually
+        ``FAILED`` and a ``failure_notifier`` is configured) run -- all
+        outside ``self._lock``, since by that point only this thread ever
+        touches this particular ``job`` (each job is submitted to the
+        executor exactly once), so there is nothing left to race against.
         """
         with self._lock:
             job.status = JobStatus.RUNNING
             job.started_at = datetime.now(UTC)
+        self._record_history(job)
+        logger.info(
+            "job %s started: file=%s targets=%s",
+            job.id,
+            job.file_path,
+            _enabled_targets_for_log(job.settings),
+        )
 
         try:
             result = self._pipeline_runner(job.file_path, job.settings, **self._pipeline_kwargs)
@@ -394,6 +434,7 @@ class JobQueue:
                 job.error = exc
                 job.status = JobStatus.FAILED
                 job.ended_at = datetime.now(UTC)
+            logger.exception("job %s failed with an unexpected error", job.id)
             self._record_history(job)
             self._record_tracked_media(job)
             self._notify_failure(job)
@@ -403,12 +444,20 @@ class JobQueue:
             job.result = result
             job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
             job.ended_at = datetime.now(UTC)
+        if job.status is JobStatus.SUCCEEDED:
+            logger.info("job %s completed: file=%s -- %s", job.id, job.file_path, result.detail)
         self._record_history(job)
         self._record_tracked_media(job)
         self._notify_failure(job)
 
     def _record_history(self, job: Job) -> None:
-        """Persist ``job``'s just-reached terminal state, if configured to."""
+        """Persist ``job``'s current state, if configured to.
+
+        Called at every stage of ``job``'s lifecycle -- ``PENDING`` (from
+        :meth:`enqueue`), ``RUNNING``, and its terminal status (from
+        :meth:`_run_job`) -- so job history always reflects what ``job`` is
+        doing right now, not just its final outcome (COL-108).
+        """
         if self._history_recorder is not None:
             self._history_recorder(job)
 

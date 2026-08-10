@@ -84,3 +84,82 @@ filesystem access to detect it itself). Surfaced as `is_docker` on
 vs. `pipx upgrade`/`pip install --upgrade`) — see
 `docs/adr/0001-update-check-detect-notify-only.md`. No code path executes
 either command; the operator always runs it themselves.
+
+## Wanted (view)
+
+A tracked media file still missing at least one enabled downmix target
+(Stereo/2.1/5.1). Nothing to do with Sonarr/Radarr's own "wanted" (missing,
+not-yet-downloaded) concept — surfaced by `GET /api/wanted` and the Wanted
+sidebar page, driven entirely by per-`(language, target)` status on a
+tracked media file. Deliberately distinct from **Tracked**: a file can be
+both Tracked and Wanted (eligible for downmixing, and still has a gap), or
+Not Tracked and still technically Wanted (it has a gap Collapsarr will never
+fill automatically, because the user opted it out).
+
+## Tracked
+
+A user-settable boolean on a **Library Node** (Series, Season, Episode, or
+Movie) controlling whether Collapsarr's pipeline should ever act on it
+automatically — queue downmix jobs from a scan/webhook, and list it in
+**Wanted**. Distinct from Sonarr/Radarr's own `monitored` flag (Collapsarr
+never reads or writes it) and from **Wanted** (see above). Setting Tracked
+on a Series or Season cascades immediately to every existing descendant,
+and also becomes that node's stored default for any child discovered later
+— a new episode file landing under a Not-Tracked series defaults to Not
+Tracked itself, even if the instance-wide default is Tracked. A Not-Tracked
+item can still be downmixed via an explicit manual trigger on its detail
+page; Tracked only gates *automatic* behavior. Resolves, in order, from the
+nearest explicit ancestor override down to the global `default_tracked`
+setting (itself defaulting to `true`) when nothing in a node's ancestry has
+been explicitly set. This resolution only applies once a **Catalog
+Identity** has located a real Library Node — an identity that can't be
+resolved to any node at all is **unresolved**, not "resolved, Tracked=false",
+and automatic behavior (enqueue, Wanted-listing) is skipped for it rather
+than falling back to `default_tracked`.
+
+## Catalog Identity
+
+The `(ArrInstance, Sonarr episode id | Radarr movie id)` identity Collapsarr
+uses to bridge an Arr-side file/episode/movie — from a scan, webhook, or API
+request — to its owning **Library Node** and resolved **Tracked** value.
+Always carries an instance; carries at most one leaf id (Sonarr XOR Radarr,
+never both — rejected at construction, since an instance is one Arr type or
+the other, never mixed). A Catalog Identity with no leaf id at all is a
+legitimate state (a file/episode not yet matched to a node) and resolves as
+**unresolved**, not as "resolved, Tracked=false" — see Tracked's resolution
+note below. Resolution itself is a single call,
+`library.service.resolve_tracked_for_source`, replacing what had drifted
+into five independent reimplementations of the same bridge logic.
+
+## Library
+
+A per-`ArrInstance` mirror of that instance's Sonarr/Radarr catalog
+(Series/Season/Episode for Sonarr, Movie for Radarr), persisted in
+Collapsarr's own database and kept in sync via the same scan/webhook
+infrastructure that maintains tracked-media state — never a live proxy to
+the Arr API. Includes items with no file yet, in a distinct "no file"
+state, so their **Tracked** preference can be set ahead of the file
+actually arriving. A Library Node that a later scan no longer sees
+(deleted upstream, in Sonarr/Radarr) is hidden rather than deleted,
+preserving its Tracked value in case it reappears. One Library exists per
+configured `ArrInstance`; the "Libraries" nav item's sidebar sub-items stop
+at this level — deeper navigation (Series > Season > Episode) happens
+inside a Library's own page, not further nested in the sidebar.
+
+## Library Node
+
+A single entry in a **Library**'s tree: a Series, Season, or Episode
+(Sonarr) or a Movie (Radarr), identified by Sonarr/Radarr's own object IDs
+rather than parsed from on-disk folder paths. The unit both **Tracked**
+status and its cascade/inheritance rules apply to.
+
+## Scheduled Task
+
+A named, recurring background activity owned by one of Collapsarr's
+scheduler classes (library scan, health checks, backups, update check),
+surfaced on the `/system/tasks` page with its cadence and next-run time
+plus a manual "Run now" trigger. Distinct from a **Job** (an individual
+downmix work item queued and drained by `JobQueue`/`JobScheduler`) — a
+Scheduled Task is the recurring *activity*, not a unit of work it produces.
+The library-scan Scheduled Task, for example, is what *enqueues* Jobs; it
+is not one itself.

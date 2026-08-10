@@ -45,6 +45,18 @@ export function SettingsIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Libraries: an open book — browsing a Series/Movie catalog (COL-100),
+// distinct from Backups' stacked cylinders and Activity's waveform.
+export function LibraryIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <path d="M12 6.5c-1.6-1-3.6-1.3-5.5-.8v11c1.9-.5 3.9-.2 5.5.8" />
+      <path d="M12 6.5c1.6-1 3.6-1.3 5.5-.8v11c-1.9-.5-3.9-.2-5.5.8" />
+      <path d="M12 6.5v11" />
+    </svg>
+  );
+}
+
 // Backups: stacked database cylinders — a saved snapshot of the store.
 export function BackupIcon(props: SVGProps<SVGSVGElement>) {
   return (
@@ -101,6 +113,41 @@ export function UpdateIcon(props: SVGProps<SVGSVGElement>) {
       <path d="M12 3.5v10.5" />
       <path d="M8 10.5 12 14.5 16 10.5" />
       <path d="M4.5 17.5v1.5a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-1.5" />
+    </svg>
+  );
+}
+
+// Tasks: a checklist — the Scheduled Task registry (COL-122), distinct from
+// Activity's plain waveform and Health's pulse-in-cross.
+export function TasksIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <rect x="4.5" y="4" width="15" height="16" rx="2" />
+      <path d="M8 9h8M8 13h8M8 17h5" />
+    </svg>
+  );
+}
+
+// Status: an info circle — the Status page's About panel (COL-123), distinct
+// from Health's pulse-in-cross, Update's tray, and Tasks' checklist.
+export function StatusIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 11v5.5" />
+      <circle cx="12" cy="8" r="0.75" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+// Logs: a document with horizontal rule lines — the current-log tail view
+// (COL-131), distinct from Tasks' checklist and Status' info circle.
+export function LogsIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <path d="M6.5 3.5h8l4 4v13a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1Z" />
+      <path d="M14 3.5v4h4" />
+      <path d="M8.5 12h7M8.5 15h7M8.5 18h4" />
     </svg>
   );
 }

@@ -24,6 +24,9 @@ const wantedResponse: WantedFile[] = [
     ],
     created_at: "2026-07-01T00:00:00Z",
     updated_at: "2026-07-02T00:00:00Z",
+    library_node_id: null,
+    node_type: null,
+    tracked: null,
   },
   {
     id: 2,
@@ -31,6 +34,9 @@ const wantedResponse: WantedFile[] = [
     missing_targets: [{ language: "fr", target: "stereo" }],
     created_at: "2026-07-03T00:00:00Z",
     updated_at: "2026-07-03T00:00:00Z",
+    library_node_id: null,
+    node_type: null,
+    tracked: null,
   },
 ];
 

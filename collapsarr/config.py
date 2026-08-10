@@ -22,6 +22,8 @@ Environment variable                Default                    Description
 ``COLLAPSARR_AUTH_PASSWORD``         *(unset)*                  First-boot seed: UI password.
 ``COLLAPSARR_AUTH_METHOD``           *(unset)*                  Seed only: forms or basic.
 ``COLLAPSARR_AUTH_REQUIRED``         *(unset)*                  Seed only: enabled or local_bypass.
+``COLLAPSARR_TRUSTED_PROXIES``       *(empty)*                  Trusted reverse-proxy allowlist.
+``COLLAPSARR_URL_BASE``              *(empty)*                  Reverse-proxy subpath prefix.
 ==================================  =========================  =======================
 
 ``COLLAPSARR_AUTH_USERNAME``/``COLLAPSARR_AUTH_PASSWORD`` (COL-53) are a
@@ -32,6 +34,27 @@ See :func:`collapsarr.settings.env_seed.seed_auth_from_env` for the seeding
 logic (one-shot: it never overwrites a credential that already exists, even
 if these variables are still set on a later boot) and the README's
 Authentication section for the password-recovery/lockout use case.
+
+``COLLAPSARR_TRUSTED_PROXIES`` (COL-112) is a comma-separated allowlist of
+IPs/CIDRs (e.g. ``10.0.0.0/8,192.168.1.1``) permitted to sit in front of
+Collapsarr as a reverse proxy and supply ``X-Forwarded-For``/
+``X-Forwarded-Proto``. Empty by default -- no peer is trusted, so those
+headers are ignored wherever they matter. An unparseable entry raises at
+``Settings`` construction (fail-fast) rather than being silently dropped. See
+:mod:`collapsarr.auth.trust` for the allowlist parsing and the
+``resolve_client_address``/``resolve_scheme`` functions that consume it.
+
+``COLLAPSARR_URL_BASE`` (COL-116) is a reverse-proxy subpath prefix (e.g.
+``/collapsarr``), matching Radarr's "Url Base" parity target. Empty by
+default -- no prefix, every route serves at the root exactly as today. When
+set, a request to ``<url_base>/...`` is stripped and routed as ``/...``, and
+the unprefixed form (e.g. a Docker healthcheck hitting ``/health`` directly)
+still resolves unchanged -- both keep working, per
+``docs/adr/0004-url-base-strip-middleware-not-root-path-flag.md``. A value
+missing its leading slash raises at ``Settings`` construction (fail-fast); a
+trailing slash is stripped automatically (normalized, not rejected). See
+:class:`collapsarr.url_base.UrlBaseMiddleware` for the strip-prefix ASGI
+middleware that consumes this setting.
 
 ``data_dir`` defaults to ``platformdirs.user_data_dir("collapsarr")`` — e.g.
 ``~/.local/share/collapsarr`` on Linux, native per-OS locations elsewhere —
@@ -155,6 +178,28 @@ class Settings(BaseSettings):
             "GlobalSettings' own default (local_bypass) when unset."
         ),
     )
+    trusted_proxies: str = Field(
+        default="",
+        description=(
+            "Comma-separated IPs/CIDRs (COL-112) trusted to sit in front of "
+            "Collapsarr as a reverse proxy and supply X-Forwarded-For/"
+            "X-Forwarded-Proto. Default empty -- no peer is trusted, so "
+            "those headers are ignored. See collapsarr.auth.trust for the "
+            "allowlist parsing and the resolve_client_address/resolve_scheme "
+            "functions that consume it."
+        ),
+    )
+    url_base: str = Field(
+        default="",
+        description=(
+            "Reverse-proxy subpath prefix (COL-116), e.g. '/collapsarr'. "
+            "Default empty -- no prefix, routes serve at the root as today. "
+            "When set, requests to <url_base>/... are stripped and routed "
+            "as /...; the unprefixed form still resolves unchanged. See "
+            "collapsarr.url_base.UrlBaseMiddleware and "
+            "docs/adr/0004-url-base-strip-middleware-not-root-path-flag.md."
+        ),
+    )
 
     @model_validator(mode="after")
     def _require_auth_seed_pair(self) -> Settings:
@@ -184,6 +229,45 @@ class Settings(BaseSettings):
         """
         if not self.database_path:
             self.database_path = str(Path(self.data_dir).expanduser() / "collapsarr.db")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_trusted_proxies(self) -> Settings:
+        """Fail fast on an unparseable ``COLLAPSARR_TRUSTED_PROXIES`` entry.
+
+        Delegates to :func:`collapsarr.auth.trust.parse_trusted_proxies` --
+        the single source of truth for the allowlist grammar -- so a
+        malformed IP/CIDR raises here, at startup, instead of being silently
+        ignored the first time a request needs the allowlist. Imported
+        locally (not at module scope) to avoid a load-time import cycle:
+        ``collapsarr.auth.trust`` imports :class:`Settings` from this module
+        for its own type hints, but by the time anything actually
+        *constructs* a ``Settings`` instance, this module has already
+        finished importing, so the deferred import here is safe.
+        """
+        from .auth.trust import parse_trusted_proxies
+
+        parse_trusted_proxies(self.trusted_proxies)
+        return self
+
+    @model_validator(mode="after")
+    def _normalize_url_base(self) -> Settings:
+        """Validate and normalize ``COLLAPSARR_URL_BASE`` (COL-116).
+
+        A configured value missing its leading slash is almost certainly a
+        misconfiguration -- :class:`~collapsarr.url_base.UrlBaseMiddleware`'s
+        prefix match assumes one -- so it raises here, at startup, rather
+        than silently never matching any request. A trailing slash is
+        stripped automatically (e.g. ``/collapsarr/`` -> ``/collapsarr``) so
+        the middleware's prefix match doesn't need to special-case it.
+        """
+        if self.url_base:
+            if not self.url_base.startswith("/"):
+                raise ValueError(
+                    "COLLAPSARR_URL_BASE must start with a leading slash, "
+                    "e.g. '/collapsarr'."
+                )
+            self.url_base = self.url_base.rstrip("/")
         return self
 
     @property

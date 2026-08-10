@@ -1,5 +1,6 @@
 import type { Backup, BackupList } from "../types/backups";
 import { apiErrorMessage, apiFetch } from "./client";
+import { prefixPath } from "../runtime/urlBase";
 
 /**
  * Fetches the backup list and support state (`GET /api/system/backup`, COL-63).
@@ -29,34 +30,32 @@ export async function createBackup(): Promise<Backup> {
 
 /**
  * Downloads a backup archive (`GET /api/system/backup/{id}/download`, COL-64)
- * and saves it to disk via the browser's download flow.
+ * via a real browser navigation, not a `fetch`.
  *
  * `backup.id` is already the `<type>/<filename>` path segment the server
  * expects (see `types/backups.ts`), so it's interpolated directly rather than
  * `encodeURIComponent`-ed -- encoding its embedded `/` would break the route.
- * A plain `<a href="...">` can't carry the stored API key / session, so this
- * routes the request through `apiFetch` (same auth as every other call),
- * reads the response as a `Blob`, and "clicks" a transient object-URL anchor
- * with `download` set -- the standard way to trigger a save dialog for a
- * fetched (rather than directly linked) resource.
+ *
+ * COL-138: this used to route through `apiFetch`, read the whole response as
+ * a `Blob`, then "click" a transient object-URL anchor -- the standard way to
+ * save a *fetched* resource. But `response.blob()` buffers the entire archive
+ * in tab memory before anything downloads, which silently stalls/OOMs on a
+ * large backup, and because the download is JS-driven rather than a real
+ * network navigation, the browser's download manager never sees it -- no
+ * progress, no failure entry, nothing. That `fetch` was only needed to attach
+ * the `X-Api-Key` header, but since COL-50 every `/api` request is *actually*
+ * authenticated by the session cookie first (`client.ts`'s own docs), which
+ * the browser attaches automatically to a plain navigation too -- so a direct
+ * `<a href>` click authenticates exactly the same way, and lets the browser
+ * stream the archive straight to disk with real progress/error reporting.
  */
-export async function downloadBackup(backup: Pick<Backup, "id" | "name">): Promise<void> {
-  const response = await apiFetch(`/api/system/backup/${backup.id}/download`);
-  if (!response.ok) {
-    throw new Error(await apiErrorMessage(response, `Failed to download backup (${response.status})`));
-  }
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  try {
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = backup.name;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+export function downloadBackup(backup: Pick<Backup, "id" | "name">): void {
+  const link = document.createElement("a");
+  link.href = prefixPath(`/api/system/backup/${backup.id}/download`);
+  link.download = backup.name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 /**

@@ -172,6 +172,76 @@ def test_upsert_multi_language_tracks_evaluated_independently(session: Session) 
 
 
 # ---------------------------------------------------------------------------
+# upsert_tracked_media: Library-node bridge ids (COL-101).
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_persists_sonarr_episode_id_and_instance_id(session: Session) -> None:
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/tv/pilot.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+        instance_id=7,
+        sonarr_episode_id=101,
+    )
+
+    assert media.instance_id == 7
+    assert media.sonarr_episode_id == 101
+    assert media.radarr_movie_id is None
+
+
+def test_upsert_persists_radarr_movie_id(session: Session) -> None:
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movies/interstellar.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+        instance_id=9,
+        radarr_movie_id=1,
+    )
+
+    assert media.instance_id == 9
+    assert media.radarr_movie_id == 1
+    assert media.sonarr_episode_id is None
+
+
+def test_upsert_without_ids_leaves_a_previously_established_linkage_alone(
+    session: Session,
+) -> None:
+    """A later id-less call (e.g. a manual trigger) doesn't clobber a known linkage."""
+    settings = DownmixSettings(enabled_targets=ALL_TARGETS)
+    upsert_tracked_media(
+        session,
+        file_path="/media/tv/pilot.mkv",
+        streams=[_stream(channels=8)],
+        settings=settings,
+        instance_id=7,
+        sonarr_episode_id=101,
+    )
+
+    media = upsert_tracked_media(
+        session, file_path="/media/tv/pilot.mkv", streams=[_stream(channels=8)], settings=settings
+    )
+
+    assert media.instance_id == 7
+    assert media.sonarr_episode_id == 101
+
+
+def test_upsert_ids_default_to_none_when_never_given(session: Session) -> None:
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/tv/pilot.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    assert media.instance_id is None
+    assert media.sonarr_episode_id is None
+    assert media.radarr_movie_id is None
+
+
+# ---------------------------------------------------------------------------
 # upsert_tracked_media: upsert-in-place semantics (no duplicates).
 # ---------------------------------------------------------------------------
 

@@ -74,7 +74,10 @@ a {
 
 .sidebar__brand-mark {
   display: inline-flex;
-  color: var(--c-accent);
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
 }
 
 .sidebar__brand-name {
@@ -132,6 +135,56 @@ a {
 
 .sidebar__link:hover .sidebar__link-icon {
   color: inherit;
+}
+
+/* ---- Libraries nav section (COL-100): expandable per-instance sub-items - */
+
+.sidebar__nav-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar__caret {
+  margin-left: auto;
+  color: var(--c-text-faint);
+  font-size: var(--fs-xs);
+}
+
+.sidebar__subnav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: var(--sp-1) 0 var(--sp-1) var(--sp-5);
+}
+
+.sidebar__sublink {
+  display: block;
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--radius-md);
+  color: var(--c-text-faint);
+  font-size: var(--fs-sm);
+  border-left: 2px solid transparent;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+
+.sidebar__sublink:hover {
+  background: var(--c-surface);
+  color: var(--c-text);
+}
+
+.sidebar__sublink--active,
+.sidebar__sublink--active:hover {
+  background: var(--c-accent-tint);
+  color: var(--c-text);
+  border-left-color: var(--c-accent);
+}
+
+.sidebar__subnav-message {
+  padding: var(--sp-1) var(--sp-3);
+  color: var(--c-text-faint);
+  font-size: var(--fs-xs);
 }
 
 .sidebar__footer {
@@ -587,6 +640,106 @@ a {
 .activity-table__error {
   color: var(--c-text-muted);
   max-width: 32ch;
+}
+
+.activity-table__error-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-table__error-text--clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.activity-table__show-more {
+  margin-top: var(--sp-1);
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--c-accent-hover);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.activity-table__show-more:hover {
+  color: var(--c-accent);
+  text-decoration: underline;
+}
+
+/* ---- Modal -------------------------------------------------------------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-5);
+  z-index: 100;
+}
+
+.modal {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.4);
+  width: 100%;
+  max-width: 640px;
+  max-height: min(80vh, 640px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--c-border);
+}
+
+.modal__title {
+  margin: 0;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+.modal__close {
+  border: none;
+  background: none;
+  color: var(--c-text-muted);
+  font-size: var(--fs-lg);
+  line-height: 1;
+  cursor: pointer;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+}
+
+.modal__close:hover {
+  color: var(--c-text);
+  background: var(--c-surface-raised);
+}
+
+.modal__body {
+  padding: var(--sp-5);
+  overflow-y: auto;
+}
+
+.activity-error-modal__text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--c-text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .activity-table__status {
@@ -1066,6 +1219,227 @@ a {
   max-width: none;
 }
 
+/* ---- Library browsing page (COL-100) ------------------------------------
+   Series > Season > Episode tree (Sonarr) or flat Movie table (Radarr),
+   rendered from GET /api/library/instances/{id}/tree. */
+
+.library-tree-panel {
+  overflow-x: auto;
+}
+
+/* "Select all" (COL-109): sits above the table/tree, inside the same
+   scrollable panel so it stays adjacent to what it acts on. */
+.library-tree-panel__actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--c-border);
+}
+
+.library-tree-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.library-tree-table th,
+.library-tree-table td {
+  padding: var(--sp-2) var(--sp-4);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.library-tree-table thead th {
+  color: var(--c-text-muted);
+  font-weight: 600;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--c-border);
+  white-space: nowrap;
+}
+
+.library-tree-table tbody tr + tr td {
+  border-top: 1px solid var(--c-border);
+}
+
+.library-tree-table__row--series td:first-child {
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+/* Nodes with no file yet (COL-100 AC): dimmed row, distinct from the
+   badge below so the distinction reads even without colour. */
+.library-tree-table__row--dimmed {
+  opacity: 0.6;
+}
+
+.library-tree-table__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.library-tree-table__caret {
+  display: inline-flex;
+  width: 1em;
+  color: var(--c-text-faint);
+  font-size: var(--fs-xs);
+}
+
+.library-tree-table__cell--indent-1 {
+  padding-left: calc(var(--sp-4) + var(--sp-5));
+}
+
+.library-tree-table__cell--indent-2 {
+  padding-left: calc(var(--sp-4) + var(--sp-5) * 2);
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+}
+
+.library-tree-table__file-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+}
+
+.library-tree-table__file-badge--present {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+}
+
+.library-tree-table__file-badge--missing {
+  color: var(--c-text-muted);
+  background: var(--c-surface-raised);
+}
+
+/* The Tracked toggle (COL-101), shared by LibraryPage's rows and
+   FileDetailPage's Tracked panel (components/TrackedToggleButton.tsx):
+   mirrors the file badge's pill shape so both status affordances on a row
+   read as the same visual language, but stays a real <button> (border,
+   cursor, disabled state) since it's interactive, unlike the read-only file
+   badge. */
+.tracked-toggle {
+  display: inline-flex;
+  align-items: center;
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.tracked-toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.tracked-toggle--on {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+  border-color: var(--c-success-tint);
+}
+
+.tracked-toggle--off {
+  color: var(--c-text-muted);
+  background: var(--c-surface-raised);
+  border-color: var(--c-border);
+}
+
+/* Row-level Select checkbox (COL-103): first column of every Library
+   tree/table row, backing the cross-level bulk selection. */
+.library-tree-table__select {
+  cursor: pointer;
+}
+
+.library-tree-table__select:disabled {
+  cursor: not-allowed;
+}
+
+/* The bulk-action toolbar (COL-103): appears above the tree/table once the
+   cross-level selection holds at least one row, offering a single Mark
+   Tracked / Mark Not Tracked action across the whole mixed-level selection. */
+.library-bulk-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4);
+  border-radius: var(--radius-md);
+  background: var(--c-surface-raised);
+  border: 1px solid var(--c-border);
+}
+
+.library-bulk-toolbar__count {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--c-text);
+  margin-right: auto;
+}
+
+.library-bulk-toolbar__clear {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--c-text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.library-bulk-toolbar__clear:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* The title search box + Tracked filter (COL-104): narrows the already-fetched
+   tree/table client-side, same layout as .activity-filters. */
+.library-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.library-filters__input,
+.library-filters__select {
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-md);
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+}
+
+.library-filters__input {
+  flex: 1 1 240px;
+  min-width: 200px;
+}
+
+.library-filters__input::placeholder {
+  color: var(--c-text-faint);
+}
+
+.library-filters__input:focus,
+.library-filters__select:focus {
+  outline: none;
+  border-color: var(--c-accent);
+}
+
 /* ---- Responsive: collapse the sidebar to a top bar on narrow screens - */
 
 @media (max-width: 640px) {
@@ -1374,6 +1748,201 @@ a {
   border: 1px solid var(--c-border);
   border-radius: var(--radius-sm);
   padding: 0 var(--sp-1);
+}
+
+/* ---- Status page (COL-123) ---------------------------------------------
+   The About panel's definition list -- structurally the same shape as
+   .update-panel__grid/.update-panel__row (Updates page), but its own class
+   names since this grid has no status-row/changelog/instructions siblings. */
+
+.status-panel {
+  padding: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.status-panel__title {
+  font-size: var(--fs-sm);
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--c-text-muted);
+}
+
+.status-panel__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--sp-4);
+  margin: 0;
+}
+
+.status-panel__row dt {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--sp-1);
+}
+
+.status-panel__row dd {
+  margin: 0;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* ---- Status page: Health summary & More Info (COL-125) ----------------- */
+
+.status-page__sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+.status-health-clear {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  color: var(--c-success);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.status-health-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin: 0;
+}
+
+.status-health-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+}
+
+.status-health-row__icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.status-health-row__icon--warning {
+  color: var(--c-warning);
+}
+
+.status-health-row__icon--error {
+  color: var(--c-danger);
+}
+
+.status-health-row__code {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-health-row__message {
+  color: var(--c-text-muted);
+}
+
+.status-links {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.status-links a {
+  color: var(--c-accent);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.status-links a:hover {
+  color: var(--c-accent-hover);
+  text-decoration: underline;
+}
+
+.status-links a:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ---- Logs page (COL-131) ------------------------------------------------ */
+
+.logs-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.logs-filters__select {
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-md);
+  color: var(--c-text);
+  font-size: var(--fs-sm);
+}
+
+.logs-filters__select:focus {
+  outline: none;
+  border-color: var(--c-accent);
+}
+
+.logs-table {
+  table-layout: fixed;
+}
+
+.logs-table__level-col {
+  width: 15%;
+}
+
+.logs-table__line-col {
+  width: 85%;
+}
+
+.logs-table__level {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+}
+
+.logs-table__level--debug {
+  color: var(--c-text-muted);
+  background: var(--c-border);
+}
+
+.logs-table__level--info {
+  color: var(--c-accent);
+  background: var(--c-accent-tint);
+}
+
+.logs-table__level--warning {
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+}
+
+.logs-table__level--error,
+.logs-table__level--critical {
+  color: var(--c-danger);
+  background: var(--c-danger-tint);
+}
+
+.logs-table__line {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -12,25 +12,13 @@ import {
 import { fetchSettings, updateSettings } from "../api/settings";
 import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
+import { formatBytes } from "../utils/format";
 
 /** Formats an ISO timestamp in the viewer's local time, or the raw value if unparseable. */
 function formatTimestamp(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
-}
-
-/** Human-readable byte size (e.g. `1.4 MB`). */
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let size = bytes / 1024;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(1)} ${units[unit]}`;
 }
 
 const TYPE_LABEL: Record<Backup["type"], string> = {
@@ -105,7 +93,6 @@ export function BackupsPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [confirmingRestoreId, setConfirmingRestoreId] = useState<string | null>(null);
@@ -218,15 +205,15 @@ export function BackupsPage() {
     }
   }
 
-  async function handleDownload(backup: Backup) {
-    setDownloadingId(backup.id);
+  function handleDownload(backup: Backup) {
+    // COL-138: downloadBackup triggers a real browser navigation rather than
+    // an awaited fetch, so there's no in-flight state to track here -- the
+    // browser's own download manager now shows progress/failure instead.
     setActionError(null);
     try {
-      await downloadBackup(backup);
+      downloadBackup(backup);
     } catch (error: unknown) {
       setActionError(error instanceof Error ? error.message : "Failed to download backup.");
-    } finally {
-      setDownloadingId(null);
     }
   }
 
@@ -479,16 +466,15 @@ export function BackupsPage() {
                 <tr key={backup.id}>
                   <td>{backup.name}</td>
                   <td>{TYPE_LABEL[backup.type] ?? backup.type}</td>
-                  <td>{formatSize(backup.size)}</td>
+                  <td>{formatBytes(backup.size)}</td>
                   <td>{formatTimestamp(backup.created_at)}</td>
                   <td className="data-table__actions">
                     <button
                       type="button"
                       className="btn btn--secondary btn--sm"
                       onClick={() => handleDownload(backup)}
-                      disabled={downloadingId === backup.id}
                     >
-                      {downloadingId === backup.id ? "Downloading…" : "Download"}
+                      Download
                     </button>
                     {confirmingRestoreId === backup.id ? (
                       <>

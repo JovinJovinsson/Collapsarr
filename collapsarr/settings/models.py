@@ -82,6 +82,14 @@ latest non-prerelease Release; ``beta`` is the latest prerelease Release
 (comparison logic for the beta channel is a later ticket -- COL-86 only
 persists the knob and always fetches the stable channel's latest release)."""
 
+DEFAULT_TRACKED = True
+"""Default :attr:`GlobalSettings.default_tracked` for a fresh install / an
+existing row backfilled by the additive migration (COL-98). A Library node
+whose ancestry carries no explicit **Tracked** override falls back to this
+instance-wide default; ``True`` means Collapsarr acts automatically on newly
+discovered media unless the user opts a subtree out (see ``CONTEXT.md``'s
+"Tracked")."""
+
 DEFAULT_UPDATE_CHANNEL = UPDATE_CHANNEL_STABLE
 """Default :attr:`GlobalSettings.update_channel` for a fresh install / an
 existing row backfilled by the additive migration. This is the ORM/DB-level
@@ -90,6 +98,17 @@ default (the column's ``default=``/``server_default=``); a fresh row's
 get_global_settings` at creation time, which overrides it with ``"beta"``
 when the running build is itself a beta build (COL-88) -- see
 :data:`BETA_LOCAL_SEGMENT_PREFIX`."""
+
+LOG_LEVEL_DEBUG = "DEBUG"
+LOG_LEVEL_INFO = "INFO"
+LOG_LEVEL_WARNING = "WARNING"
+LOG_LEVEL_ERROR = "ERROR"
+LOG_LEVELS = (LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_WARNING, LOG_LEVEL_ERROR)
+"""The four levels settable from Settings -> General's log-level dropdown
+(COL-130), matching Python's own level names (excluding ``CRITICAL``/
+``NOTSET``, which the dropdown doesn't expose). Validated against by
+:func:`collapsarr.settings.service.update_global_settings`, same treatment as
+:data:`UPDATE_CHANNEL_STABLE`/:data:`UPDATE_CHANNEL_BETA` above."""
 
 BETA_LOCAL_SEGMENT_PREFIX = "+beta"
 """The bare PEP 440 local-version marker a beta build carries in its running
@@ -205,6 +224,28 @@ class GlobalSettings(Base):
     DB-level constraint forcing the error threshold below the warning
     threshold, matching how ``backup_interval_days``/``backup_retention_days``
     also carry no cross-field constraint.
+
+    ``log_level`` (COL-130) is ``DEBUG``|``INFO``|``WARNING``|``ERROR``, or
+    ``None`` -- unlike every other field on this row, ``None`` is a
+    *meaningful* value, not just "not migrated yet": it means "no override,
+    fall back to the ``COLLAPSARR_LOG_LEVEL`` environment setting" (default
+    ``INFO``), resolved once at boot by
+    :func:`collapsarr.logging_setup.configure_logging`. Nullable at the DB
+    level with no ``server_default`` -- an existing install's row is
+    backfilled to ``NULL`` (not a concrete level) by the additive migration,
+    which is exactly the "still deferring to the env setting" behaviour it
+    already had. Validated against :data:`LOG_LEVELS` by
+    :func:`collapsarr.settings.service.update_global_settings`, same
+    treatment as ``update_channel`` above. A write here (through ``PUT
+    /api/settings``) is applied live to the ``collapsarr`` logger's effective
+    level and rotating file handler's ``backupCount`` by
+    :func:`collapsarr.logging_setup.apply_log_level` -- called from
+    :mod:`collapsarr.settings.routes`, mirroring how
+    :func:`rotate_session_secret`'s caller pushes the fresh secret into the
+    running process's cached copy -- and a persisted level survives a
+    restart, re-applied once the database is available during
+    :func:`collapsarr.main.create_app`'s lifespan (after the env-sourced boot
+    floor from ``configure_logging`` above has already run).
     """
 
     __tablename__ = "global_settings"
@@ -279,6 +320,15 @@ class GlobalSettings(Base):
         default=DEFAULT_UPDATE_CHANNEL,
         server_default=text(f"'{DEFAULT_UPDATE_CHANNEL}'"),
     )
+
+    default_tracked: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=DEFAULT_TRACKED,
+        server_default=text("1"),
+    )
+
+    log_level: Mapped[str | None] = mapped_column(String(10), nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)

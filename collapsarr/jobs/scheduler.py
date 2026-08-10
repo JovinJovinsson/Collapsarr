@@ -88,8 +88,15 @@ from pathlib import Path
 import httpx
 from sqlalchemy.orm import Session, sessionmaker
 
+from collapsarr.arr.catalog import (
+    MalformedCatalogResponse,
+    RadarrCatalog,
+    SonarrCatalog,
+    fetch_radarr_catalog,
+    fetch_sonarr_catalog,
+)
 from collapsarr.arr.files import fetch_monitored_files
-from collapsarr.arr.models import resolve_path
+from collapsarr.arr.models import ArrInstance, InstanceType, resolve_path
 from collapsarr.arr.service import list_instances, list_path_mappings
 from collapsarr.arr.webhooks import ResolvedWebhookFile
 from collapsarr.config import Settings
@@ -97,7 +104,14 @@ from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_
 from collapsarr.downmix.targets import DownmixSettings, detect_qualifying_targets
 from collapsarr.jobs.history import list_job_history
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus
+from collapsarr.library.service import (
+    get_node_by_source_id,
+    list_nodes,
+    resolve_tracked,
+    sync_library,
+)
 from collapsarr.media.service import upsert_tracked_media
+from collapsarr.settings.service import get_global_settings
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +119,17 @@ logger = logging.getLogger(__name__)
 #: :func:`~collapsarr.downmix.probe.probe_audio_streams` (called positionally),
 #: and is injectable so tests need neither ``ffprobe`` nor real media files.
 ProbeFn = Callable[[Path], Sequence[AudioStreamInfo]]
+
+#: Signature of the catalog-fetch seam: pull a Sonarr instance's full catalog.
+#: Matches :func:`~collapsarr.arr.catalog.fetch_sonarr_catalog`, and is
+#: injectable so the library-sync integration test needs no real Sonarr.
+CatalogFetchFn = Callable[[ArrInstance], SonarrCatalog]
+
+#: Signature of the Radarr catalog-fetch seam (COL-99): pull a Radarr
+#: instance's full, flat movie catalog. Matches
+#: :func:`~collapsarr.arr.catalog.fetch_radarr_catalog`, and is injectable so
+#: the library-sync integration test needs no real Radarr.
+RadarrCatalogFetchFn = Callable[[ArrInstance], RadarrCatalog]
 
 #: A job is "in flight" -- and so a duplicate -- when in either of these states.
 _ACTIVE_STATUSES = (JobStatus.PENDING, JobStatus.RUNNING)
@@ -134,8 +159,12 @@ class JobScheduler:
     downmix engine already takes a ``DownmixSettings`` argument, and a real
     settings store can be threaded through here later.
 
-    ``probe`` and ``now`` are injectable seams for testing (a stub probe and a
-    controllable clock); both default to the real implementations.
+    ``probe``, ``catalog_fetch``, ``radarr_catalog_fetch`` and ``now`` are
+    injectable seams for testing (a stub probe, stub Sonarr/Radarr full-catalog
+    fetches, and a controllable clock); all default to the real
+    implementations. ``catalog_fetch`` (COL-98) and ``radarr_catalog_fetch``
+    (COL-99) are what the scan uses to mirror each Sonarr/Radarr instance's
+    catalog into the Library on the same cadence -- see :meth:`scan_once`.
     """
 
     def __init__(
@@ -146,6 +175,8 @@ class JobScheduler:
         *,
         downmix_settings: DownmixSettings | None = None,
         probe: ProbeFn = probe_audio_streams,
+        catalog_fetch: CatalogFetchFn = fetch_sonarr_catalog,
+        radarr_catalog_fetch: RadarrCatalogFetchFn = fetch_radarr_catalog,
         now: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._queue = queue
@@ -153,6 +184,8 @@ class JobScheduler:
         self._settings = settings
         self._downmix_settings = downmix_settings or DownmixSettings()
         self._probe = probe
+        self._catalog_fetch = catalog_fetch
+        self._radarr_catalog_fetch = radarr_catalog_fetch
         self._now = now
         self._interval_seconds = settings.scan_interval_hours * 3600.0
         self._dedup_window = timedelta(hours=settings.scan_interval_hours)
@@ -160,6 +193,26 @@ class JobScheduler:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_scan_at: datetime | None = None
+        self._not_tracked_logged: dict[Path, datetime] = {}
+        self._bridge_missing_logged: dict[Path, datetime] = {}
+        self._not_tracked_log_lock = threading.Lock()
+
+    @property
+    def last_scan_at(self) -> datetime | None:
+        """UTC timestamp the most recent :meth:`scan_once` run started, or ``None`` (COL-122).
+
+        ``None`` until the first scan (manual or periodic) actually runs --
+        there is no persisted store for this, only an in-memory marker stamped
+        at the top of :meth:`scan_once`, so it resets on every process
+        restart same as the periodic loop's own ``time.monotonic()``-based
+        "next scan" bookkeeping. Exists so ``GET /api/system/tasks``
+        (:mod:`collapsarr.system.tasks`) can compute the Library Scan
+        Scheduled Task's next-run time the same way the other three
+        schedulers already expose theirs from their own existing state (see
+        ``docs/adr/0005-system-tasks-endpoint-not-shared-scheduler.md``).
+        """
+        return self._last_scan_at
 
     # -- Enqueue path (shared by webhook + scan) ----------------------------
 
@@ -171,8 +224,18 @@ class JobScheduler:
         so it is a host-local path ready to probe. Enqueuing a job (rather than
         running the pipeline inline) keeps the webhook response fast; the
         background loop, woken here, drains it promptly.
+
+        Passes ``file``'s ``instance_id``/``sonarr_episode_id``/
+        ``radarr_movie_id`` (COL-101) through to :meth:`enqueue_file` so the
+        resulting tracked-media row carries the Library-node bridge from the
+        moment a file first shows up via webhook.
         """
-        job = self.enqueue_file(file.file_path)
+        job = self.enqueue_file(
+            file.file_path,
+            instance_id=file.instance_id,
+            sonarr_episode_id=file.sonarr_episode_id,
+            radarr_movie_id=file.radarr_movie_id,
+        )
         if job is None:
             logger.info(
                 "webhook: no job enqueued for %s (duplicate or nothing to do)",
@@ -188,20 +251,46 @@ class JobScheduler:
         *,
         session: Session | None = None,
         settings: DownmixSettings | None = None,
+        instance_id: int | None = None,
+        sonarr_episode_id: int | None = None,
+        radarr_movie_id: int | None = None,
+        respect_tracked: bool = True,
     ) -> Job | None:
         """Enqueue a downmix job for ``file_path`` unless it should be skipped.
 
         Returns the created :class:`~collapsarr.jobs.queue.Job`, or ``None`` when
-        the file is a duplicate (already queued / recently processed), has no
-        qualifying downmix target, or cannot be probed. ``session`` (when given)
-        is reused for the history-based dedup lookup and the tracked-media
-        upsert below; otherwise a short-lived one is opened.
+        the file is a duplicate (already queued / recently processed), resolves
+        to **Not Tracked** (``respect_tracked`` -- see below), has no qualifying
+        downmix target, or cannot be probed. ``session`` (when given) is reused
+        for the history-based dedup lookup and the tracked-media upsert below;
+        otherwise a short-lived one is opened.
+
+        ``respect_tracked`` (COL-102) gates the enqueue on the file's resolved
+        **Tracked** value (``CONTEXT.md``): when ``True`` (the automatic paths --
+        :meth:`on_file_ready`, :meth:`scan_once`) a file whose owning
+        :class:`~collapsarr.library.models.LibraryNode` resolves to Not Tracked
+        is *tracked* (its media row is still upserted, below) but never
+        auto-enqueued -- Tracked gates automatic behavior only. :meth:`trigger_file`
+        passes ``False`` so an explicit manual trigger still downmixes a
+        Not-Tracked file. The gate is a no-op when there is no catalog identity
+        to resolve (``instance_id`` / episode / movie id all absent, e.g. a
+        bare-path manual trigger): such a file can't be bridged to a node, so it
+        is treated as Tracked and proceeds -- exactly the pre-COL-102 behavior.
 
         ``settings`` overrides :attr:`_downmix_settings` for this call only --
         used by :meth:`trigger_file` (COL-23) to pass a per-call allow-list
         override without mutating the scheduler's own default. It defaults to
         ``self._downmix_settings``, which is what :meth:`on_file_ready` and
         :meth:`scan_once` implicitly use.
+
+        ``instance_id``/``sonarr_episode_id``/``radarr_movie_id`` (COL-101) are
+        the Arr instance's own object ids for ``file_path``, when the caller
+        has them (:meth:`on_file_ready` and :meth:`scan_once` do;
+        :meth:`trigger_file`'s manual-trigger-by-bare-path callers don't).
+        Passed straight through to :meth:`_track_media` -- see
+        :func:`~collapsarr.media.service.upsert_tracked_media` for how an
+        id-less call is handled without clobbering a previously-established
+        linkage.
 
         The cheap dedup check runs first so an already-handled file isn't probed
         needlessly. It is re-checked under :attr:`_enqueue_lock` immediately
@@ -231,7 +320,31 @@ class JobScheduler:
             logger.warning("skipping %s: could not probe audio streams: %s", path, exc)
             return None
 
-        self._track_media(path, streams, effective_settings, session)
+        self._track_media(
+            path,
+            streams,
+            effective_settings,
+            session,
+            instance_id=instance_id,
+            sonarr_episode_id=sonarr_episode_id,
+            radarr_movie_id=radarr_movie_id,
+        )
+
+        # Tracked gate (COL-102): an automatic trigger never auto-enqueues a
+        # Not-Tracked file. Placed *after* _track_media so the file is still
+        # mirrored/tracked (it just isn't queued) and *before* the enqueue, so
+        # nothing about an already-queued/running job or produced tracks is
+        # touched -- Tracked only gates *future* automatic enqueueing.
+        if respect_tracked and not self._resolve_tracked(
+            session,
+            instance_id=instance_id,
+            sonarr_episode_id=sonarr_episode_id,
+            radarr_movie_id=radarr_movie_id,
+            path=path,
+        ):
+            if self._should_log_not_tracked(path):
+                logger.info("skipping %s: resolved Not Tracked, not auto-enqueuing", path)
+            return None
 
         if not detect_qualifying_targets(streams, effective_settings):
             return None
@@ -247,8 +360,12 @@ class JobScheduler:
         streams: Sequence[AudioStreamInfo],
         settings: DownmixSettings,
         session: Session | None,
+        *,
+        instance_id: int | None = None,
+        sonarr_episode_id: int | None = None,
+        radarr_movie_id: int | None = None,
     ) -> None:
-        """Upsert ``path``'s tracked-media row from ``streams`` (COL-95).
+        """Upsert ``path``'s tracked-media row from ``streams`` (COL-95/COL-101).
 
         Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
         when the caller passed one (:meth:`scan_once` does, since it already
@@ -257,12 +374,103 @@ class JobScheduler:
         don't have one open).
         """
         if session is not None:
-            upsert_tracked_media(session, file_path=path, streams=streams, settings=settings)
+            upsert_tracked_media(
+                session,
+                file_path=path,
+                streams=streams,
+                settings=settings,
+                instance_id=instance_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_movie_id=radarr_movie_id,
+            )
             return
         with self._session_factory() as owned_session:
             upsert_tracked_media(
-                owned_session, file_path=path, streams=streams, settings=settings
+                owned_session,
+                file_path=path,
+                streams=streams,
+                settings=settings,
+                instance_id=instance_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_movie_id=radarr_movie_id,
             )
+
+    def _resolve_tracked(
+        self,
+        session: Session | None,
+        *,
+        instance_id: int | None,
+        sonarr_episode_id: int | None,
+        radarr_movie_id: int | None,
+        path: Path | None = None,
+    ) -> bool:
+        """Resolve the file's effective **Tracked** value for the auto-enqueue gate.
+
+        Returns ``True`` (proceed) when there is no catalog identity to gate on
+        -- an ``instance_id`` plus an episode *or* movie id is required to bridge
+        the file to its :class:`~collapsarr.library.models.LibraryNode`; without
+        one (a bare-path manual trigger) the file is treated as Tracked, the
+        pre-COL-102 behavior. With ids present but no matching node, falls back
+        to ``GlobalSettings.default_tracked`` -- the same fallback
+        :func:`~collapsarr.library.service.resolve_tracked` itself uses when
+        nothing in a node's ancestry is explicit; this fallback is logged (COL-134)
+        via ``path`` (when the caller has one) so it's diagnosable from server
+        logs whether a file shown/skipped this way is genuinely Tracked or the
+        bridge simply couldn't find a node. Mirrors :meth:`_is_duplicate`'s
+        session handling: reuses ``session`` when the caller has one open (the
+        scan), else opens a short-lived one (the webhook/manual paths).
+        """
+        if instance_id is None or (sonarr_episode_id is None and radarr_movie_id is None):
+            return True
+        if session is not None:
+            return self._resolve_tracked_in(
+                session,
+                instance_id=instance_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_movie_id=radarr_movie_id,
+                path=path,
+            )
+        with self._session_factory() as owned_session:
+            return self._resolve_tracked_in(
+                owned_session,
+                instance_id=instance_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_movie_id=radarr_movie_id,
+                path=path,
+            )
+
+    def _resolve_tracked_in(
+        self,
+        session: Session,
+        *,
+        instance_id: int,
+        sonarr_episode_id: int | None,
+        radarr_movie_id: int | None,
+        path: Path | None = None,
+    ) -> bool:
+        """Resolve Tracked for a file with catalog ids, within ``session``."""
+        default_tracked = get_global_settings(session).default_tracked
+        node = get_node_by_source_id(
+            session,
+            instance_id=instance_id,
+            sonarr_episode_id=sonarr_episode_id,
+            radarr_movie_id=radarr_movie_id,
+        )
+        if node is None:
+            if path is None or self._should_log_bridge_missing(path):
+                logger.warning(
+                    "tracked bridge: no LibraryNode for instance_id=%s "
+                    "sonarr_episode_id=%s radarr_movie_id=%s (%s) -- "
+                    "falling back to default_tracked=%s",
+                    instance_id,
+                    sonarr_episode_id,
+                    radarr_movie_id,
+                    path,
+                    default_tracked,
+                )
+            return default_tracked
+        nodes_by_id = {n.id: n for n in list_nodes(session, instance_id)}
+        return resolve_tracked(node, nodes_by_id, default_tracked)
 
     def trigger_file(
         self,
@@ -291,16 +499,21 @@ class JobScheduler:
           are unioned in just for this trigger; ``self._downmix_settings``
           itself, and every other trigger, are unaffected.
 
-        Still goes through the same dedup and qualifying-target detection as
-        the automatic triggers -- the acceptance criteria ask to bypass the
-        *language allow-list* specifically, not dedup or "does this file
+        Bypasses the **Tracked** gate (COL-102): a manual trigger is an
+        explicit user action, so it downmixes even a Not-Tracked file (Tracked
+        gates only *automatic* enqueueing -- ``CONTEXT.md``). It still goes
+        through the same dedup and qualifying-target detection as the automatic
+        triggers -- the acceptance criteria ask to bypass the *language
+        allow-list* (and Tracked) specifically, not dedup or "does this file
         actually need downmixing". Returns the created
         :class:`~collapsarr.jobs.queue.Job`, or ``None`` for the same reasons
         :meth:`enqueue_file` would (duplicate, unprobeable, or still no
         qualifying target even with the extra languages included).
         """
         settings = self._settings_with_extra_languages(extra_languages)
-        return self.enqueue_file(file_path, session=session, settings=settings)
+        return self.enqueue_file(
+            file_path, session=session, settings=settings, respect_tracked=False
+        )
 
     def _settings_with_extra_languages(
         self, extra_languages: Iterable[str] | None
@@ -327,6 +540,35 @@ class JobScheduler:
             job.file_path == path and job.status in _ACTIVE_STATUSES
             for job in self._queue.list_jobs()
         )
+
+    def _should_log_once(self, cache: dict[Path, datetime], path: Path) -> bool:
+        """Whether to log ``path`` now against ``cache``, or suppress a repeat.
+
+        Logged once per file, then suppressed until :attr:`_dedup_window`
+        elapses -- the same window :meth:`_is_recently_processed` uses --
+        so a persistently-recurring condition doesn't spam one identical
+        line per scan forever, while a scan interval later a fresh line
+        still confirms it's still true (rather than going silent
+        permanently). ``cache`` lets callers track distinct log conditions
+        (COL-135's Not-Tracked skip, COL-134's bridge-missing fallback)
+        independently -- one firing never suppresses the other for the
+        same file.
+        """
+        now = self._now()
+        with self._not_tracked_log_lock:
+            last = cache.get(path)
+            if last is not None and now - last < self._dedup_window:
+                return False
+            cache[path] = now
+            return True
+
+    def _should_log_not_tracked(self, path: Path) -> bool:
+        """Whether to log ``path``'s Not-Tracked skip now (COL-135)."""
+        return self._should_log_once(self._not_tracked_logged, path)
+
+    def _should_log_bridge_missing(self, path: Path) -> bool:
+        """Whether to log ``path``'s bridge-missing fallback now (COL-134)."""
+        return self._should_log_once(self._bridge_missing_logged, path)
 
     def _is_recently_processed(self, path: Path, session: Session) -> bool:
         """Whether a terminal history row for ``path`` falls inside the dedup window."""
@@ -358,17 +600,36 @@ class JobScheduler:
         return self.scan_once()
 
     def scan_once(self) -> list[Job]:
-        """Scan every configured instance's monitored files and enqueue qualifying ones.
+        """Scan every configured instance: mirror its Library and enqueue qualifying files.
+
+        Two independent per-instance passes share the one scan cadence:
+
+        - **Library mirror (COL-98/COL-99):** for each Sonarr instance, fetch
+          its full catalog (:attr:`_catalog_fetch`); for each Radarr instance,
+          fetch its full movie catalog (:attr:`_radarr_catalog_fetch`); then
+          :func:`~collapsarr.library.service.sync_library` -- upserting every
+          Series/Season/Episode or Movie node (files-not-yet-present included)
+          and soft-hiding any node the catalog no longer reports.
+        - **Downmix discovery (COL-22):** enqueue every monitored file with a
+          qualifying missing target.
 
         Returns the jobs enqueued this pass (skipped/no-op files excluded). A
-        fetch failure for one instance is logged and skipped rather than
-        aborting the whole scan, so one unreachable Sonarr/Radarr doesn't stop
-        the others from being scanned.
+        fetch failure for one instance -- for either pass -- is logged and
+        skipped rather than aborting the whole scan, so one unreachable
+        Sonarr/Radarr doesn't stop the others (or the other pass) from running.
+
+        Stamps :attr:`last_scan_at` (COL-122) at the very start, before any
+        instance is synced -- so it reflects when this pass *started*, and is
+        set even if the pass later fails partway through fetching some
+        instance's catalog/files.
         """
+        self._last_scan_at = self._now()
         enqueued: list[Job] = []
         with self._session_factory() as session:
             instances = list_instances(session)
             for instance in instances:
+                self._sync_instance_library(session, instance)
+
                 try:
                     files = fetch_monitored_files(instance)
                 except httpx.HTTPError as exc:
@@ -382,7 +643,13 @@ class JobScheduler:
                 mappings = list_path_mappings(session, instance.id)
                 for monitored in files:
                     local_path = resolve_path(monitored.file_path, mappings)
-                    job = self.enqueue_file(local_path, session=session)
+                    job = self.enqueue_file(
+                        local_path,
+                        session=session,
+                        instance_id=monitored.instance_id,
+                        sonarr_episode_id=monitored.sonarr_episode_id,
+                        radarr_movie_id=monitored.radarr_movie_id,
+                    )
                     if job is not None:
                         enqueued.append(job)
         logger.info(
@@ -391,6 +658,40 @@ class JobScheduler:
             len(instances),
         )
         return enqueued
+
+    def _sync_instance_library(self, session: Session, instance: ArrInstance) -> None:
+        """Mirror one configured instance's catalog into the Library (COL-98/COL-99).
+
+        Dispatches on ``instance.type``: a Sonarr instance's full
+        Series/Season/Episode catalog is fetched via :attr:`_catalog_fetch`, a
+        Radarr instance's full movie catalog via :attr:`_radarr_catalog_fetch`
+        -- both then upserted through the same
+        :func:`~collapsarr.library.service.sync_library` entry point. A
+        catalog-fetch failure -- a network/HTTP-status failure
+        (``httpx.HTTPError``) or an HTTP 200 with an unexpected body shape
+        (:class:`~collapsarr.arr.catalog.MalformedCatalogResponse`, COL-136)
+        -- is logged and swallowed so it never aborts the scan. Crucially,
+        ``sync_library`` is *not* called on either failure, so neither a
+        transient outage nor a malformed-but-200 response ever soft-hides
+        the whole mirror.
+        """
+        catalog: SonarrCatalog | RadarrCatalog
+        try:
+            if instance.type is InstanceType.SONARR:
+                catalog = self._catalog_fetch(instance)
+            elif instance.type is InstanceType.RADARR:
+                catalog = self._radarr_catalog_fetch(instance)
+            else:  # pragma: no cover - InstanceType has exactly two members
+                return
+        except (httpx.HTTPError, MalformedCatalogResponse) as exc:
+            logger.warning(
+                "scan: failed to fetch catalog from instance %r (id=%s): %s",
+                instance.name,
+                instance.id,
+                exc,
+            )
+            return
+        sync_library(session, instance_id=instance.id, catalog=catalog)
 
     # -- Background loop lifecycle ------------------------------------------
 
