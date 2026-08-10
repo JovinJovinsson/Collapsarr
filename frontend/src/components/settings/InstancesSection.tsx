@@ -11,12 +11,11 @@ type ListState =
 
 interface InstanceFormValues {
   name: string;
-  type: InstanceType;
   base_url: string;
   api_key: string;
 }
 
-const EMPTY_FORM: InstanceFormValues = { name: "", type: "sonarr", base_url: "", api_key: "" };
+const EMPTY_FORM: InstanceFormValues = { name: "", base_url: "", api_key: "" };
 
 const TYPE_LABEL: Record<InstanceType, string> = { sonarr: "Sonarr", radarr: "Radarr" };
 const STATUS_LABEL: Record<ArrInstance["status"], string> = {
@@ -41,8 +40,16 @@ function validateInstanceForm(form: InstanceFormValues): string | null {
 /**
  * Instances + path-mappings CRUD (COL-33's AC1), backed by COL-27's
  * `/api/instances` and nested `/api/instances/{id}/path-mappings`.
+ *
+ * Type-scoped (COL-144): the old composed `/settings` page rendered one
+ * table mixing Sonarr and Radarr instances with a type `<select>` on the
+ * create form; `SettingsSonarrPage`/`SettingsRadarrPage` each render this
+ * same component fixed to one `type` instead, so the table only ever lists
+ * that type's instances and the create form has no type selector -- the
+ * backend has no `?type=` filter on `GET /api/instances`, so filtering
+ * happens client-side over the full list.
  */
-export function InstancesSection() {
+export function InstancesSection({ type }: { type: InstanceType }) {
   const [state, setState] = useState<ListState>({ status: "loading" });
 
   const [showCreate, setShowCreate] = useState(false);
@@ -87,7 +94,7 @@ export function InstancesSection() {
     try {
       await createInstance({
         name: createForm.name.trim(),
-        type: createForm.type,
+        type,
         base_url: createForm.base_url.trim(),
         api_key: createForm.api_key.trim(),
       });
@@ -105,7 +112,6 @@ export function InstancesSection() {
     setEditingId(instance.id);
     setEditForm({
       name: instance.name,
-      type: instance.type,
       base_url: instance.base_url,
       api_key: instance.api_key,
     });
@@ -152,15 +158,16 @@ export function InstancesSection() {
     }
   }
 
-  const instances = state.status === "ready" ? state.instances : [];
+  const instances = state.status === "ready" ? state.instances.filter((instance) => instance.type === type) : [];
+  const typeLabel = TYPE_LABEL[type];
 
   return (
     <section className="settings-section">
       <div className="settings-section__header">
         <div>
-          <h2 className="settings-section__title">Instances</h2>
+          <h2 className="settings-section__title">{typeLabel}</h2>
           <p className="settings-section__summary">
-            Sonarr/Radarr connections and their remote-to-local path mappings.
+            {typeLabel} connections and their remote-to-local path mappings.
           </p>
         </div>
         <button
@@ -183,23 +190,10 @@ export function InstancesSection() {
               <input
                 id="instance-name"
                 type="text"
-                placeholder="Sonarr"
+                placeholder={typeLabel}
                 value={createForm.name}
                 onChange={(event) => setCreateForm({ ...createForm, name: event.target.value })}
               />
-            </div>
-            <div className="form-field">
-              <label htmlFor="instance-type">Type</label>
-              <select
-                id="instance-type"
-                value={createForm.type}
-                onChange={(event) =>
-                  setCreateForm({ ...createForm, type: event.target.value as InstanceType })
-                }
-              >
-                <option value="sonarr">Sonarr</option>
-                <option value="radarr">Radarr</option>
-              </select>
             </div>
             <div className="form-field">
               <label htmlFor="instance-base-url">Base URL</label>
@@ -245,7 +239,7 @@ export function InstancesSection() {
       {state.status === "ready" && instances.length === 0 && (
         <div className="panel panel--empty">
           <p className="panel__message">
-            No arr instances configured yet. Add a Sonarr or Radarr connection to get started.
+            No {typeLabel} instances configured yet. Add a {typeLabel} connection to get started.
           </p>
         </div>
       )}

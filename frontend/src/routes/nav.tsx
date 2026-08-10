@@ -19,7 +19,8 @@ import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { LogsPage } from "../pages/LogsPage";
 import { SettingsConnectPage } from "../pages/SettingsConnectPage";
 import { SettingsGeneralPage } from "../pages/SettingsGeneralPage";
-import { SettingsPage } from "../pages/SettingsPage";
+import { SettingsRadarrPage } from "../pages/SettingsRadarrPage";
+import { SettingsSonarrPage } from "../pages/SettingsSonarrPage";
 import { SettingsTargetsPage } from "../pages/SettingsTargetsPage";
 import { StatusPage } from "../pages/StatusPage";
 import { TasksPage } from "../pages/TasksPage";
@@ -44,27 +45,26 @@ export const LIBRARIES_PATH = "/libraries";
 export const SYSTEM_PATH = "/system";
 
 /**
- * Base path of the "Settings" primary nav item -- still the old composed
- * `SettingsPage` for now (COL-142 only splits out General; Instances/
- * Targets/Connect migrate to their own pages in later Epic tickets). Kept as
- * a constant, mirroring `LIBRARIES_PATH`/`SYSTEM_PATH`, since `Sidebar`
- * (to special-case Settings' sidebar entry onto `NavSection`) and this
- * module's own `navItems` entry below both need to recognise the same path
- * without risking drift between two hardcoded string literals.
+ * Base path of the "Settings" nav group. Now that every section has migrated
+ * off the old composed `SettingsPage` (COL-142/COL-143/COL-144), this behaves
+ * exactly like `SYSTEM_PATH`: a bare route that redirects to the sub-nav's
+ * first entry (wired in `router.tsx`), and the `NavSection` `to`/expand base
+ * both Sidebar and this module use -- no more of the narrower
+ * `SETTINGS_GENERAL_PATH`-as-`to` workaround COL-142/COL-143 needed while the
+ * old page still lived at this path. Kept as a constant, mirroring
+ * `LIBRARIES_PATH`/`SYSTEM_PATH`, so `Sidebar`, `router.tsx`, and this
+ * module's own `settingsNavItems` below can't drift on the literal string.
  */
 export const SETTINGS_PATH = "/settings";
 
-/**
- * Path of the Settings sub-nav's first entry, General (COL-142). Unlike
- * `SYSTEM_PATH`, whose `NavSection` `to` and default-redirect target are the
- * group's own base path, Settings' base path (`SETTINGS_PATH`) still serves
- * the old composed page until every remaining section has migrated -- so the
- * sidebar's Settings entry links/expands through this narrower path instead
- * (COL-142 AC), not `SETTINGS_PATH` itself. No bare `SETTINGS_PATH` ->
- * `SETTINGS_GENERAL_PATH` redirect is wired yet; that ships with the last
- * migration (COL-144), once nothing else needs the old composed page.
- */
+/** Path of the Settings sub-nav's General entry (COL-142). */
 export const SETTINGS_GENERAL_PATH = `${SETTINGS_PATH}/general`;
+
+/** Path of the Settings sub-nav's Sonarr entry (COL-144). */
+export const SETTINGS_SONARR_PATH = `${SETTINGS_PATH}/sonarr`;
+
+/** Path of the Settings sub-nav's Radarr entry (COL-144). */
+export const SETTINGS_RADARR_PATH = `${SETTINGS_PATH}/radarr`;
 
 /** Path of the Settings sub-nav's Targets entry (COL-143). */
 export const SETTINGS_TARGETS_PATH = `${SETTINGS_PATH}/targets`;
@@ -84,12 +84,17 @@ export interface NavItem {
  * definitions) and the sidebar (links) read from this, so adding a view is a
  * one-line change here. Kept in its own module to avoid a router <-> sidebar
  * import cycle.
+ *
+ * Settings isn't listed here (COL-144): like System, it's an expandable
+ * `NavSection` group rather than a single destination/page component, so
+ * `Sidebar` renders it directly (mirroring how System is rendered) and
+ * `router.tsx` wires its bare-path redirect + `settingsNavItems` explicitly
+ * rather than through this array.
  */
 export const navItems: NavItem[] = [
   { to: "/wanted", label: "Wanted", icon: <WantedIcon />, element: <WantedPage /> },
   { to: LIBRARIES_PATH, label: "Libraries", icon: <LibraryIcon />, element: <LibrariesIndexPage /> },
   { to: "/activity", label: "Activity", icon: <ActivityIcon />, element: <ActivityPage /> },
-  { to: SETTINGS_PATH, label: "Settings", icon: <SettingsIcon />, element: <SettingsPage /> },
 ];
 
 /**
@@ -116,18 +121,23 @@ export const systemNavItems: NavItem[] = [
 ];
 
 /**
- * The **Settings** sub-nav (COL-139/COL-142/COL-143): mirrors
+ * The **Settings** sub-nav (COL-139/COL-142/COL-143/COL-144): mirrors
  * `systemNavItems`' shape, splitting the old composed `SettingsPage` into
  * Bazarr-style dedicated pages one at a time. General (COL-142) was the
- * first migrated page; Targets and Connect (COL-143) are the second and
- * third -- `SettingsTargetsPage`/`SettingsConnectPage` render
- * `TargetsSection`'s/`ConnectSection`'s content unchanged. The old
- * `/settings` route (wired via `navItems` above) still serves the
- * not-yet-migrated Instances section and stays reachable until it migrates
- * too (COL-144, the last ticket in this Epic).
+ * first migrated page; Targets and Connect (COL-143) were the second and
+ * third; Sonarr and Radarr (COL-144) are the last two, splitting the old
+ * combined Sonarr/Radarr instances table into two type-scoped pages
+ * (`SettingsSonarrPage`/`SettingsRadarrPage`, both rendering
+ * `InstancesSection` fixed to one `type`). This is the full Phase-1 order:
+ * General, Sonarr, Radarr, Targets, Connect -- the old composed
+ * `SettingsPage` and its `/settings` route are gone; a bare `/settings`
+ * redirects to `SETTINGS_GENERAL_PATH` instead (wired in `router.tsx`,
+ * mirroring the bare `/system` redirect).
  */
 export const settingsNavItems: NavItem[] = [
   { to: SETTINGS_GENERAL_PATH, label: "General", icon: <SettingsIcon />, element: <SettingsGeneralPage /> },
+  { to: SETTINGS_SONARR_PATH, label: "Sonarr", icon: <SettingsIcon />, element: <SettingsSonarrPage /> },
+  { to: SETTINGS_RADARR_PATH, label: "Radarr", icon: <SettingsIcon />, element: <SettingsRadarrPage /> },
   { to: SETTINGS_TARGETS_PATH, label: "Targets", icon: <SettingsIcon />, element: <SettingsTargetsPage /> },
   { to: SETTINGS_CONNECT_PATH, label: "Connect", icon: <SettingsIcon />, element: <SettingsConnectPage /> },
 ];

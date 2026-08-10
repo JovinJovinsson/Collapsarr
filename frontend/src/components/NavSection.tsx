@@ -9,12 +9,18 @@ export interface NavSectionProps {
   /**
    * Destination of the group's default link, and the base path
    * `useNavGroupExpanded` expands under (this path itself, or anything
-   * nested under it). For System this is the group's own base path
-   * (`/system`); Settings (COL-142) instead passes its sub-nav's first
-   * entry (`/settings/general`), since the group's actual base path
-   * (`/settings`) still belongs to the old composed page mid-migration --
-   * so don't assume `to` is always the group's literal base path when
-   * reusing this component elsewhere.
+   * nested under it) -- for both current consumers (System's `/system`,
+   * Settings' `/settings` as of COL-144) this is the group's own literal
+   * base path, which also has a bare-path `<Navigate>` redirect to the
+   * sub-nav's first entry (wired in `router.tsx`) so the link itself is
+   * always a valid destination. From COL-142 through COL-143, Settings
+   * passed a narrower path here (`/settings/general`) because `/settings`
+   * itself still served the old composed page mid-migration; that workaround
+   * is gone now that nothing owns the bare base path but the redirect. If a
+   * future consumer's base path is ever a real page again (not just a
+   * redirect), passing a narrower `to` here is still the way to route around
+   * it -- this prop still does double duty (default link + expand base), so
+   * don't assume it must equal the group's literal base path everywhere.
    */
   to: string;
   label: string;

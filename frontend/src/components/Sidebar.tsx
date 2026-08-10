@@ -5,16 +5,9 @@ import type { ReactNode } from "react";
 
 import { logout } from "../api/auth";
 import { useHealth } from "../hooks/useHealth";
-import {
-  LIBRARIES_PATH,
-  navItems,
-  SETTINGS_GENERAL_PATH,
-  SETTINGS_PATH,
-  settingsNavItems,
-  SYSTEM_PATH,
-  systemNavItems,
-} from "../routes/nav";
+import { LIBRARIES_PATH, navItems, SETTINGS_PATH, settingsNavItems, SYSTEM_PATH, systemNavItems } from "../routes/nav";
 import type { NavItem } from "../routes/nav";
+import { SettingsIcon } from "./icons";
 import { LibraryNavSection } from "./LibraryNavSection";
 import { NavSection } from "./NavSection";
 
@@ -80,25 +73,16 @@ export function Sidebar() {
           // primary nav item uses.
           if (item.to === LIBRARIES_PATH) return <LibraryNavSection key={item.to} {...item} />;
 
-          // Settings (COL-142): expands only while a /settings/general route
-          // is active, mirroring System's NavSection below, though it
-          // links/expands through SETTINGS_GENERAL_PATH rather than
-          // SETTINGS_PATH -- the latter still serves the old composed
-          // SettingsPage (Instances/Targets/Connect) until COL-144.
-          if (item.to === SETTINGS_PATH) {
-            return (
-              <NavSection
-                key={item.to}
-                to={SETTINGS_GENERAL_PATH}
-                label={item.label}
-                icon={item.icon}
-                items={settingsNavItems}
-              />
-            );
-          }
-
           return <NavLinkItem key={item.to} {...item} />;
         })}
+
+        {/* Settings (COL-142/COL-144): expands only while a /settings/*
+            route is active. Once every section had migrated off the old
+            composed SettingsPage (COL-144), SETTINGS_PATH itself became a
+            bare redirect (router.tsx) rather than a distinct page, so `to`
+            can be the group's own base path -- same as System below -- and
+            isn't part of `navItems` for the same reason System isn't. */}
+        <NavSection to={SETTINGS_PATH} label="Settings" icon={<SettingsIcon />} items={settingsNavItems} />
 
         {/* System (COL-63): expands only while a /system/* route is active
             (COL-141), rather than always-visible like the primary items

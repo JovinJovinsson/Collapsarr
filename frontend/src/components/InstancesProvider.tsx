@@ -17,7 +17,8 @@ import type { InstancesState } from "../context/instancesContext";
  * page's own). Mounted once in `AppShell`, above both the sidebar and the
  * routed `<Outlet />`, so both share this single fetch/state instead.
  *
- * The Settings page's `InstancesSection` intentionally stays on its own
+ * Settings' Sonarr/Radarr pages' shared `InstancesSection` (COL-144;
+ * `/settings/sonarr`, `/settings/radarr`) intentionally stays on its own
  * `fetchInstances()` call rather than this provider: it owns create/update/
  * delete/reload of instances, which this read-only shared state doesn't
  * (and doesn't need to for the Libraries browsing views).

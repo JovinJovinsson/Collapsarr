@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 
 import { fetchInstances } from "../api/instances";
 import { fetchSettings } from "../api/settings";
+import { SETTINGS_SONARR_PATH } from "../routes/nav";
 
 const DISMISSED_STORAGE_KEY = "collapsarr.onboardingDismissed";
 
@@ -49,6 +50,14 @@ type LoadState =
  * Renders nothing while loading or on a fetch error, matching `HealthBanner`'s
  * "fail quiet" stance: a transient network hiccup shouldn't block the rest of
  * the app shell from rendering.
+ *
+ * The CTA links into `SETTINGS_SONARR_PATH` (COL-144): the old composed
+ * `/settings` route showed the combined Sonarr/Radarr instances table
+ * directly, but that page is gone now that Instances split into type-scoped
+ * pages -- a bare `/settings` redirects to General instead, which has no
+ * instance CRUD, so linking there would add an extra click. Sonarr is the
+ * more direct landing spot (first of the two instance pages in nav order);
+ * Radarr is one click away via the Settings sub-nav either way.
  */
 export function OnboardingPanel() {
   const [dismissed, setDismissedState] = useState(isDismissed);
@@ -90,8 +99,8 @@ export function OnboardingPanel() {
         <h2 className="onboarding-panel__title">Welcome to Collapsarr</h2>
         <p className="onboarding-panel__message">
           Your auto-generated API key is <code>{state.apiKey}</code>. Next,{" "}
-          <Link to="/settings">connect your first Sonarr or Radarr instance</Link> so Collapsarr
-          knows what to track.
+          <Link to={SETTINGS_SONARR_PATH}>connect your first Sonarr or Radarr instance</Link> so
+          Collapsarr knows what to track.
         </p>
       </div>
       <button

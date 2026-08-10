@@ -62,7 +62,7 @@ function renderPanel() {
     <MemoryRouter initialEntries={["/wanted"]}>
       <Routes>
         <Route path="/wanted" element={<OnboardingPanel />} />
-        <Route path="/settings" element={<div>Settings view</div>} />
+        <Route path="/settings/sonarr" element={<div>Settings view</div>} />
       </Routes>
     </MemoryRouter>,
   );
@@ -72,7 +72,7 @@ function renderPanel() {
  * Covers COL-54's AC: the onboarding panel renders with the auto-generated
  * API key and a working link to instance configuration while the install is
  * unconfigured, is dismissible and stays dismissed, and gets out of the way
- * once an arr instance is configured. Prior art: `settingsPage.test.tsx`
+ * once an arr instance is configured. Prior art: `settingsSonarr.test.tsx`
  * (mocked-fetch render pattern) and `apiClient.test.ts` (localStorage
  * persistence pattern).
  */
@@ -94,7 +94,9 @@ describe("OnboardingPanel", () => {
     expect(screen.getByText("onboarding-server-key")).toBeInTheDocument();
 
     const link = screen.getByRole("link", { name: /connect your first sonarr or radarr instance/i });
-    expect(link).toHaveAttribute("href", "/settings");
+    // Links to the Sonarr instances page directly (COL-144) rather than the
+    // old composed /settings route -- see OnboardingPanel's doc comment.
+    expect(link).toHaveAttribute("href", "/settings/sonarr");
 
     fireEvent.click(link);
     expect(await screen.findByText("Settings view")).toBeInTheDocument();
