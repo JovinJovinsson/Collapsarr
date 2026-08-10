@@ -62,7 +62,8 @@ function renderPanel() {
     <MemoryRouter initialEntries={["/wanted"]}>
       <Routes>
         <Route path="/wanted" element={<OnboardingPanel />} />
-        <Route path="/settings/sonarr" element={<div>Settings view</div>} />
+        <Route path="/settings/sonarr" element={<div>Sonarr settings view</div>} />
+        <Route path="/settings/radarr" element={<div>Radarr settings view</div>} />
       </Routes>
     </MemoryRouter>,
   );
@@ -86,20 +87,23 @@ describe("OnboardingPanel", () => {
     localStorage.clear();
   });
 
-  it("renders the auto-generated API key and a working link to instance configuration when unconfigured", async () => {
+  it("renders the auto-generated API key and two separate links to instance configuration when unconfigured", async () => {
     stubFetch([]);
     renderPanel();
 
     expect(await screen.findByText(/welcome to collapsarr/i)).toBeInTheDocument();
     expect(screen.getByText("onboarding-server-key")).toBeInTheDocument();
 
-    const link = screen.getByRole("link", { name: /connect your first sonarr or radarr instance/i });
-    // Links to the Sonarr instances page directly (COL-144) rather than the
-    // old composed /settings route -- see OnboardingPanel's doc comment.
-    expect(link).toHaveAttribute("href", "/settings/sonarr");
+    // COL-145: Two separate inline links, one per type.
+    const sonarrLink = screen.getByRole("link", { name: "Sonarr" });
+    expect(sonarrLink).toHaveAttribute("href", "/settings/sonarr");
 
-    fireEvent.click(link);
-    expect(await screen.findByText("Settings view")).toBeInTheDocument();
+    const radarrLink = screen.getByRole("link", { name: "Radarr" });
+    expect(radarrLink).toHaveAttribute("href", "/settings/radarr");
+
+    // Verify navigation works for both.
+    fireEvent.click(sonarrLink);
+    expect(await screen.findByText("Sonarr settings view")).toBeInTheDocument();
   });
 
   it("renders nothing once at least one arr instance is configured", async () => {
