@@ -1899,6 +1899,14 @@ a {
   table-layout: fixed;
 }
 
+.logs-table__level-col {
+  width: 15%;
+}
+
+.logs-table__line-col {
+  width: 85%;
+}
+
 .logs-table__level {
   display: inline-flex;
   align-items: center;
