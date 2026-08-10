@@ -32,11 +32,11 @@ export const routes: RouteObject[] = [
       // first System view (Tasks).
       { path: SYSTEM_PATH, element: <Navigate to={`${SYSTEM_PATH}/tasks`} replace /> },
       ...systemNavItems.map(({ to, element }) => ({ path: to, element })),
-      // Settings sub-nav (COL-142): General is the first migrated page. The
-      // old composed `/settings` route (wired via `navItems` above) still
-      // serves Instances/Targets/Connect and stays reachable -- no bare
-      // /settings -> /settings/general redirect yet (that ships with the
-      // last migration, COL-144).
+      // Settings sub-nav (COL-142/COL-143): General, Targets, and Connect
+      // are migrated. The old composed `/settings` route (wired via
+      // `navItems` above) still serves Instances and stays reachable -- no
+      // bare /settings -> /settings/general redirect yet (that ships with
+      // the last migration, COL-144).
       ...settingsNavItems.map(({ to, element }) => ({ path: to, element })),
       // Per-file detail (COL-34): not a primary nav destination, so it's
       // wired directly here rather than through `navItems` (the sidebar's

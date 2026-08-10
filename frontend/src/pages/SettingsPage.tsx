@@ -1,6 +1,4 @@
-import { ConnectSection } from "../components/settings/ConnectSection";
 import { InstancesSection } from "../components/settings/InstancesSection";
-import { TargetsSection } from "../components/settings/TargetsSection";
 
 /**
  * The old composed Settings view (COL-33, plus Connect from COL-36):
@@ -11,24 +9,24 @@ import { TargetsSection } from "../components/settings/TargetsSection";
  * (COL-36).
  *
  * General moved to its own dedicated page at `/settings/general`
- * (`SettingsGeneralPage`, COL-142) -- the first of Settings' Bazarr-style
- * sub-nav pages. This page keeps serving its remaining sections
- * (Instances/Targets/Connect) at the old `/settings` route until each has
- * migrated too (later tickets in this Epic); no redirect off this route is
- * wired yet (that ships with the last migration, COL-144).
+ * (`SettingsGeneralPage`, COL-142); Targets and Connect moved to
+ * `/settings/targets`/`/settings/connect` (`SettingsTargetsPage`/
+ * `SettingsConnectPage`, COL-143) -- the second and third of Settings'
+ * Bazarr-style sub-nav pages. This page keeps serving its one remaining
+ * section (Instances) at the old `/settings` route until it migrates too
+ * (later ticket in this Epic, COL-144); no redirect off this route is wired
+ * yet (that ships with that last migration).
  */
 export function SettingsPage() {
   return (
     <div className="view view--settings">
       <header className="view__header">
         <h1 className="view__title">Settings</h1>
-        <p className="view__summary">Instances, downmix targets, and Connect.</p>
+        <p className="view__summary">Arr instances and path mappings.</p>
       </header>
 
       <div className="settings-sections">
         <InstancesSection />
-        <TargetsSection />
-        <ConnectSection />
       </div>
     </div>
   );

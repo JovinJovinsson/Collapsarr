@@ -3,67 +3,31 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SettingsPage } from "../pages/SettingsPage";
-import type { NotifierConfig } from "../types/notifiers";
-import type { GlobalSettings } from "../types/settings";
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
 }
 
-const settings: GlobalSettings = {
-  enabled_targets: ["stereo"],
-  language_allow_list: null,
-  stereo_codec: "aac",
-  stereo_bitrate_kbps: null,
-  surround_codec: "ac3",
-  surround_bitrate_kbps: 448,
-  concurrency_limit: 1,
-  ui_auth_enabled: false,
-  auth_required: "local_bypass",
-  auth_method: "forms",
-  backup_interval_days: 7,
-  backup_retention_days: 28,
-  disk_space_warning_percent: 5,
-  disk_space_error_percent: 2,
-  update_channel: "stable",
-  default_tracked: true,
-  log_level: null,
-  api_key: "server-key",
-  created_at: "2026-07-01T00:00:00Z",
-  updated_at: "2026-07-01T00:00:00Z",
-};
-
-const notifierConfig: NotifierConfig = {
-  webhook_url: null,
-  webhook_enabled: false,
-  discord_webhook_url: null,
-  discord_enabled: false,
-  created_at: "2026-07-01T00:00:00Z",
-  updated_at: "2026-07-01T00:00:00Z",
-};
-
 /**
- * Smoke test: renders the composed Settings view (COL-33, plus Connect from
- * COL-36) against a mocked API and checks each remaining section (Instances /
- * Targets / Connect) mounts and shows its populated or empty state -- the
- * deeper per-section behaviour (CRUD, validation, error surfacing) is
- * covered by `settingsInstances.test.tsx`, `settingsTargets.test.tsx`, and
- * `settingsConnect.test.tsx`. General moved to its own page (COL-142),
- * covered by `settingsGeneral.test.tsx`; this smoke test no longer asserts
- * on it.
+ * Smoke test: renders the composed Settings view (COL-33) against a mocked
+ * API and checks its one remaining section (Instances) mounts and shows its
+ * empty state -- the deeper per-section behaviour (CRUD, validation, error
+ * surfacing) is covered by `settingsInstances.test.tsx`. General moved to
+ * its own page (COL-142), covered by `settingsGeneral.test.tsx`; Targets and
+ * Connect moved to their own pages (COL-143), covered by
+ * `settingsTargets.test.tsx`/`settingsConnect.test.tsx`; this smoke test no
+ * longer asserts on any of them.
  */
 describe("SettingsPage", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("mounts all settings sections against a mocked API response", async () => {
+  it("mounts the Instances section against a mocked API response", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
         if (url === "/api/instances") return Promise.resolve(jsonResponse([]));
-        if (url === "/api/settings") return Promise.resolve(jsonResponse(settings));
-        if (url === "/api/notifiers") return Promise.resolve(jsonResponse(notifierConfig));
         return Promise.reject(new Error(`Unhandled request in test mock: ${url}`));
       }),
     );
@@ -76,7 +40,5 @@ describe("SettingsPage", () => {
 
     expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(await screen.findByText(/no arr instances configured yet/i)).toBeInTheDocument();
-    expect(await screen.findByRole("checkbox", { name: /stereo/i })).toBeInTheDocument();
-    expect(await screen.findByLabelText(/^webhook url$/i)).toHaveValue("");
   });
 });

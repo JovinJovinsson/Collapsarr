@@ -17,8 +17,10 @@ import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
 import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { LogsPage } from "../pages/LogsPage";
+import { SettingsConnectPage } from "../pages/SettingsConnectPage";
 import { SettingsGeneralPage } from "../pages/SettingsGeneralPage";
 import { SettingsPage } from "../pages/SettingsPage";
+import { SettingsTargetsPage } from "../pages/SettingsTargetsPage";
 import { StatusPage } from "../pages/StatusPage";
 import { TasksPage } from "../pages/TasksPage";
 import { UpdatesPage } from "../pages/UpdatesPage";
@@ -64,6 +66,12 @@ export const SETTINGS_PATH = "/settings";
  */
 export const SETTINGS_GENERAL_PATH = `${SETTINGS_PATH}/general`;
 
+/** Path of the Settings sub-nav's Targets entry (COL-143). */
+export const SETTINGS_TARGETS_PATH = `${SETTINGS_PATH}/targets`;
+
+/** Path of the Settings sub-nav's Connect entry (COL-143). */
+export const SETTINGS_CONNECT_PATH = `${SETTINGS_PATH}/connect`;
+
 export interface NavItem {
   to: string;
   label: string;
@@ -108,14 +116,18 @@ export const systemNavItems: NavItem[] = [
 ];
 
 /**
- * The **Settings** sub-nav (COL-139/COL-142): mirrors `systemNavItems`'
- * shape, splitting the old composed `SettingsPage` into Bazarr-style
- * dedicated pages one at a time. General is the first migrated page --
- * `SettingsGeneralPage` renders `GeneralSection`'s content unchanged. The
- * old `/settings` route (wired via `navItems` above) still serves the
- * not-yet-migrated Instances/Targets/Connect sections and stays reachable
- * until each has its own entry here (later tickets in this Epic).
+ * The **Settings** sub-nav (COL-139/COL-142/COL-143): mirrors
+ * `systemNavItems`' shape, splitting the old composed `SettingsPage` into
+ * Bazarr-style dedicated pages one at a time. General (COL-142) was the
+ * first migrated page; Targets and Connect (COL-143) are the second and
+ * third -- `SettingsTargetsPage`/`SettingsConnectPage` render
+ * `TargetsSection`'s/`ConnectSection`'s content unchanged. The old
+ * `/settings` route (wired via `navItems` above) still serves the
+ * not-yet-migrated Instances section and stays reachable until it migrates
+ * too (COL-144, the last ticket in this Epic).
  */
 export const settingsNavItems: NavItem[] = [
   { to: SETTINGS_GENERAL_PATH, label: "General", icon: <SettingsIcon />, element: <SettingsGeneralPage /> },
+  { to: SETTINGS_TARGETS_PATH, label: "Targets", icon: <SettingsIcon />, element: <SettingsTargetsPage /> },
+  { to: SETTINGS_CONNECT_PATH, label: "Connect", icon: <SettingsIcon />, element: <SettingsConnectPage /> },
 ];
