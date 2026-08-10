@@ -1,6 +1,7 @@
-import { NavLink, useLocation } from "react-router-dom";
+import { NavLink } from "react-router-dom";
 
 import { useInstances } from "../hooks/useInstances";
+import { useNavGroupExpanded } from "../hooks/useNavGroupExpanded";
 import type { NavItem } from "../routes/nav";
 
 /**
@@ -8,13 +9,16 @@ import type { NavItem } from "../routes/nav";
  *
  * Unlike every other primary nav item, its sub-items aren't statically known
  * -- there's one per configured `ArrInstance` -- so it can't be rendered by
- * `Sidebar`'s generic `NavLinkItem` the way Wanted/Activity/Settings are;
+ * `Sidebar`'s generic `NavLinkItem` the way Wanted/Activity/Settings are, nor
+ * by `NavSection` (COL-141), the fixed-list counterpart used by System --
  * `Sidebar` special-cases this item to render `LibraryNavSection` instead.
  *
  * Expands to list every configured instance whenever any `/libraries/*`
- * route is active (i.e. on select), collapsed otherwise. Sidebar nesting
- * stops here -- no Series/Season sub-tree in the sidebar itself; that lives
- * on the instance's own page (`LibraryPage`).
+ * route is active (i.e. on select), collapsed otherwise -- the same
+ * expand-on-select rule `NavSection` uses, shared via `useNavGroupExpanded`
+ * (COL-141) so the two can't drift apart. Sidebar nesting stops here -- no
+ * Series/Season sub-tree in the sidebar itself; that lives on the instance's
+ * own page (`LibraryPage`).
  *
  * Instance list comes from `useInstances()` (COL-100 code review), the
  * `GET /api/instances` fetch shared with the Libraries pages via
@@ -22,8 +26,7 @@ import type { NavItem } from "../routes/nav";
  * own copy.
  */
 export function LibraryNavSection({ to, label, icon }: NavItem) {
-  const location = useLocation();
-  const expanded = location.pathname === to || location.pathname.startsWith(`${to}/`);
+  const expanded = useNavGroupExpanded(to);
 
   const state = useInstances();
 

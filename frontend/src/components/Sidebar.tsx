@@ -5,9 +5,10 @@ import type { ReactNode } from "react";
 
 import { logout } from "../api/auth";
 import { useHealth } from "../hooks/useHealth";
-import { LIBRARIES_PATH, navItems, systemNavItems } from "../routes/nav";
+import { LIBRARIES_PATH, navItems, SYSTEM_PATH, systemNavItems } from "../routes/nav";
 import type { NavItem } from "../routes/nav";
 import { LibraryNavSection } from "./LibraryNavSection";
+import { NavSection } from "./NavSection";
 
 /** Renders one nav link; shared by the primary and System sections. */
 function NavLinkItem({ to, label, icon }: NavItem): ReactNode {
@@ -76,12 +77,15 @@ export function Sidebar() {
           ),
         )}
 
-        <li className="sidebar__section" aria-hidden>
-          System
-        </li>
-        {systemNavItems.map((item) => (
-          <NavLinkItem key={item.to} {...item} />
-        ))}
+        {/* System (COL-63): expands only while a /system/* route is active
+            (COL-141), rather than always-visible like the primary items
+            above -- System's own pages/routes/order are unchanged. */}
+        <NavSection
+          to={SYSTEM_PATH}
+          label="System"
+          items={systemNavItems}
+          className="sidebar__nav-group--system"
+        />
       </ul>
 
       <div className="sidebar__footer">

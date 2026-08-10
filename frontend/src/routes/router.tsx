@@ -6,7 +6,7 @@ import { LibraryPage } from "../pages/LibraryPage";
 import { LoginPage } from "../pages/LoginPage";
 import { SetupPage } from "../pages/SetupPage";
 import { getUrlBase } from "../runtime/urlBase";
-import { navItems, systemNavItems } from "./nav";
+import { navItems, SYSTEM_PATH, systemNavItems } from "./nav";
 
 /**
  * Route config, exported separately from `router` (below) so tests can drive
@@ -30,7 +30,7 @@ export const routes: RouteObject[] = [
       ...navItems.map(({ to, element }) => ({ path: to, element })),
       // System area (COL-63): its pages, plus a bare /system that lands on the
       // first System view (Tasks).
-      { path: "/system", element: <Navigate to="/system/tasks" replace /> },
+      { path: SYSTEM_PATH, element: <Navigate to={`${SYSTEM_PATH}/tasks`} replace /> },
       ...systemNavItems.map(({ to, element }) => ({ path: to, element })),
       // Per-file detail (COL-34): not a primary nav destination, so it's
       // wired directly here rather than through `navItems` (the sidebar's

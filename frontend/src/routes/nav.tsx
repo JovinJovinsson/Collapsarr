@@ -32,6 +32,14 @@ import { WantedPage } from "../pages/WantedPage";
  */
 export const LIBRARIES_PATH = "/libraries";
 
+/**
+ * Base path of the "System" nav group (COL-63) -- `Sidebar` (COL-141) and
+ * `router.tsx` both need it: the former as `NavSection`'s `to` (its default
+ * link + the expand-on-select base path), the latter for the bare `/system`
+ * redirect wired alongside `systemNavItems`' own routes.
+ */
+export const SYSTEM_PATH = "/system";
+
 export interface NavItem {
   to: string;
   label: string;
@@ -67,10 +75,10 @@ export const navItems: NavItem[] = [
  * above.
  */
 export const systemNavItems: NavItem[] = [
-  { to: "/system/tasks", label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
-  { to: "/system/backups", label: "Backups", icon: <BackupIcon />, element: <BackupsPage /> },
-  { to: "/system/health", label: "Health", icon: <HealthIcon />, element: <HealthChecksPage /> },
-  { to: "/system/status", label: "Status", icon: <StatusIcon />, element: <StatusPage /> },
-  { to: "/system/updates", label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
-  { to: "/system/logs", label: "Logs", icon: <LogsIcon />, element: <LogsPage /> },
+  { to: `${SYSTEM_PATH}/tasks`, label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
+  { to: `${SYSTEM_PATH}/backups`, label: "Backups", icon: <BackupIcon />, element: <BackupsPage /> },
+  { to: `${SYSTEM_PATH}/health`, label: "Health", icon: <HealthIcon />, element: <HealthChecksPage /> },
+  { to: `${SYSTEM_PATH}/status`, label: "Status", icon: <StatusIcon />, element: <StatusPage /> },
+  { to: `${SYSTEM_PATH}/updates`, label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
+  { to: `${SYSTEM_PATH}/logs`, label: "Logs", icon: <LogsIcon />, element: <LogsPage /> },
 ];
