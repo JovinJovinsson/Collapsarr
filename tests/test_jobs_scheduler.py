@@ -11,6 +11,7 @@ SQLite database built from the ``settings`` fixture.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
@@ -732,6 +733,51 @@ def test_enqueue_file_skips_a_not_tracked_file_but_still_tracks_it(
     assert scheduler._queue.list_jobs() == []
     with session_factory() as session:
         assert get_tracked_media(session, "/tv/a.mkv") is not None  # still tracked/mirrored
+
+
+def test_enqueue_file_logs_not_tracked_skip_once_per_dedup_window(
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """COL-135: repeat scans of the same Not-Tracked file don't spam one log line each."""
+    caplog.set_level(logging.INFO, logger="collapsarr.jobs.scheduler")
+    instance = _add_instance(session_factory)
+    _seed_episode_node(session_factory, instance.id, tracked=False)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+    assert "resolved Not Tracked" in caplog.text
+
+    caplog.clear()
+    scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+    assert "resolved Not Tracked" not in caplog.text
+
+
+def test_enqueue_file_logs_not_tracked_skip_again_after_dedup_window(
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """COL-135: the skip line reappears once the dedup window has elapsed."""
+    caplog.set_level(logging.INFO, logger="collapsarr.jobs.scheduler")
+    instance = _add_instance(session_factory)
+    _seed_episode_node(session_factory, instance.id, tracked=False)
+    clock = {"now": _FIXED_NOW}
+    scheduler = JobScheduler(
+        JobQueue(pipeline_runner=_stub_runner()),
+        session_factory,
+        settings,
+        probe=_probe_returning(_SURROUND),
+        now=lambda: clock["now"],
+    )
+
+    scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+    clock["now"] = _FIXED_NOW + timedelta(hours=settings.scan_interval_hours, seconds=1)
+    caplog.clear()
+    scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
+
+    assert "resolved Not Tracked" in caplog.text
 
 
 def test_enqueue_file_enqueues_a_tracked_file(

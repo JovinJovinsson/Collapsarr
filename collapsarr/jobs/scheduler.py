@@ -193,6 +193,8 @@ class JobScheduler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_scan_at: datetime | None = None
+        self._not_tracked_logged: dict[Path, datetime] = {}
+        self._not_tracked_log_lock = threading.Lock()
 
     @property
     def last_scan_at(self) -> datetime | None:
@@ -337,7 +339,8 @@ class JobScheduler:
             sonarr_episode_id=sonarr_episode_id,
             radarr_movie_id=radarr_movie_id,
         ):
-            logger.info("skipping %s: resolved Not Tracked, not auto-enqueuing", path)
+            if self._should_log_not_tracked(path):
+                logger.info("skipping %s: resolved Not Tracked, not auto-enqueuing", path)
             return None
 
         if not detect_qualifying_targets(streams, effective_settings):
@@ -516,6 +519,23 @@ class JobScheduler:
             job.file_path == path and job.status in _ACTIVE_STATUSES
             for job in self._queue.list_jobs()
         )
+
+    def _should_log_not_tracked(self, path: Path) -> bool:
+        """Whether to log ``path``'s Not-Tracked skip now, or suppress a repeat (COL-135).
+
+        Logged once per file, then suppressed until :attr:`_dedup_window`
+        elapses -- the same window :meth:`_is_recently_processed` uses --
+        so a persistently Not-Tracked file doesn't spam one identical line
+        per scan forever, while a scan interval later a fresh line still
+        confirms it's still true (rather than going silent permanently).
+        """
+        now = self._now()
+        with self._not_tracked_log_lock:
+            last = self._not_tracked_logged.get(path)
+            if last is not None and now - last < self._dedup_window:
+                return False
+            self._not_tracked_logged[path] = now
+            return True
 
     def _is_recently_processed(self, path: Path, session: Session) -> bool:
         """Whether a terminal history row for ``path`` falls inside the dedup window."""
