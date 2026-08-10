@@ -5,8 +5,7 @@ import { GeneralSection } from "../components/settings/GeneralSection";
  * pages, split out of the old composed `SettingsPage`. Wraps `GeneralSection`
  * unchanged -- API key, auth, concurrency, codec/bitrate overrides,
  * disk-space alerts, credential change, log-out-everywhere. `log_level`
- * stays here for now; it moves to a dedicated Logging page in Phase 2 (out
- * of scope here).
+ * moved to its own Logging page in COL-147 (Phase 2).
  *
  * Keeps the same `view__header`/`h1.view__title` shell every other
  * AppShell-routed page has (e.g. `TasksPage`, `HealthChecksPage`) even
