@@ -17,9 +17,13 @@ from pathlib import Path
 import pytest
 
 from collapsarr.config import Settings
+from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs.queue import DEFAULT_MAX_CONCURRENCY, Job, JobQueue, JobStatus
+from collapsarr.migrations import upgrade_to_head
+from collapsarr.settings.service import update_global_settings
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
 _NOTHING_TO_DO = PipelineResult(
@@ -408,3 +412,104 @@ def test_run_job_logs_error_when_the_runner_raises_unexpectedly(
     assert errors[0].exc_info[1] is not None
     assert str(errors[0].exc_info[1]) == "boom"
     assert job.status is JobStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Default Audio Track preference wiring (COL-152): the persisted opt-in toggle
+# and (language, tier) preference must actually reach run_downmix_pipeline's
+# kwargs for a real job dispatched through a JobQueue built via from_settings.
+# ---------------------------------------------------------------------------
+
+
+class _KwargsCapturingRunner:
+    """A pipeline_runner stub that records the **kwargs each job passes it."""
+
+    def __init__(self, result: PipelineResult) -> None:
+        self._result = result
+        self.kwargs_calls: list[dict[str, object]] = []
+
+    def __call__(
+        self, file_path: Path, settings: DownmixSettings, **kwargs: object
+    ) -> PipelineResult:
+        self.kwargs_calls.append(kwargs)
+        return self._result
+
+
+def _write_default_audio_settings(
+    settings: Settings,
+    *,
+    auto_set_default_audio: bool,
+    default_audio_language: str | None = None,
+    default_audio_channel_tier: DownmixTarget | None = None,
+) -> None:
+    """Persist the Default Audio Track settings into ``settings``' database.
+
+    Runs the migration chain (the same schema from_settings will find) then
+    writes the singleton GlobalSettings row, so a subsequent
+    ``JobQueue.from_settings`` reads exactly these values back.
+    """
+    upgrade_to_head(settings)
+    engine = create_engine_from_settings(settings)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        update_global_settings(
+            session,
+            default_audio_language=default_audio_language,
+            default_audio_channel_tier=default_audio_channel_tier,
+            auto_set_default_audio=auto_set_default_audio,
+        )
+    engine.dispose()
+
+
+def test_from_settings_threads_default_audio_preference_when_toggle_on(tmp_path: Path) -> None:
+    """Toggle on: a job dispatched through the queue reaches the pipeline with the fix armed."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_default_audio_settings(
+        settings,
+        auto_set_default_audio=True,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+    )
+
+    runner = _KwargsCapturingRunner(_SUCCESS)
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.run_pending()
+
+    assert len(runner.kwargs_calls) == 1
+    kwargs = runner.kwargs_calls[0]
+    assert kwargs["auto_set_default_audio"] is True
+    assert kwargs["default_audio_preference"] == DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE
+    )
+
+
+def test_from_settings_passes_no_default_audio_kwargs_when_toggle_off(tmp_path: Path) -> None:
+    """Toggle off (the default): the pipeline call is byte-for-byte pre-COL-152 -- no fix kwargs."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    # Even with a language/tier persisted, the off toggle must gate them out.
+    _write_default_audio_settings(
+        settings,
+        auto_set_default_audio=False,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+    )
+
+    runner = _KwargsCapturingRunner(_SUCCESS)
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.run_pending()
+
+    assert len(runner.kwargs_calls) == 1
+    kwargs = runner.kwargs_calls[0]
+    assert "auto_set_default_audio" not in kwargs
+    assert "default_audio_preference" not in kwargs
+    assert kwargs == {}

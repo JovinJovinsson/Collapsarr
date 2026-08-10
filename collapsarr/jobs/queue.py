@@ -78,6 +78,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from sqlalchemy.orm import Session, sessionmaker
+
 from collapsarr.config import Settings, get_settings
 from collapsarr.downmix.pipeline import PipelineResult, run_downmix_pipeline
 from collapsarr.downmix.targets import DownmixSettings
@@ -279,10 +281,25 @@ class JobQueue:
         obtainable here -- construct via :meth:`__init__` directly instead)
         to opt out.
 
-        The database engine backing those defaults is created at most once,
+        This factory is also where the persisted **Preferred Default Audio**
+        settings reach a real downmix job (COL-152): it reads
+        ``GlobalSettings.auto_set_default_audio`` and, when that opt-in toggle
+        is on, folds ``auto_set_default_audio=True`` plus the adapted
+        ``default_audio_preference`` (from
+        ``GlobalSettings.default_audio_language``/``default_audio_channel_tier``)
+        into the ``pipeline_kwargs`` every enqueued job passes to
+        :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline` -- so the
+        automatic in-band Default Audio Track fix is genuinely reachable from a
+        real job dispatched through this queue, not only from the pipeline
+        function's parameter surface. With the toggle off (the default) nothing
+        is added and a job runs byte-for-byte as it did before the feature; an
+        explicit ``pipeline_kwargs`` key from the caller always wins. See
+        :meth:`_resolve_pipeline_kwargs`.
+
+        The database engine backing all of the above is created at most once,
         here, for this :class:`JobQueue` instance -- shared between
-        ``history_recorder``, ``failure_notifier``, and
-        ``tracked_media_recorder`` when more than one needs defaulting, but
+        ``history_recorder``, ``failure_notifier``,
+        ``tracked_media_recorder``, and the Default-Audio settings read, but
         not shared with the FastAPI app's own request-scoped engine (see
         :mod:`collapsarr.main`). For SQLite (this project's only supported
         backend today) that's safe -- both point at the same on-disk file --
@@ -301,47 +318,85 @@ class JobQueue:
         """
         resolved = settings or get_settings()
 
+        from collapsarr.database import (
+            create_engine_from_settings,
+            create_session_factory,
+        )
+        from collapsarr.migrations import upgrade_to_head
+
+        upgrade_to_head(resolved)
+        engine = create_engine_from_settings(resolved)
+        session_factory = create_session_factory(engine)
+
         resolved_history_recorder = history_recorder
+        if resolved_history_recorder is None:
+            from collapsarr.jobs.history import make_history_recorder
+
+            resolved_history_recorder = make_history_recorder(session_factory)
+
         resolved_failure_notifier = failure_notifier
+        if resolved_failure_notifier is None:
+            from collapsarr.jobs.failure_notify import make_failure_notifier
+
+            resolved_failure_notifier = make_failure_notifier(session_factory)
+
         resolved_tracked_media_recorder = tracked_media_recorder
-        if (
-            resolved_history_recorder is None
-            or resolved_failure_notifier is None
-            or resolved_tracked_media_recorder is None
-        ):
-            from collapsarr.database import (
-                create_engine_from_settings,
-                create_session_factory,
-            )
-            from collapsarr.migrations import upgrade_to_head
+        if resolved_tracked_media_recorder is None:
+            from collapsarr.jobs.tracked_media import make_tracked_media_recorder
 
-            upgrade_to_head(resolved)
-            engine = create_engine_from_settings(resolved)
-            session_factory = create_session_factory(engine)
-
-            if resolved_history_recorder is None:
-                from collapsarr.jobs.history import make_history_recorder
-
-                resolved_history_recorder = make_history_recorder(session_factory)
-
-            if resolved_failure_notifier is None:
-                from collapsarr.jobs.failure_notify import make_failure_notifier
-
-                resolved_failure_notifier = make_failure_notifier(session_factory)
-
-            if resolved_tracked_media_recorder is None:
-                from collapsarr.jobs.tracked_media import make_tracked_media_recorder
-
-                resolved_tracked_media_recorder = make_tracked_media_recorder(session_factory)
+            resolved_tracked_media_recorder = make_tracked_media_recorder(session_factory)
 
         return cls(
             max_concurrency=resolved.job_max_concurrency,
             pipeline_runner=pipeline_runner,
-            pipeline_kwargs=pipeline_kwargs,
+            pipeline_kwargs=cls._resolve_pipeline_kwargs(pipeline_kwargs, session_factory),
             history_recorder=resolved_history_recorder,
             failure_notifier=resolved_failure_notifier,
             tracked_media_recorder=resolved_tracked_media_recorder,
         )
+
+    @staticmethod
+    def _resolve_pipeline_kwargs(
+        pipeline_kwargs: Mapping[str, Any] | None,
+        session_factory: sessionmaker[Session],
+    ) -> dict[str, Any]:
+        """Fold the persisted Default Audio Track preference into ``pipeline_kwargs`` (COL-152).
+
+        Reads the singleton :class:`~collapsarr.settings.models.GlobalSettings`
+        row from ``session_factory`` (the same DB the recorders above bind to)
+        and, **only** when its opt-in ``auto_set_default_audio`` toggle is on,
+        threads ``auto_set_default_audio=True`` plus the adapted
+        ``default_audio_preference`` (:func:`~collapsarr.settings.service.
+        as_default_audio_preference`) into the kwargs every enqueued downmix job
+        passes to :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`. This
+        is the production wiring that makes the automatic in-band fix reachable:
+        a real downmix job dispatched through this queue now actually applies it.
+
+        With the toggle off (the default, every fresh install's state) nothing is
+        added, so a job's pipeline call is byte-for-byte what it was before this
+        feature. An explicit ``pipeline_kwargs`` from the caller always wins --
+        keys already present are never overwritten -- so a test (or a future
+        alternate wiring) can still pin its own values.
+
+        The imports below are deferred, matching the surrounding factory: the
+        settings service pulls in the ORM/adapters, which don't need to load for
+        a lightweight :meth:`__init__` construction that never touches Settings.
+        """
+        from collapsarr.settings.service import (
+            as_default_audio_preference,
+            get_global_settings,
+        )
+
+        resolved = dict(pipeline_kwargs or {})
+        with session_factory() as session:
+            global_settings = get_global_settings(session)
+        if global_settings.auto_set_default_audio:
+            resolved.setdefault("auto_set_default_audio", True)
+            resolved.setdefault(
+                "default_audio_preference",
+                as_default_audio_preference(global_settings),
+            )
+        return resolved
 
     @property
     def max_concurrency(self) -> int:

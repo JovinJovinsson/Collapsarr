@@ -69,6 +69,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from collapsarr import __version__
+from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 
 from .models import (
@@ -373,4 +374,28 @@ def as_downmix_settings(settings: GlobalSettings) -> DownmixSettings:
         stereo_bitrate_kbps=settings.stereo_bitrate_kbps,
         surround_codec=settings.surround_codec,
         surround_bitrate_kbps=settings.surround_bitrate_kbps,
+    )
+
+
+def as_default_audio_preference(settings: GlobalSettings) -> DefaultAudioPreference | None:
+    """Adapt a persisted :class:`GlobalSettings` row into a :class:`DefaultAudioPreference`.
+
+    The shape the automatic in-band Default Audio Track fix (COL-152) consumes,
+    via :func:`~collapsarr.downmix.default_audio.resolve_default_audio_output_index`
+    and the downmix pipeline -- pairing the row's ``default_audio_language`` with
+    its ``default_audio_channel_tier`` (stored as a
+    :class:`~collapsarr.downmix.targets.DownmixTarget` value, decoded back here).
+
+    Returns ``None`` -- "no actionable preference" -- whenever either half is
+    unset: a preference only means something as a complete
+    ``(language, channel tier)`` pair, the same way
+    :func:`as_downmix_settings` decodes its own columns. Whether to *act* on the
+    returned preference at all is the caller's ``auto_set_default_audio`` gate,
+    not this adapter's concern.
+    """
+    if settings.default_audio_language is None or settings.default_audio_channel_tier is None:
+        return None
+    return DefaultAudioPreference(
+        language=settings.default_audio_language,
+        channel_tier=DownmixTarget(settings.default_audio_channel_tier),
     )
