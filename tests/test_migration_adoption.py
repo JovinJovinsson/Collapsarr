@@ -207,14 +207,16 @@ def test_already_versioned_database_runs_only_pending_deltas(settings: Settings)
 # --------------------------------------------------------------------------- #
 #: Columns a *post-baseline* migration adds (COL-66's backup schedule knobs,
 #: COL-79's disk-space thresholds, COL-101's Library-node bridge ids, COL-151's
-#: Preferred Default Audio setting, COL-154's current-default-track snapshot).
+#: Preferred Default Audio setting, COL-154's current-default-track snapshot,
+#: COL-155's job-history ``kind``).
 #: ``create_all`` below always builds the table from the live
 #: ``Base.metadata`` -- i.e. with these columns already present -- so they are
 #: dropped by raw DDL afterwards to de-evolve the stand-in back to what a real
-#: pre-COL-66/pre-COL-79/pre-COL-101/pre-COL-151/pre-COL-154 create_all-era
-#: release actually had on disk. This mirrors the ``DROP INDEX`` idiom just
-#: below for the same reason: the unversioned DB this function fabricates
-#: predates every post-baseline delta, not just the index-reconcile one.
+#: pre-COL-66/pre-COL-79/pre-COL-101/pre-COL-151/pre-COL-154/pre-COL-155
+#: create_all-era release actually had on disk. This mirrors the ``DROP
+#: INDEX`` idiom just below for the same reason: the unversioned DB this
+#: function fabricates predates every post-baseline delta, not just the
+#: index-reconcile one.
 POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_interval_days"),
     ("global_settings", "backup_retention_days"),
@@ -231,20 +233,22 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("tracked_media_files", "radarr_movie_id"),
     ("tracked_media_files", "current_default_language"),
     ("tracked_media_files", "current_default_channel_layout"),
+    ("job_history", "kind"),
 )
 
 #: Indexes a *post-baseline* migration adds on an *indexed* post-baseline
-#: column (COL-101's three -- see :data:`POST_BASELINE_COLUMNS` above; none of
-#: the earlier post-baseline columns were indexed, so this is new). Unlike
-#: :data:`BASELINE_INDEXES` (which the baseline migration itself owns and the
-#: reconcile-indexes delta heals independently of column adoption), these only
-#: exist at all because ``create_all`` built the column they index -- so they
-#: must be dropped *before* that column, mirroring the baseline's own
-#: index-then-column drop order.
+#: column (COL-101's three, plus COL-155's job-history ``kind`` -- see
+#: :data:`POST_BASELINE_COLUMNS` above; none of the earlier post-baseline
+#: columns were indexed). Unlike :data:`BASELINE_INDEXES` (which the baseline
+#: migration itself owns and the reconcile-indexes delta heals independently
+#: of column adoption), these only exist at all because ``create_all`` built
+#: the column they index -- so they must be dropped *before* that column,
+#: mirroring the baseline's own index-then-column drop order.
 POST_BASELINE_INDEXES: tuple[str, ...] = (
     "ix_tracked_media_files_instance_id",
     "ix_tracked_media_files_sonarr_episode_id",
     "ix_tracked_media_files_radarr_movie_id",
+    "ix_job_history_kind",
 )
 
 #: Whole tables a *post-baseline* migration adds (COL-75's

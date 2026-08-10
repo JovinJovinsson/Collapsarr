@@ -6,7 +6,7 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Three endpoints, each wrapping an existing service without adding new job logic:
+Four endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
@@ -21,6 +21,12 @@ Three endpoints, each wrapping an existing service without adding new job logic:
   optional ``extra_languages`` list is the allow-list-bypass option: those
   languages are forced past the scheduler's ``language_allow_list`` for this one
   call, letting a user downmix a language they normally don't auto-process.
+- ``POST /api/jobs/trigger-default-audio`` -- manually enqueues a
+  ``SET_DEFAULT_AUDIO`` job for one specific file
+  (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`,
+  COL-155), mirroring ``POST /api/jobs/trigger``'s shape: same request
+  (a bare ``file_path``), same response shape (``enqueued`` + the job, or
+  ``enqueued=False``/``job=null`` when the file needs no change).
 
 The scan/trigger endpoints operate on the live
 :class:`~collapsarr.jobs.scheduler.JobScheduler` the app wired onto
@@ -41,7 +47,7 @@ from sqlalchemy.orm import Session
 from ..database import get_session
 from .history import list_job_history
 from .models import JobHistory
-from .queue import Job, JobStatus
+from .queue import Job, JobKind, JobStatus
 from .scheduler import JobScheduler
 
 router = APIRouter(prefix="/api", tags=["jobs"])
@@ -80,6 +86,7 @@ class JobHistoryRead(BaseModel):
     job_id: str
     file_path: str
     status: JobStatus
+    kind: JobKind
     started_at: datetime | None
     ended_at: datetime | None
     exit_code: int | None
@@ -139,6 +146,36 @@ class ManualTriggerResult(BaseModel):
     job: EnqueuedJob | None
 
 
+class SetDefaultAudioTriggerRequest(BaseModel):
+    """Request body for ``POST /api/jobs/trigger-default-audio`` (COL-155).
+
+    ``file_path`` names the (host-local) file to fix. Unlike
+    :class:`ManualTriggerRequest` there is no allow-list-bypass option --
+    the Default Audio Track fix isn't gated by a language allow-list at all,
+    so there is nothing analogous to bypass.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str
+
+
+class SetDefaultAudioTriggerResult(BaseModel):
+    """Response for ``POST /api/jobs/trigger-default-audio`` (COL-155).
+
+    ``enqueued`` is ``True`` with the created ``job`` when a
+    ``SET_DEFAULT_AUDIO`` job was queued. It is ``False`` with ``job`` ``null``
+    when the file was skipped -- no Default Audio Track preference is
+    configured, a duplicate (already queued / recently processed), unprobeable,
+    or the file already carries the correct disposition -- mirroring
+    :meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`
+    returning ``None``.
+    """
+
+    enqueued: bool
+    job: EnqueuedJob | None
+
+
 # --- endpoints ---------------------------------------------------------------
 
 
@@ -146,16 +183,19 @@ class ManualTriggerResult(BaseModel):
 def list_job_history_endpoint(
     file: str | None = None,
     status: JobStatus | None = None,
+    kind: JobKind | None = None,
     session: Session = Depends(get_session),
 ) -> list[JobHistory]:
-    """List persisted job history, optionally filtered by file and/or status.
+    """List persisted job history, optionally filtered by file, status, and/or kind.
 
     ``file`` matches a file path exactly (the form job history stores);
     ``status`` matches a single :class:`~collapsarr.jobs.queue.JobStatus`
-    (``pending``/``running``/``succeeded``/``failed``). Both may be combined;
-    omitting both returns every row, ordered by insertion.
+    (``pending``/``running``/``succeeded``/``failed``); ``kind`` (COL-155)
+    matches a single :class:`~collapsarr.jobs.queue.JobKind`
+    (``downmix``/``set_default_audio``). Any combination may be given;
+    omitting all returns every row, ordered by insertion.
     """
-    return list_job_history(session, file_path=file, status=status)
+    return list_job_history(session, file_path=file, status=status, kind=kind)
 
 
 @router.post("/jobs/scan", response_model=ScanResult, status_code=202)
@@ -191,3 +231,28 @@ def manual_trigger_endpoint(
     if job is None:
         return ManualTriggerResult(enqueued=False, job=None)
     return ManualTriggerResult(enqueued=True, job=EnqueuedJob.from_job(job))
+
+
+@router.post(
+    "/jobs/trigger-default-audio",
+    response_model=SetDefaultAudioTriggerResult,
+    status_code=202,
+)
+def manual_set_default_audio_trigger_endpoint(
+    body: SetDefaultAudioTriggerRequest,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+) -> SetDefaultAudioTriggerResult:
+    """Manually enqueue a ``SET_DEFAULT_AUDIO`` job for one file (COL-155).
+
+    Wraps :meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`:
+    probes the file, resolves whether its Default Audio Track disposition
+    needs to change against the persisted preference, and enqueues a job
+    only when it does. A ``202`` is returned whether or not a job was
+    enqueued; the ``enqueued`` flag distinguishes the two (a skipped file --
+    no preference configured, duplicate, unprobeable, or already correct --
+    is not an error).
+    """
+    job = scheduler.trigger_set_default_audio(body.file_path)
+    if job is None:
+        return SetDefaultAudioTriggerResult(enqueued=False, job=None)
+    return SetDefaultAudioTriggerResult(enqueued=True, job=EnqueuedJob.from_job(job))

@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from collapsarr.config import Settings
 from collapsarr.downmix.targets import DownmixSettings
 from collapsarr.jobs.models import JobHistory
-from collapsarr.jobs.queue import Job, JobStatus
+from collapsarr.jobs.queue import Job, JobKind, JobStatus
 from collapsarr.jobs.routes import get_job_scheduler
 from collapsarr.main import create_app
 from collapsarr.settings.service import get_global_settings, update_global_settings
@@ -44,8 +44,9 @@ def _seed_history(
     job_id: str,
     file_path: str,
     status: JobStatus,
+    kind: JobKind = JobKind.DOWNMIX,
 ) -> None:
-    session.add(JobHistory(job_id=job_id, file_path=file_path, status=status))
+    session.add(JobHistory(job_id=job_id, file_path=file_path, status=status, kind=kind))
     session.commit()
 
 
@@ -57,10 +58,13 @@ class _FakeScheduler:
         *,
         scan_jobs: list[Job] | None = None,
         trigger_job: Job | None = None,
+        default_audio_trigger_job: Job | None = None,
     ) -> None:
         self._scan_jobs = scan_jobs or []
         self._trigger_job = trigger_job
+        self._default_audio_trigger_job = default_audio_trigger_job
         self.trigger_calls: list[tuple[str, frozenset[str]]] = []
+        self.default_audio_trigger_calls: list[str] = []
 
     def scan_now(self) -> list[Job]:
         return self._scan_jobs
@@ -76,6 +80,15 @@ class _FakeScheduler:
             (file_path, frozenset(extra_languages) if extra_languages is not None else frozenset())
         )
         return self._trigger_job
+
+    def trigger_set_default_audio(
+        self,
+        file_path: str,
+        *,
+        session: Session | None = None,
+    ) -> Job | None:
+        self.default_audio_trigger_calls.append(file_path)
+        return self._default_audio_trigger_job
 
 
 def _job(file_path: str) -> Job:
@@ -105,6 +118,7 @@ def test_history_lists_rows_with_full_shape(client: TestClient, session: Session
     assert row["job_id"] == "job-1"
     assert row["file_path"] == "/media/a.mkv"
     assert row["status"] == "succeeded"
+    assert row["kind"] == "downmix"  # COL-155: a bare JobHistory() row defaults to DOWNMIX
     for key in (
         "id",
         "started_at",
@@ -166,6 +180,38 @@ def test_history_combines_file_and_status_filters(
 def test_history_rejects_an_unknown_status_value(client: TestClient) -> None:
     response = client.get(
         "/api/jobs/history", params={"status": "bogus"}, headers=_auth_headers(client)
+    )
+    assert response.status_code == 422
+
+
+def test_history_filters_by_kind(client: TestClient, session: Session) -> None:
+    _seed_history(
+        session,
+        job_id="j-downmix",
+        file_path="/media/a.mkv",
+        status=JobStatus.SUCCEEDED,
+        kind=JobKind.DOWNMIX,
+    )
+    _seed_history(
+        session,
+        job_id="j-default-audio",
+        file_path="/media/b.mkv",
+        status=JobStatus.SUCCEEDED,
+        kind=JobKind.SET_DEFAULT_AUDIO,
+    )
+
+    response = client.get(
+        "/api/jobs/history", params={"kind": "set_default_audio"}, headers=_auth_headers(client)
+    )
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-default-audio"]
+
+
+def test_history_rejects_an_unknown_kind_value(client: TestClient) -> None:
+    response = client.get(
+        "/api/jobs/history", params={"kind": "bogus"}, headers=_auth_headers(client)
     )
     assert response.status_code == 422
 
@@ -286,6 +332,94 @@ def test_trigger_rejects_unknown_body_fields(client: TestClient) -> None:
     assert response.status_code == 422, response.text
 
 
+# --- POST /api/jobs/trigger-default-audio (COL-155) --------------------------
+
+
+def test_trigger_default_audio_enqueues_a_job_and_returns_it(client: TestClient) -> None:
+    fake = _FakeScheduler(default_audio_trigger_job=_job("/media/movie.mkv"))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/trigger-default-audio",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is True
+    assert body["job"]["file_path"] == "/media/movie.mkv"
+    assert body["job"]["status"] == "pending"
+    assert fake.default_audio_trigger_calls == ["/media/movie.mkv"]
+
+
+def test_trigger_default_audio_reports_not_enqueued_when_the_file_is_skipped(
+    client: TestClient,
+) -> None:
+    fake = _FakeScheduler(default_audio_trigger_job=None)  # no preference / duplicate / correct
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/trigger-default-audio",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is False
+    assert body["job"] is None
+
+
+def test_trigger_default_audio_rejects_unknown_body_fields(client: TestClient) -> None:
+    fake = _FakeScheduler(default_audio_trigger_job=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/trigger-default-audio",
+            json={"file_path": "/media/movie.mkv", "extra_languages": ["jpn"]},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422, response.text
+
+
+def test_trigger_default_audio_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> the trigger fails loudly, not silently."""
+    response = client.post(
+        "/api/jobs/trigger-default-audio",
+        json={"file_path": "/media/movie.mkv"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 503
+
+
+def test_trigger_default_audio_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, no preference configured -> skipped."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs/trigger-default-audio",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"enqueued": False, "job": None}
+
+
 # --- auth-required behaviour --------------------------------------------------
 
 
@@ -302,4 +436,14 @@ def test_scan_endpoint_requires_the_api_key(client: TestClient, session: Session
 def test_trigger_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     response = client.post("/api/jobs/trigger", json={"file_path": "/media/movie.mkv"})
+    assert response.status_code == 401
+
+
+def test_trigger_default_audio_endpoint_requires_the_api_key(
+    client: TestClient, session: Session
+) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post(
+        "/api/jobs/trigger-default-audio", json={"file_path": "/media/movie.mkv"}
+    )
     assert response.status_code == 401
