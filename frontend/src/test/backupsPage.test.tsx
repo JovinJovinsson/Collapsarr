@@ -226,71 +226,43 @@ describe("BackupsPage", () => {
     expect(await screen.findByText("invalid retention")).toBeInTheDocument();
   });
 
-  // --- Download action (COL-64) ------------------------------------------------
+  // --- Download action (COL-64, COL-138) ---------------------------------------
 
-  it("downloads a backup via the per-row Download action", async () => {
-    const blob = new Blob(["fake zip bytes"], { type: "application/zip" });
+  it("downloads a backup via a real browser navigation, not a fetch", async () => {
+    // COL-138: the Download button no longer fetches+blobs the archive -- it
+    // clicks a plain `<a href>` pointed at the download endpoint so the
+    // browser streams it straight to disk (and the session cookie, which a
+    // real navigation carries automatically, authenticates it). No `/download`
+    // fetch call should happen at all; only the initial list/settings loads.
     const fetchMock = vi.fn((url: string) => {
-      if (url === `/api/system/backup/${sampleBackup.id}/download`) {
-        return Promise.resolve({ ok: true, status: 200, blob: () => Promise.resolve(blob) });
-      }
-      if (url === "/api/system/backup") {
-        return Promise.resolve(jsonResponse(listWithOne));
-      }
-      if (url === "/api/settings") {
-        return Promise.resolve(jsonResponse(sampleSettings));
-      }
-      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    // jsdom's `URL` has no `createObjectURL`/`revokeObjectURL` at all (unlike a
-    // real browser), so they're defined fresh here rather than `vi.spyOn`-ed
-    // onto an existing method, then removed again in `finally`.
-    const createObjectURL = vi.fn().mockReturnValue("blob:mock-url");
-    const revokeObjectURL = vi.fn();
-    Object.defineProperty(URL, "createObjectURL", {
-      value: createObjectURL,
-      configurable: true,
-    });
-    Object.defineProperty(URL, "revokeObjectURL", {
-      value: revokeObjectURL,
-      configurable: true,
-    });
-    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
-
-    try {
-      render(<BackupsPage />);
-      fireEvent.click(await screen.findByRole("button", { name: /^download$/i }));
-
-      await waitFor(() => expect(clickSpy).toHaveBeenCalledTimes(1));
-      expect(createObjectURL).toHaveBeenCalledWith(blob);
-      expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
-
-      const downloadCall = fetchMock.mock.calls.find(([url]) => (url as string).endsWith("/download"));
-      expect(downloadCall?.[0]).toBe(`/api/system/backup/${sampleBackup.id}/download`);
-    } finally {
-      delete (URL as { createObjectURL?: unknown }).createObjectURL;
-      delete (URL as { revokeObjectURL?: unknown }).revokeObjectURL;
-      clickSpy.mockRestore();
-    }
-  });
-
-  it("surfaces an error when the download fails", async () => {
-    const fetchMock = vi.fn((url: string) => {
-      if (url.endsWith("/download")) {
-        return Promise.resolve(jsonResponse({ detail: "backup not found" }, 404));
-      }
       if (url === "/api/system/backup") return Promise.resolve(jsonResponse(listWithOne));
       if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<BackupsPage />);
-    fireEvent.click(await screen.findByRole("button", { name: /^download$/i }));
+    let capturedHref = "";
+    let capturedDownload = "";
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(function (this: HTMLAnchorElement) {
+        capturedHref = this.href;
+        capturedDownload = this.download;
+      });
 
-    expect(await screen.findByText("backup not found")).toBeInTheDocument();
+    try {
+      render(<BackupsPage />);
+      fireEvent.click(await screen.findByRole("button", { name: /^download$/i }));
+
+      await waitFor(() => expect(clickSpy).toHaveBeenCalledTimes(1));
+      expect(capturedHref).toContain(`/api/system/backup/${sampleBackup.id}/download`);
+      expect(capturedDownload).toBe(sampleBackup.name);
+      expect(fetchMock.mock.calls.some(([url]) => (url as string).endsWith("/download"))).toBe(
+        false,
+      );
+    } finally {
+      clickSpy.mockRestore();
+    }
   });
 
   // --- Delete action (COL-65) --------------------------------------------------

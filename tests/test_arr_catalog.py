@@ -11,7 +11,11 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from collapsarr.arr.catalog import fetch_radarr_catalog, fetch_sonarr_catalog
+from collapsarr.arr.catalog import (
+    MalformedCatalogResponse,
+    fetch_radarr_catalog,
+    fetch_sonarr_catalog,
+)
 from collapsarr.arr.models import ArrInstance, InstanceType
 
 _SERIES_PAYLOAD = [
@@ -114,6 +118,35 @@ def test_fetch_propagates_http_errors() -> None:
         fetch_sonarr_catalog(_sonarr_instance(), transport=transport)
 
 
+def test_fetch_raises_on_a_200_series_response_with_a_non_list_body() -> None:
+    """COL-136: an HTTP 200 whose body isn't the documented list shape must not
+    be silently treated as an empty catalog -- see module docstring."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/series":
+            return httpx.Response(200, json={"error": "maintenance mode"})
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    with pytest.raises(MalformedCatalogResponse):
+        fetch_sonarr_catalog(_sonarr_instance(), transport=transport)
+
+
+def test_fetch_raises_on_a_200_episode_response_with_a_non_list_body() -> None:
+    """COL-136: same guard for the per-series episode endpoint."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/series":
+            return httpx.Response(200, json=_SERIES_PAYLOAD)
+        if request.url.path == "/api/v3/episode":
+            return httpx.Response(200, json={"error": "maintenance mode"})
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    with pytest.raises(MalformedCatalogResponse):
+        fetch_sonarr_catalog(_sonarr_instance(), transport=transport)
+
+
 # --- Radarr (COL-99) ----------------------------------------------------------
 
 _MOVIE_PAYLOAD = [
@@ -172,4 +205,18 @@ def test_radarr_fetch_propagates_http_errors() -> None:
 
     transport = httpx.MockTransport(handler)
     with pytest.raises(httpx.HTTPStatusError):
+        fetch_radarr_catalog(_radarr_instance(), transport=transport)
+
+
+def test_radarr_fetch_raises_on_a_200_response_with_a_non_list_body() -> None:
+    """COL-136: an HTTP 200 whose body isn't the documented list shape must not
+    be silently treated as an empty catalog -- see module docstring."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/movie":
+            return httpx.Response(200, json={"error": "maintenance mode"})
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    with pytest.raises(MalformedCatalogResponse):
         fetch_radarr_catalog(_radarr_instance(), transport=transport)

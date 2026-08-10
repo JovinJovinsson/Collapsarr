@@ -266,8 +266,8 @@ export function LogsPage() {
           <table className="data-table logs-table">
             <thead>
               <tr>
-                <th scope="col">Level</th>
-                <th scope="col">Line</th>
+                <th scope="col" className="logs-table__level-col">Level</th>
+                <th scope="col" className="logs-table__line-col">Line</th>
               </tr>
             </thead>
             <tbody>

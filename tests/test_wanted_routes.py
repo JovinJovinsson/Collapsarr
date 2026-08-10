@@ -10,6 +10,9 @@ query rather than a stub.
 
 from __future__ import annotations
 
+import logging
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -201,6 +204,45 @@ def test_wanted_excludes_a_file_marked_not_tracked(
 
     response = client.get("/api/wanted", headers=_auth_headers(client))
     assert response.json() == []
+
+
+def test_wanted_falls_back_to_default_tracked_and_warns_when_the_node_is_missing(
+    client: TestClient, session: Session, caplog: pytest.LogCaptureFixture
+) -> None:
+    """COL-134: ids present but never synced to a LibraryNode -- bridge can't resolve.
+
+    Distinct from the id-less case (below): here ``instance_id``/
+    ``sonarr_episode_id`` are captured, but no matching
+    :class:`~collapsarr.library.models.LibraryNode` was ever created (e.g. a
+    scan raced ahead of the library sync). Falls back to
+    ``GlobalSettings.default_tracked`` the same as the id-less case, but --
+    unlike that case -- this is diagnosable: a WARNING is logged so a
+    Wanted/scheduler divergence report can be traced to this exact fallback.
+    """
+    caplog.set_level(logging.WARNING, logger="collapsarr.media.service")
+    instance = ArrInstance(
+        name="Sonarr", type=InstanceType.SONARR, base_url="http://sonarr.local", api_key="k"
+    )
+    session.add(instance)
+    session.commit()
+    session.refresh(instance)
+    update_global_settings(session, enabled_targets=ALL_TARGETS)
+    upsert_tracked_media(
+        session,
+        file_path="/media/pilot.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+        instance_id=instance.id,
+        sonarr_episode_id=101,  # never synced via sync_library -- no matching node exists
+    )
+
+    response = client.get("/api/wanted", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    assert [row["file_path"] for row in response.json()] == ["/media/pilot.mkv"]
+    assert response.json()[0]["tracked"] is None  # bridge unresolved, same as the id-less case
+    assert "no LibraryNode" in caplog.text
+    assert "COL-134" in caplog.text
 
 
 def test_wanted_tracked_fields_are_none_when_the_bridge_is_unresolved(

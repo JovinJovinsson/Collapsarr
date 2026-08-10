@@ -320,7 +320,16 @@ def _sync_radarr_catalog(session: Session, *, instance_id: int, catalog: RadarrC
 
 
 def _soft_hide_missing(existing: dict[str, LibraryNode], seen: set[str]) -> None:
-    """Mark any existing node whose key wasn't ``seen`` in this sync as hidden."""
+    """Mark any existing node whose key wasn't ``seen`` in this sync as hidden.
+
+    A malformed-but-200 catalog response (COL-136) is guarded against
+    upstream, not here: :mod:`collapsarr.arr.catalog` raises
+    :class:`~collapsarr.arr.catalog.MalformedCatalogResponse` rather than
+    silently returning an empty catalog for a non-list payload, so a
+    genuinely empty ``seen`` reaching this function means the fetch
+    actually succeeded and reported nothing -- soft-hiding everything is
+    the correct, intentional behavior in that case.
+    """
     for node_key, node in existing.items():
         if node_key not in seen and not node.hidden:
             node.hidden = True

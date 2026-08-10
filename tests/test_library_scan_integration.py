@@ -16,6 +16,9 @@ uses the injected catalog fetch and is unaffected.
 
 from __future__ import annotations
 
+import logging
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
@@ -24,6 +27,7 @@ from collapsarr.arr.catalog import (
     CatalogEpisode,
     CatalogMovie,
     CatalogSeries,
+    MalformedCatalogResponse,
     RadarrCatalog,
     SonarrCatalog,
 )
@@ -243,3 +247,47 @@ def test_a_second_scan_soft_hides_a_removed_movie_from_the_tree_api(
     assert response.status_code == 200
     movies = response.json()["movies"]
     assert {m["radarr_movie_id"] for m in movies} == {1}  # movie 2 soft-hidden
+
+
+def test_a_malformed_catalog_response_never_soft_hides_the_movie_tree(
+    settings: Settings, client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """COL-136: a 200-with-bad-shape fetch must not wipe a previously-synced Library.
+
+    Mirrors ``test_a_second_scan_soft_hides_a_removed_movie_from_the_tree_api``,
+    but the second scan's fetch raises
+    :class:`~collapsarr.arr.catalog.MalformedCatalogResponse` (what
+    :func:`~collapsarr.arr.catalog.fetch_radarr_catalog` now raises for a 200
+    response whose body isn't the documented list shape) instead of legitimately
+    reporting fewer movies. Unlike a real removal, this must leave every
+    previously-synced movie exactly as it was.
+    """
+    caplog.set_level(logging.WARNING, logger="collapsarr.jobs.scheduler")
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    instance_id = _seed_radarr_instance(session_factory)
+
+    calls = {"n": 0}
+
+    def radarr_catalog_fetch(_instance: ArrInstance) -> RadarrCatalog:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _radarr_catalog(instance_id)
+        raise MalformedCatalogResponse("GET /api/v3/movie returned a non-list body: dict")
+
+    queue = JobQueue.from_settings(settings)
+    scheduler = JobScheduler(
+        queue, session_factory, settings, radarr_catalog_fetch=radarr_catalog_fetch
+    )
+
+    scheduler.scan_once()
+    scheduler.scan_once()
+
+    assert "failed to fetch catalog" in caplog.text
+    response = client.get(
+        f"/api/library/instances/{instance_id}/tree", headers=_auth_headers(client)
+    )
+    assert response.status_code == 200
+    movies = response.json()["movies"]
+    assert {m["title"] for m in movies} == {"Arrival", "Not Yet Downloaded"}  # untouched
