@@ -6,7 +6,7 @@ import { LibraryPage } from "../pages/LibraryPage";
 import { LoginPage } from "../pages/LoginPage";
 import { SetupPage } from "../pages/SetupPage";
 import { getUrlBase } from "../runtime/urlBase";
-import { navItems, SYSTEM_PATH, systemNavItems } from "./nav";
+import { navItems, settingsNavItems, SYSTEM_PATH, systemNavItems } from "./nav";
 
 /**
  * Route config, exported separately from `router` (below) so tests can drive
@@ -32,6 +32,12 @@ export const routes: RouteObject[] = [
       // first System view (Tasks).
       { path: SYSTEM_PATH, element: <Navigate to={`${SYSTEM_PATH}/tasks`} replace /> },
       ...systemNavItems.map(({ to, element }) => ({ path: to, element })),
+      // Settings sub-nav (COL-142): General is the first migrated page. The
+      // old composed `/settings` route (wired via `navItems` above) still
+      // serves Instances/Targets/Connect and stays reachable -- no bare
+      // /settings -> /settings/general redirect yet (that ships with the
+      // last migration, COL-144).
+      ...settingsNavItems.map(({ to, element }) => ({ path: to, element })),
       // Per-file detail (COL-34): not a primary nav destination, so it's
       // wired directly here rather than through `navItems` (the sidebar's
       // source of truth) -- it's reached from a file row, not the sidebar.

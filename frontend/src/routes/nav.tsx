@@ -17,6 +17,7 @@ import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
 import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { LogsPage } from "../pages/LogsPage";
+import { SettingsGeneralPage } from "../pages/SettingsGeneralPage";
 import { SettingsPage } from "../pages/SettingsPage";
 import { StatusPage } from "../pages/StatusPage";
 import { TasksPage } from "../pages/TasksPage";
@@ -40,6 +41,29 @@ export const LIBRARIES_PATH = "/libraries";
  */
 export const SYSTEM_PATH = "/system";
 
+/**
+ * Base path of the "Settings" primary nav item -- still the old composed
+ * `SettingsPage` for now (COL-142 only splits out General; Instances/
+ * Targets/Connect migrate to their own pages in later Epic tickets). Kept as
+ * a constant, mirroring `LIBRARIES_PATH`/`SYSTEM_PATH`, since `Sidebar`
+ * (to special-case Settings' sidebar entry onto `NavSection`) and this
+ * module's own `navItems` entry below both need to recognise the same path
+ * without risking drift between two hardcoded string literals.
+ */
+export const SETTINGS_PATH = "/settings";
+
+/**
+ * Path of the Settings sub-nav's first entry, General (COL-142). Unlike
+ * `SYSTEM_PATH`, whose `NavSection` `to` and default-redirect target are the
+ * group's own base path, Settings' base path (`SETTINGS_PATH`) still serves
+ * the old composed page until every remaining section has migrated -- so the
+ * sidebar's Settings entry links/expands through this narrower path instead
+ * (COL-142 AC), not `SETTINGS_PATH` itself. No bare `SETTINGS_PATH` ->
+ * `SETTINGS_GENERAL_PATH` redirect is wired yet; that ships with the last
+ * migration (COL-144), once nothing else needs the old composed page.
+ */
+export const SETTINGS_GENERAL_PATH = `${SETTINGS_PATH}/general`;
+
 export interface NavItem {
   to: string;
   label: string;
@@ -57,7 +81,7 @@ export const navItems: NavItem[] = [
   { to: "/wanted", label: "Wanted", icon: <WantedIcon />, element: <WantedPage /> },
   { to: LIBRARIES_PATH, label: "Libraries", icon: <LibraryIcon />, element: <LibrariesIndexPage /> },
   { to: "/activity", label: "Activity", icon: <ActivityIcon />, element: <ActivityPage /> },
-  { to: "/settings", label: "Settings", icon: <SettingsIcon />, element: <SettingsPage /> },
+  { to: SETTINGS_PATH, label: "Settings", icon: <SettingsIcon />, element: <SettingsPage /> },
 ];
 
 /**
@@ -81,4 +105,17 @@ export const systemNavItems: NavItem[] = [
   { to: `${SYSTEM_PATH}/status`, label: "Status", icon: <StatusIcon />, element: <StatusPage /> },
   { to: `${SYSTEM_PATH}/updates`, label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
   { to: `${SYSTEM_PATH}/logs`, label: "Logs", icon: <LogsIcon />, element: <LogsPage /> },
+];
+
+/**
+ * The **Settings** sub-nav (COL-139/COL-142): mirrors `systemNavItems`'
+ * shape, splitting the old composed `SettingsPage` into Bazarr-style
+ * dedicated pages one at a time. General is the first migrated page --
+ * `SettingsGeneralPage` renders `GeneralSection`'s content unchanged. The
+ * old `/settings` route (wired via `navItems` above) still serves the
+ * not-yet-migrated Instances/Targets/Connect sections and stays reachable
+ * until each has its own entry here (later tickets in this Epic).
+ */
+export const settingsNavItems: NavItem[] = [
+  { to: SETTINGS_GENERAL_PATH, label: "General", icon: <SettingsIcon />, element: <SettingsGeneralPage /> },
 ];

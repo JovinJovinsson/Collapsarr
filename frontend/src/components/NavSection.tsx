@@ -6,7 +6,16 @@ import { useNavGroupExpanded } from "../hooks/useNavGroupExpanded";
 import type { NavItem } from "../routes/nav";
 
 export interface NavSectionProps {
-  /** Base path for the group -- also the destination of its default link. */
+  /**
+   * Destination of the group's default link, and the base path
+   * `useNavGroupExpanded` expands under (this path itself, or anything
+   * nested under it). For System this is the group's own base path
+   * (`/system`); Settings (COL-142) instead passes its sub-nav's first
+   * entry (`/settings/general`), since the group's actual base path
+   * (`/settings`) still belongs to the old composed page mid-migration --
+   * so don't assume `to` is always the group's literal base path when
+   * reusing this component elsewhere.
+   */
   to: string;
   label: string;
   /** Optional: the plain `<li className="sidebar__section">` header this

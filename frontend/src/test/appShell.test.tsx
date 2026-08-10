@@ -63,9 +63,12 @@ describe("app shell", () => {
       "href",
       "/activity",
     );
+    // Settings' sidebar entry links through to its sub-nav's first page
+    // (COL-142) rather than the old composed /settings route directly --
+    // see settingsNav.test.tsx for the fuller expand/collapse coverage.
     expect(within(nav).getByRole("link", { name: /settings/i })).toHaveAttribute(
       "href",
-      "/settings",
+      "/settings/general",
     );
   });
 

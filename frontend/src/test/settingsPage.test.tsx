@@ -44,11 +44,13 @@ const notifierConfig: NotifierConfig = {
 
 /**
  * Smoke test: renders the composed Settings view (COL-33, plus Connect from
- * COL-36) against a mocked API and checks each section (Instances / Targets /
- * Connect / General) mounts and shows its populated or empty state -- the
+ * COL-36) against a mocked API and checks each remaining section (Instances /
+ * Targets / Connect) mounts and shows its populated or empty state -- the
  * deeper per-section behaviour (CRUD, validation, error surfacing) is
- * covered by `settingsInstances.test.tsx`, `settingsTargets.test.tsx`,
- * `settingsConnect.test.tsx`, and `settingsGeneral.test.tsx`.
+ * covered by `settingsInstances.test.tsx`, `settingsTargets.test.tsx`, and
+ * `settingsConnect.test.tsx`. General moved to its own page (COL-142),
+ * covered by `settingsGeneral.test.tsx`; this smoke test no longer asserts
+ * on it.
  */
 describe("SettingsPage", () => {
   afterEach(() => {
@@ -76,6 +78,5 @@ describe("SettingsPage", () => {
     expect(await screen.findByText(/no arr instances configured yet/i)).toBeInTheDocument();
     expect(await screen.findByRole("checkbox", { name: /stereo/i })).toBeInTheDocument();
     expect(await screen.findByLabelText(/^webhook url$/i)).toHaveValue("");
-    expect(await screen.findByLabelText(/server api key/i)).toHaveValue("server-key");
   });
 });
