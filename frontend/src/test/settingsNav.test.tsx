@@ -39,17 +39,18 @@ function renderWithSettingsNav(path: string) {
 /**
  * COL-142 established this suite; COL-143 (Targets/Connect) and COL-144
  * (Sonarr/Radarr, plus the composed `SettingsPage`'s removal) extended it.
- * Settings is now fully migrated -- `/settings` is a bare redirect to
- * `/settings/general` (mirroring `/system` -> `/system/tasks`), so the
- * `NavSection` `to`/expand-base tension COL-142's review flagged (the
- * sidebar staying collapsed while the old composed page or Targets/Connect
- * were active, since `to` pointed at the narrower `/settings/general`) is
- * gone: `to` is `/settings` itself now, exactly like System's `to={SYSTEM_PATH}`,
- * so every `/settings/*` route expands the group correctly.
+ * COL-146 (Phase 2) appends Scheduler as the sixth entry. Settings is now
+ * fully migrated -- `/settings` is a bare redirect to `/settings/general`
+ * (mirroring `/system` -> `/system/tasks`), so the `NavSection` `to`/
+ * expand-base tension COL-142's review flagged (the sidebar staying
+ * collapsed while the old composed page or Targets/Connect were active,
+ * since `to` pointed at the narrower `/settings/general`) is gone: `to` is
+ * `/settings` itself now, exactly like System's `to={SYSTEM_PATH}`, so every
+ * `/settings/*` route expands the group correctly.
  */
-describe("Settings navigation (COL-142, COL-143, COL-144)", () => {
-  it("orders settingsNavItems as General, Sonarr, Radarr, Targets, Connect", () => {
-    const expectedOrder = ["General", "Sonarr", "Radarr", "Targets", "Connect"];
+describe("Settings navigation (COL-142, COL-143, COL-144, COL-146)", () => {
+  it("orders settingsNavItems as General, Sonarr, Radarr, Targets, Connect, Scheduler", () => {
+    const expectedOrder = ["General", "Sonarr", "Radarr", "Targets", "Connect", "Scheduler"];
     const actualOrder = settingsNavItems.map((item) => item.label);
 
     expect(actualOrder).toEqual(expectedOrder);
@@ -74,12 +75,13 @@ describe("Settings navigation (COL-142, COL-143, COL-144)", () => {
     // systemNav.test.tsx's equivalent assertion.
     const settingsHrefs = new Set(settingsNavItems.map((item) => item.to));
     const settingsLinks = links.filter((link) => settingsHrefs.has(link.getAttribute("href") ?? ""));
-    expect(settingsLinks).toHaveLength(5);
+    expect(settingsLinks).toHaveLength(6);
     expect(settingsLinks[0]).toHaveTextContent("General");
     expect(settingsLinks[1]).toHaveTextContent("Sonarr");
     expect(settingsLinks[2]).toHaveTextContent("Radarr");
     expect(settingsLinks[3]).toHaveTextContent("Targets");
     expect(settingsLinks[4]).toHaveTextContent("Connect");
+    expect(settingsLinks[5]).toHaveTextContent("Scheduler");
   });
 
   // COL-142/COL-144: Settings renders through the shared `NavSection`

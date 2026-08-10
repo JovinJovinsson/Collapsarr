@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { BackupsPage } from "../pages/BackupsPage";
 import type { Backup, BackupList } from "../types/backups";
-import type { GlobalSettings } from "../types/settings";
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
@@ -20,42 +19,12 @@ const sampleBackup: Backup = {
 const emptyList: BackupList = { supported: true, backups: [] };
 const listWithOne: BackupList = { supported: true, backups: [sampleBackup] };
 
-const sampleSettings: GlobalSettings = {
-  enabled_targets: ["stereo"],
-  language_allow_list: null,
-  stereo_codec: "aac",
-  stereo_bitrate_kbps: null,
-  surround_codec: "ac3",
-  surround_bitrate_kbps: 448,
-  concurrency_limit: 1,
-  ui_auth_enabled: false,
-  auth_required: "local_bypass",
-  auth_method: "forms",
-  backup_interval_days: 7,
-  backup_retention_days: 28,
-  disk_space_warning_percent: 5,
-  disk_space_error_percent: 2,
-  update_channel: "stable",
-  default_tracked: true,
-  log_level: null,
-  api_key: "abc123",
-  created_at: "2026-07-27T00:00:00Z",
-  updated_at: "2026-07-27T00:00:00Z",
-};
-
-/** Routes a mocked `fetch` by URL/method: `/api/system/backup` vs. `/api/settings`. */
+/** Routes a mocked `fetch` by URL/method against `/api/system/backup`. */
 function stubFetch(options: {
   backups?: BackupList;
-  settings?: GlobalSettings;
   onBackupPost?: () => { ok: boolean; status: number; json: () => Promise<unknown> };
-  onSettingsPut?: (body: unknown) => { ok: boolean; status: number; json: () => Promise<unknown> };
 }) {
-  const {
-    backups = emptyList,
-    settings = sampleSettings,
-    onBackupPost,
-    onSettingsPut,
-  } = options;
+  const { backups = emptyList, onBackupPost } = options;
 
   const fetchMock = vi.fn((url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
@@ -64,13 +33,6 @@ function stubFetch(options: {
     }
     if (url === "/api/system/backup") {
       return Promise.resolve(jsonResponse(backups));
-    }
-    if (url === "/api/settings" && method === "PUT") {
-      const body: unknown = init?.body ? JSON.parse(init.body as string) : {};
-      return Promise.resolve(onSettingsPut ? onSettingsPut(body) : jsonResponse({ ...settings, ...(body as object) }));
-    }
-    if (url === "/api/settings") {
-      return Promise.resolve(jsonResponse(settings));
     }
     return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
   });
@@ -113,9 +75,6 @@ describe("BackupsPage", () => {
       if (url === "/api/system/backup") {
         return Promise.resolve(jsonResponse(backupCreated ? listWithOne : emptyList));
       }
-      if (url === "/api/settings") {
-        return Promise.resolve(jsonResponse(sampleSettings));
-      }
       return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -151,7 +110,6 @@ describe("BackupsPage", () => {
   it("renders an error state when the initial load fails", async () => {
     const fetchMock = vi.fn((url: string) => {
       if (url === "/api/system/backup") return Promise.reject(new Error("network down"));
-      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -170,62 +128,6 @@ describe("BackupsPage", () => {
     expect(within(row as HTMLElement).getByText(expected)).toBeInTheDocument();
   });
 
-  // --- Backup schedule (COL-66) ------------------------------------------------
-
-  it("renders the persisted interval/retention values from a mocked GET", async () => {
-    stubFetch({ settings: { ...sampleSettings, backup_interval_days: 3, backup_retention_days: 14 } });
-    render(<BackupsPage />);
-
-    expect(await screen.findByLabelText(/backup interval/i)).toHaveValue(3);
-    expect(screen.getByLabelText(/backup retention/i)).toHaveValue(14);
-  });
-
-  it("saves edited interval/retention via PUT and persists across reload", async () => {
-    const fetchMock = stubFetch({});
-    render(<BackupsPage />);
-
-    const intervalInput = await screen.findByLabelText(/backup interval/i);
-    const retentionInput = screen.getByLabelText(/backup retention/i);
-    fireEvent.change(intervalInput, { target: { value: "10" } });
-    fireEvent.change(retentionInput, { target: { value: "30" } });
-    fireEvent.click(screen.getByRole("button", { name: /save schedule/i }));
-
-    expect(await screen.findByText("Saved.")).toBeInTheDocument();
-    const putCall = fetchMock.mock.calls.find(
-      ([url, init]) => url === "/api/settings" && (init as RequestInit | undefined)?.method === "PUT",
-    );
-    expect(putCall).toBeDefined();
-    const body: unknown = JSON.parse((putCall?.[1] as RequestInit).body as string);
-    expect(body).toEqual({ backup_interval_days: 10, backup_retention_days: 30 });
-    expect(intervalInput).toHaveValue(10);
-    expect(retentionInput).toHaveValue(30);
-  });
-
-  it("rejects a non-positive interval before saving, without calling PUT", async () => {
-    const fetchMock = stubFetch({});
-    render(<BackupsPage />);
-
-    const intervalInput = await screen.findByLabelText(/backup interval/i);
-    fireEvent.change(intervalInput, { target: { value: "0" } });
-    fireEvent.click(screen.getByRole("button", { name: /save schedule/i }));
-
-    expect(await screen.findByText(/must be a whole number of 1 or more/i)).toBeInTheDocument();
-    expect(
-      fetchMock.mock.calls.some(
-        ([url, init]) => url === "/api/settings" && (init as RequestInit | undefined)?.method === "PUT",
-      ),
-    ).toBe(false);
-  });
-
-  it("surfaces an error when saving the schedule fails", async () => {
-    stubFetch({ onSettingsPut: () => jsonResponse({ detail: "invalid retention" }, 422) });
-    render(<BackupsPage />);
-
-    fireEvent.click(await screen.findByRole("button", { name: /save schedule/i }));
-
-    expect(await screen.findByText("invalid retention")).toBeInTheDocument();
-  });
-
   // --- Download action (COL-64, COL-138) ---------------------------------------
 
   it("downloads a backup via a real browser navigation, not a fetch", async () => {
@@ -233,10 +135,9 @@ describe("BackupsPage", () => {
     // clicks a plain `<a href>` pointed at the download endpoint so the
     // browser streams it straight to disk (and the session cookie, which a
     // real navigation carries automatically, authenticates it). No `/download`
-    // fetch call should happen at all; only the initial list/settings loads.
+    // fetch call should happen at all; only the initial list load.
     const fetchMock = vi.fn((url: string) => {
       if (url === "/api/system/backup") return Promise.resolve(jsonResponse(listWithOne));
-      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -278,7 +179,6 @@ describe("BackupsPage", () => {
       if (url === "/api/system/backup") {
         return Promise.resolve(jsonResponse(deleted ? emptyList : listWithOne));
       }
-      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -326,7 +226,6 @@ describe("BackupsPage", () => {
         );
       }
       if (url === "/api/system/backup") return Promise.resolve(jsonResponse(listWithOne));
-      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -375,7 +274,6 @@ describe("BackupsPage", () => {
         return Promise.resolve(jsonResponse({ status: "restoring", backup_id: sampleBackup.id }, 202));
       }
       if (url === "/api/system/backup") return Promise.resolve(jsonResponse(listWithOne));
-      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -420,7 +318,6 @@ describe("BackupsPage", () => {
         );
       }
       if (url === "/api/system/backup") return Promise.resolve(jsonResponse(listWithOne));
-      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -436,7 +333,7 @@ describe("BackupsPage", () => {
 
   // --- Upload & Restore action (COL-73) ---------------------------------------
 
-  const zipFile = () => new File(["PK fake zip bytes"], "backup.zip", { type: "application/zip" });
+  const zipFile = () => new File(["PK fake zip bytes"], "backup.zip", { type: "application/zip" });
 
   it("shows an Upload & Restore control that confirms before uploading", async () => {
     const fetchMock = stubFetch({ backups: emptyList });
@@ -471,7 +368,6 @@ describe("BackupsPage", () => {
         return Promise.resolve(jsonResponse({ status: "restoring" }, 202));
       }
       if (url === "/api/system/backup") return Promise.resolve(jsonResponse(emptyList));
-      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -517,7 +413,6 @@ describe("BackupsPage", () => {
         );
       }
       if (url === "/api/system/backup") return Promise.resolve(jsonResponse(emptyList));
-      if (url === "/api/settings") return Promise.resolve(jsonResponse(sampleSettings));
       return Promise.reject(new Error(`Unexpected fetch: ${method} ${url}`));
     });
     vi.stubGlobal("fetch", fetchMock);
