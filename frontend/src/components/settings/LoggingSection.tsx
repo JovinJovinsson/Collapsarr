@@ -74,7 +74,10 @@ export function LoggingSection() {
       <div className="settings-section__header">
         <div>
           <h2 className="settings-section__title">Logging</h2>
-          <p className="settings-section__summary">The runtime log-level override.</p>
+          <p className="settings-section__summary">
+            Override the log level without a restart, or defer to the{" "}
+            <code>COLLAPSARR_LOG_LEVEL</code> environment setting.
+          </p>
         </div>
       </div>
 
