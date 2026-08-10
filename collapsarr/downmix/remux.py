@@ -102,6 +102,7 @@ def build_remux_command(
     settings: DownmixSettings,
     *,
     ffmpeg_path: str = _DEFAULT_FFMPEG_PATH,
+    default_audio_index: int | None = None,
 ) -> list[str]:
     """Build the FFmpeg argv that remuxes ``file_path`` into ``temp_file_path``.
 
@@ -117,13 +118,34 @@ def build_remux_command(
     subtitle stream is present), with the codec/bitrate drawn from
     ``settings`` and an ``-metadata:s:a:N language=<lang>`` tag.
 
+    ``default_audio_index`` folds the automatic Default Audio Track fix
+    (COL-152) into this *same* invocation: when it is ``None`` (the default),
+    **no** ``-disposition`` flag is emitted at all, so the command is
+    byte-for-byte what it was before the feature existed. When it is an output
+    audio-relative index, that output audio stream gets
+    ``-disposition:a:N default`` and every *other* output audio stream (existing
+    copies and newly-encoded tracks alike) gets ``-disposition:a:N 0`` —
+    explicit on all of them, so the winner is set and any wrongly-defaulted
+    track is cleared regardless of what disposition ``-c copy`` would otherwise
+    carry over. The output audio layout is the existing streams in order
+    (indices ``0 .. len(streams)-1``) followed by one per qualifying target;
+    the caller resolves ``default_audio_index`` against that layout via
+    :func:`~collapsarr.downmix.default_audio.resolve_default_audio_output_index`.
+
     Raises:
         ValueError: ``qualifying_targets`` is empty, or one of its entries'
             language has no matching stream in ``streams`` — both indicate
             mismatched inputs (this file's own probe/detect output should
-            never produce either), not an ffmpeg runtime failure.
+            never produce either), not an ffmpeg runtime failure; or
+            ``default_audio_index`` falls outside the output audio layout.
     """
     sources = _resolve_sources(streams, qualifying_targets)
+    total_audio_streams = len(streams) + len(sources)
+    if default_audio_index is not None and not 0 <= default_audio_index < total_audio_streams:
+        raise ValueError(
+            f"default_audio_index {default_audio_index} is out of range for "
+            f"{total_audio_streams} output audio stream(s)"
+        )
 
     command = [
         ffmpeg_path,
@@ -153,6 +175,11 @@ def build_remux_command(
             command += [f"-b:a:{audio_index}", f"{bitrate_kbps}k"]
         command += [f"-metadata:s:a:{audio_index}", f"language={target.language}"]
 
+    if default_audio_index is not None:
+        for audio_index in range(total_audio_streams):
+            flag = "default" if audio_index == default_audio_index else "0"
+            command += [f"-disposition:a:{audio_index}", flag]
+
     command.append(str(temp_file_path))
     return command
 
@@ -165,6 +192,7 @@ def run_remux(
     *,
     ffmpeg_path: str = _DEFAULT_FFMPEG_PATH,
     timeout: float = _DEFAULT_TIMEOUT,
+    default_audio_index: int | None = None,
     runner: _Runner | None = None,
 ) -> RemuxResult:
     """Run the FFmpeg remux for ``file_path``, returning a structured result.
@@ -173,6 +201,11 @@ def run_remux(
     filesystem, required for a later atomic rename in COL-18), reserving a
     unique name via :func:`tempfile.mkstemp` before invoking ffmpeg so two
     concurrent jobs on the same file can never collide.
+
+    ``default_audio_index`` is forwarded to :func:`build_remux_command` (see
+    there): ``None`` emits no disposition flags, keeping the command
+    byte-for-byte unchanged; an output audio-relative index folds the Default
+    Audio Track fix into this same invocation and atomic swap.
 
     ``runner`` overrides how the subprocess is invoked (signature
     ``(command, timeout) -> subprocess.CompletedProcess``); it defaults to a
@@ -189,8 +222,18 @@ def run_remux(
     """
     path = Path(file_path)
     # Validate before touching the filesystem: a bad-input ValueError here
-    # must never leave a temp file behind.
-    _resolve_sources(streams, qualifying_targets)
+    # (empty/mismatched targets, or an out-of-range default_audio_index) must
+    # never leave a temp file behind. Building the command against a throwaway
+    # path exercises exactly the same validation build_remux_command applies.
+    build_remux_command(
+        path,
+        path,
+        streams,
+        qualifying_targets,
+        settings,
+        ffmpeg_path=ffmpeg_path,
+        default_audio_index=default_audio_index,
+    )
 
     run = runner or _run_ffmpeg
     fd, temp_name = tempfile.mkstemp(
@@ -200,7 +243,13 @@ def run_remux(
     temp_path = Path(temp_name)
 
     command = build_remux_command(
-        path, temp_path, streams, qualifying_targets, settings, ffmpeg_path=ffmpeg_path
+        path,
+        temp_path,
+        streams,
+        qualifying_targets,
+        settings,
+        ffmpeg_path=ffmpeg_path,
+        default_audio_index=default_audio_index,
     )
 
     try:

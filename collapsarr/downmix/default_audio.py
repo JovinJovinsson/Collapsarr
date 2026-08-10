@@ -45,7 +45,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from collapsarr.downmix.probe import AudioStreamInfo
-from collapsarr.downmix.targets import DownmixTarget
+from collapsarr.downmix.targets import DownmixTarget, QualifyingTarget
 
 # Deliberately a private, module-local copy rather than importing
 # `collapsarr.downmix.targets`'s own private mapping -- `collapsarr.downmix.remux`
@@ -98,6 +98,84 @@ def resolve_default_audio_stream(
         return _best_available(same_language)
 
     return _best_available(streams)
+
+
+def resolve_default_audio_output_index(
+    streams: Sequence[AudioStreamInfo],
+    qualifying_targets: Sequence[QualifyingTarget],
+    preference: DefaultAudioPreference,
+) -> int | None:
+    """Resolve the disposition winner over a downmix job's *final* stream layout.
+
+    Where :func:`resolve_default_audio_stream` answers "which existing stream
+    should be default", this answers the question the automatic in-band fix
+    (COL-152) actually needs: given a file's current audio streams *plus* the
+    new tracks a downmix job is about to encode, which **output** audio-relative
+    index should carry the Default Audio Track disposition -- or ``None`` when
+    nothing needs to change.
+
+    The final output audio layout mirrors
+    :func:`~collapsarr.downmix.remux.build_remux_command`: the existing streams
+    first, in their probed order (output audio indices ``0 .. len(streams)-1``),
+    then one freshly-encoded track per entry in ``qualifying_targets``, in that
+    order (indices ``len(streams) ..``). New tracks are modelled as ordinary,
+    non-default :class:`~collapsarr.downmix.probe.AudioStreamInfo` (their
+    language and channel count are the only fields resolution reads), so a job
+    that adds the preferred tier can legitimately make one of its *new* tracks
+    the winner. New tracks are given indices above every existing stream's, so
+    the "ties broken toward the lowest index" rule keeps preferring an existing
+    stream on a tie.
+
+    Returns ``None`` -- meaning "emit no disposition flags", so the remux stays
+    byte-for-byte what it would be without this feature -- in two cases:
+
+    - :func:`resolve_default_audio_stream` finds no winner (a final layout with
+      fewer than two streams); or
+    - the resolved winner already carries the disposition **and** no other
+      output stream wrongly carries it too (the acceptance criteria's
+      "nothing to change" no-op). A newly-encoded track can never satisfy this,
+      as it starts non-default, so any job whose winner is a new track always
+      returns its index.
+    """
+    final_streams = _final_audio_layout(streams, qualifying_targets)
+    winner = resolve_default_audio_stream(final_streams, preference)
+    if winner is None:
+        return None
+
+    output_index = next(i for i, stream in enumerate(final_streams) if stream is winner)
+
+    already_correct = winner.is_default and not any(
+        stream.is_default for i, stream in enumerate(final_streams) if i != output_index
+    )
+    if already_correct:
+        return None
+    return output_index
+
+
+def _final_audio_layout(
+    streams: Sequence[AudioStreamInfo], qualifying_targets: Sequence[QualifyingTarget]
+) -> list[AudioStreamInfo]:
+    """Model the output audio layout of a downmix: existing streams then new tracks.
+
+    New tracks carry only the fields resolution reads (``language``,
+    ``channels``, ``is_default=False``); ``index`` is set above every existing
+    stream's so tie-breaks keep favouring existing streams, and the unused
+    ``codec``/``channel_layout`` are left as empty placeholders.
+    """
+    layout = list(streams)
+    next_index = max((stream.index for stream in streams), default=-1) + 1
+    for offset, target in enumerate(qualifying_targets):
+        layout.append(
+            AudioStreamInfo(
+                index=next_index + offset,
+                codec="",
+                channels=_TARGET_CHANNELS[target.target],
+                channel_layout="",
+                language=target.language,
+                is_default=False,
+            )
+        )
+    return layout
 
 
 def _find_exact_match(
