@@ -1323,6 +1323,19 @@ a {
   background: var(--c-surface-raised);
 }
 
+/* Current Default Audio Track column (COL-154): plain text, not a pill --
+   this is read-only informational data, not a status affordance like the
+   file badge/Tracked toggle above. The unknown state is dimmed the same way
+   .library-tree-table__file-badge--missing dims a missing file. */
+.library-tree-table__default-track {
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+.library-tree-table__default-track--unknown {
+  color: var(--c-text-muted);
+}
+
 /* The Tracked toggle (COL-101), shared by LibraryPage's rows and
    FileDetailPage's Tracked panel (components/TrackedToggleButton.tsx):
    mirrors the file badge's pill shape so both status affordances on a row

@@ -70,6 +70,7 @@ const seriesTree: LibraryTreeResponse = {
               title: "Pilot",
               has_file: true,
               tracked: true,
+              current_default_track: null,
             },
             {
               id: 31,
@@ -80,6 +81,7 @@ const seriesTree: LibraryTreeResponse = {
               title: "Cat's in the Bag...",
               has_file: false,
               tracked: true,
+              current_default_track: null,
             },
           ],
         },
@@ -120,6 +122,7 @@ const twoSeriesTree: LibraryTreeResponse = {
               title: "Uno",
               has_file: true,
               tracked: true,
+              current_default_track: null,
             },
           ],
         },
@@ -165,6 +168,7 @@ const mixedTrackedTree: LibraryTreeResponse = {
               title: "Uno",
               has_file: true,
               tracked: false,
+              current_default_track: null,
             },
           ],
         },
@@ -214,6 +218,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               title: "The Target",
               has_file: true,
               tracked: true,
+              current_default_track: null,
             },
             {
               id: 34,
@@ -224,6 +229,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               title: "The Detail",
               has_file: true,
               tracked: false,
+              current_default_track: null,
             },
           ],
         },
@@ -242,6 +248,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               title: "Ebb Tide",
               has_file: true,
               tracked: true,
+              current_default_track: null,
             },
           ],
         },
@@ -253,7 +260,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
 const movieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
-    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true },
+    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true, current_default_track: null },
     {
       id: 41,
       kind: "movie",
@@ -261,6 +268,7 @@ const movieTree: MovieLibraryTreeResponse = {
       title: "Dune: Part Two",
       has_file: false,
       tracked: true,
+      current_default_track: null,
     },
   ],
 };
@@ -269,7 +277,7 @@ const movieTree: MovieLibraryTreeResponse = {
 const mixedTrackedMovieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
-    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true },
+    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true, current_default_track: null },
     {
       id: 41,
       kind: "movie",
@@ -277,6 +285,7 @@ const mixedTrackedMovieTree: MovieLibraryTreeResponse = {
       title: "Dune: Part Two",
       has_file: false,
       tracked: false,
+      current_default_track: null,
     },
   ],
 };
@@ -378,6 +387,58 @@ describe("LibraryPage (COL-100)", () => {
 
     expect(within(missingRow).getByText("Missing")).toBeInTheDocument();
     expect(missingRow.className).toContain("library-tree-table__row--dimmed");
+  });
+
+  it("renders the current Default Audio Track column, with a clear unknown state (COL-154)", async () => {
+    const treeWithDefaultTrack: LibraryTreeResponse = {
+      ...seriesTree,
+      series: [
+        {
+          ...seriesTree.series[0],
+          seasons: [
+            {
+              ...seriesTree.series[0].seasons[0],
+              episodes: [
+                {
+                  ...seriesTree.series[0].seasons[0].episodes[0],
+                  current_default_track: { language: "dan", channel_layout: "5.1" },
+                },
+                seriesTree.series[0].seasons[0].episodes[1], // current_default_track: null
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: treeWithDefaultTrack }));
+    renderLibraryPage(1);
+
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+
+    const pilotRow = (await screen.findByText(/pilot/i)).closest("tr") as HTMLElement;
+    expect(within(pilotRow).getByText("Dan · 5.1")).toBeInTheDocument();
+
+    const unprobedRow = screen.getByText(/cat's in the bag/i).closest("tr") as HTMLElement;
+    expect(within(unprobedRow).getByText("Unknown")).toBeInTheDocument();
+  });
+
+  it("renders the current Default Audio Track column for a flat Movie list (COL-154)", async () => {
+    const movieTreeWithDefaultTrack: MovieLibraryTreeResponse = {
+      ...movieTree,
+      movies: [
+        { ...movieTree.movies[0], current_default_track: { language: "eng", channel_layout: "5.1" } },
+        movieTree.movies[1], // current_default_track: null
+      ],
+    };
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [radarrInstance], tree: movieTreeWithDefaultTrack }));
+    renderLibraryPage(2);
+
+    const interstellarRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+    expect(within(interstellarRow).getByText("Eng · 5.1")).toBeInTheDocument();
+
+    const duneRow = screen.getByText("Dune: Part Two").closest("tr") as HTMLElement;
+    expect(within(duneRow).getByText("Unknown")).toBeInTheDocument();
   });
 
   it("renders a Radarr instance's flat Movie list with no season/episode nesting", async () => {

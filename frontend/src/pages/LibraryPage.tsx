@@ -12,6 +12,7 @@ import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import { useInstances } from "../hooks/useInstances";
 import type { ArrInstance } from "../types/instances";
 import type {
+  CurrentDefaultTrack,
   EpisodeNode,
   LibraryNodeKind,
   LibraryTree,
@@ -42,6 +43,43 @@ function FileStatusBadge({ hasFile }: { hasFile: boolean }) {
       {hasFile ? "Has file" : "Missing"}
     </span>
   );
+}
+
+/** Title-cases the first character only -- "stereo" -> "Stereo", "5.1"/"unknown" pass through/normalize as-is. */
+function capitalizeFirst(value: string): string {
+  return value.length === 0 ? value : value[0].toUpperCase() + value.slice(1);
+}
+
+/**
+ * Formats a current Default Audio Track snapshot (COL-154) for display, e.g.
+ * "Danish · 5.1". Both halves come straight from the probed ffprobe metadata
+ * (a language tag, e.g. "dan", and a channel layout, e.g. "5.1"/"stereo") --
+ * only capitalized, not translated into a full language name, since the
+ * backend doesn't carry one.
+ */
+function formatCurrentDefaultTrack(track: CurrentDefaultTrack): string {
+  return `${capitalizeFirst(track.language)} · ${capitalizeFirst(track.channel_layout)}`;
+}
+
+/**
+ * The current Default Audio Track column's cell (COL-154), shared by
+ * `SeriesTree`'s episode rows and `MovieTable`'s rows -- the file-bearing
+ * leaf levels the backend actually attaches a snapshot to. `track === null`
+ * is a clear "unknown" state (dimmed, matching `FileStatusBadge`'s missing
+ * styling) -- covers both a file that hasn't been probed since this shipped
+ * and one whose ffprobe metadata carries no Default Audio Track disposition
+ * flag on any stream; both are indistinguishable to this cell and rendered
+ * the same way.
+ */
+function DefaultAudioTrackCell({ track }: { track: CurrentDefaultTrack | null }) {
+  if (track === null) {
+    return (
+      <span className="library-tree-table__default-track library-tree-table__default-track--unknown">
+        Unknown
+      </span>
+    );
+  }
+  return <span className="library-tree-table__default-track">{formatCurrentDefaultTrack(track)}</span>;
 }
 
 /**
@@ -365,6 +403,7 @@ function SeriesTree({
             <th scope="col">Select</th>
             <th scope="col">Title</th>
             <th scope="col">File</th>
+            <th scope="col">Default Audio</th>
             <th scope="col">Tracked</th>
           </tr>
         </thead>
@@ -395,6 +434,7 @@ function SeriesTree({
                       {seriesNode.title}
                     </button>
                   </td>
+                  <td />
                   <td />
                   <td>
                     <TrackedToggleButton
@@ -432,6 +472,7 @@ function SeriesTree({
                             </button>
                           </td>
                           <td />
+                          <td />
                           <td>
                             <TrackedToggleButton
                               tracked={seasonNode.tracked}
@@ -463,6 +504,9 @@ function SeriesTree({
                               </td>
                               <td>
                                 <FileStatusBadge hasFile={episode.has_file} />
+                              </td>
+                              <td>
+                                <DefaultAudioTrackCell track={episode.current_default_track} />
                               </td>
                               <td>
                                 <TrackedToggleButton
@@ -504,6 +548,7 @@ function MovieTable({
             <th scope="col">Select</th>
             <th scope="col">Title</th>
             <th scope="col">File</th>
+            <th scope="col">Default Audio</th>
             <th scope="col">Tracked</th>
           </tr>
         </thead>
@@ -523,6 +568,9 @@ function MovieTable({
               <td>{movie.title}</td>
               <td>
                 <FileStatusBadge hasFile={movie.has_file} />
+              </td>
+              <td>
+                <DefaultAudioTrackCell track={movie.current_default_track} />
               </td>
               <td>
                 <TrackedToggleButton

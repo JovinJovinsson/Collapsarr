@@ -29,6 +29,8 @@ from sqlalchemy.orm import Session
 from ..arr.models import InstanceType
 from ..arr.service import get_instance
 from ..database import get_session
+from ..media.models import TrackedMediaFile
+from ..media.service import list_tracked_media_by_instance
 from .models import LibraryNode, LibraryNodeKind
 from .service import LibraryNodeNotFoundError, build_movie_tree, build_tree, get_node, set_tracked
 
@@ -36,6 +38,19 @@ router = APIRouter(prefix="/api", tags=["library"])
 
 
 # --- schemas -----------------------------------------------------------------
+
+
+class CurrentDefaultTrack(BaseModel):
+    """A file-bearing leaf node's current Default Audio Track snapshot (COL-154).
+
+    Mirrors :class:`~collapsarr.media.models.TrackedMediaFile`'s
+    ``current_default_language``/``current_default_channel_layout`` columns,
+    refreshed at every existing probe call site (scan, webhook import, manual
+    trigger). Rendered by the Library page as e.g. "Danish · 5.1".
+    """
+
+    language: str
+    channel_layout: str
 
 
 class EpisodeNode(BaseModel):
@@ -49,6 +64,10 @@ class EpisodeNode(BaseModel):
     title: str
     has_file: bool
     tracked: bool
+    #: ``None`` when the file hasn't been probed since COL-154 shipped, or
+    #: its ffprobe metadata carries no Default Audio Track disposition flag
+    #: on any stream -- both render as "unknown" on the Library page.
+    current_default_track: CurrentDefaultTrack | None = None
 
 
 class SeasonNode(BaseModel):
@@ -88,6 +107,8 @@ class MovieNode(BaseModel):
     title: str
     has_file: bool
     tracked: bool
+    #: See :attr:`EpisodeNode.current_default_track` (COL-154).
+    current_default_track: CurrentDefaultTrack | None = None
 
 
 class MovieLibraryTreeResponse(BaseModel):
@@ -141,6 +162,24 @@ class BulkTrackedUpdateResponse(BaseModel):
 # --- endpoints ---------------------------------------------------------------
 
 
+def _current_default_track(media: TrackedMediaFile | None) -> CurrentDefaultTrack | None:
+    """Adapt a bridged :class:`~collapsarr.media.models.TrackedMediaFile`'s snapshot columns.
+
+    ``None`` when there is no bridged row at all (never probed/scanned via a
+    call site that captured this node's catalog ids), or when the row exists
+    but its snapshot columns are themselves ``NULL`` (never probed since
+    COL-154 shipped, or no stream reports the disposition flag) -- both are
+    the same "unknown" outcome from the Library page's point of view.
+    """
+    if media is None or media.current_default_language is None:
+        return None
+    assert media.current_default_channel_layout is not None  # written together, see the model
+    return CurrentDefaultTrack(
+        language=media.current_default_language,
+        channel_layout=media.current_default_channel_layout,
+    )
+
+
 @router.get(
     "/library/instances/{instance_id}/tree",
     response_model=LibraryTreeResponse | MovieLibraryTreeResponse,
@@ -154,12 +193,27 @@ def get_library_tree_endpoint(
     (:class:`LibraryTreeResponse`); a Radarr instance (COL-99) returns the flat
     Movie list (:class:`MovieLibraryTreeResponse`). ``404`` if no instance with
     ``instance_id`` exists.
+
+    Each Episode/Movie leaf also carries its current-default-track snapshot
+    (COL-154), bridged from :mod:`collapsarr.media.service`'s tracked-media
+    rows the same way Tracked resolution bridges the other direction: one
+    bulk fetch of every tracked-media row for this instance
+    (:func:`~collapsarr.media.service.list_tracked_media_by_instance`), keyed
+    by the same ``sonarr_episode_id``/``radarr_movie_id`` this tree already
+    carries, rather than a per-node query.
     """
     instance = get_instance(session, instance_id)
     if instance is None:
         raise HTTPException(status_code=404, detail=f"No arr instance with id={instance_id}")
 
+    tracked_media = list_tracked_media_by_instance(session, instance_id)
+
     if instance.type is InstanceType.RADARR:
+        media_by_movie_id = {
+            media.radarr_movie_id: media
+            for media in tracked_media
+            if media.radarr_movie_id is not None
+        }
         movie_tree = build_movie_tree(session, instance_id)
         return MovieLibraryTreeResponse(
             instance_id=movie_tree.instance_id,
@@ -170,11 +224,19 @@ def get_library_tree_endpoint(
                     title=movie.title,
                     has_file=movie.has_file,
                     tracked=movie.tracked,
+                    current_default_track=_current_default_track(
+                        media_by_movie_id.get(movie.radarr_movie_id)
+                    ),
                 )
                 for movie in movie_tree.movies
             ],
         )
 
+    media_by_episode_id = {
+        media.sonarr_episode_id: media
+        for media in tracked_media
+        if media.sonarr_episode_id is not None
+    }
     tree = build_tree(session, instance_id)
     return LibraryTreeResponse(
         instance_id=tree.instance_id,
@@ -198,6 +260,9 @@ def get_library_tree_endpoint(
                                 title=episode.title,
                                 has_file=episode.has_file,
                                 tracked=episode.tracked,
+                                current_default_track=_current_default_track(
+                                    media_by_episode_id.get(episode.sonarr_episode_id)
+                                ),
                             )
                             for episode in season.episodes
                         ],

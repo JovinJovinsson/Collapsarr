@@ -50,6 +50,26 @@ from .models import MediaTargetStatus, TrackedMediaFile, TrackedMediaTargetStatu
 logger = logging.getLogger(__name__)
 
 
+def _current_default_stream(streams: Sequence[AudioStreamInfo]) -> AudioStreamInfo | None:
+    """Return the stream currently carrying the Default Audio Track disposition, if any (COL-154).
+
+    Reuses :attr:`~collapsarr.downmix.probe.AudioStreamInfo.is_default`
+    (COL-150) rather than reprobing or reinventing detection -- this is
+    exactly what that field exists for. ``None`` when the file has no audio
+    streams, or none of them report the disposition flag (a file that
+    predates COL-150-aware tooling, or whose encoder never wrote a
+    ``disposition`` block at all) -- both render as "unknown" on the Library
+    page. On the rare malformed file reporting *more than one* default
+    stream, the lowest-index one wins, matching the tie-break convention
+    :func:`~collapsarr.downmix.default_audio._best_available` already uses
+    elsewhere in this package.
+    """
+    defaults = [stream for stream in streams if stream.is_default]
+    if not defaults:
+        return None
+    return min(defaults, key=lambda stream: stream.index)
+
+
 def _channels_by_language(streams: Sequence[AudioStreamInfo]) -> dict[str, set[int]]:
     """Group stream channel counts by language.
 
@@ -73,6 +93,25 @@ def get_tracked_media(session: Session, file_path: str | Path) -> TrackedMediaFi
 def list_tracked_media(session: Session) -> list[TrackedMediaFile]:
     """Return every tracked media file, ordered by id (insertion order)."""
     return list(session.scalars(select(TrackedMediaFile).order_by(TrackedMediaFile.id)))
+
+
+def list_tracked_media_by_instance(session: Session, instance_id: int) -> list[TrackedMediaFile]:
+    """Return every tracked media file bridged to ``instance_id`` (COL-154).
+
+    The reverse direction of :func:`~collapsarr.library.service.get_node_by_source_id`:
+    given an Arr instance id, returns every :class:`TrackedMediaFile` row that
+    carries it -- the bulk-fetch the Library tree read path
+    (:mod:`collapsarr.library.routes`) uses to attach each Episode/Movie leaf's
+    current-default-track snapshot without an N+1 query per node. Ordered by id
+    (insertion order), matching :func:`list_tracked_media`.
+    """
+    return list(
+        session.scalars(
+            select(TrackedMediaFile)
+            .where(TrackedMediaFile.instance_id == instance_id)
+            .order_by(TrackedMediaFile.id)
+        )
+    )
 
 
 def list_target_statuses(
@@ -140,6 +179,15 @@ def upsert_tracked_media(
     scan/webhook already established, so the bridge back to this file's
     :class:`~collapsarr.library.models.LibraryNode` (and so its **Tracked**
     value) survives even when a later call has no fresher id to offer.
+
+    The current-default-track snapshot (COL-154:
+    :attr:`~collapsarr.media.models.TrackedMediaFile.current_default_language`/
+    :attr:`~collapsarr.media.models.TrackedMediaFile.current_default_channel_layout`)
+    is, unlike the ids above, *unconditionally* recomputed from ``streams`` on
+    every call -- it reflects what ffprobe reported *this* time, not a
+    linkage that should survive an id-less call. Unlike ``instance_id`` et
+    al., there is nothing to preserve: a stale snapshot from a previous probe
+    would just be wrong.
     """
     path_str = str(file_path)
     media = get_tracked_media(session, path_str)
@@ -154,6 +202,12 @@ def upsert_tracked_media(
         media.sonarr_episode_id = sonarr_episode_id
     if radarr_movie_id is not None:
         media.radarr_movie_id = radarr_movie_id
+
+    default_stream = _current_default_stream(streams)
+    media.current_default_language = default_stream.language if default_stream else None
+    media.current_default_channel_layout = (
+        default_stream.channel_layout if default_stream else None
+    )
 
     channels_by_language = _channels_by_language(streams)
     qualifying = {(qt.language, qt.target) for qt in detect_qualifying_targets(streams, settings)}

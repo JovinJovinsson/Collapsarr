@@ -21,6 +21,7 @@ from .service import (
     list_files_missing_targets,
     list_target_statuses,
     list_tracked_media,
+    list_tracked_media_by_instance,
     record_target_processed,
     upsert_tracked_media,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "list_files_missing_targets",
     "list_target_statuses",
     "list_tracked_media",
+    "list_tracked_media_by_instance",
     "record_target_processed",
     "upsert_tracked_media",
 ]

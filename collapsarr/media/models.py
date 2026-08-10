@@ -112,6 +112,31 @@ class TrackedMediaFile(Base):
     #: instance. ``NULL`` on a Sonarr file or an unresolved row.
     radarr_movie_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
+    #: The language of the audio stream that currently carries the
+    #: container's Default Audio Track disposition, as of the most recent
+    #: probe through an existing call site (scan, webhook import, manual
+    #: trigger -- COL-154). Mirrors
+    #: :attr:`~collapsarr.downmix.probe.AudioStreamInfo.language`'s own
+    #: normalization (including the literal ``"unknown"`` bucket for an
+    #: untagged stream), so it is *not* itself an "unset" sentinel --
+    #: ``NULL`` here specifically means "never probed since this shipped, or
+    #: the file's ffprobe metadata carries no ``disposition.default`` flag on
+    #: any stream at all" (the latter is indistinguishable from the former at
+    #: read time, and both render the same "unknown" state on the Library
+    #: page). Refreshed unconditionally on every
+    #: :func:`~collapsarr.media.service.upsert_tracked_media` call, the same
+    #: single write path every probe call site already funnels through.
+    current_default_language: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    #: The channel layout of that same stream
+    #: (:attr:`~collapsarr.downmix.probe.AudioStreamInfo.channel_layout`,
+    #: e.g. ``"5.1"``, ``"stereo"``, or the ``"<channels>ch"`` fallback) --
+    #: paired with :attr:`current_default_language` to render the Library
+    #: page's current Default Audio Track column (e.g. "Danish · 5.1").
+    #: ``NULL`` under the exact same conditions as
+    #: :attr:`current_default_language` -- the two are always written or left
+    #: ``NULL`` together, never independently.
+    current_default_channel_layout: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)
 
