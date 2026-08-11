@@ -156,6 +156,19 @@ class Job:
     empty and are filled in by the queue as the job runs -- never mutate
     them directly.
 
+    ``priority`` (COL-163) likewise starts at a placeholder (``0``) and is
+    immediately overwritten by :meth:`JobQueue._enqueue` -- a plain,
+    lock-guarded counter on the owning :class:`JobQueue` -- with the next
+    value in a monotonically increasing per-queue sequence, so it reads as
+    "join position": the first job ever enqueued on a queue gets ``0``, the
+    next ``1``, and so on, shared across :meth:`JobQueue.enqueue` and
+    :meth:`JobQueue.enqueue_default_audio` (both funnel through
+    :meth:`_enqueue`) so the two kinds interleave into one ordering rather
+    than each keeping its own. This is a pure prefactor for a future
+    priority-pull worker pool (COL-164): nothing in this slice reads
+    ``priority`` back to change execution order -- :meth:`JobQueue.run_pending`
+    still runs whatever is ``PENDING`` at call time, unordered by it.
+
     ``kind`` (COL-155) selects which pipeline the job runs -- ``DOWNMIX``
     (the default, and only kind before COL-155) uses ``settings``;
     ``SET_DEFAULT_AUDIO`` uses ``preference`` instead. ``settings`` stays a
@@ -186,6 +199,7 @@ class Job:
     id: UUID = field(default_factory=uuid4)
     kind: JobKind = JobKind.DOWNMIX
     preference: DefaultAudioPreference | None = None
+    priority: int = 0
     status: JobStatus = JobStatus.PENDING
     result: PipelineResult | None = None
     error: BaseException | None = None
@@ -324,6 +338,12 @@ class JobQueue:
         self._tracked_media_recorder = tracked_media_recorder
         self._lock = threading.Lock()
         self._jobs: dict[UUID, Job] = {}
+        #: Next value :meth:`_enqueue` will hand out as a job's ``priority``
+        #: (COL-163) -- a plain lock-guarded counter, starting at 0 and
+        #: incrementing once per enqueued job (across both ``enqueue`` and
+        #: ``enqueue_default_audio``), so "priority" reads as join order:
+        #: lower means enqueued earlier.
+        self._next_priority = 0
 
     @classmethod
     def from_settings(
@@ -539,8 +559,18 @@ class JobQueue:
         return self._enqueue(job)
 
     def _enqueue(self, job: Job) -> Job:
-        """Shared tail of :meth:`enqueue`/:meth:`enqueue_default_audio`: store + persist."""
+        """Shared tail of :meth:`enqueue`/:meth:`enqueue_default_audio`: assign priority + persist.
+
+        ``job.priority`` (COL-163) is assigned here, under ``self._lock``,
+        atomically with the job's insertion into ``self._jobs`` -- so
+        priority order and ``self._jobs`` insertion order (what
+        :meth:`list_jobs` returns) always agree, and two jobs enqueued
+        concurrently from different threads never race to the same
+        priority value.
+        """
         with self._lock:
+            job.priority = self._next_priority
+            self._next_priority += 1
             self._jobs[job.id] = job
         self._record_history(job)
         return job

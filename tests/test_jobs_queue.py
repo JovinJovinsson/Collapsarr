@@ -71,6 +71,39 @@ def test_enqueue_creates_a_pending_job_with_file_path_and_settings() -> None:
     assert queue.get_job(job.id) is job
 
 
+def test_enqueue_assigns_priority_as_a_monotonically_increasing_sequence() -> None:
+    """COL-163 AC: priority is a plain 0, 1, 2, ... join-order sequence per queue."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+
+    first = queue.enqueue("/media/a.mkv", DownmixSettings())
+    second = queue.enqueue("/media/b.mkv", DownmixSettings())
+    third = queue.enqueue("/media/c.mkv", DownmixSettings())
+
+    assert (first.priority, second.priority, third.priority) == (0, 1, 2)
+
+
+def test_priority_assignment_is_thread_safe_under_concurrent_enqueue() -> None:
+    """Many threads enqueueing at once each get a distinct, gap-free priority."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job_count = 50
+    jobs: list[Job] = []
+    jobs_lock = threading.Lock()
+
+    def worker(index: int) -> None:
+        job = queue.enqueue(f"/media/{index}.mkv", DownmixSettings())
+        with jobs_lock:
+            jobs.append(job)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(job_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    priorities = sorted(job.priority for job in jobs)
+    assert priorities == list(range(job_count))  # every value used exactly once, no gaps
+
+
 def test_default_max_concurrency_is_one() -> None:
     assert DEFAULT_MAX_CONCURRENCY == 1
     assert JobQueue().max_concurrency == 1
@@ -558,6 +591,21 @@ def test_enqueue_creates_a_downmix_job_by_default() -> None:
 
     assert job.kind is JobKind.DOWNMIX
     assert job.preference is None
+
+
+def test_enqueue_default_audio_shares_the_same_priority_sequence_as_enqueue() -> None:
+    """COL-163: a DOWNMIX and a SET_DEFAULT_AUDIO job interleave into one priority order."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+
+    downmix_job = queue.enqueue("/media/a.mkv", DownmixSettings())
+    default_audio_job = queue.enqueue_default_audio("/media/b.mkv", _PREFERENCE)
+    another_downmix_job = queue.enqueue("/media/c.mkv", DownmixSettings())
+
+    assert (downmix_job.priority, default_audio_job.priority, another_downmix_job.priority) == (
+        0,
+        1,
+        2,
+    )
 
 
 def test_run_pending_dispatches_set_default_audio_jobs_to_their_own_runner() -> None:

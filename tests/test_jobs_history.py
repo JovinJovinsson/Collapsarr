@@ -79,6 +79,7 @@ def test_record_job_history_persists_a_queued_job(session: Session) -> None:
     assert history.file_path == "/media/movie.mkv"
     assert history.status is JobStatus.PENDING
     assert history.kind is JobKind.DOWNMIX
+    assert history.priority == job.priority
     assert history.started_at is None
     assert history.ended_at is None
     assert history.exit_code is None
@@ -163,6 +164,35 @@ def test_record_job_history_upserts_the_same_row_across_lifecycle_calls(
     assert finished_history.id == queued_history.id
     assert finished_history.status is JobStatus.SUCCEEDED
     assert list_job_history(session) == [finished_history]
+
+
+def test_record_job_history_persists_priority_matching_the_jobs_enqueue_order(
+    session: Session,
+) -> None:
+    """COL-163: priority persists as each job's own join-order sequence number."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    first = queue.enqueue("/media/a.mkv", DownmixSettings())
+    second = queue.enqueue("/media/b.mkv", DownmixSettings())
+
+    first_history = record_job_history(session, first)
+    second_history = record_job_history(session, second)
+
+    assert (first_history.priority, second_history.priority) == (first.priority, second.priority)
+    assert first_history.priority < second_history.priority
+
+
+def test_record_job_history_keeps_priority_stable_across_lifecycle_calls(
+    session: Session,
+) -> None:
+    """Re-recording the same job as it runs never changes its persisted priority."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queued_history = record_job_history(session, job)
+    queue.run_pending()
+    finished_history = record_job_history(session, job)
+
+    assert finished_history.priority == queued_history.priority == job.priority
 
 
 # ---------------------------------------------------------------------------
