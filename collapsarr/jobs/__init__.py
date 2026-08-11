@@ -23,9 +23,11 @@ from .history import (
 from .models import JobHistory
 from .queue import (
     DEFAULT_MAX_CONCURRENCY,
+    DefaultAudioPipelineRunner,
     FailureNotifier,
     HistoryRecorder,
     Job,
+    JobKind,
     JobQueue,
     JobStatus,
     PipelineRunner,
@@ -35,10 +37,12 @@ from .tracked_media import make_tracked_media_recorder, record_tracked_media
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
+    "DefaultAudioPipelineRunner",
     "FailureNotifier",
     "HistoryRecorder",
     "Job",
     "JobHistory",
+    "JobKind",
     "JobQueue",
     "JobStatus",
     "PipelineRunner",

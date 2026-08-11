@@ -99,6 +99,15 @@ get_global_settings` at creation time, which overrides it with ``"beta"``
 when the running build is itself a beta build (COL-88) -- see
 :data:`BETA_LOCAL_SEGMENT_PREFIX`."""
 
+DEFAULT_AUTO_SET_DEFAULT_AUDIO = False
+"""Default :attr:`GlobalSettings.auto_set_default_audio` for a fresh install
+/ an existing row backfilled by the additive migration (COL-151). Off by
+default -- this is an opt-in behaviour change (automatically flipping which
+audio stream carries the Default Audio Track disposition), not something a
+fresh install should do without the operator first configuring
+``default_audio_language``/``default_audio_channel_tier`` and turning it on
+deliberately."""
+
 LOG_LEVEL_DEBUG = "DEBUG"
 LOG_LEVEL_INFO = "INFO"
 LOG_LEVEL_WARNING = "WARNING"
@@ -246,6 +255,32 @@ class GlobalSettings(Base):
     restart, re-applied once the database is available during
     :func:`collapsarr.main.create_app`'s lifespan (after the env-sourced boot
     floor from ``configure_logging`` above has already run).
+
+    ``default_audio_language``/``default_audio_channel_tier`` (COL-151) are
+    the **Preferred Default Audio** setting: a ``(language, channel tier)``
+    pair deciding which audio stream on a file *should* carry the
+    container's Default Audio Track disposition.
+    :class:`~collapsarr.downmix.targets.DownmixTarget` is reused for the
+    tier rather than inventing a parallel enum, matching ``enabled_targets``
+    above. Both are nullable with no ``server_default``, defaulting to
+    ``None`` (unset) for a fresh install and for an existing row backfilled
+    by the additive migration -- there is no sensible universal default
+    language, so the feature simply has no effect until an operator
+    configures both. Validated against :class:`DownmixTarget`'s values by
+    :func:`collapsarr.settings.service.update_global_settings`, same
+    treatment as ``log_level`` above. Consumed by
+    :func:`collapsarr.downmix.default_audio.resolve_default_audio_stream`,
+    which decides *which* stream should be default given these two fields
+    plus a file's probed audio streams -- actually applying that decision to
+    a file is a later ticket's concern (COL-152 automatic, COL-153
+    manual/bulk).
+
+    ``auto_set_default_audio`` (COL-151) is the opt-in toggle gating whether
+    Collapsarr acts on the preference above automatically; see
+    :data:`DEFAULT_AUTO_SET_DEFAULT_AUDIO`. Carries a DB-side
+    ``server_default`` (matching ``auth_method``/``auth_required`` above) so
+    the additive migration backfills existing installs to ``False`` rather
+    than leaving the column ``NULL``.
     """
 
     __tablename__ = "global_settings"
@@ -329,6 +364,19 @@ class GlobalSettings(Base):
     )
 
     log_level: Mapped[str | None] = mapped_column(String(10), nullable=True, default=None)
+
+    default_audio_language: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, default=None
+    )
+    default_audio_channel_tier: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, default=None
+    )
+    auto_set_default_audio: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=DEFAULT_AUTO_SET_DEFAULT_AUDIO,
+        server_default=text("0"),
+    )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)

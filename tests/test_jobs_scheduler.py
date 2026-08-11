@@ -27,12 +27,20 @@ from collapsarr.arr.models import ArrInstance, InstanceType, RemotePathMapping
 from collapsarr.arr.webhooks import ResolvedWebhookFile
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError
-from collapsarr.downmix.targets import DownmixSettings
+from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs import scheduler as scheduler_module
 from collapsarr.jobs.history import record_job_history
-from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
+from collapsarr.jobs.queue import (
+    DefaultAudioPipelineRunner,
+    Job,
+    JobKind,
+    JobQueue,
+    JobStatus,
+    PipelineRunner,
+)
 from collapsarr.jobs.scheduler import JobScheduler
 from collapsarr.library.service import set_tracked, upsert_series_episode_node
 from collapsarr.media.service import get_tracked_media
@@ -55,6 +63,15 @@ _FIXED_NOW = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
 
 def _stub_runner(result: PipelineResult = _SUCCESS) -> PipelineRunner:
     def runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        return result
+
+    return runner
+
+
+def _stub_default_audio_runner(result: PipelineResult = _SUCCESS) -> DefaultAudioPipelineRunner:
+    def runner(
+        file_path: Path, preference: DefaultAudioPreference, **_: object
+    ) -> PipelineResult:
         return result
 
     return runner
@@ -938,3 +955,244 @@ def test_scan_once_skips_a_not_tracked_file(
     assert scheduler._queue.list_jobs() == []
     with session_factory() as session:
         assert get_tracked_media(session, "/tv/a.mkv") is not None
+
+
+# ---------------------------------------------------------------------------
+# Manual "set default audio track" trigger (COL-155).
+# ---------------------------------------------------------------------------
+
+# Two eng streams: 5.1 (not default) and stereo (currently default). With a
+# preference of eng/5.1, the 5.1 stream is the exact-match winner but doesn't
+# yet carry the disposition -- needs a fix.
+_NEEDS_DEFAULT_AUDIO_FIX: list[AudioStreamInfo] = [
+    AudioStreamInfo(
+        index=0,
+        codec="ac3",
+        channels=6,
+        channel_layout="5.1(side)",
+        language="eng",
+        is_default=False,
+    ),
+    AudioStreamInfo(
+        index=1, codec="aac", channels=2, channel_layout="stereo", language="eng", is_default=True
+    ),
+]
+# Same streams, but the 5.1 one already carries the disposition -- nothing to do.
+_DEFAULT_AUDIO_ALREADY_CORRECT: list[AudioStreamInfo] = [
+    AudioStreamInfo(
+        index=0,
+        codec="ac3",
+        channels=6,
+        channel_layout="5.1(side)",
+        language="eng",
+        is_default=True,
+    ),
+    AudioStreamInfo(
+        index=1,
+        codec="aac",
+        channels=2,
+        channel_layout="stereo",
+        language="eng",
+        is_default=False,
+    ),
+]
+# A single stream -- fewer than two to compare, resolve_default_audio_stream
+# returns None regardless of preference.
+_SINGLE_STREAM: list[AudioStreamInfo] = [
+    AudioStreamInfo(
+        index=0, codec="aac", channels=2, channel_layout="stereo", language="eng", is_default=True
+    ),
+]
+# Two different-language 5.1 streams, neither a stereo track yet: qualifies for
+# a Stereo downmix job under default settings (for both languages) *and*
+# needs a Default Audio Track fix (the eng/5.1 exact-match winner isn't
+# currently default) -- used by the shared-dedup tests below, which need one
+# fixture both trigger_file and trigger_set_default_audio act on.
+_SURROUND_TWO_LANGUAGES_NEEDS_DEFAULT_AUDIO_FIX: list[AudioStreamInfo] = [
+    AudioStreamInfo(
+        index=0,
+        codec="ac3",
+        channels=6,
+        channel_layout="5.1(side)",
+        language="eng",
+        is_default=False,
+    ),
+    AudioStreamInfo(
+        index=1,
+        codec="ac3",
+        channels=6,
+        channel_layout="5.1(side)",
+        language="jpn",
+        is_default=True,
+    ),
+]
+
+_PREFERENCE = DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE)
+
+
+def _configure_preference(session_factory: sessionmaker[Session]) -> None:
+    with session_factory() as session:
+        update_global_settings(
+            session,
+            default_audio_language=_PREFERENCE.language,
+            default_audio_channel_tier=_PREFERENCE.channel_tier,
+        )
+
+
+def test_trigger_set_default_audio_enqueues_a_set_default_audio_job_when_a_fix_is_needed(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _configure_preference(session_factory)
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX), queue=queue
+    )
+
+    job = scheduler.trigger_set_default_audio("/media/movie.mkv")
+
+    assert job is not None
+    assert job.file_path == Path("/media/movie.mkv")
+    assert job.kind is JobKind.SET_DEFAULT_AUDIO
+    assert job.preference == _PREFERENCE
+    assert job.status is JobStatus.PENDING
+    assert scheduler._queue.list_jobs() == [job]
+
+
+def test_trigger_set_default_audio_skips_when_already_correct(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _configure_preference(session_factory)
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_DEFAULT_AUDIO_ALREADY_CORRECT),
+        queue=queue,
+    )
+
+    assert scheduler.trigger_set_default_audio("/media/movie.mkv") is None
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_trigger_set_default_audio_skips_a_file_with_fewer_than_two_streams(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _configure_preference(session_factory)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SINGLE_STREAM))
+
+    assert scheduler.trigger_set_default_audio("/media/movie.mkv") is None
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_trigger_set_default_audio_skips_when_no_preference_is_configured(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """No default_audio_language/channel_tier set -- nothing to resolve against."""
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX)
+    )
+
+    assert scheduler.trigger_set_default_audio("/media/movie.mkv") is None
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_trigger_set_default_audio_skips_a_file_that_cannot_be_probed(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _configure_preference(session_factory)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_raising())
+
+    assert scheduler.trigger_set_default_audio("/media/movie.mkv") is None
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_trigger_set_default_audio_bypasses_the_tracked_gate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC4: mirrors trigger_file -- a manual trigger acts even if default_tracked is False."""
+    _configure_preference(session_factory)
+    with session_factory() as session:
+        update_global_settings(session, default_tracked=False)
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX), queue=queue
+    )
+
+    job = scheduler.trigger_set_default_audio("/media/movie.mkv")
+
+    assert job is not None
+
+
+# --- De-duplication spans both job kinds (COL-155's headline risk) ---------
+
+
+def test_trigger_set_default_audio_is_blocked_by_an_in_flight_downmix_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A pending DOWNMIX job for a file blocks a SET_DEFAULT_AUDIO trigger for it."""
+    _configure_preference(session_factory)
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(), default_audio_pipeline_runner=_stub_default_audio_runner()
+    )
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND_TWO_LANGUAGES_NEEDS_DEFAULT_AUDIO_FIX),
+        queue=queue,
+    )
+    downmix_job = scheduler.trigger_file("/media/movie.mkv")
+    assert downmix_job is not None
+    assert downmix_job.kind is JobKind.DOWNMIX
+
+    result = scheduler.trigger_set_default_audio("/media/movie.mkv")
+
+    assert result is None
+    assert len(scheduler._queue.list_jobs()) == 1  # only the DOWNMIX job
+
+
+def test_trigger_file_is_blocked_by_an_in_flight_set_default_audio_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """The reverse: a pending SET_DEFAULT_AUDIO job blocks a DOWNMIX trigger for the same file."""
+    _configure_preference(session_factory)
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(), default_audio_pipeline_runner=_stub_default_audio_runner()
+    )
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND_TWO_LANGUAGES_NEEDS_DEFAULT_AUDIO_FIX),
+        queue=queue,
+    )
+    default_audio_job = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    assert default_audio_job is not None
+    assert default_audio_job.kind is JobKind.SET_DEFAULT_AUDIO
+
+    result = scheduler.trigger_file("/media/movie.mkv")
+
+    assert result is None
+    assert len(scheduler._queue.list_jobs()) == 1  # only the SET_DEFAULT_AUDIO job
+
+
+def test_trigger_set_default_audio_re_enqueues_after_a_terminal_downmix_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A SUCCEEDED/FAILED job of either kind is not 'active' -- dedup only blocks in-flight jobs."""
+    _configure_preference(session_factory)
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(), default_audio_pipeline_runner=_stub_default_audio_runner()
+    )
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_SURROUND_TWO_LANGUAGES_NEEDS_DEFAULT_AUDIO_FIX),
+        queue=queue,
+    )
+    downmix_job = scheduler.trigger_file("/media/movie.mkv")
+    assert downmix_job is not None
+    downmix_job.status = JobStatus.SUCCEEDED  # in-memory only; no history row persisted
+
+    result = scheduler.trigger_set_default_audio("/media/movie.mkv")
+
+    assert result is not None
+    assert len(scheduler._queue.list_jobs()) == 2

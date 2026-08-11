@@ -13,6 +13,11 @@ from .apply import (
     ApplyResult,
     apply_remux_result,
 )
+from .default_audio import (
+    DefaultAudioPreference,
+    resolve_default_audio_output_index,
+    resolve_default_audio_stream,
+)
 from .pipeline import PipelineOutcome, PipelineResult, run_downmix_pipeline
 from .probe import (
     AudioStreamInfo,
@@ -35,6 +40,7 @@ __all__ = [
     "ApplyFailureReason",
     "ApplyResult",
     "AudioStreamInfo",
+    "DefaultAudioPreference",
     "DownmixSettings",
     "DownmixTarget",
     "FfprobeError",
@@ -49,6 +55,8 @@ __all__ = [
     "detect_qualifying_targets",
     "probe_audio_streams",
     "probe_media_summary",
+    "resolve_default_audio_output_index",
+    "resolve_default_audio_stream",
     "run_downmix_pipeline",
     "run_remux",
 ]

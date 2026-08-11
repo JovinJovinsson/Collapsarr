@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
-import { fetchJobHistory, triggerDownmix } from "../api/activity";
+import { fetchJobHistory, triggerDownmix, triggerSetDefaultAudio } from "../api/activity";
 import { updateTracked } from "../api/library";
 import { fetchSettings } from "../api/settings";
 import { fetchWantedList } from "../api/wanted";
 import { WantedIcon } from "../components/icons";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
-import type { JobHistoryEntry, JobStatus, ManualTriggerResult } from "../types/activity";
+import { JOB_KIND_LABEL } from "../types/activity";
+import type { JobHistoryEntry, JobKind, JobStatus, ManualTriggerResult } from "../types/activity";
 import type { GlobalSettings } from "../types/settings";
 import type { DownmixTarget, WantedFile } from "../types/wanted";
 
@@ -59,6 +60,8 @@ interface StatusRow {
   target: DownmixTarget | string;
   label: string;
   tone: "missing" | JobStatus;
+  /** The job kind (COL-155) that produced this row's latest attempt, or `null` for a still-"Missing" row with no recorded attempt yet. */
+  kind: JobKind | null;
 }
 
 /**
@@ -69,7 +72,12 @@ interface StatusRow {
  *
  * Job history (COL-29's `list_job_history`) is ordered oldest-to-newest, so
  * the last entry per `(language, target)` key -- applied after the
- * "missing" rows are seeded -- is that pair's most recent attempt.
+ * "missing" rows are seeded -- is that pair's most recent attempt. A row's
+ * `kind` (COL-155/COL-157) reflects that latest attempt's job kind -- both a
+ * `DOWNMIX` job's enabled targets and a `SET_DEFAULT_AUDIO` job's resolved
+ * preference land in the same `(language, target)` key space (see
+ * `collapsarr.jobs.history._target`/`_language`), so the kind label is what
+ * lets a reader tell the two apart.
  */
 function buildStatusRows(file: WantedFile, history: JobHistoryEntry[]): StatusRow[] {
   const rows = new Map<string, StatusRow>();
@@ -82,6 +90,7 @@ function buildStatusRows(file: WantedFile, history: JobHistoryEntry[]): StatusRo
       target: missing.target,
       label: "Missing",
       tone: "missing",
+      kind: null,
     });
   }
 
@@ -94,6 +103,7 @@ function buildStatusRows(file: WantedFile, history: JobHistoryEntry[]): StatusRo
       target: entry.target,
       label: STATUS_LABEL[entry.status],
       tone: entry.status,
+      kind: entry.kind,
     });
   }
 
@@ -128,6 +138,16 @@ function buildStatusRows(file: WantedFile, history: JobHistoryEntry[]): StatusRo
  * instance/episode/movie id captured for this file), the panel shows a
  * "status unavailable" message rather than a broken toggle -- see that
  * module's docstring for when this happens.
+ *
+ * Also exposes a manual "Set Default Audio Track" action (COL-157,
+ * `POST /api/jobs/trigger-default-audio`, COL-155), enqueuing a
+ * `SET_DEFAULT_AUDIO` job for this file against the current global
+ * Preferred Default Audio setting -- unlike "Trigger downmix" it takes no
+ * override input, since that fix isn't gated by a language allow-list. The
+ * per-target/per-language status table's new "Kind" column (COL-155's job
+ * history `kind` field) distinguishes a row produced by a `DOWNMIX` job from
+ * one produced by a `SET_DEFAULT_AUDIO` job, since both can land in the same
+ * `(language, target)` key (see `buildStatusRows`).
  */
 export function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
@@ -136,6 +156,9 @@ export function FileDetailPage() {
   const [historyState, setHistoryState] = useState<HistoryLoadState>({ status: "loading" });
   const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
   const [triggerState, setTriggerState] = useState<TriggerState>({ status: "idle" });
+  const [defaultAudioTriggerState, setDefaultAudioTriggerState] = useState<TriggerState>({
+    status: "idle",
+  });
   const [extraLanguages, setExtraLanguages] = useState("");
   const [trackedPending, setTrackedPending] = useState(false);
   const [trackedError, setTrackedError] = useState<string | null>(null);
@@ -232,6 +255,29 @@ export function FileDetailPage() {
       setTriggerState({ status: "result", result });
     } catch (error: unknown) {
       setTriggerState({
+        status: "error",
+        message: error instanceof Error ? error.message : "Unknown error.",
+      });
+    }
+  }
+
+  /**
+   * Manually enqueues a `SET_DEFAULT_AUDIO` job for this file (COL-155's
+   * `POST /api/jobs/trigger-default-audio`, COL-157's "Set Default Audio
+   * Track" action). Mirrors `handleTrigger` above -- same
+   * submitting/error/result state shape and result-display pattern -- minus
+   * the language-bypass input, which has no analogue here (the Default
+   * Audio Track fix isn't gated by a language allow-list).
+   */
+  async function handleTriggerDefaultAudio() {
+    if (fileState.status !== "ready") return;
+
+    setDefaultAudioTriggerState({ status: "submitting" });
+    try {
+      const result = await triggerSetDefaultAudio({ file_path: fileState.file.file_path });
+      setDefaultAudioTriggerState({ status: "result", result });
+    } catch (error: unknown) {
+      setDefaultAudioTriggerState({
         status: "error",
         message: error instanceof Error ? error.message : "Unknown error.",
       });
@@ -351,6 +397,7 @@ export function FileDetailPage() {
                     <th scope="col">Language</th>
                     <th scope="col">Target</th>
                     <th scope="col">Status</th>
+                    <th scope="col">Kind</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -362,6 +409,15 @@ export function FileDetailPage() {
                         <span className={`activity-table__status activity-table__status--${row.tone}`}>
                           {row.label}
                         </span>
+                      </td>
+                      <td>
+                        {row.kind ? (
+                          <span className={`activity-table__kind activity-table__kind--${row.kind}`}>
+                            {JOB_KIND_LABEL[row.kind]}
+                          </span>
+                        ) : (
+                          "—"
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -430,6 +486,50 @@ export function FileDetailPage() {
                   </>
                 ) : (
                   "No job enqueued — the file was skipped (already queued, unprobeable, or nothing qualifying even with the bypass)."
+                )}
+              </p>
+            )}
+          </div>
+
+          <div className="panel file-detail__panel">
+            <h2 className="settings-form__subtitle">Set Default Audio Track</h2>
+            <p className="panel__message file-detail__hint">
+              Swaps this file&apos;s Default Audio Track disposition onto the track matching the
+              current Preferred Default Audio setting, if it isn&apos;t already set correctly.
+            </p>
+
+            <div className="form-actions">
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={handleTriggerDefaultAudio}
+                disabled={defaultAudioTriggerState.status === "submitting"}
+              >
+                {defaultAudioTriggerState.status === "submitting"
+                  ? "Setting…"
+                  : "Set Default Audio Track"}
+              </button>
+            </div>
+
+            {defaultAudioTriggerState.status === "error" && (
+              <p className="form-error">
+                Couldn&apos;t trigger Set Default Audio Track: {defaultAudioTriggerState.message}
+              </p>
+            )}
+
+            {defaultAudioTriggerState.status === "result" && (
+              <p className={defaultAudioTriggerState.result.enqueued ? "form-success" : "form-hint"}>
+                {defaultAudioTriggerState.result.enqueued && defaultAudioTriggerState.result.job ? (
+                  <>
+                    Job <code>{defaultAudioTriggerState.result.job.id}</code> enqueued —{" "}
+                    <span
+                      className={`activity-table__status activity-table__status--${defaultAudioTriggerState.result.job.status}`}
+                    >
+                      {STATUS_LABEL[defaultAudioTriggerState.result.job.status]}
+                    </span>
+                  </>
+                ) : (
+                  "No job enqueued — the file was skipped (already correct, no preference configured, already queued, or unprobeable)."
                 )}
               </p>
             )}

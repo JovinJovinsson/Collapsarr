@@ -28,6 +28,7 @@ const historyResponse: JobHistoryEntry[] = [
     job_id: "11111111-1111-1111-1111-111111111111",
     file_path: FILE_PATH,
     status: "succeeded",
+    kind: "downmix",
     started_at: "2026-07-10T10:00:00Z",
     ended_at: "2026-07-10T10:05:00Z",
     exit_code: 0,
@@ -93,10 +94,19 @@ function defaultHandler(
     history: unknown;
     settings: unknown;
     trigger: { ok: boolean; status?: number; body: unknown };
+    defaultAudioTrigger: { ok: boolean; status?: number; body: unknown };
     tracked: { ok: boolean; status?: number; body: unknown };
   }> = {},
 ): Handler {
   return (url, init) => {
+    if (url === "/api/jobs/trigger-default-audio") {
+      return (
+        overrides.defaultAudioTrigger ?? {
+          ok: true,
+          body: { enqueued: true, job: { id: "default-audio-job-1", file_path: FILE_PATH, status: "pending" } },
+        }
+      );
+    }
     if (url.startsWith("/api/jobs/trigger")) {
       return overrides.trigger ?? { ok: true, body: { enqueued: true, job: { id: "job-1", file_path: FILE_PATH, status: "pending" } } };
     }
@@ -264,6 +274,161 @@ describe("FileDetailPage", () => {
     resolveTrigger({ ok: true, status: 202, json: () => Promise.resolve({ enqueued: true, job: { id: "job-9", file_path: FILE_PATH, status: "pending" } }) });
 
     expect(await screen.findByText("Queued")).toBeInTheDocument();
+  });
+
+  // --- Set Default Audio Track (COL-155, COL-157) -----------------------------
+
+  it('"Set Default Audio Track" calls the single-file default-audio trigger endpoint and reflects the resulting job\'s queued state', async () => {
+    const { calls } = mockFetchRouter(
+      defaultHandler({
+        defaultAudioTrigger: {
+          ok: true,
+          body: { enqueued: true, job: { id: "default-audio-job-42", file_path: FILE_PATH, status: "pending" } },
+        },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    fireEvent.click(screen.getByRole("button", { name: /^set default audio track$/i }));
+
+    expect(await screen.findByText(/default-audio-job-42/i)).toBeInTheDocument();
+    expect(await screen.findByText("Queued")).toBeInTheDocument();
+
+    const triggerCall = calls.find((call) => call.url === "/api/jobs/trigger-default-audio");
+    expect(triggerCall).toBeDefined();
+    expect(triggerCall?.init?.method).toBe("POST");
+    expect(JSON.parse(String(triggerCall?.init?.body))).toEqual({ file_path: FILE_PATH });
+  });
+
+  it('shows a skipped message when "Set Default Audio Track" enqueues no job', async () => {
+    mockFetchRouter(
+      defaultHandler({ defaultAudioTrigger: { ok: true, body: { enqueued: false, job: null } } }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    fireEvent.click(screen.getByRole("button", { name: /^set default audio track$/i }));
+
+    expect(await screen.findByText(/no job enqueued/i)).toBeInTheDocument();
+  });
+
+  it('shows an error message when the "Set Default Audio Track" request fails', async () => {
+    mockFetchRouter(
+      defaultHandler({
+        defaultAudioTrigger: { ok: false, status: 503, body: { detail: "Job scheduler is not available." } },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    fireEvent.click(screen.getByRole("button", { name: /^set default audio track$/i }));
+
+    expect(
+      await screen.findByText(/couldn't trigger set default audio track: job scheduler is not available\./i),
+    ).toBeInTheDocument();
+  });
+
+  it('disables the "Set Default Audio Track" button while the request is in flight', async () => {
+    let resolveTrigger!: (value: { ok: boolean; status?: number; json: () => Promise<unknown> }) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "/api/jobs/trigger-default-audio") {
+          return new Promise((resolve) => {
+            resolveTrigger = resolve;
+          });
+        }
+        const handler = defaultHandler();
+        const { ok, status = 200, body } = handler(url);
+        return Promise.resolve({ ok, status, json: () => Promise.resolve(body) });
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    const button = screen.getByRole("button", { name: /^set default audio track$/i });
+    fireEvent.click(button);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /setting…/i })).toBeDisabled());
+
+    resolveTrigger({
+      ok: true,
+      status: 202,
+      json: () => Promise.resolve({ enqueued: true, job: { id: "default-audio-job-9", file_path: FILE_PATH, status: "pending" } }),
+    });
+
+    expect(await screen.findByText("Queued")).toBeInTheDocument();
+  });
+
+  it("shows each status row's job kind, distinguishing a Downmix attempt from a Set Default Audio Track attempt", async () => {
+    mockFetchRouter(
+      defaultHandler({
+        history: [
+          ...historyResponse,
+          {
+            id: 11,
+            job_id: "22222222-2222-2222-2222-222222222222",
+            file_path: FILE_PATH,
+            status: "succeeded",
+            kind: "set_default_audio",
+            started_at: "2026-07-11T10:00:00Z",
+            ended_at: "2026-07-11T10:01:00Z",
+            exit_code: 0,
+            error_text: null,
+            target: "5.1",
+            language: "en",
+            created_at: "2026-07-11T10:00:00Z",
+            updated_at: "2026-07-11T10:01:00Z",
+          },
+        ],
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    const downmixRow = (await screen.findByText("Stereo")).closest("tr") as HTMLElement;
+    expect(within(downmixRow).getByText("Downmix")).toBeInTheDocument();
+
+    const defaultAudioRow = (await screen.findByText("5.1")).closest("tr") as HTMLElement;
+    expect(within(defaultAudioRow).getByText("Set Default Audio Track")).toBeInTheDocument();
+  });
+
+  it("resolves a row's kind to the latest attempt when a Set Default Audio Track job and a Downmix job land on the same language/target pair", async () => {
+    // Both entries key to "en::stereo" -- `buildStatusRows` keeps only the
+    // latest (last in the oldest-to-newest history array), so this row
+    // should show `set_default_audio`'s kind, not `downmix`'s, even though
+    // the downmix entry (id 10, from `historyResponse`) is seeded first.
+    mockFetchRouter(
+      defaultHandler({
+        history: [
+          ...historyResponse,
+          {
+            id: 11,
+            job_id: "22222222-2222-2222-2222-222222222222",
+            file_path: FILE_PATH,
+            status: "succeeded",
+            kind: "set_default_audio",
+            started_at: "2026-07-11T10:00:00Z",
+            ended_at: "2026-07-11T10:01:00Z",
+            exit_code: 0,
+            error_text: null,
+            target: "stereo",
+            language: "en",
+            created_at: "2026-07-11T10:00:00Z",
+            updated_at: "2026-07-11T10:01:00Z",
+          },
+        ],
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    const stereoRow = (await screen.findByText("Stereo")).closest("tr") as HTMLElement;
+    expect(within(stereoRow).getByText("Set Default Audio Track")).toBeInTheDocument();
+    expect(within(stereoRow).queryByText("Downmix")).not.toBeInTheDocument();
   });
 
   // --- Tracked indicator + toggle (COL-101) -----------------------------------

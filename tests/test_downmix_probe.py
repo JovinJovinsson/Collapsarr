@@ -76,13 +76,32 @@ def test_probes_7_1_file() -> None:
 
 @requires_ffprobe
 def test_probes_multi_language_file() -> None:
-    """A file with multiple audio streams returns one entry per stream, each tagged."""
+    """A file with multiple audio streams returns one entry per stream, each tagged.
+
+    ``multi_lang.mkv`` also happens to carry the container's Default Audio
+    Track disposition on its first (English) stream and not its second
+    (French) stream, so this same real-ffprobe fixture doubles as the
+    integration coverage for ``is_default`` (COL-150): one stream explicitly
+    flagged default, one explicitly flagged non-default.
+    """
     streams = probe_audio_streams(FIXTURES_DIR / "multi_lang.mkv")
 
     assert streams == [
-        AudioStreamInfo(index=0, codec="aac", channels=2, channel_layout="stereo", language="eng"),
         AudioStreamInfo(
-            index=1, codec="ac3", channels=6, channel_layout="5.1(side)", language="fre"
+            index=0,
+            codec="aac",
+            channels=2,
+            channel_layout="stereo",
+            language="eng",
+            is_default=True,
+        ),
+        AudioStreamInfo(
+            index=1,
+            codec="ac3",
+            channels=6,
+            channel_layout="5.1(side)",
+            language="fre",
+            is_default=False,
         ),
     ]
 
@@ -279,6 +298,108 @@ def test_empty_streams_list_returns_empty_list() -> None:
     _, runner = _stub_runner(stdout=json.dumps({"streams": []}))
 
     assert probe_audio_streams("/media/silent-video.mkv", runner=runner) == []  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# is_default: Default Audio Track disposition exposure (COL-150).
+# ---------------------------------------------------------------------------
+
+
+def test_stream_explicitly_flagged_default_reports_is_default_true() -> None:
+    """A stream with disposition.default = 1 is reported as the default track."""
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_name": "aac",
+                "codec_type": "audio",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "tags": {"language": "eng"},
+                "disposition": {"default": 1},
+            }
+        ]
+    }
+    _, runner = _stub_runner(stdout=json.dumps(payload))
+
+    streams = probe_audio_streams("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert streams == [
+        AudioStreamInfo(
+            index=0,
+            codec="aac",
+            channels=2,
+            channel_layout="stereo",
+            language="eng",
+            is_default=True,
+        )
+    ]
+
+
+def test_stream_explicitly_flagged_non_default_reports_is_default_false() -> None:
+    """A stream with disposition.default = 0 is reported as not the default track."""
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_name": "ac3",
+                "codec_type": "audio",
+                "channels": 6,
+                "channel_layout": "5.1",
+                "tags": {"language": "fre"},
+                "disposition": {"default": 0},
+            }
+        ]
+    }
+    _, runner = _stub_runner(stdout=json.dumps(payload))
+
+    streams = probe_audio_streams("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert streams == [
+        AudioStreamInfo(
+            index=0,
+            codec="ac3",
+            channels=6,
+            channel_layout="5.1",
+            language="fre",
+            is_default=False,
+        )
+    ]
+
+
+def test_stream_with_no_disposition_metadata_reports_is_default_false() -> None:
+    """A stream missing the disposition block entirely probes as not-default, not an error.
+
+    Some encoders omit ``disposition`` altogether rather than writing an
+    explicit ``default: 0`` — this must be treated the same as an explicit
+    non-default flag rather than erroring or guessing.
+    """
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_name": "aac",
+                "codec_type": "audio",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "tags": {"language": "eng"},
+            }
+        ]
+    }
+    _, runner = _stub_runner(stdout=json.dumps(payload))
+
+    streams = probe_audio_streams("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert streams == [
+        AudioStreamInfo(
+            index=0,
+            codec="aac",
+            channels=2,
+            channel_layout="stereo",
+            language="eng",
+            is_default=False,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,8 @@ from collapsarr.arr.catalog import (
     SonarrCatalog,
 )
 from collapsarr.arr.models import ArrInstance, InstanceType
+from collapsarr.downmix.probe import AudioStreamInfo
+from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.library import routes as library_routes
 from collapsarr.library.models import LibraryNodeKind, make_node_key
 from collapsarr.library.service import (
@@ -36,6 +38,7 @@ from collapsarr.library.service import (
     set_tracked,
     sync_library,
 )
+from collapsarr.media.service import upsert_tracked_media
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
 UNREACHABLE_URL = "http://127.0.0.1:9"
@@ -176,6 +179,117 @@ def test_tree_radarr_reflects_default_tracked_false(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert all(m["tracked"] is False for m in response.json()["movies"])
+
+
+# --- current Default Audio Track snapshot (COL-154) --------------------------
+
+
+def test_tree_episode_current_default_track_reflects_a_probed_default_stream(
+    client: TestClient,
+) -> None:
+    instance_id = _seed_library(client)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        upsert_tracked_media(
+            session,
+            file_path="/media/pilot.mkv",
+            streams=[
+                AudioStreamInfo(
+                    index=0, codec="ac3", channels=2, channel_layout="stereo", language="eng"
+                ),
+                AudioStreamInfo(
+                    index=1,
+                    codec="ac3",
+                    channels=6,
+                    channel_layout="5.1",
+                    language="dan",
+                    is_default=True,
+                ),
+            ],
+            settings=DownmixSettings(enabled_targets=frozenset({DownmixTarget.STEREO})),
+            instance_id=instance_id,
+            sonarr_episode_id=101,
+        )
+
+    response = client.get(
+        f"/api/library/instances/{instance_id}/tree", headers=_auth_headers(client)
+    )
+
+    assert response.status_code == 200, response.text
+    episodes = response.json()["series"][0]["seasons"][0]["episodes"]
+    probed_episode = next(e for e in episodes if e["episode_number"] == 1)
+    assert probed_episode["current_default_track"] == {"language": "dan", "channel_layout": "5.1"}
+    # The sibling episode was never probed -- unknown, not a stale/copied value.
+    unprobed_episode = next(e for e in episodes if e["episode_number"] == 2)
+    assert unprobed_episode["current_default_track"] is None
+
+
+def test_tree_episode_current_default_track_is_null_when_no_stream_reports_default(
+    client: TestClient,
+) -> None:
+    instance_id = _seed_library(client)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        upsert_tracked_media(
+            session,
+            file_path="/media/pilot.mkv",
+            streams=[
+                AudioStreamInfo(
+                    index=0, codec="ac3", channels=2, channel_layout="stereo", language="eng"
+                )
+            ],
+            settings=DownmixSettings(enabled_targets=frozenset({DownmixTarget.STEREO})),
+            instance_id=instance_id,
+            sonarr_episode_id=101,
+        )
+
+    response = client.get(
+        f"/api/library/instances/{instance_id}/tree", headers=_auth_headers(client)
+    )
+
+    episodes = response.json()["series"][0]["seasons"][0]["episodes"]
+    probed_episode = next(e for e in episodes if e["episode_number"] == 1)
+    assert probed_episode["current_default_track"] is None
+
+
+def test_tree_movie_current_default_track_reflects_a_probed_default_stream(
+    client: TestClient,
+) -> None:
+    instance_id = _seed_library(client, type_=InstanceType.RADARR)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        upsert_tracked_media(
+            session,
+            file_path="/media/arrival.mkv",
+            streams=[
+                AudioStreamInfo(
+                    index=0,
+                    codec="dts",
+                    channels=6,
+                    channel_layout="5.1",
+                    language="eng",
+                    is_default=True,
+                )
+            ],
+            settings=DownmixSettings(enabled_targets=frozenset({DownmixTarget.STEREO})),
+            instance_id=instance_id,
+            radarr_movie_id=1,
+        )
+
+    response = client.get(
+        f"/api/library/instances/{instance_id}/tree", headers=_auth_headers(client)
+    )
+
+    assert response.status_code == 200, response.text
+    movies = {m["title"]: m for m in response.json()["movies"]}
+    assert movies["Arrival"]["current_default_track"] == {
+        "language": "eng",
+        "channel_layout": "5.1",
+    }
+    assert movies["Not Yet Downloaded"]["current_default_track"] is None
 
 
 def test_tree_requires_the_api_key(client: TestClient) -> None:

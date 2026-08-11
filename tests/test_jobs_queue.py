@@ -17,9 +17,14 @@ from pathlib import Path
 import pytest
 
 from collapsarr.config import Settings
+from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.downmix.default_audio import DefaultAudioPreference
+from collapsarr.downmix.default_audio_pipeline import run_default_audio_pipeline
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
-from collapsarr.jobs.queue import DEFAULT_MAX_CONCURRENCY, Job, JobQueue, JobStatus
+from collapsarr.jobs.queue import DEFAULT_MAX_CONCURRENCY, Job, JobKind, JobQueue, JobStatus
+from collapsarr.migrations import upgrade_to_head
+from collapsarr.settings.service import update_global_settings
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
 _NOTHING_TO_DO = PipelineResult(
@@ -408,3 +413,274 @@ def test_run_job_logs_error_when_the_runner_raises_unexpectedly(
     assert errors[0].exc_info[1] is not None
     assert str(errors[0].exc_info[1]) == "boom"
     assert job.status is JobStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Default Audio Track preference wiring (COL-152): the persisted opt-in toggle
+# and (language, tier) preference must actually reach run_downmix_pipeline's
+# kwargs for a real job dispatched through a JobQueue built via from_settings.
+# ---------------------------------------------------------------------------
+
+
+class _KwargsCapturingRunner:
+    """A pipeline_runner stub that records the **kwargs each job passes it."""
+
+    def __init__(self, result: PipelineResult) -> None:
+        self._result = result
+        self.kwargs_calls: list[dict[str, object]] = []
+
+    def __call__(
+        self, file_path: Path, settings: DownmixSettings, **kwargs: object
+    ) -> PipelineResult:
+        self.kwargs_calls.append(kwargs)
+        return self._result
+
+
+def _write_default_audio_settings(
+    settings: Settings,
+    *,
+    auto_set_default_audio: bool,
+    default_audio_language: str | None = None,
+    default_audio_channel_tier: DownmixTarget | None = None,
+) -> None:
+    """Persist the Default Audio Track settings into ``settings``' database.
+
+    Runs the migration chain (the same schema from_settings will find) then
+    writes the singleton GlobalSettings row, so a subsequent
+    ``JobQueue.from_settings`` reads exactly these values back.
+    """
+    upgrade_to_head(settings)
+    engine = create_engine_from_settings(settings)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        update_global_settings(
+            session,
+            default_audio_language=default_audio_language,
+            default_audio_channel_tier=default_audio_channel_tier,
+            auto_set_default_audio=auto_set_default_audio,
+        )
+    engine.dispose()
+
+
+def test_from_settings_threads_default_audio_preference_when_toggle_on(tmp_path: Path) -> None:
+    """Toggle on: a job dispatched through the queue reaches the pipeline with the fix armed."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_default_audio_settings(
+        settings,
+        auto_set_default_audio=True,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+    )
+
+    runner = _KwargsCapturingRunner(_SUCCESS)
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.run_pending()
+
+    assert len(runner.kwargs_calls) == 1
+    kwargs = runner.kwargs_calls[0]
+    assert kwargs["auto_set_default_audio"] is True
+    assert kwargs["default_audio_preference"] == DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE
+    )
+
+
+def test_from_settings_passes_no_default_audio_kwargs_when_toggle_off(tmp_path: Path) -> None:
+    """Toggle off (the default): the pipeline call is byte-for-byte pre-COL-152 -- no fix kwargs."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    # Even with a language/tier persisted, the off toggle must gate them out.
+    _write_default_audio_settings(
+        settings,
+        auto_set_default_audio=False,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+    )
+
+    runner = _KwargsCapturingRunner(_SUCCESS)
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.run_pending()
+
+    assert len(runner.kwargs_calls) == 1
+    kwargs = runner.kwargs_calls[0]
+    assert "auto_set_default_audio" not in kwargs
+    assert "default_audio_preference" not in kwargs
+    assert kwargs == {}
+
+
+# ---------------------------------------------------------------------------
+# Job kinds (COL-155): SET_DEFAULT_AUDIO jobs run through their own injected
+# runner, sharing this queue's concurrency limit; DOWNMIX jobs are unaffected.
+# ---------------------------------------------------------------------------
+
+_PREFERENCE = DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE)
+
+
+class _StubDefaultAudioRunner:
+    """A default_audio_pipeline_runner stub recording (file_path, preference) calls."""
+
+    def __init__(self, result: PipelineResult) -> None:
+        self._result = result
+        self.calls: list[tuple[Path, DefaultAudioPreference]] = []
+
+    def __call__(
+        self, file_path: Path, preference: DefaultAudioPreference, **_: object
+    ) -> PipelineResult:
+        self.calls.append((file_path, preference))
+        return self._result
+
+
+def test_enqueue_default_audio_creates_a_pending_set_default_audio_job() -> None:
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+
+    job = queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
+
+    assert job.file_path == Path("/media/movie.mkv")
+    assert job.kind is JobKind.SET_DEFAULT_AUDIO
+    assert job.preference == _PREFERENCE
+    assert job.status is JobStatus.PENDING
+    assert queue.list_jobs() == [job]
+
+
+def test_enqueue_creates_a_downmix_job_by_default() -> None:
+    """Unchanged from before COL-155: a plain enqueue() is always a DOWNMIX job."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    assert job.kind is JobKind.DOWNMIX
+    assert job.preference is None
+
+
+def test_run_pending_dispatches_set_default_audio_jobs_to_their_own_runner() -> None:
+    downmix_runner = _stub_runner(_SUCCESS)
+    default_audio_runner = _StubDefaultAudioRunner(_SUCCESS)
+    queue = JobQueue(
+        pipeline_runner=downmix_runner, default_audio_pipeline_runner=default_audio_runner
+    )
+    job = queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
+
+    (ran_job,) = queue.run_pending()
+
+    assert ran_job is job
+    assert ran_job.status is JobStatus.SUCCEEDED
+    assert ran_job.result is _SUCCESS
+    assert default_audio_runner.calls == [(Path("/media/movie.mkv"), _PREFERENCE)]
+    assert downmix_runner.calls == []  # the DOWNMIX runner is never touched
+
+
+def test_run_pending_dispatches_downmix_jobs_to_the_downmix_runner_only() -> None:
+    """The inverse: a DOWNMIX job never reaches the default_audio_pipeline_runner."""
+    downmix_runner = _stub_runner(_SUCCESS)
+    default_audio_runner = _StubDefaultAudioRunner(_SUCCESS)
+    queue = JobQueue(
+        pipeline_runner=downmix_runner, default_audio_pipeline_runner=default_audio_runner
+    )
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.run_pending()
+
+    assert downmix_runner.calls == [(Path("/media/movie.mkv"), DownmixSettings())]
+    assert default_audio_runner.calls == []
+
+
+def test_run_pending_captures_a_failed_set_default_audio_job() -> None:
+    default_audio_runner = _StubDefaultAudioRunner(_FAILED)
+    queue = JobQueue(default_audio_pipeline_runner=default_audio_runner)
+    job = queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
+
+    queue.run_pending()
+
+    assert job.status is JobStatus.FAILED
+    assert job.result is _FAILED
+
+
+def test_default_audio_pipeline_runner_defaults_to_the_real_pipeline() -> None:
+    """Mirrors pipeline_runner's own default -- a bare JobQueue() is production-ready."""
+    queue = JobQueue()
+    assert queue._default_audio_pipeline_runner is run_default_audio_pipeline
+
+
+def test_downmix_and_set_default_audio_jobs_share_the_concurrency_cap(tmp_path: Path) -> None:
+    """AC: the concurrency limit genuinely spans both kinds, not one pool each."""
+    active = 0
+    max_active_seen = 0
+    state_lock = threading.Lock()
+
+    def bump() -> None:
+        nonlocal active, max_active_seen
+        with state_lock:
+            active += 1
+            max_active_seen = max(max_active_seen, active)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+
+    def downmix_runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        bump()
+        return _SUCCESS
+
+    def default_audio_runner(
+        file_path: Path, preference: DefaultAudioPreference, **_: object
+    ) -> PipelineResult:
+        bump()
+        return _SUCCESS
+
+    queue = JobQueue(
+        max_concurrency=2,
+        pipeline_runner=downmix_runner,
+        default_audio_pipeline_runner=default_audio_runner,
+    )
+    for i in range(3):
+        queue.enqueue(tmp_path / f"downmix-{i}.mkv", DownmixSettings())
+    for i in range(3):
+        queue.enqueue_default_audio(tmp_path / f"default-audio-{i}.mkv", _PREFERENCE)
+
+    jobs = queue.run_pending()
+
+    assert max_active_seen == 2  # the cap held across both kinds combined
+    assert all(job.status is JobStatus.SUCCEEDED for job in jobs)
+
+
+def test_from_settings_threads_default_audio_pipeline_runner_through(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None, database_path=str(tmp_path / "collapsarr.db"), data_dir=str(tmp_path)
+    )
+    default_audio_runner = _StubDefaultAudioRunner(_SUCCESS)
+
+    queue = JobQueue.from_settings(
+        settings,
+        pipeline_runner=_stub_runner(_SUCCESS),
+        default_audio_pipeline_runner=default_audio_runner,
+    )
+    queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
+    queue.run_pending()
+
+    assert default_audio_runner.calls == [(Path("/media/movie.mkv"), _PREFERENCE)]
+
+
+def test_run_job_start_log_reports_the_preference_for_a_set_default_audio_job(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    queue = JobQueue(default_audio_pipeline_runner=_StubDefaultAudioRunner(_SUCCESS))
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        job = queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
+        queue.run_pending()
+
+    start_records = [
+        r for r in caplog.records if r.levelno == logging.INFO and "started" in r.message
+    ]
+    assert len(start_records) == 1
+    message = start_records[0].message
+    assert str(job.id) in message
+    assert "set_default_audio" in message
+    assert "eng/5.1" in message

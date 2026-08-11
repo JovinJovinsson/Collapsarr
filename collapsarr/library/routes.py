@@ -30,12 +30,32 @@ from ..arr.models import InstanceType
 from ..arr.service import get_instance
 from ..database import get_session
 from .models import LibraryNode, LibraryNodeKind
-from .service import LibraryNodeNotFoundError, build_movie_tree, build_tree, get_node, set_tracked
+from .service import (
+    LibraryNodeNotFoundError,
+    TreeDefaultTrack,
+    build_movie_tree,
+    build_tree,
+    get_node,
+    set_tracked,
+)
 
 router = APIRouter(prefix="/api", tags=["library"])
 
 
 # --- schemas -----------------------------------------------------------------
+
+
+class CurrentDefaultTrack(BaseModel):
+    """A file-bearing leaf node's current Default Audio Track snapshot (COL-154).
+
+    The wire-response mirror of :class:`~collapsarr.library.service.TreeDefaultTrack`,
+    which already carries the doc for what these two fields mean and where
+    ``None``/each field comes from. Rendered by the Library page as e.g.
+    "Dan · 5.1".
+    """
+
+    language: str
+    channel_layout: str
 
 
 class EpisodeNode(BaseModel):
@@ -49,6 +69,10 @@ class EpisodeNode(BaseModel):
     title: str
     has_file: bool
     tracked: bool
+    #: ``None`` when the file hasn't been probed since COL-154 shipped, or
+    #: its ffprobe metadata carries no Default Audio Track disposition flag
+    #: on any stream -- both render as "unknown" on the Library page.
+    current_default_track: CurrentDefaultTrack | None = None
 
 
 class SeasonNode(BaseModel):
@@ -88,6 +112,8 @@ class MovieNode(BaseModel):
     title: str
     has_file: bool
     tracked: bool
+    #: See :attr:`EpisodeNode.current_default_track` (COL-154).
+    current_default_track: CurrentDefaultTrack | None = None
 
 
 class MovieLibraryTreeResponse(BaseModel):
@@ -141,6 +167,21 @@ class BulkTrackedUpdateResponse(BaseModel):
 # --- endpoints ---------------------------------------------------------------
 
 
+def _to_current_default_track(track: TreeDefaultTrack | None) -> CurrentDefaultTrack | None:
+    """Wrap a resolved :class:`~collapsarr.library.service.TreeDefaultTrack` for the response.
+
+    The enrichment itself -- the tracked-media bulk fetch and the dict-by-id
+    lookup -- lives in :func:`~collapsarr.library.service.build_tree`/
+    :func:`~collapsarr.library.service.build_movie_tree` (COL-154), the same
+    place Tracked resolution lives; this is just the response-schema copy,
+    mirroring how every other field on :class:`EpisodeNode`/:class:`MovieNode`
+    below is copied off its ``Tree*`` counterpart.
+    """
+    if track is None:
+        return None
+    return CurrentDefaultTrack(language=track.language, channel_layout=track.channel_layout)
+
+
 @router.get(
     "/library/instances/{instance_id}/tree",
     response_model=LibraryTreeResponse | MovieLibraryTreeResponse,
@@ -154,6 +195,12 @@ def get_library_tree_endpoint(
     (:class:`LibraryTreeResponse`); a Radarr instance (COL-99) returns the flat
     Movie list (:class:`MovieLibraryTreeResponse`). ``404`` if no instance with
     ``instance_id`` exists.
+
+    Each Episode/Movie leaf also carries its current-default-track snapshot
+    (COL-154), already resolved onto the tree by
+    :func:`~collapsarr.library.service.build_tree`/
+    :func:`~collapsarr.library.service.build_movie_tree` the same way they
+    resolve Tracked -- this endpoint only copies it onto the response schema.
     """
     instance = get_instance(session, instance_id)
     if instance is None:
@@ -170,6 +217,7 @@ def get_library_tree_endpoint(
                     title=movie.title,
                     has_file=movie.has_file,
                     tracked=movie.tracked,
+                    current_default_track=_to_current_default_track(movie.current_default_track),
                 )
                 for movie in movie_tree.movies
             ],
@@ -198,6 +246,9 @@ def get_library_tree_endpoint(
                                 title=episode.title,
                                 has_file=episode.has_file,
                                 tracked=episode.tracked,
+                                current_default_track=_to_current_default_track(
+                                    episode.current_default_track
+                                ),
                             )
                             for episode in season.episodes
                         ],

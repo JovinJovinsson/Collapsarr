@@ -32,7 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import JobHistory
-from .queue import HistoryRecorder, Job, JobStatus
+from .queue import HistoryRecorder, Job, JobKind, JobStatus
 
 
 def _exit_code(job: Job) -> int | None:
@@ -52,14 +52,31 @@ def _error_text(job: Job) -> str | None:
 
 
 def _target(job: Job) -> str | None:
-    """Comma-joined enabled downmix targets the job was configured with."""
+    """What the job was configured to do, target-wise.
+
+    A ``DOWNMIX`` job: comma-joined enabled downmix targets. A
+    ``SET_DEFAULT_AUDIO`` job (COL-155): its resolved preference's channel
+    tier (e.g. ``"5.1"``) -- there is no downmix target to report, so
+    ``job.settings`` (a placeholder for this kind, see
+    :meth:`~collapsarr.jobs.queue.JobQueue.enqueue_default_audio`) is never
+    consulted.
+    """
+    if job.kind is JobKind.SET_DEFAULT_AUDIO:
+        return job.preference.channel_tier.value if job.preference is not None else None
     if not job.settings.enabled_targets:
         return None
     return ",".join(sorted(target.value for target in job.settings.enabled_targets))
 
 
 def _language(job: Job) -> str | None:
-    """Comma-joined language allow-list, or ``None`` when unrestricted."""
+    """What the job was configured to do, language-wise.
+
+    A ``DOWNMIX`` job: comma-joined language allow-list, or ``None`` when
+    unrestricted. A ``SET_DEFAULT_AUDIO`` job (COL-155): its resolved
+    preference's language.
+    """
+    if job.kind is JobKind.SET_DEFAULT_AUDIO:
+        return job.preference.language if job.preference is not None else None
     if job.settings.language_allow_list is None:
         return None
     return ",".join(sorted(job.settings.language_allow_list))
@@ -83,6 +100,7 @@ def record_job_history(session: Session, job: Job) -> JobHistory:
 
     history.file_path = str(job.file_path)
     history.status = job.status
+    history.kind = job.kind
     history.started_at = job.started_at
     history.ended_at = job.ended_at
     history.exit_code = _exit_code(job)
@@ -107,20 +125,24 @@ def list_job_history(
     *,
     file_path: str | Path | None = None,
     status: JobStatus | None = None,
+    kind: JobKind | None = None,
 ) -> list[JobHistory]:
-    """Return persisted job history, optionally filtered by file or status.
+    """Return persisted job history, optionally filtered by file, status, and/or kind.
 
     Ordered by ``id`` (insertion order), matching the pattern used
     throughout the service layer. ``file_path`` matches exactly (the same
     string form :func:`record_job_history` stores, i.e. ``str(job.file_path)``);
-    ``status`` matches a single :class:`~collapsarr.jobs.queue.JobStatus`.
-    Both filters may be combined; omitting both returns every row.
+    ``status`` matches a single :class:`~collapsarr.jobs.queue.JobStatus`;
+    ``kind`` (COL-155) matches a single :class:`~collapsarr.jobs.queue.JobKind`.
+    Any combination of the three may be given; omitting all returns every row.
     """
     stmt = select(JobHistory).order_by(JobHistory.id)
     if file_path is not None:
         stmt = stmt.where(JobHistory.file_path == str(file_path))
     if status is not None:
         stmt = stmt.where(JobHistory.status == status)
+    if kind is not None:
+        stmt = stmt.where(JobHistory.kind == kind)
     return list(session.scalars(stmt))
 
 

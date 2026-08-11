@@ -36,6 +36,25 @@ and "trigger this file") to call, on top of the automatic ones above:
   want auto-processed) without mutating the process-wide
   ``self._downmix_settings`` used by every other trigger.
 
+COL-155 adds a third manual, on-demand entry point, for the other half of the
+Preferred Default Audio feature (COL-151/COL-152/COL-153):
+
+- :meth:`trigger_set_default_audio` -- probes the file, resolves which
+  existing audio stream should carry the Default Audio Track disposition
+  via :func:`~collapsarr.downmix.default_audio.resolve_default_audio_stream`
+  against the persisted preference (:func:`~collapsarr.settings.service.
+  as_default_audio_preference`), and enqueues a ``SET_DEFAULT_AUDIO`` job
+  (:meth:`~collapsarr.jobs.queue.JobQueue.enqueue_default_audio`) only when
+  the resolved winner differs from what the file already has -- otherwise
+  returns ``None`` ("skipped"), mirroring :meth:`trigger_file`'s skip
+  semantics. Like :meth:`trigger_file`, it bypasses the **Tracked** gate
+  (COL-102): a manual trigger is an explicit user action. It shares
+  :meth:`enqueue_file`'s de-duplication (below) with every ``DOWNMIX``
+  trigger, since both job kinds run through the same
+  :class:`~collapsarr.jobs.queue.JobQueue` and are matched purely by file
+  path -- an in-flight ``DOWNMIX`` job for a file blocks a
+  ``SET_DEFAULT_AUDIO`` trigger for it, and vice versa.
+
 De-duplication
 --------------
 Overlapping triggers (a webhook firing while a scan is mid-flight, or two scans
@@ -100,6 +119,7 @@ from collapsarr.arr.models import ArrInstance, InstanceType, resolve_path
 from collapsarr.arr.service import list_instances, list_path_mappings
 from collapsarr.arr.webhooks import ResolvedWebhookFile
 from collapsarr.config import Settings
+from collapsarr.downmix.default_audio import DefaultAudioPreference, resolve_default_audio_stream
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_streams
 from collapsarr.downmix.targets import DownmixSettings, detect_qualifying_targets
 from collapsarr.jobs.history import list_job_history
@@ -111,7 +131,7 @@ from collapsarr.library.service import (
     sync_library,
 )
 from collapsarr.media.service import upsert_tracked_media
-from collapsarr.settings.service import get_global_settings
+from collapsarr.settings.service import as_default_audio_preference, get_global_settings
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +544,111 @@ class JobScheduler:
         if not extra or allow_list is None:
             return self._downmix_settings
         return replace(self._downmix_settings, language_allow_list=allow_list | extra)
+
+    def trigger_set_default_audio(
+        self,
+        file_path: str | Path,
+        *,
+        session: Session | None = None,
+    ) -> Job | None:
+        """Manually trigger a Default Audio Track fix job for one file on demand (COL-155).
+
+        The entry point the single-file "set default audio track" REST
+        endpoint (:mod:`collapsarr.jobs.routes`) calls. Unlike
+        :meth:`trigger_file` (which delegates to :meth:`enqueue_file`), this
+        has its own probe/decide/enqueue sequence -- the "does this file need
+        anything" question is a different algorithm
+        (:func:`~collapsarr.downmix.default_audio.resolve_default_audio_stream`
+        over the *existing* disposition, not
+        :func:`~collapsarr.downmix.targets.detect_qualifying_targets` over
+        missing downmix targets):
+
+        1. Resolve the persisted **Preferred Default Audio** setting
+           (:func:`~collapsarr.settings.service.as_default_audio_preference`).
+           Returns ``None`` -- nothing to act on -- if either half of the
+           preference (language / channel tier) is unset; unlike COL-153's
+           pipeline (an explicit per-call ``preference`` argument), a manual
+           trigger's preference always comes from persisted settings, so an
+           unset one really does mean there's nothing to compare against.
+        2. De-duplication (shared with every ``DOWNMIX`` trigger --
+           :meth:`_is_duplicate` matches purely on file path, oblivious to
+           kind, so an in-flight job of *either* kind for this file blocks
+           the other -- see the module docstring).
+        3. Probe the file's audio streams. A probe failure is logged and
+           skipped, same as :meth:`enqueue_file`.
+        4. Resolve the disposition winner. Returns ``None`` when there are
+           fewer than two streams to compare, or when the winner already --
+           and solely -- carries the disposition (nothing to change).
+        5. Re-check de-duplication under :attr:`_enqueue_lock` (closing the
+           same race window :meth:`enqueue_file` closes) and enqueue via
+           :meth:`~collapsarr.jobs.queue.JobQueue.enqueue_default_audio`.
+
+        Bypasses the **Tracked** gate unconditionally, the same rationale as
+        :meth:`trigger_file`: a manual trigger is an explicit user action
+        (CONTEXT.md's Tracked gates *automatic* enqueueing only). Does
+        **not** call :meth:`_track_media` -- Default Audio Track disposition
+        is orthogonal to the downmix-target tracking
+        :func:`~collapsarr.media.service.upsert_tracked_media` maintains for
+        the Wanted view, so there is nothing of that shape to record here.
+
+        Returns the created :class:`~collapsarr.jobs.queue.Job`, or ``None``
+        for any of the "nothing to do" reasons above (no preference
+        configured, duplicate, unprobeable, or the file already correct).
+        """
+        path = Path(file_path)
+
+        preference = self._resolve_default_audio_preference(session)
+        if preference is None:
+            logger.info(
+                "skipping %s: no Default Audio Track preference configured", path
+            )
+            return None
+
+        if self._is_duplicate(path, session):
+            return None
+
+        try:
+            streams = self._probe(path)
+        except FfprobeError as exc:
+            logger.warning("skipping %s: could not probe audio streams: %s", path, exc)
+            return None
+
+        winner = resolve_default_audio_stream(streams, preference)
+        if winner is None or self._default_audio_already_correct(streams, winner):
+            return None
+
+        with self._enqueue_lock:
+            if self._is_duplicate(path, session):
+                return None
+            return self._queue.enqueue_default_audio(path, preference)
+
+    def _resolve_default_audio_preference(
+        self, session: Session | None
+    ) -> DefaultAudioPreference | None:
+        """Adapt the persisted Preferred Default Audio setting, opening a session if needed.
+
+        Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
+        when the caller has one open, else opens a short-lived one.
+        """
+        if session is not None:
+            return as_default_audio_preference(get_global_settings(session))
+        with self._session_factory() as owned_session:
+            return as_default_audio_preference(get_global_settings(owned_session))
+
+    @staticmethod
+    def _default_audio_already_correct(
+        streams: Sequence[AudioStreamInfo], winner: AudioStreamInfo
+    ) -> bool:
+        """Whether ``winner`` already -- and solely -- carries the Default Audio Track disposition.
+
+        Mirrors :func:`~collapsarr.downmix.default_audio_pipeline._already_correct`
+        (a private helper of that module, deliberately not imported here --
+        the check is two lines and this module already has ``streams`` in
+        the exact shape it needs, no index lookup required).
+        """
+        return winner.is_default and not any(
+            stream.is_default for stream in streams if stream is not winner
+        )
 
     def _is_duplicate(self, path: Path, session: Session | None) -> bool:
         """Whether ``path`` is already queued/running or was recently processed."""

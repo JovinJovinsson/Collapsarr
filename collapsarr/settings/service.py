@@ -50,6 +50,18 @@ is the caller's job (:func:`collapsarr.settings.routes.update_settings_endpoint`
 calls :func:`collapsarr.logging_setup.apply_log_level`), mirroring how
 :func:`rotate_session_secret`'s caller pushes the fresh secret into the
 running process's own cached copy.
+
+``default_audio_language``/``default_audio_channel_tier`` (COL-151) both
+follow ``log_level``'s nullable-clearable convention (the :data:`_UNSET`
+sentinel): an explicit ``None`` clears a configured Preferred Default Audio
+preference, while omitting the argument leaves whatever is already stored
+untouched. ``default_audio_channel_tier`` takes a
+:class:`~collapsarr.downmix.targets.DownmixTarget` (not a bare string,
+matching ``enabled_targets``' own typing) and is stored as its ``.value``.
+``auto_set_default_audio`` follows the plain "only change what's passed"
+rule every other boolean field here follows (``ui_auth_enabled``,
+``default_tracked``) -- there is no clear-to-default sentinel since it
+always holds a concrete ``True``/``False``.
 """
 
 from __future__ import annotations
@@ -57,6 +69,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from collapsarr import __version__
+from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 
 from .models import (
@@ -178,6 +191,9 @@ def update_global_settings(
     update_channel: str | None = None,
     default_tracked: bool | None = None,
     log_level: str | None | _Unset = _UNSET,
+    default_audio_language: str | None | _Unset = _UNSET,
+    default_audio_channel_tier: DownmixTarget | None | _Unset = _UNSET,
+    auto_set_default_audio: bool | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -231,6 +247,20 @@ def update_global_settings(
     :data:`~collapsarr.settings.models.LOG_LEVELS`, raising
     :class:`ValueError` otherwise. This function only persists the value --
     it does not itself touch the running logger; see the module docstring.
+
+    ``default_audio_language``/``default_audio_channel_tier`` (COL-151) use
+    the :data:`_UNSET` sentinel, like ``log_level``: passing ``None``
+    explicitly clears a configured Preferred Default Audio preference field,
+    while omitting the argument leaves the stored value untouched.
+    ``default_audio_channel_tier`` is stored as its
+    :class:`~collapsarr.downmix.targets.DownmixTarget` ``.value`` -- there is
+    no separate validation step needed since the parameter is already typed
+    to the enum, so an invalid tier can't reach this function at all (the
+    HTTP boundary, :mod:`collapsarr.settings.routes`, also types the field as
+    the enum for the same reason).
+
+    ``auto_set_default_audio`` (COL-151) follows the same "only change what's
+    passed" rule as every other boolean field here.
     """
     settings = get_global_settings(session)
 
@@ -279,6 +309,14 @@ def update_global_settings(
         if log_level is not None and log_level not in LOG_LEVELS:
             raise ValueError(f"log_level must be one of {LOG_LEVELS!r}; got {log_level!r}")
         settings.log_level = log_level
+    if not isinstance(default_audio_language, _Unset):
+        settings.default_audio_language = default_audio_language
+    if not isinstance(default_audio_channel_tier, _Unset):
+        settings.default_audio_channel_tier = (
+            default_audio_channel_tier.value if default_audio_channel_tier is not None else None
+        )
+    if auto_set_default_audio is not None:
+        settings.auto_set_default_audio = auto_set_default_audio
 
     session.commit()
     session.refresh(settings)
@@ -336,4 +374,28 @@ def as_downmix_settings(settings: GlobalSettings) -> DownmixSettings:
         stereo_bitrate_kbps=settings.stereo_bitrate_kbps,
         surround_codec=settings.surround_codec,
         surround_bitrate_kbps=settings.surround_bitrate_kbps,
+    )
+
+
+def as_default_audio_preference(settings: GlobalSettings) -> DefaultAudioPreference | None:
+    """Adapt a persisted :class:`GlobalSettings` row into a :class:`DefaultAudioPreference`.
+
+    The shape the automatic in-band Default Audio Track fix (COL-152) consumes,
+    via :func:`~collapsarr.downmix.default_audio.resolve_default_audio_output_index`
+    and the downmix pipeline -- pairing the row's ``default_audio_language`` with
+    its ``default_audio_channel_tier`` (stored as a
+    :class:`~collapsarr.downmix.targets.DownmixTarget` value, decoded back here).
+
+    Returns ``None`` -- "no actionable preference" -- whenever either half is
+    unset: a preference only means something as a complete
+    ``(language, channel tier)`` pair, the same way
+    :func:`as_downmix_settings` decodes its own columns. Whether to *act* on the
+    returned preference at all is the caller's ``auto_set_default_audio`` gate,
+    not this adapter's concern.
+    """
+    if settings.default_audio_language is None or settings.default_audio_channel_tier is None:
+        return None
+    return DefaultAudioPreference(
+        language=settings.default_audio_language,
+        channel_tier=DownmixTarget(settings.default_audio_channel_tier),
     )
