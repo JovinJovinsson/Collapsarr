@@ -118,6 +118,23 @@ manual retry. Only a true *batch* action (COL-172's "Requeue all failed")
 still respects the window, since a bulk retry of every failed file is closer
 in spirit to the automatic paths this cooldown protects against.
 
+**Auto-Queue Limit (COL-171).** The scanner never auto-enqueues more than
+:data:`AUTO_QUEUE_LIMIT` (fixed at 5, not user-configurable) total ``PENDING``
+Jobs from Wanted at once -- this is the root-cause fix for "dozens of movies
+queued at once": before COL-171, both the periodic scan and ``POST
+/api/jobs/scan`` ("Scan now") enqueued *every* qualifying file in one pass.
+:meth:`top_up` is the one shared method every auto-enqueue hook point calls to
+enforce this, rather than four separate ad-hoc implementations: (1) a Job
+completing, success or failure alike, via the job-terminal hook wired onto
+``queue`` in :meth:`__init__` (:meth:`~collapsarr.jobs.queue.JobQueue.
+set_job_terminal_hook`); (2) a Job being cancelled (COL-168, :meth:`cancel_job`);
+(3) the periodic background scan (:meth:`scan_once`); and (4) ``POST
+/api/jobs/scan`` (:meth:`scan_now`, an alias for :meth:`scan_once`). A manual
+trigger or requeue (:meth:`trigger_file`/:meth:`requeue_file`) is never
+blocked by the limit -- it simply consumes the same shared ``PENDING``-count
+budget :meth:`top_up` watches. See :meth:`top_up`'s own docstring for the
+algorithm and its thread-safety/re-entrancy analysis.
+
 Threads, not asyncio: this matches :mod:`collapsarr.jobs.queue`'s rationale --
 the pipeline shells out to blocking ``ffprobe``/``ffmpeg`` subprocesses -- and
 avoids pulling in an external scheduler dependency (there is none in
@@ -194,6 +211,17 @@ _TERMINAL_STATUSES = (JobStatus.SUCCEEDED, JobStatus.FAILED)
 
 _STOP_JOIN_TIMEOUT = 5.0
 
+#: Fixed cap (COL-171) on how many total ``PENDING`` Jobs the scheduler will
+#: ever auto-enqueue from Wanted at once -- **not** user-configurable (unlike
+#: e.g. ``concurrency_limit``, COL-165). Counts every ``PENDING`` Job
+#: regardless of origin -- auto (scan/top-up) or manual (trigger/requeue) --
+#: since the scheduler never tracks which is which; see :meth:`JobScheduler.
+#: top_up` for the algorithm and :meth:`JobScheduler._count_pending` for the
+#: count itself. A manual trigger/requeue that pushes the live total above
+#: this is never blocked -- it simply consumes the same shared budget
+#: :meth:`top_up` watches (see :meth:`JobScheduler.trigger_file`).
+AUTO_QUEUE_LIMIT = 5
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
@@ -255,6 +283,22 @@ class JobScheduler:
         self._not_tracked_logged: dict[Path, datetime] = {}
         self._bridge_missing_logged: dict[Path, datetime] = {}
         self._not_tracked_log_lock = threading.Lock()
+        #: Serializes concurrent :meth:`top_up` passes (COL-171) -- distinct
+        #: from :attr:`_enqueue_lock` (never acquired while already holding
+        #: this one; :meth:`top_up` calls :meth:`enqueue_file`, which takes
+        #: :attr:`_enqueue_lock` itself, so nesting the two would deadlock).
+        #: Without this, two top-ups racing on different threads (e.g. a
+        #: worker-thread completion hook and a request thread's cancel/scan)
+        #: could each observe the pending count as under the limit and
+        #: together push it over -- this lock makes "count, then fill" one
+        #: atomic step across threads. See :meth:`top_up`.
+        self._top_up_lock = threading.Lock()
+        # COL-171: wire the shared top-up method as the queue's job-terminal
+        # hook, so a Job finishing on any worker thread -- success or failure
+        # -- immediately re-tops-up the Auto-Queue Limit's budget if a slot
+        # just freed. See `top_up`'s docstring for the deadlock/re-entrancy
+        # analysis of calling back into `queue` from its own worker thread.
+        queue.set_job_terminal_hook(self._top_up_on_job_terminal)
 
     @property
     def last_scan_at(self) -> datetime | None:
@@ -849,9 +893,15 @@ class JobScheduler:
           the time :meth:`~collapsarr.jobs.queue.JobQueue.cancel` ran:
           "too late," left exactly as it was, history row intact.
 
+        A successful cancel (``True``) frees a slot in the Auto-Queue Limit's
+        budget, so it also runs :meth:`top_up` immediately afterward (COL-171)
+        -- the second of the four top-up hook points (see :meth:`top_up`'s
+        docstring). A ``False``/``None`` outcome leaves the live ``PENDING``
+        count unchanged, so no top-up runs for either.
+
         Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
         when the caller has one open (the route always does), else opens a
-        short-lived one for the ``JobHistory`` delete.
+        short-lived one for the ``JobHistory`` delete and the top-up.
         """
         if self._queue.get_job(job_id) is None:
             return None
@@ -859,9 +909,11 @@ class JobScheduler:
             return False
         if session is not None:
             delete_job_history(session, job_id)
+            self.top_up(session=session)
         else:
             with self._session_factory() as owned_session:
                 delete_job_history(owned_session, job_id)
+                self.top_up(session=owned_session)
         return True
 
     # -- Bump to front (COL-169) -----------------------------------------------
@@ -939,6 +991,141 @@ class JobScheduler:
         """
         return self.trigger_file(file_path, session=session, bypass_dedup_window=True)
 
+    # -- Auto-Queue Limit / top-up (COL-171) -----------------------------------
+
+    def top_up(self, *, session: Session | None = None) -> list[Job]:
+        """Auto-enqueue enough Wanted entries to reach :data:`AUTO_QUEUE_LIMIT`, if under it.
+
+        The one shared "top-up" method every auto-enqueue hook point calls,
+        rather than each reimplementing the cap:
+
+        1. **Job completion** (success or failure) -- wired in :meth:`__init__`
+           as the queue's job-terminal hook
+           (:meth:`~collapsarr.jobs.queue.JobQueue.set_job_terminal_hook`), so
+           this runs on the worker thread the instant any Job finishes, via
+           :meth:`_top_up_on_job_terminal`.
+        2. **Cancellation** (COL-168) -- :meth:`cancel_job` calls this
+           directly right after a successful cancel frees a slot.
+        3. **Periodic background scan** -- :meth:`scan_once` calls this for
+           its enqueue pass (the library-mirror sync is unaffected/uncapped).
+        4. **``POST /api/jobs/scan``** ("Scan now") -- an alias for
+           :meth:`scan_once` (:meth:`scan_now`), so it inherits the cap for
+           free -- this is the fix for the Epic's namesake "dozens of movies
+           queued at once" bug: a manual scan no longer flushes every
+           qualifying file, just enough to reach the limit.
+
+        Counts *every* ``PENDING`` Job in the live queue (:meth:`_count_pending`)
+        regardless of origin -- auto (a prior top-up/scan) or manual
+        (trigger/requeue) -- since the scheduler never tracks which is which.
+        A manual trigger/requeue that has already pushed the count above
+        :data:`AUTO_QUEUE_LIMIT` is never touched or rolled back here -- this
+        method only ever *adds* Jobs, up to the limit; it is a no-op (and
+        returns ``[]``) whenever the count is already at or above the limit.
+
+        Walks every configured instance's monitored files in exactly the
+        same order :meth:`scan_once` always has (:func:`~collapsarr.arr.
+        service.list_instances` order, then each instance's
+        :func:`~collapsarr.arr.files.fetch_monitored_files` order), calling
+        :meth:`enqueue_file` per file -- so "the next not-yet-queued Wanted
+        entry" means precisely what the periodic scan already means by it,
+        not a second, possibly-inconsistent definition of Wanted. Stops as
+        soon as the count reaches the limit, or once every configured
+        instance's monitored files have been walked (Wanted exhausted) --
+        exhaustion is a silent no-op, not an error, same as a file with
+        nothing to do. A per-instance fetch failure is logged and skipped,
+        same as :meth:`scan_once` -- one unreachable Sonarr/Radarr doesn't
+        stop the walk over the others.
+
+        **Thread-safety.** The whole "count, then fill" pass runs under
+        :attr:`_top_up_lock` -- distinct from :attr:`_enqueue_lock`, which
+        :meth:`enqueue_file` itself takes for its own duplicate re-check, so
+        the two never nest (that would deadlock: :attr:`_enqueue_lock` is a
+        plain, non-reentrant :class:`threading.Lock`). Without
+        :attr:`_top_up_lock`, two top-ups racing on different threads (e.g.
+        the completion hook firing on a worker thread while a request thread
+        is mid-:meth:`cancel_job`) could each read the same
+        under-the-limit pending count and, combined, enqueue past it.
+
+        **Re-entrancy/deadlock.** This method is safe to call from inside
+        :class:`~collapsarr.jobs.queue.JobQueue`'s own worker-thread
+        completion path (hook point 1 above): :meth:`~collapsarr.jobs.queue.
+        JobQueue._run_job` invokes the job-terminal hook only *after*
+        releasing ``JobQueue``'s internal lock (see that method's own
+        docstring), so this method's calls back into the queue
+        (:meth:`_count_pending` -> ``list_jobs``; :meth:`enqueue_file` ->
+        ``JobQueue.enqueue``) never contend with a lock the calling thread is
+        still holding. It is equally safe from a request-handling thread
+        (:meth:`cancel_job`, the ``POST /api/jobs/scan`` route) -- those
+        threads never hold any ``JobQueue`` lock to begin with.
+
+        Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
+        when the caller already has one open (:meth:`scan_once` does), else
+        opens a short-lived one (the completion hook and :meth:`cancel_job`
+        typically don't).
+        """
+        with self._top_up_lock:
+            if session is not None:
+                return self._top_up_locked(session)
+            with self._session_factory() as owned_session:
+                return self._top_up_locked(owned_session)
+
+    def _top_up_on_job_terminal(self, job: Job) -> None:
+        """Adapt :meth:`top_up` to :data:`~collapsarr.jobs.queue.JobTerminalHook`'s shape (COL-171).
+
+        The just-terminated ``job`` carries nothing :meth:`top_up` needs --
+        it only cares about the *current* total pending count, not which Job
+        just finished or why -- so this exists purely to match the callback
+        signature :meth:`~collapsarr.jobs.queue.JobQueue.set_job_terminal_hook`
+        expects (``Callable[[Job], None]``).
+        """
+        self.top_up()
+
+    def _count_pending(self) -> int:
+        """Total ``PENDING`` Jobs in the live queue right now, any origin (COL-171).
+
+        The scheduler never records *why* a Job was enqueued -- auto (scan/
+        top-up) or manual (trigger/requeue) -- so this simply counts every
+        currently-``PENDING`` one, matching the Acceptance Criteria's "counts
+        total PENDING Jobs regardless of origin."
+        """
+        return sum(1 for job in self._queue.list_jobs() if job.status is JobStatus.PENDING)
+
+    def _top_up_locked(self, session: Session) -> list[Job]:
+        """The body of :meth:`top_up`, run with :attr:`_top_up_lock` already held."""
+        enqueued: list[Job] = []
+        pending = self._count_pending()
+        if pending >= AUTO_QUEUE_LIMIT:
+            return enqueued
+        for instance in list_instances(session):
+            if pending >= AUTO_QUEUE_LIMIT:
+                break
+            try:
+                files = fetch_monitored_files(instance)
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "top-up: failed to fetch files from instance %r (id=%s): %s",
+                    instance.name,
+                    instance.id,
+                    exc,
+                )
+                continue
+            mappings = list_path_mappings(session, instance.id)
+            for monitored in files:
+                if pending >= AUTO_QUEUE_LIMIT:
+                    break
+                local_path = resolve_path(monitored.file_path, mappings)
+                job = self.enqueue_file(
+                    local_path,
+                    session=session,
+                    instance_id=monitored.instance_id,
+                    sonarr_episode_id=monitored.sonarr_episode_id,
+                    radarr_movie_id=monitored.radarr_movie_id,
+                )
+                if job is not None:
+                    enqueued.append(job)
+                    pending += 1
+        return enqueued
+
     # -- Periodic full-library scan -----------------------------------------
 
     def scan_now(self) -> list[Job]:
@@ -956,23 +1143,31 @@ class JobScheduler:
         return self.scan_once()
 
     def scan_once(self) -> list[Job]:
-        """Scan every configured instance: mirror its Library and enqueue qualifying files.
+        """Scan every configured instance: mirror its Library and top up the Auto-Queue Limit.
 
-        Two independent per-instance passes share the one scan cadence:
+        Two independent passes share the one scan cadence:
 
         - **Library mirror (COL-98/COL-99):** for each Sonarr instance, fetch
           its full catalog (:attr:`_catalog_fetch`); for each Radarr instance,
           fetch its full movie catalog (:attr:`_radarr_catalog_fetch`); then
           :func:`~collapsarr.library.service.sync_library` -- upserting every
           Series/Season/Episode or Movie node (files-not-yet-present included)
-          and soft-hiding any node the catalog no longer reports.
-        - **Downmix discovery (COL-22):** enqueue every monitored file with a
-          qualifying missing target.
+          and soft-hiding any node the catalog no longer reports. Runs for
+          *every* configured instance, uncapped -- the Auto-Queue Limit
+          (below) gates enqueueing, never library mirroring.
+        - **Downmix discovery (COL-22), capped (COL-171):** :meth:`top_up`
+          enqueues only enough not-yet-queued Wanted entries to bring the
+          total ``PENDING`` count up to :data:`AUTO_QUEUE_LIMIT` -- not every
+          qualifying file in the library, as it did before COL-171. This is
+          what makes ``POST /api/jobs/scan`` ("Scan now", :meth:`scan_now`)
+          respect the same limit as the periodic loop for free: it's a thin
+          alias for this method.
 
-        Returns the jobs enqueued this pass (skipped/no-op files excluded). A
-        fetch failure for one instance -- for either pass -- is logged and
-        skipped rather than aborting the whole scan, so one unreachable
-        Sonarr/Radarr doesn't stop the others (or the other pass) from running.
+        Returns the jobs :meth:`top_up` enqueued this pass (skipped/no-op/
+        over-the-limit files excluded). A catalog- or file-fetch failure for
+        one instance is logged and skipped rather than aborting the whole
+        scan, so one unreachable Sonarr/Radarr doesn't stop the others (or
+        the other pass) from running.
 
         Stamps :attr:`last_scan_at` (COL-122) at the very start, before any
         instance is synced -- so it reflects when this pass *started*, and is
@@ -980,39 +1175,11 @@ class JobScheduler:
         instance's catalog/files.
         """
         self._last_scan_at = self._now()
-        enqueued: list[Job] = []
         with self._session_factory() as session:
-            instances = list_instances(session)
-            for instance in instances:
+            for instance in list_instances(session):
                 self._sync_instance_library(session, instance)
-
-                try:
-                    files = fetch_monitored_files(instance)
-                except httpx.HTTPError as exc:
-                    logger.warning(
-                        "scan: failed to fetch files from instance %r (id=%s): %s",
-                        instance.name,
-                        instance.id,
-                        exc,
-                    )
-                    continue
-                mappings = list_path_mappings(session, instance.id)
-                for monitored in files:
-                    local_path = resolve_path(monitored.file_path, mappings)
-                    job = self.enqueue_file(
-                        local_path,
-                        session=session,
-                        instance_id=monitored.instance_id,
-                        sonarr_episode_id=monitored.sonarr_episode_id,
-                        radarr_movie_id=monitored.radarr_movie_id,
-                    )
-                    if job is not None:
-                        enqueued.append(job)
-        logger.info(
-            "scan complete: enqueued %d job(s) across %d instance(s)",
-            len(enqueued),
-            len(instances),
-        )
+            enqueued = self.top_up(session=session)
+        logger.info("scan complete: enqueued %d job(s)", len(enqueued))
         return enqueued
 
     def _sync_instance_library(self, session: Session, instance: ArrInstance) -> None:

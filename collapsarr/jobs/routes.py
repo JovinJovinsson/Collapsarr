@@ -14,8 +14,10 @@ Eight endpoints, each wrapping an existing service without adding new job logic:
   JobStatus` value). Mirrors Sonarr/Radarr's ``/history`` view.
 - ``POST /api/jobs/scan`` -- triggers an immediate full-library scan
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.scan_now`, COL-23), enqueuing a
-  downmix job for every monitored file that has a qualifying missing target. The
-  Sonarr/Radarr analogue is the ``RescanSeries``/``RefreshMovie`` command.
+  downmix job for enough monitored files with a qualifying missing target to
+  reach the Auto-Queue Limit (COL-171, fixed at 5 total ``PENDING`` jobs) --
+  not every qualifying file, as it did before COL-171. The Sonarr/Radarr
+  analogue is the ``RescanSeries``/``RefreshMovie`` command.
 - ``POST /api/jobs/trigger`` -- manually enqueues a downmix job for one specific
   file (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_file`, COL-23). The
   optional ``extra_languages`` list is the allow-list-bypass option: those

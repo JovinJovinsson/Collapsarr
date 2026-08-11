@@ -42,7 +42,7 @@ from collapsarr.jobs.queue import (
     JobStatus,
     PipelineRunner,
 )
-from collapsarr.jobs.scheduler import JobScheduler
+from collapsarr.jobs.scheduler import AUTO_QUEUE_LIMIT, JobScheduler
 from collapsarr.library.service import set_tracked, upsert_series_episode_node
 from collapsarr.media.service import get_tracked_media
 from collapsarr.migrations import upgrade_to_head
@@ -60,6 +60,7 @@ _STEREO_ONLY: list[AudioStreamInfo] = [
 ]
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
+_FAILURE = PipelineResult(outcome=PipelineOutcome.REMUX_FAILED, success=False, detail="boom")
 _FIXED_NOW = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
 
 
@@ -957,7 +958,18 @@ def test_bump_job_to_front_repeated_calls_move_each_new_bump_strictly_ahead(
 def test_start_runs_an_initial_scan_and_drains_the_queue(
     settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Starting the loop triggers a scan and runs what it enqueues."""
+    """Starting the loop triggers a scan and runs what it enqueues.
+
+    Uses a probe that qualifies only on its first call (COL-171): a Job
+    completing now triggers an immediate :meth:`~collapsarr.jobs.scheduler.
+    JobScheduler.top_up` pass, and ``fake_fetch`` unconditionally re-reports
+    the same single file every call -- mirroring that in a real deployment a
+    successful downmix rewrites the file, so the *next* probe correctly finds
+    nothing left to do (see the module docstring's Recently-Processed Window
+    rationale). Without this, the stub pipeline's no-op "success" plus a
+    probe that never changes its answer would make ``top_up`` re-enqueue the
+    same file forever.
+    """
     _add_instance(session_factory)
     scanned = threading.Event()
 
@@ -968,8 +980,14 @@ def test_start_runs_an_initial_scan_and_drains_the_queue(
     monkeypatch.setattr(scheduler_module, "fetch_monitored_files", fake_fetch)
     queue = JobQueue(pipeline_runner=_stub_runner())
     queue.start()
+    probe_calls = {"n": 0}
+
+    def probe_once_then_nothing_to_do(path: Path) -> Sequence[AudioStreamInfo]:
+        probe_calls["n"] += 1
+        return _SURROUND if probe_calls["n"] == 1 else _STEREO_ONLY
+
     scheduler = _make_scheduler(
-        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+        settings, session_factory, probe=probe_once_then_nothing_to_do, queue=queue
     )
 
     scheduler.start()
@@ -1514,3 +1532,255 @@ def test_trigger_set_default_audio_re_enqueues_after_a_terminal_downmix_job(
 
     assert result is not None
     assert len(scheduler._queue.list_jobs()) == 2
+
+
+# ---------------------------------------------------------------------------
+# Auto-Queue Limit / top-up (COL-171)
+# ---------------------------------------------------------------------------
+
+
+def _seed_pending(scheduler: JobScheduler, count: int) -> list[Job]:
+    """Fill ``scheduler``'s live queue with ``count`` distinct manually-triggered PENDING Jobs.
+
+    Each seeded file is outside any configured instance's Wanted list, so
+    ``top_up`` never rediscovers/re-probes it -- these exist purely to
+    occupy budget slots.
+    """
+    jobs: list[Job] = []
+    for i in range(count):
+        job = scheduler.trigger_file(f"/media/seed{i}.mkv")
+        assert job is not None
+        jobs.append(job)
+    return jobs
+
+
+def test_top_up_runs_on_job_completion_success(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: a Job completing (success) tops up the budget when pending count is below the limit.
+
+    A probe that qualifies a given path only on its *first* call (mirroring
+    a real downmix rewriting the file, so the next probe finds nothing left
+    to do -- see the module docstring's Recently-Processed Window rationale)
+    keeps this deterministic without needing a ``history_recorder``: once the
+    topped-up Wanted file's own Job also completes, ``top_up`` stops
+    re-enqueuing it rather than looping forever.
+    """
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    seen: dict[Path, int] = {}
+
+    def probe_qualifies_once_per_path(path: Path) -> Sequence[AudioStreamInfo]:
+        seen[path] = seen.get(path, 0) + 1
+        return _SURROUND if seen[path] == 1 else _STEREO_ONLY
+
+    queue = JobQueue(pipeline_runner=_stub_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=probe_qualifies_once_per_path, queue=queue
+    )
+
+    for i in range(AUTO_QUEUE_LIMIT - 1):
+        queue.enqueue(Path(f"/filler{i}.mkv"), DownmixSettings())
+    trigger_job = scheduler.trigger_file("/media/trigger.mkv")
+    assert trigger_job is not None
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+    queue.start()
+    try:
+        assert queue.wait_idle(timeout=5.0)
+    finally:
+        queue.shutdown()
+
+    jobs = queue.list_jobs()
+    assert any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+    assert len(jobs) == AUTO_QUEUE_LIMIT + 1  # every filler + trigger + the topped-up extra
+    assert all(job.status is JobStatus.SUCCEEDED for job in jobs)
+
+
+def test_top_up_runs_on_job_completion_failure(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: a Job completing with a FAILURE also tops up the budget, same as a success."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    seen: dict[Path, int] = {}
+
+    def probe_qualifies_once_per_path(path: Path) -> Sequence[AudioStreamInfo]:
+        seen[path] = seen.get(path, 0) + 1
+        return _SURROUND if seen[path] == 1 else _STEREO_ONLY
+
+    queue = JobQueue(pipeline_runner=_stub_runner(_FAILURE))
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=probe_qualifies_once_per_path, queue=queue
+    )
+
+    for i in range(AUTO_QUEUE_LIMIT - 1):
+        queue.enqueue(Path(f"/filler{i}.mkv"), DownmixSettings())
+    trigger_job = scheduler.trigger_file("/media/trigger.mkv")
+    assert trigger_job is not None
+
+    queue.start()
+    try:
+        assert queue.wait_idle(timeout=5.0)
+    finally:
+        queue.shutdown()
+
+    jobs = queue.list_jobs()
+    assert any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+    assert all(job.status is JobStatus.FAILED for job in jobs)
+
+
+def test_top_up_runs_on_cancellation(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: cancelling a PENDING Job (COL-168) frees a slot and immediately tops it back up."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    seeded = _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+    with session_factory() as session:
+        # No history_recorder wired on this queue -- seed the PENDING row
+        # cancel_job's history delete expects, mirroring the other cancel_job
+        # tests above.
+        record_job_history(session, seeded[0])
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(seeded[0].id, session=session)
+
+    assert outcome is True
+    jobs = scheduler._queue.list_jobs()
+    assert any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT  # the cancelled slot was refilled
+
+
+def test_trigger_file_is_not_blocked_by_the_auto_queue_limit(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: a manual trigger that pushes pending above the limit is never blocked or rejected."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+    extra = scheduler.trigger_file("/media/one_more.mkv")
+
+    assert extra is not None
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT + 1
+
+
+def test_requeue_file_is_not_blocked_by_the_auto_queue_limit(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: a requeue (COL-170) that pushes pending above the limit is never blocked either."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+
+    extra = scheduler.requeue_file("/media/one_more.mkv")
+
+    assert extra is not None
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT + 1
+
+
+def test_scan_now_enqueues_at_most_the_auto_queue_limit(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: ``scan_now`` ("Scan now") enqueues at most the limit, not every qualifying file."""
+    instance = _add_instance(session_factory)
+    files = [
+        MonitoredFile(instance_id=instance.id, media_title="Show", file_path=f"/tv/{i}.mkv")
+        for i in range(AUTO_QUEUE_LIMIT + 3)
+    ]
+    _patch_fetch(monkeypatch, {instance.id: files})
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_now()
+
+    assert len(enqueued) == AUTO_QUEUE_LIMIT
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+
+def test_scan_once_applies_the_same_limit_as_scan_now(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the periodic background scan (`scan_once`) applies the same limit."""
+    instance = _add_instance(session_factory)
+    files = [
+        MonitoredFile(instance_id=instance.id, media_title="Show", file_path=f"/tv/{i}.mkv")
+        for i in range(AUTO_QUEUE_LIMIT + 3)
+    ]
+    _patch_fetch(monkeypatch, {instance.id: files})
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_once()
+
+    assert len(enqueued) == AUTO_QUEUE_LIMIT
+
+
+def test_scan_once_stops_when_wanted_is_exhausted_below_the_limit(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: fewer than the limit's worth of not-yet-queued Wanted entries is a silent no-op."""
+    instance = _add_instance(session_factory)
+    files = [
+        MonitoredFile(instance_id=instance.id, media_title="Show", file_path=f"/tv/{i}.mkv")
+        for i in range(AUTO_QUEUE_LIMIT - 2)  # fewer than the limit -- Wanted exhausts first
+    ]
+    _patch_fetch(monkeypatch, {instance.id: files})
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_once()
+
+    assert len(enqueued) == AUTO_QUEUE_LIMIT - 2
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT - 2
+
+
+def test_top_up_is_a_no_op_once_already_at_the_limit(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the scheduler never auto-enqueues more than the limit's worth of PENDING Jobs."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+
+    result = scheduler.top_up()
+
+    assert result == []
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT

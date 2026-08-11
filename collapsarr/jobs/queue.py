@@ -63,7 +63,15 @@ is configured, that same worker thread calls it -- but only for a job that
 reached ``SUCCEEDED`` -- so the file's just-processed ``(language, target)``
 pairs flip to ``PROCESSED`` in tracked media (COL-95,
 :mod:`collapsarr.jobs.tracked_media`), the Wanted view's data source,
-immediately rather than only after the next scan re-probes the file.
+immediately rather than only after the next scan re-probes the file. Finally,
+when a job-terminal hook is set (:meth:`JobQueue.set_job_terminal_hook`), that
+same worker thread calls it too -- for *every* terminal job, success or
+failure alike, unconditionally. :class:`~collapsarr.jobs.scheduler.
+JobScheduler` wires its own :meth:`~collapsarr.jobs.scheduler.JobScheduler.
+top_up` here (COL-171), so a Job finishing anywhere immediately re-tops-up
+the Auto-Queue Limit's budget if a slot just freed -- see that method's
+docstring for the full algorithm and a re-entrancy/deadlock analysis of
+calling back into this queue from its own worker thread.
 
 This module deliberately does not import :mod:`collapsarr.jobs.history`,
 :mod:`collapsarr.jobs.failure_notify`, or :mod:`collapsarr.jobs.tracked_media`
@@ -283,6 +291,19 @@ FailureNotifier = Callable[[Job], None]
 #: appearing in the Wanted view without waiting for the next scan (COL-95).
 TrackedMediaRecorder = Callable[[Job], None]
 
+#: Signature a job-terminal hook must match: called after *every* Job reaches
+#: a terminal status -- ``SUCCEEDED`` or ``FAILED`` alike, unconditionally
+#: (unlike ``failure_notifier``/``tracked_media_recorder``, each gated on one
+#: specific terminal status). :class:`~collapsarr.jobs.scheduler.JobScheduler`
+#: wires its :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up` here
+#: (COL-171), so a Job finishing -- for any reason -- immediately re-tops-up
+#: the Auto-Queue Limit's budget if a slot just freed. Must be safe to call
+#: concurrently (same requirement as the three recorders above) and must
+#: never raise -- see :meth:`JobQueue._call_job_terminal_hook`, which
+#: defensively swallows any exception the hook raises so a hook problem can
+#: never fail the Job it just finished, or the worker thread running it.
+JobTerminalHook = Callable[[Job], None]
+
 
 class JobQueue:
     """Bounded-concurrency queue that runs the downmix pipeline per enqueued file.
@@ -407,6 +428,15 @@ class JobQueue:
         #: enqueued, so freshly-submitted work always sorts *after* every
         #: rehydrated job rather than wrongly jumping the queue.
         self._next_priority = 0
+        #: Callback invoked after every Job reaches a terminal status, success or
+        #: failure alike (COL-171) -- ``None`` until
+        #: :meth:`set_job_terminal_hook` is called. Late-bound via a setter
+        #: rather than a constructor argument because
+        #: :class:`~collapsarr.jobs.scheduler.JobScheduler` (its only
+        #: caller) takes an already-constructed :class:`JobQueue` as its own
+        #: first constructor argument -- the queue has to exist before the
+        #: scheduler that wires the hook does. See :meth:`set_job_terminal_hook`.
+        self._job_terminal_hook: JobTerminalHook | None = None
         #: The persistent worker pool (COL-164). Started explicitly by a
         #: :meth:`start` call (never implicitly on enqueue), then lives until
         #: :meth:`shutdown` (or process exit -- the threads are daemons).
@@ -608,6 +638,20 @@ class JobQueue:
     def max_concurrency(self) -> int:
         """The configured cap on simultaneously running jobs."""
         return self._max_concurrency
+
+    def set_job_terminal_hook(self, hook: JobTerminalHook | None) -> None:
+        """Set (or clear, with ``None``) the job-terminal hook (COL-171).
+
+        Late-bound rather than constructor-injected -- see the attribute's
+        own docstring in :meth:`__init__` for why.
+        :class:`~collapsarr.jobs.scheduler.JobScheduler` calls this on its
+        own ``queue`` constructor argument, wiring :meth:`~collapsarr.jobs.
+        scheduler.JobScheduler.top_up` as the hook -- so production wiring in
+        :mod:`collapsarr.main` (which constructs the queue, then the
+        scheduler around it) needs no changes of its own to get this: simply
+        constructing a ``JobScheduler(job_queue, ...)`` wires it.
+        """
+        self._job_terminal_hook = hook
 
     def enqueue(self, file_path: str | Path, settings: DownmixSettings) -> Job:
         """Add a file + its target/language context to the queue as a ``DOWNMIX`` job.
@@ -962,6 +1006,7 @@ class JobQueue:
                 self._record_history(job)
                 self._record_tracked_media(job)
                 self._notify_failure(job)
+                self._call_job_terminal_hook(job)
                 return
 
             with self._lock:
@@ -973,6 +1018,7 @@ class JobQueue:
             self._record_history(job)
             self._record_tracked_media(job)
             self._notify_failure(job)
+            self._call_job_terminal_hook(job)
         finally:
             # Only now -- after every side effect -- is the job fully done, so
             # this is where wait_idle is allowed to observe it as no longer
@@ -1024,3 +1070,32 @@ class JobQueue:
             self._failure_notifier(job)
         except Exception:  # noqa: BLE001 - a notifier failure must never fail the job
             pass
+
+    def _call_job_terminal_hook(self, job: Job) -> None:
+        """Invoke the job-terminal hook for ``job``, if one is configured (COL-171).
+
+        Unlike :meth:`_notify_failure`/:meth:`_record_tracked_media` (each
+        gated on one specific terminal status), this fires for *every*
+        terminal ``job`` -- ``SUCCEEDED`` or ``FAILED`` alike -- since
+        :class:`~collapsarr.jobs.scheduler.JobScheduler`'s
+        :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up` (the hook
+        production wiring installs, via :meth:`set_job_terminal_hook`) needs
+        to re-check the Auto-Queue Limit's budget regardless of *why* a slot
+        just freed up.
+
+        Called from the worker thread, outside ``self._lock`` -- same as
+        ``_record_tracked_media``/``_notify_failure`` above, and for the same
+        reason: by this point only this thread still touches ``job``, so a
+        hook that itself enqueues more work (as ``top_up`` does) can safely
+        call back into this very :class:`JobQueue` (``list_jobs``/``enqueue``)
+        without this thread already holding a lock those methods also need --
+        no deadlock, no reentrancy. Wrapped in a defensive ``try``/``except``,
+        same as :meth:`_notify_failure`: a hook problem must never fail the
+        job it just finished, or wedge the worker loop.
+        """
+        if self._job_terminal_hook is None:
+            return
+        try:
+            self._job_terminal_hook(job)
+        except Exception:  # noqa: BLE001 - a hook failure must never fail the worker loop
+            logger.exception("job-terminal hook raised for job %s", job.id)
