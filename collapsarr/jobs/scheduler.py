@@ -68,18 +68,34 @@ considered a duplicate -- and skipped -- when either:
   path reached a terminal state (``SUCCEEDED``/``FAILED``) within the
   de-duplication window.
 
-The window is the scan interval itself (``settings.scan_interval_hours``). The
-reasoning: a successful downmix rewrites the file, so the next scan's re-probe
-would already report "nothing to do" -- but a *failed* run leaves the file
-unchanged and would otherwise be re-enqueued by every subsequent trigger. Tying
-the window to the scan interval means a file is attempted at most once per scan
-cycle, which both stops a webhook + scheduled scan from double-enqueuing within
-a cycle and prevents a persistently-failing file from being retried faster than
-once per cycle, while still allowing a periodic retry after the window elapses.
-Checking persisted history (not just the in-memory queue) also covers files
-processed in a *previous* process run: after a restart the in-memory queue is
-empty, but a file downmixed minutes before the restart is still correctly
-skipped.
+The window is ``GlobalSettings.recently_processed_window_minutes`` (COL-167;
+:mod:`collapsarr.settings.models`), read **live** from the settings service on
+every check -- not cached at construction, unlike ``scan_interval_hours``
+(:attr:`_interval_seconds`), which the loop *does* cache since it only governs
+the background thread's own sleep/wake cadence and has no "must react
+instantly to a settings change" requirement. This field used to be silently
+derived from ``scan_interval_hours`` (``timedelta(hours=settings.
+scan_interval_hours)``, cached once in ``__init__``); COL-167 decouples the
+two so the dedup cooldown can be tuned independently, and so a ``PUT
+/api/settings`` change takes effect on the very next dedup check with no
+restart or scheduler reconstruction -- ``concurrency_limit`` still needs a
+restart (the worker pool's thread count is fixed at construction), but there
+is no equivalent structural reason to require one here. ``0`` disables the
+cooldown entirely: every check treats every file as eligible, i.e. a file is
+never considered "recently processed".
+
+The reasoning for having a cooldown at all: a successful downmix rewrites the
+file, so the next scan's re-probe would already report "nothing to do" -- but
+a *failed* run leaves the file unchanged and would otherwise be re-enqueued by
+every subsequent trigger. The default (360 minutes / 6h, matching
+``scan_interval_hours``'s own default) means a file is attempted at most once
+per scan cycle by default, which both stops a webhook + scheduled scan from
+double-enqueuing within a cycle and prevents a persistently-failing file from
+being retried faster than once per cycle, while still allowing a periodic
+retry after the window elapses. Checking persisted history (not just the
+in-memory queue) also covers files processed in a *previous* process run:
+after a restart the in-memory queue is empty, but a file downmixed minutes
+before the restart is still correctly skipped.
 
 The dedup check plus the enqueue are performed under a lock so the webhook
 thread and the scan thread can't both pass the "not a duplicate" check for the
@@ -171,8 +187,11 @@ class JobScheduler:
     ``queue`` is the shared :class:`~collapsarr.jobs.queue.JobQueue` both
     triggers enqueue onto (its worker pool runs them, COL-164). ``session_factory``
     opens sessions for reading configured instances, path mappings, and job
-    history. ``settings`` supplies ``scan_interval_hours`` (both the loop period
-    and the dedup window).
+    history. ``settings`` supplies ``scan_interval_hours``, the periodic scan
+    loop's own cadence -- and, as of COL-167, *only* that; the "recently
+    processed" dedup window is a separate, persisted
+    ``GlobalSettings.recently_processed_window_minutes`` value read live on
+    every dedup check (see the module docstring).
 
     ``downmix_settings`` is the target/language configuration every enqueued job
     is created with; it defaults to :class:`~collapsarr.downmix.targets.DownmixSettings`'s
@@ -210,7 +229,6 @@ class JobScheduler:
         self._radarr_catalog_fetch = radarr_catalog_fetch
         self._now = now
         self._interval_seconds = settings.scan_interval_hours * 3600.0
-        self._dedup_window = timedelta(hours=settings.scan_interval_hours)
         self._enqueue_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -363,7 +381,7 @@ class JobScheduler:
             radarr_movie_id=radarr_movie_id,
             path=path,
         ):
-            if self._should_log_not_tracked(path):
+            if self._should_log_not_tracked(path, session):
                 logger.info("skipping %s: resolved Not Tracked, not auto-enqueuing", path)
             return None
 
@@ -478,7 +496,7 @@ class JobScheduler:
             radarr_movie_id=radarr_movie_id,
         )
         if node is None:
-            if path is None or self._should_log_bridge_missing(path):
+            if path is None or self._should_log_bridge_missing(path, session):
                 logger.warning(
                     "tracked bridge: no LibraryNode for instance_id=%s "
                     "sonarr_episode_id=%s radarr_movie_id=%s (%s) -- "
@@ -667,38 +685,67 @@ class JobScheduler:
             for job in self._queue.list_jobs()
         )
 
-    def _should_log_once(self, cache: dict[Path, datetime], path: Path) -> bool:
+    def _dedup_window_minutes(self, session: Session | None) -> int:
+        """Read ``GlobalSettings.recently_processed_window_minutes`` live (COL-167).
+
+        Deliberately **not** cached on ``self`` -- read fresh from the settings
+        service on every call, so a ``PUT /api/settings`` change is visible on
+        the very next dedup check with no restart or scheduler reconstruction.
+        Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
+        when the caller has one open, else opens a short-lived one.
+        """
+        if session is not None:
+            return get_global_settings(session).recently_processed_window_minutes
+        with self._session_factory() as owned_session:
+            return get_global_settings(owned_session).recently_processed_window_minutes
+
+    def _should_log_once(
+        self, cache: dict[Path, datetime], path: Path, session: Session | None
+    ) -> bool:
         """Whether to log ``path`` now against ``cache``, or suppress a repeat.
 
-        Logged once per file, then suppressed until :attr:`_dedup_window`
-        elapses -- the same window :meth:`_is_recently_processed` uses --
-        so a persistently-recurring condition doesn't spam one identical
-        line per scan forever, while a scan interval later a fresh line
-        still confirms it's still true (rather than going silent
-        permanently). ``cache`` lets callers track distinct log conditions
-        (COL-135's Not-Tracked skip, COL-134's bridge-missing fallback)
-        independently -- one firing never suppresses the other for the
-        same file.
+        Logged once per file, then suppressed until the live dedup window
+        (:meth:`_dedup_window_minutes`) elapses -- the same window
+        :meth:`_is_recently_processed` uses -- so a persistently-recurring
+        condition doesn't spam one identical line per scan forever, while a
+        dedup window later a fresh line still confirms it's still true
+        (rather than going silent permanently). A window of ``0`` (cooldown
+        disabled) means every call re-logs, matching the "no cooldown"
+        semantics elsewhere. ``cache`` lets callers track distinct log
+        conditions (COL-135's Not-Tracked skip, COL-134's bridge-missing
+        fallback) independently -- one firing never suppresses the other for
+        the same file.
         """
+        window = timedelta(minutes=self._dedup_window_minutes(session))
         now = self._now()
         with self._not_tracked_log_lock:
             last = cache.get(path)
-            if last is not None and now - last < self._dedup_window:
+            if last is not None and now - last < window:
                 return False
             cache[path] = now
             return True
 
-    def _should_log_not_tracked(self, path: Path) -> bool:
+    def _should_log_not_tracked(self, path: Path, session: Session | None) -> bool:
         """Whether to log ``path``'s Not-Tracked skip now (COL-135)."""
-        return self._should_log_once(self._not_tracked_logged, path)
+        return self._should_log_once(self._not_tracked_logged, path, session)
 
-    def _should_log_bridge_missing(self, path: Path) -> bool:
+    def _should_log_bridge_missing(self, path: Path, session: Session | None) -> bool:
         """Whether to log ``path``'s bridge-missing fallback now (COL-134)."""
-        return self._should_log_once(self._bridge_missing_logged, path)
+        return self._should_log_once(self._bridge_missing_logged, path, session)
 
     def _is_recently_processed(self, path: Path, session: Session) -> bool:
-        """Whether a terminal history row for ``path`` falls inside the dedup window."""
-        cutoff = self._now() - self._dedup_window
+        """Whether a terminal history row for ``path`` falls inside the live dedup window.
+
+        Reads ``GlobalSettings.recently_processed_window_minutes`` live via
+        :func:`~collapsarr.settings.service.get_global_settings` on every call
+        (COL-167) rather than a value cached at :meth:`__init__` -- see the
+        module docstring. ``0`` short-circuits to "never recently processed":
+        every file is always eligible for retry.
+        """
+        minutes = get_global_settings(session).recently_processed_window_minutes
+        if minutes <= 0:
+            return False
+        cutoff = self._now() - timedelta(minutes=minutes)
         for row in list_job_history(session, file_path=str(path)):
             if row.status not in _TERMINAL_STATUSES or row.ended_at is None:
                 continue

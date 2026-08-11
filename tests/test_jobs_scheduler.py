@@ -45,6 +45,7 @@ from collapsarr.jobs.scheduler import JobScheduler
 from collapsarr.library.service import set_tracked, upsert_series_episode_node
 from collapsarr.media.service import get_tracked_media
 from collapsarr.migrations import upgrade_to_head
+from collapsarr.settings.models import DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES
 from collapsarr.settings.service import update_global_settings
 
 # A 5.1 stream: with default (Stereo) settings, Stereo (2ch < 6ch, not present)
@@ -242,10 +243,70 @@ def test_enqueue_file_skips_a_recently_processed_file(
 def test_enqueue_file_re_enqueues_a_file_processed_before_the_window(
     settings: Settings, session_factory: sessionmaker[Session]
 ) -> None:
-    # Default window is scan_interval_hours (6h); 7h ago is outside it.
+    # Default window is recently_processed_window_minutes (COL-167; 360min =
+    # 6h); 7h ago is outside it.
     ended = _FIXED_NOW - timedelta(hours=7)
     with session_factory() as session:
         _record_terminal(session, "/media/movie.mkv", ended_at=ended)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        job = scheduler.enqueue_file("/media/movie.mkv", session=session)
+    assert job is not None
+
+
+def test_enqueue_file_respects_a_configured_recently_processed_window(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """COL-167: the dedup window is a settings-driven value, not scan_interval_hours."""
+    with session_factory() as session:
+        update_global_settings(session, recently_processed_window_minutes=30)
+        # 45 minutes ago is outside a 30-minute window, even though it's well
+        # inside the default 360-minute (6h) window -- proving the check uses
+        # the configured value, not the default.
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW - timedelta(minutes=45))
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        job = scheduler.enqueue_file("/media/movie.mkv", session=session)
+    assert job is not None
+
+
+def test_enqueue_file_recently_processed_window_reloads_live_without_restart(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """COL-167: a PATCH-style settings change is visible on the *next* check --
+
+    no scheduler reconstruction, and the value is not cached at ``__init__``.
+    """
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW - timedelta(minutes=45))
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    # Default window (360min) still covers a 45-minute-old terminal row.
+    with session_factory() as session:
+        assert scheduler.enqueue_file("/media/movie.mkv", session=session) is None
+
+    # Simulate the PATCH settings endpoint narrowing the window -- same
+    # scheduler instance, no reconstruction.
+    with session_factory() as session:
+        update_global_settings(session, recently_processed_window_minutes=30)
+
+    with session_factory() as session:
+        job = scheduler.enqueue_file("/media/movie.mkv", session=session)
+    assert job is not None
+
+
+def test_enqueue_file_recently_processed_window_zero_disables_the_cooldown(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """COL-167: ``0`` means "no cooldown, always allow retry" -- even seconds-old."""
+    with session_factory() as session:
+        update_global_settings(session, recently_processed_window_minutes=0)
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW - timedelta(seconds=1))
 
     scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
 
@@ -792,7 +853,9 @@ def test_enqueue_file_logs_not_tracked_skip_again_after_dedup_window(
     )
 
     scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
-    clock["now"] = _FIXED_NOW + timedelta(hours=settings.scan_interval_hours, seconds=1)
+    clock["now"] = _FIXED_NOW + timedelta(
+        minutes=DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES, seconds=1
+    )
     caplog.clear()
     scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
 

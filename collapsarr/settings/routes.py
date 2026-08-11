@@ -80,6 +80,17 @@ Preferred Default Audio setting a later ticket's Targets settings page
 value for the two nullable fields (clears a configured preference); omitting
 either field leaves it untouched. ``auto_set_default_audio`` is a plain
 boolean, same treatment as ``ui_auth_enabled``/``default_tracked``.
+
+``recently_processed_window_minutes`` (COL-167) is also read/write here --
+the scheduler's "recently processed" dedup cooldown, in minutes, no longer
+silently derived from ``scan_interval_hours``. Constrained to ``>= 0``
+(``Field(ge=0)``, unlike the backup/disk-space knobs above, since ``0`` is a
+valid, meaningful value here -- "no cooldown", not "unset"). No dedicated
+endpoint: it round-trips through this same ``GET``/``PUT /api/settings``
+alongside ``concurrency_limit``. Unlike ``concurrency_limit`` (read once at
+worker-pool construction), :class:`~collapsarr.jobs.scheduler.JobScheduler`
+reads this field live from the settings row on every dedup check, so a
+``PUT`` here changes behavior on the very next check with no restart.
 """
 
 from __future__ import annotations
@@ -154,6 +165,7 @@ class SettingsRead(BaseModel):
     default_audio_language: str | None
     default_audio_channel_tier: DownmixTarget | None
     auto_set_default_audio: bool
+    recently_processed_window_minutes: int
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -190,6 +202,7 @@ class SettingsUpdate(BaseModel):
     default_audio_language: str | None = None
     default_audio_channel_tier: DownmixTarget | None = None
     auto_set_default_audio: bool | None = None
+    recently_processed_window_minutes: int | None = Field(default=None, ge=0)
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -229,6 +242,7 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
             else None
         ),
         auto_set_default_audio=settings.auto_set_default_audio,
+        recently_processed_window_minutes=settings.recently_processed_window_minutes,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -303,6 +317,8 @@ def update_settings_endpoint(
         kwargs["default_audio_channel_tier"] = body.default_audio_channel_tier
     if "auto_set_default_audio" in provided:
         kwargs["auto_set_default_audio"] = body.auto_set_default_audio
+    if "recently_processed_window_minutes" in provided:
+        kwargs["recently_processed_window_minutes"] = body.recently_processed_window_minutes
 
     updated = update_global_settings(session, **kwargs)  # type: ignore[arg-type]
     if "log_level" in provided:

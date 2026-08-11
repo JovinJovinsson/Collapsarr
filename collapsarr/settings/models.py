@@ -99,6 +99,17 @@ get_global_settings` at creation time, which overrides it with ``"beta"``
 when the running build is itself a beta build (COL-88) -- see
 :data:`BETA_LOCAL_SEGMENT_PREFIX`."""
 
+DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES = 360
+"""Default :attr:`GlobalSettings.recently_processed_window_minutes` for a
+fresh install / an existing row backfilled by the additive migration
+(COL-167). In minutes; ``360`` (6h) matches :data:`collapsarr.config.
+Settings.scan_interval_hours`'s own default, which is what this field
+replaces as the scheduler's "recently processed" dedup cooldown -- see
+:mod:`collapsarr.jobs.scheduler`'s module docstring. ``0`` is a valid,
+meaningful value distinct from "unset": it disables the cooldown entirely,
+so a file is always eligible for retry regardless of when it was last
+processed."""
+
 DEFAULT_AUTO_SET_DEFAULT_AUDIO = False
 """Default :attr:`GlobalSettings.auto_set_default_audio` for a fresh install
 / an existing row backfilled by the additive migration (COL-151). Off by
@@ -282,6 +293,22 @@ class GlobalSettings(Base):
     ``server_default`` (matching ``auth_method``/``auth_required`` above) so
     the additive migration backfills existing installs to ``False`` rather
     than leaving the column ``NULL``.
+
+    ``recently_processed_window_minutes`` (COL-167) is the scheduler's
+    "recently processed" dedup cooldown, in minutes -- see
+    :data:`DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES` and
+    :mod:`collapsarr.jobs.scheduler`'s module docstring. It used to be
+    silently derived from ``scan_interval_hours``; this column decouples the
+    two so the cooldown can be tuned independently of scan cadence.
+    :class:`~collapsarr.jobs.scheduler.JobScheduler` reads it live from this
+    row on every dedup check (unlike ``concurrency_limit``, which the worker
+    pool's fixed thread count forces to be read once at startup), so a
+    ``PUT /api/settings`` change takes effect on the very next check with no
+    restart. ``0`` disables the cooldown entirely (always eligible for
+    retry). Carries a DB-side ``server_default`` (matching
+    ``auto_set_default_audio`` above) so the additive migration backfills
+    existing installs to the documented default rather than leaving the
+    column ``NULL``.
     """
 
     __tablename__ = "global_settings"
@@ -377,6 +404,13 @@ class GlobalSettings(Base):
         nullable=False,
         default=DEFAULT_AUTO_SET_DEFAULT_AUDIO,
         server_default=text("0"),
+    )
+
+    recently_processed_window_minutes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES,
+        server_default=text(str(DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES)),
     )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
