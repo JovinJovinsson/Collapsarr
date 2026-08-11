@@ -16,6 +16,7 @@ import threading
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -32,7 +33,7 @@ from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs import scheduler as scheduler_module
-from collapsarr.jobs.history import record_job_history
+from collapsarr.jobs.history import get_job_history, record_job_history
 from collapsarr.jobs.queue import (
     DefaultAudioPipelineRunner,
     Job,
@@ -694,6 +695,81 @@ def test_trigger_file_skips_a_file_with_nothing_to_do_even_with_extra_languages(
     )
 
     assert scheduler.trigger_file("/media/movie.mkv", extra_languages={"jpn"}) is None
+
+
+# ---------------------------------------------------------------------------
+# cancel_job (COL-168)
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_job_removes_a_pending_job_and_deletes_its_history(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    with session_factory() as session:
+        # _make_scheduler's queue has no history_recorder wired (unlike the
+        # production JobQueue.from_settings path) -- seed the row a real
+        # history_recorder would already have written on enqueue.
+        record_job_history(session, job)
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(job.id, session=session)
+
+    assert outcome is True
+    assert scheduler._queue.get_job(job.id) is None
+    with session_factory() as session:
+        assert get_job_history(session, job.id) is None
+
+
+def test_cancel_job_reports_too_late_for_a_job_no_longer_pending(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    # Simulate a worker having already claimed the job before the cancel request lands.
+    job.status = JobStatus.RUNNING
+    with session_factory() as session:
+        record_job_history(session, job)
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(job.id, session=session)
+
+    assert outcome is False
+    # Left exactly as it was: still in the live queue, history row untouched.
+    assert scheduler._queue.get_job(job.id) is not None
+    with session_factory() as session:
+        assert get_job_history(session, job.id) is not None
+
+
+def test_cancel_job_returns_none_for_an_id_not_in_the_live_queue(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(uuid4(), session=session)
+
+    assert outcome is None
+
+
+def test_cancel_job_opens_its_own_session_when_none_is_given(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Mirrors ``_is_duplicate``'s session handling: works without a caller-supplied session."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    with session_factory() as session:
+        record_job_history(session, job)
+
+    outcome = scheduler.cancel_job(job.id)
+
+    assert outcome is True
+    with session_factory() as session:
+        assert get_job_history(session, job.id) is None
 
 
 # ---------------------------------------------------------------------------

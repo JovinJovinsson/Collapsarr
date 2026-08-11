@@ -121,6 +121,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import httpx
 from sqlalchemy.orm import Session, sessionmaker
@@ -140,7 +141,7 @@ from collapsarr.config import Settings
 from collapsarr.downmix.default_audio import DefaultAudioPreference, resolve_default_audio_stream
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_streams
 from collapsarr.downmix.targets import DownmixSettings, detect_qualifying_targets
-from collapsarr.jobs.history import list_job_history
+from collapsarr.jobs.history import delete_job_history, list_job_history
 from collapsarr.jobs.queue import Job, JobQueue, JobStatus
 from collapsarr.library.service import (
     get_node_by_source_id,
@@ -755,6 +756,52 @@ class JobScheduler:
             if ended >= cutoff:
                 return True
         return False
+
+    # -- Cancel (COL-168) -----------------------------------------------------
+
+    def cancel_job(self, job_id: UUID, *, session: Session | None = None) -> bool | None:
+        """Cancel one still-``PENDING`` Job by id -- deletion, not a new status (COL-168).
+
+        The entry point ``DELETE /api/jobs/{job_id}`` (:mod:`collapsarr.jobs.
+        routes`) calls, mirroring :meth:`trigger_file`/
+        :meth:`trigger_set_default_audio`'s shape: one scheduler method the
+        route wraps directly, rather than the route reaching into
+        :attr:`_queue`'s primitives itself.
+
+        Three-way result, matching the endpoint's own three outcomes:
+
+        * ``None`` -- ``job_id`` names no Job the live queue knows about at
+          all (:meth:`~collapsarr.jobs.queue.JobQueue.get_job` returns
+          ``None``): unknown id, or one from a run the process has since
+          restarted past (only ``PENDING`` rows survive a restart, see
+          :class:`~collapsarr.jobs.queue.JobQueue`'s module docstring). The
+          route reports this as ``404`` -- there is nothing to act on.
+        * ``True`` -- the Job was still ``PENDING`` and
+          :meth:`~collapsarr.jobs.queue.JobQueue.cancel` removed it from the
+          live queue; its persisted ``JobHistory`` row is then deleted too
+          (:func:`~collapsarr.jobs.history.delete_job_history`), so a
+          cancelled Job leaves no trace at all -- no audit row, no cooldown
+          interaction with the Recently-Processed Window (see the module
+          docstring above).
+        * ``False`` -- the Job exists but is no longer ``PENDING`` (a worker
+          already claimed it, or it already reached a terminal status) by
+          the time :meth:`~collapsarr.jobs.queue.JobQueue.cancel` ran:
+          "too late," left exactly as it was, history row intact.
+
+        Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
+        when the caller has one open (the route always does), else opens a
+        short-lived one for the ``JobHistory`` delete.
+        """
+        if self._queue.get_job(job_id) is None:
+            return None
+        if not self._queue.cancel(job_id):
+            return False
+        if session is not None:
+            delete_job_history(session, job_id)
+        else:
+            with self._session_factory() as owned_session:
+                delete_job_history(owned_session, job_id)
+        return True
 
     # -- Periodic full-library scan -----------------------------------------
 

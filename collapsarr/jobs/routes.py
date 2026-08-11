@@ -6,7 +6,7 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Four endpoints, each wrapping an existing service without adding new job logic:
+Six endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
@@ -41,6 +41,17 @@ Four endpoints, each wrapping an existing service without adding new job logic:
   once per resulting file -- always against the current global Preferred
   Default Audio setting; there is no per-call override, unlike
   ``trigger``'s ``extra_languages``.
+- ``DELETE /api/jobs/{job_id}`` -- cancels one specific still-``PENDING``
+  Job (COL-168) (:meth:`collapsarr.jobs.scheduler.JobScheduler.cancel_job`).
+  "Cancel" is deletion, not a new status: on success the Job's persisted
+  :class:`~collapsarr.jobs.models.JobHistory` row is deleted too -- a
+  cancelled Job leaves no trace, no audit row, no cooldown interaction with
+  the Recently-Processed Window. Because the queue's worker pool keeps
+  running concurrently, the Job may already have been claimed (or already
+  finished) by the time the request lands; that is reported back distinctly
+  (see :class:`CancelJobResult`) rather than erroring or silently pretending
+  success. A ``job_id`` not present in the live queue at all -- unknown,
+  malformed, or already gone -- is a ``404``.
 
 The scan/trigger endpoints operate on the live
 :class:`~collapsarr.jobs.scheduler.JobScheduler` the app wired onto
@@ -54,6 +65,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -246,6 +258,25 @@ class BulkSetDefaultAudioTriggerResult(BaseModel):
     """
 
     results: list[FileSetDefaultAudioResult]
+
+
+class CancelJobResult(BaseModel):
+    """Response for ``DELETE /api/jobs/{job_id}`` (COL-168).
+
+    ``cancelled`` is ``True`` when the Job was still ``PENDING`` and has now
+    been removed from the live queue *and* had its
+    :class:`~collapsarr.jobs.models.JobHistory` row deleted -- it leaves no
+    trace at all. It is ``False`` -- not an error -- when the Job still
+    exists but is no longer ``PENDING`` (a worker already claimed it, or it
+    has already reached a terminal status): "too late" to cancel, distinct
+    from both success and a generic failure; the already-claimed/finished
+    Job runs (or has run) to completion normally, history row intact. A
+    ``job_id`` not present in the live queue at all -- unknown, malformed,
+    or already gone -- is reported as ``404``, not this shape (there is
+    nothing to act on either way).
+    """
+
+    cancelled: bool
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -476,3 +507,29 @@ def bulk_set_default_audio_trigger_endpoint(
             )
 
     return BulkSetDefaultAudioTriggerResult(results=results)
+
+
+@router.delete("/jobs/{job_id}", response_model=CancelJobResult)
+def cancel_job_endpoint(
+    job_id: str,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+    session: Session = Depends(get_session),
+) -> CancelJobResult:
+    """Cancel one still-``PENDING`` Job by id (COL-168).
+
+    Wraps :meth:`~collapsarr.jobs.scheduler.JobScheduler.cancel_job` --
+    see there for the get/cancel/delete-history sequence and its
+    ``None``/``False``/``True`` result contract. A ``job_id`` that isn't a
+    valid UUID can't name any job at all, so it's folded into the same
+    ``404`` :meth:`~collapsarr.jobs.scheduler.JobScheduler.cancel_job`
+    reports for an unknown one, without calling it.
+    """
+    try:
+        job_uuid = UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id!r}") from None
+
+    outcome = scheduler.cancel_job(job_uuid, session=session)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
+    return CancelJobResult(cancelled=outcome)

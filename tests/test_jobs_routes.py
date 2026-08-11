@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from pathlib import Path
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -74,6 +75,7 @@ class _FakeScheduler:
         trigger_job: Job | None = None,
         default_audio_trigger_job: Job | None = None,
         default_audio_trigger_jobs_by_file: dict[str, Job | None] | None = None,
+        cancel_result: bool | None = True,
     ) -> None:
         self._scan_jobs = scan_jobs or []
         self._trigger_job = trigger_job
@@ -82,8 +84,15 @@ class _FakeScheduler:
         #: single job/None (the field above) can't tell different resolved
         #: files apart. Falls back to the fixed value above when unset.
         self._default_audio_trigger_jobs_by_file = default_audio_trigger_jobs_by_file
+        #: COL-168's ``cancel_job`` result, mirroring the real
+        #: :meth:`~collapsarr.jobs.scheduler.JobScheduler.cancel_job`'s
+        #: three-way contract: ``None`` (404, "no such job"), ``True``
+        #: (cancelled), ``False`` (too late). Defaults to ``True`` so a test
+        #: that doesn't care about cancel behaviour still gets a sane value.
+        self._cancel_result = cancel_result
         self.trigger_calls: list[tuple[str, frozenset[str]]] = []
         self.default_audio_trigger_calls: list[str] = []
+        self.cancel_calls: list[UUID] = []
 
     def scan_now(self) -> list[Job]:
         return self._scan_jobs
@@ -110,6 +119,10 @@ class _FakeScheduler:
         if self._default_audio_trigger_jobs_by_file is not None:
             return self._default_audio_trigger_jobs_by_file.get(file_path)
         return self._default_audio_trigger_job
+
+    def cancel_job(self, job_id: UUID, *, session: Session | None = None) -> bool | None:
+        self.cancel_calls.append(job_id)
+        return self._cancel_result
 
 
 def _job(file_path: str) -> Job:
@@ -920,6 +933,95 @@ def test_bulk_trigger_default_audio_wires_through_a_real_scheduler(settings: Set
     }
 
 
+# --- DELETE /api/jobs/{job_id} (COL-168) --------------------------------------
+#
+# These are HTTP-contract tests only -- request/response shape, the id ->
+# scheduler.cancel_job(UUID) call, and the None/True/False -> 404/200 mapping
+# -- via the same fake-scheduler dependency_overrides pattern as every other
+# endpoint above. JobScheduler.cancel_job's own behaviour (the real
+# JobQueue.cancel + JobHistory-delete sequence) is exercised directly, with a
+# real queue/session, in tests/test_jobs_scheduler.py.
+
+
+def test_cancel_job_returns_cancelled_true_on_success(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(cancel_result=True)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.delete(f"/api/jobs/{job_id}", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"cancelled": True}
+    assert fake.cancel_calls == [job_id]
+
+
+def test_cancel_job_returns_cancelled_false_when_already_claimed(client: TestClient) -> None:
+    """A no-longer-PENDING Job is "too late", not an error and not a silent success."""
+    job_id = uuid4()
+    fake = _FakeScheduler(cancel_result=False)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.delete(f"/api/jobs/{job_id}", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"cancelled": False}
+    assert fake.cancel_calls == [job_id]
+
+
+def test_cancel_job_returns_404_for_a_job_not_in_the_live_queue(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(cancel_result=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.delete(f"/api/jobs/{job_id}", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.cancel_calls == [job_id]
+
+
+def test_cancel_job_returns_404_for_a_malformed_job_id_without_calling_the_scheduler(
+    client: TestClient,
+) -> None:
+    fake = _FakeScheduler()
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.delete("/api/jobs/not-a-uuid", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.cancel_calls == []  # not a UUID at all -- never reaches the scheduler
+
+
+def test_cancel_job_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> cancel fails loudly, not silently."""
+    response = client.delete(f"/api/jobs/{uuid4()}", headers=_auth_headers(client))
+    assert response.status_code == 503
+
+
+def test_cancel_job_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, unknown id -> 404 (nothing to act on)."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.delete(f"/api/jobs/{uuid4()}", headers=_auth_headers(client))
+
+    assert response.status_code == 404
+
+
 # --- auth-required behaviour --------------------------------------------------
 
 
@@ -957,4 +1059,10 @@ def test_bulk_trigger_default_audio_endpoint_requires_the_api_key(
         "/api/jobs/trigger-default-audio/bulk",
         json={"references": [{"node_type": "episode", "node_id": 1}]},
     )
+    assert response.status_code == 401
+
+
+def test_cancel_job_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.delete(f"/api/jobs/{uuid4()}")
     assert response.status_code == 401
