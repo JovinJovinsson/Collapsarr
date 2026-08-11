@@ -773,6 +773,70 @@ def test_cancel_job_opens_its_own_session_when_none_is_given(
 
 
 # ---------------------------------------------------------------------------
+# bump_job_to_front (COL-169)
+# ---------------------------------------------------------------------------
+
+
+def test_bump_job_to_front_reassigns_priority_ahead_of_every_other_pending_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    first = scheduler.trigger_file("/media/first.mkv")
+    second = scheduler.trigger_file("/media/second.mkv")
+    assert first is not None
+    assert second is not None
+
+    outcome = scheduler.bump_job_to_front(second.id)
+
+    assert outcome is True
+    assert second.priority < first.priority
+
+
+def test_bump_job_to_front_reports_too_late_for_a_job_no_longer_pending(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    # Simulate a worker having already claimed the job before the bump request lands.
+    job.status = JobStatus.RUNNING
+    original_priority = job.priority
+
+    outcome = scheduler.bump_job_to_front(job.id)
+
+    assert outcome is False
+    # Left exactly as it was: still in the live queue, priority untouched.
+    assert scheduler._queue.get_job(job.id) is not None
+    assert job.priority == original_priority
+
+
+def test_bump_job_to_front_returns_none_for_an_id_not_in_the_live_queue(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    outcome = scheduler.bump_job_to_front(uuid4())
+
+    assert outcome is None
+
+
+def test_bump_job_to_front_repeated_calls_move_each_new_bump_strictly_ahead(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: bump A, then bump B -> B ends up strictly ahead of (would run before) A."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job_a = scheduler.trigger_file("/media/a.mkv")
+    job_b = scheduler.trigger_file("/media/b.mkv")
+    assert job_a is not None
+    assert job_b is not None
+
+    assert scheduler.bump_job_to_front(job_a.id) is True
+    assert scheduler.bump_job_to_front(job_b.id) is True
+
+    assert job_b.priority < job_a.priority
+
+
+# ---------------------------------------------------------------------------
 # Background loop: triggering + lifecycle.
 # ---------------------------------------------------------------------------
 

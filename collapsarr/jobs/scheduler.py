@@ -803,6 +803,44 @@ class JobScheduler:
                 delete_job_history(owned_session, job_id)
         return True
 
+    # -- Bump to front (COL-169) -----------------------------------------------
+
+    def bump_job_to_front(self, job_id: UUID) -> bool | None:
+        """Bump one still-``PENDING`` Job ahead of every other pending Job (COL-169).
+
+        The entry point ``POST /api/jobs/{job_id}/bump`` (:mod:`collapsarr.jobs.
+        routes`) calls, mirroring :meth:`cancel_job`'s shape: one scheduler
+        method the route wraps directly, delegating the actual reordering to
+        :meth:`~collapsarr.jobs.queue.JobQueue.bump_to_front` -- this is the
+        only reordering primitive in scope (COL-169); there is no general
+        "move to an arbitrary position".
+
+        Three-way result, matching :meth:`cancel_job`'s ``None``/``True``/
+        ``False`` contract (and the route's own three outcomes):
+
+        * ``None`` -- ``job_id`` names no Job the live queue knows about at
+          all (:meth:`~collapsarr.jobs.queue.JobQueue.get_job` returns
+          ``None``): unknown id, or one from a run the process has since
+          restarted past. The route reports this as ``404`` -- there is
+          nothing to act on.
+        * ``True`` -- the Job was still ``PENDING`` and
+          :meth:`~collapsarr.jobs.queue.JobQueue.bump_to_front` reassigned its
+          priority below every other pending Job's, so it is the very next
+          Job a free worker claims.
+        * ``False`` -- the Job exists but is no longer ``PENDING`` (a worker
+          already claimed it, or it already reached a terminal status) by the
+          time :meth:`~collapsarr.jobs.queue.JobQueue.bump_to_front` ran:
+          "too late," left exactly as it was -- not an error, and distinct
+          from both ``None`` and success.
+
+        Unlike :meth:`cancel_job`, there is no ``JobHistory`` interaction --
+        bumping only reorders a still-pending Job, it doesn't change its fate
+        or delete anything, so no ``session`` is needed here.
+        """
+        if self._queue.get_job(job_id) is None:
+            return None
+        return self._queue.bump_to_front(job_id)
+
     # -- Periodic full-library scan -----------------------------------------
 
     def scan_now(self) -> list[Job]:

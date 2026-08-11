@@ -6,7 +6,7 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Six endpoints, each wrapping an existing service without adding new job logic:
+Seven endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
@@ -52,6 +52,17 @@ Six endpoints, each wrapping an existing service without adding new job logic:
   (see :class:`CancelJobResult`) rather than erroring or silently pretending
   success. A ``job_id`` not present in the live queue at all -- unknown,
   malformed, or already gone -- is a ``404``.
+- ``POST /api/jobs/{job_id}/bump`` -- bumps one still-``PENDING`` Job to the
+  front of the queue (COL-169)
+  (:meth:`collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front`), the only
+  reordering primitive in scope -- there is no general "move to an arbitrary
+  position". Wraps :meth:`~collapsarr.jobs.queue.JobQueue.bump_to_front`,
+  which reassigns the Job's priority below every other pending Job's, so it
+  is the very next Job a free worker claims. Mirrors the ``DELETE``
+  endpoint's result shape: a Job that's no longer ``PENDING`` (already
+  claimed/terminal) reports ``bumped=False`` rather than erroring (see
+  :class:`BumpJobResult`), and a ``job_id`` not present in the live queue at
+  all is a ``404``, same as the ``DELETE`` endpoint.
 
 The scan/trigger endpoints operate on the live
 :class:`~collapsarr.jobs.scheduler.JobScheduler` the app wired onto
@@ -277,6 +288,25 @@ class CancelJobResult(BaseModel):
     """
 
     cancelled: bool
+
+
+class BumpJobResult(BaseModel):
+    """Response for ``POST /api/jobs/{job_id}/bump`` (COL-169).
+
+    ``bumped`` is ``True`` when the Job was still ``PENDING`` and has now
+    been reassigned a priority ahead of every other currently-pending Job --
+    it is the very next Job a free worker claims. It is ``False`` -- not an
+    error -- when the Job still exists but is no longer ``PENDING`` (a
+    worker already claimed it, or it has already reached a terminal status):
+    "too late" to bump, distinct from both success and a generic failure;
+    the already-claimed/finished Job runs (or has run) to completion
+    normally, unaffected. A ``job_id`` not present in the live queue at all
+    -- unknown, malformed, or already gone -- is reported as ``404``, not
+    this shape (there is nothing to act on either way). Mirrors
+    :class:`CancelJobResult`'s shape exactly.
+    """
+
+    bumped: bool
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -533,3 +563,29 @@ def cancel_job_endpoint(
     if outcome is None:
         raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
     return CancelJobResult(cancelled=outcome)
+
+
+@router.post("/jobs/{job_id}/bump", response_model=BumpJobResult)
+def bump_job_endpoint(
+    job_id: str,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+) -> BumpJobResult:
+    """Bump one still-``PENDING`` Job to the front of the queue by id (COL-169).
+
+    Wraps :meth:`~collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front` --
+    see there for the ``None``/``True``/``False`` result contract. A
+    ``job_id`` that isn't a valid UUID can't name any job at all, so it's
+    folded into the same ``404``
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front` reports
+    for an unknown one, without calling it -- mirroring
+    :func:`cancel_job_endpoint`.
+    """
+    try:
+        job_uuid = UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id!r}") from None
+
+    outcome = scheduler.bump_job_to_front(job_uuid)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
+    return BumpJobResult(bumped=outcome)

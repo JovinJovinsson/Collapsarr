@@ -76,6 +76,7 @@ class _FakeScheduler:
         default_audio_trigger_job: Job | None = None,
         default_audio_trigger_jobs_by_file: dict[str, Job | None] | None = None,
         cancel_result: bool | None = True,
+        bump_result: bool | None = True,
     ) -> None:
         self._scan_jobs = scan_jobs or []
         self._trigger_job = trigger_job
@@ -90,9 +91,16 @@ class _FakeScheduler:
         #: (cancelled), ``False`` (too late). Defaults to ``True`` so a test
         #: that doesn't care about cancel behaviour still gets a sane value.
         self._cancel_result = cancel_result
+        #: COL-169's ``bump_job_to_front`` result, mirroring the real
+        #: :meth:`~collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front`'s
+        #: three-way contract: ``None`` (404, "no such job"), ``True``
+        #: (bumped), ``False`` (too late). Defaults to ``True`` so a test
+        #: that doesn't care about bump behaviour still gets a sane value.
+        self._bump_result = bump_result
         self.trigger_calls: list[tuple[str, frozenset[str]]] = []
         self.default_audio_trigger_calls: list[str] = []
         self.cancel_calls: list[UUID] = []
+        self.bump_calls: list[UUID] = []
 
     def scan_now(self) -> list[Job]:
         return self._scan_jobs
@@ -123,6 +131,10 @@ class _FakeScheduler:
     def cancel_job(self, job_id: UUID, *, session: Session | None = None) -> bool | None:
         self.cancel_calls.append(job_id)
         return self._cancel_result
+
+    def bump_job_to_front(self, job_id: UUID) -> bool | None:
+        self.bump_calls.append(job_id)
+        return self._bump_result
 
 
 def _job(file_path: str) -> Job:
@@ -1022,6 +1034,98 @@ def test_cancel_job_wires_through_a_real_scheduler(settings: Settings) -> None:
     assert response.status_code == 404
 
 
+# --- POST /api/jobs/{job_id}/bump (COL-169) -----------------------------------
+#
+# These are HTTP-contract tests only -- request/response shape, the id ->
+# scheduler.bump_job_to_front(UUID) call, and the None/True/False -> 404/200
+# mapping -- via the same fake-scheduler dependency_overrides pattern as
+# every other endpoint above, mirroring the DELETE section. The real
+# priority-reassignment + "next claimed by a free worker" behaviour is
+# exercised end-to-end against a real JobQueue and worker pool in
+# tests/test_jobs_queue.py::test_bumped_job_is_claimed_before_earlier_enqueued_pending_jobs,
+# and JobScheduler.bump_job_to_front's own None/True/False mapping is
+# exercised directly, with a real queue, in tests/test_jobs_scheduler.py.
+
+
+def test_bump_job_returns_bumped_true_on_success(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(bump_result=True)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(f"/api/jobs/{job_id}/bump", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"bumped": True}
+    assert fake.bump_calls == [job_id]
+
+
+def test_bump_job_returns_bumped_false_when_already_claimed(client: TestClient) -> None:
+    """A no-longer-PENDING Job is "too late", not an error and not a silent success."""
+    job_id = uuid4()
+    fake = _FakeScheduler(bump_result=False)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(f"/api/jobs/{job_id}/bump", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"bumped": False}
+    assert fake.bump_calls == [job_id]
+
+
+def test_bump_job_returns_404_for_a_job_not_in_the_live_queue(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(bump_result=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(f"/api/jobs/{job_id}/bump", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.bump_calls == [job_id]
+
+
+def test_bump_job_returns_404_for_a_malformed_job_id_without_calling_the_scheduler(
+    client: TestClient,
+) -> None:
+    fake = _FakeScheduler()
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/not-a-uuid/bump", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.bump_calls == []  # not a UUID at all -- never reaches the scheduler
+
+
+def test_bump_job_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> bump fails loudly, not silently."""
+    response = client.post(f"/api/jobs/{uuid4()}/bump", headers=_auth_headers(client))
+    assert response.status_code == 503
+
+
+def test_bump_job_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, unknown id -> 404 (nothing to act on)."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post(f"/api/jobs/{uuid4()}/bump", headers=_auth_headers(client))
+
+    assert response.status_code == 404
+
+
 # --- auth-required behaviour --------------------------------------------------
 
 
@@ -1065,4 +1169,10 @@ def test_bulk_trigger_default_audio_endpoint_requires_the_api_key(
 def test_cancel_job_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     response = client.delete(f"/api/jobs/{uuid4()}")
+    assert response.status_code == 401
+
+
+def test_bump_job_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post(f"/api/jobs/{uuid4()}/bump")
     assert response.status_code == 401
