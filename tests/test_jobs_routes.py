@@ -611,6 +611,78 @@ def test_bulk_trigger_default_audio_cascades_a_series_reference_to_descendant_fi
     assert set(fake.default_audio_trigger_calls) == {"/media/e101.mkv", "/media/e102.mkv"}
 
 
+def test_bulk_trigger_default_audio_cascade_includes_a_hidden_descendant_episode(
+    client: TestClient,
+) -> None:
+    """A Series-level cascade must still reach a soft-hidden descendant Episode.
+
+    Regression test for the ``include_hidden=False`` divergence fixed in
+    :func:`~collapsarr.jobs.routes._resolve_default_audio_leaf_files` -- a node
+    soft-hidden by a later sync (dropped from the catalog, not deleted, see
+    :func:`~collapsarr.library.service.sync_library`) still has a real on-disk
+    file, so it must stay in scope for the cascade exactly like
+    :func:`~collapsarr.library.service.set_tracked`'s cascade. Mirrors the
+    hidden-node fixture pattern from
+    ``tests.test_library_service.test_disappeared_node_is_hidden_then_reappears_with_override``:
+    sync once with the full catalog, then again with a catalog that drops one
+    episode, soft-hiding it without deleting it.
+    """
+    instance_id = _seed_library(client)
+    series_id = _node_id(client, instance_id, make_node_key(LibraryNodeKind.SERIES, series_id=1))
+
+    app = client.app
+    assert isinstance(app, FastAPI)
+    with app.state.session_factory() as session:
+        # Episode 103 dropped from this catalog -> soft-hidden, not deleted.
+        reduced = SonarrCatalog(
+            instance_id=instance_id,
+            series=(
+                CatalogSeries(
+                    series_id=1,
+                    title="Breaking Bad",
+                    season_numbers=(1,),
+                    episodes=(
+                        CatalogEpisode(101, 1, 1, "Pilot", has_file=True),
+                        CatalogEpisode(102, 1, 2, "Cat's in the Bag", has_file=True),
+                    ),
+                ),
+            ),
+        )
+        sync_library(session, instance_id=instance_id, catalog=reduced)
+        hidden_episode = next(
+            n
+            for n in list_nodes(session, instance_id)
+            if n.node_key == make_node_key(LibraryNodeKind.EPISODE, series_id=1, episode_id=103)
+        )
+        assert hidden_episode.hidden is True  # sanity: this test needs a genuinely hidden node
+
+    _bridge_file(
+        client, file_path="/media/e103.mkv", instance_id=instance_id, sonarr_episode_id=103
+    )
+
+    fake = _FakeScheduler(
+        default_audio_trigger_jobs_by_file={"/media/e103.mkv": _job("/media/e103.mkv")}
+    )
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/trigger-default-audio/bulk",
+            json={"references": [{"node_type": "series", "node_id": series_id}]},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    file_paths = {r["file_path"] for r in response.json()["results"]}
+    # The hidden episode's file must still surface here -- proves the cascade
+    # walks list_nodes' hidden-included set. Against the old
+    # include_hidden=False behaviour this file is silently dropped and both
+    # assertions below fail.
+    assert "/media/e103.mkv" in file_paths
+    assert "/media/e103.mkv" in fake.default_audio_trigger_calls
+
+
 def test_bulk_trigger_default_audio_deduplicates_a_file_reachable_via_two_references(
     client: TestClient,
 ) -> None:
