@@ -653,6 +653,7 @@ def test_start_runs_an_initial_scan_and_drains_the_queue(
 
     monkeypatch.setattr(scheduler_module, "fetch_monitored_files", fake_fetch)
     queue = JobQueue(pipeline_runner=_stub_runner())
+    queue.start()
     scheduler = _make_scheduler(
         settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
     )
@@ -663,6 +664,7 @@ def test_start_runs_an_initial_scan_and_drains_the_queue(
         _wait_until(lambda: _all_terminal(queue), timeout=5.0)
     finally:
         scheduler.stop()
+        queue.shutdown()
 
     jobs = queue.list_jobs()
     assert len(jobs) == 1

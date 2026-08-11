@@ -60,7 +60,8 @@ def _failed_job(
 ) -> Job:
     queue = JobQueue(pipeline_runner=_stub_runner(result))
     job = queue.enqueue(file_path, settings or DownmixSettings())
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     assert job.status is JobStatus.FAILED
     return job
 
@@ -113,7 +114,8 @@ def test_notify_job_failure_reports_the_unexpected_exception_as_the_error(
         pipeline_runner=lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("ffmpeg missing"))
     )
     job = queue.enqueue("/media/movie.mkv", DownmixSettings())
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     assert job.status is JobStatus.FAILED
 
     update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
@@ -208,7 +210,8 @@ def test_run_pending_automatically_dispatches_a_notification_when_wired_via_make
     )
     queue.enqueue("/media/tv/The Show/S01E01.mkv", DownmixSettings())
 
-    queue.run_pending()  # note: no notify_job_failure(...) call anywhere here
+    queue.start()
+    queue.wait_idle()  # note: no notify_job_failure(...) call anywhere here
 
     assert len(seen) == 1
     details = json.loads(seen[0].content)["details"]
@@ -235,7 +238,8 @@ def test_run_pending_does_not_dispatch_a_notification_for_a_succeeded_job(
     )
     queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     assert seen == []
 
@@ -256,7 +260,8 @@ def _failed_default_audio_job(
 
     queue = JobQueue(default_audio_pipeline_runner=runner)
     job = queue.enqueue_default_audio(file_path, _PREFERENCE)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     assert job.status is JobStatus.FAILED
     assert job.kind is JobKind.SET_DEFAULT_AUDIO
     return job

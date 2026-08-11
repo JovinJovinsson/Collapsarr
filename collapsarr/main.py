@@ -237,10 +237,12 @@ def create_app(
             seed_auth_from_env(seed_session, resolved_settings)
 
         scheduler: JobScheduler | None = None
+        job_queue: JobQueue | None = None
         if on_file_ready is None and enable_scheduler:
-            queue = JobQueue.from_settings(resolved_settings)
-            scheduler = JobScheduler(queue, session_factory, resolved_settings)
-            app.state.job_queue = queue
+            job_queue = JobQueue.from_settings(resolved_settings)
+            job_queue.start()  # spin up the persistent worker pool (COL-164)
+            scheduler = JobScheduler(job_queue, session_factory, resolved_settings)
+            app.state.job_queue = job_queue
             app.state.job_scheduler = scheduler
             app.state.on_file_ready = scheduler.on_file_ready
             scheduler.start()
@@ -327,6 +329,11 @@ def create_app(
         finally:
             if scheduler is not None:
                 scheduler.stop()
+            # Stop the queue's worker pool after the scheduler (no new work is
+            # enqueued once the scan loop is stopped); any in-flight job runs
+            # to completion first (COL-164).
+            if job_queue is not None:
+                job_queue.shutdown()
             if backup_scheduler is not None:
                 backup_scheduler.stop()
             health_scheduler.stop()

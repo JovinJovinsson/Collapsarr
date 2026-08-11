@@ -230,9 +230,10 @@ def test_a_successful_downmix_job_removes_the_file_from_wanted_without_a_rescan(
     # Before the job runs, the file is wanted (AC1's scenario).
     assert _wanted_paths(client) == {"/media/movie.mkv"}
 
-    ran = queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
-    assert ran[0].status is JobStatus.SUCCEEDED
+    assert job.status is JobStatus.SUCCEEDED
     # No further scan/enqueue_file call happens here -- the job-completion
     # hook alone must be what clears the file from the wanted-list.
     assert _wanted_paths(client) == set()
@@ -383,9 +384,10 @@ def test_flipping_not_tracked_does_not_cancel_an_already_queued_job(
     # runs to completion. Tracked only gates *future* automatic enqueueing.
     assert queue.get_job(job.id) is not None
     assert queue.get_job(job.id).status is JobStatus.PENDING  # type: ignore[union-attr]
-    ran = queue.run_pending()
-    assert [j.id for j in ran] == [job.id]
-    assert ran[0].status is JobStatus.SUCCEEDED
+    queue.start()
+    queue.wait_idle()
+    assert [j.id for j in queue.list_jobs()] == [job.id]
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
 
 
 def test_flipping_not_tracked_does_not_cancel_a_running_job(
@@ -437,7 +439,8 @@ def test_flipping_not_tracked_leaves_already_produced_tracks_untouched(
     )
 
     scheduler.enqueue_file("/media/pilot.mkv", instance_id=instance_id, sonarr_episode_id=101)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     with session_factory() as session:
         produced_before = {

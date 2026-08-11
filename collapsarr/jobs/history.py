@@ -7,9 +7,8 @@ view) is a separate epic's concern -- this module is the whole surface.
 
 :func:`record_job_history` is the write path: call it with a
 :class:`~collapsarr.jobs.queue.Job` at any point in its lifecycle (right
-after :meth:`~collapsarr.jobs.queue.JobQueue.enqueue`, and again after
-:meth:`~collapsarr.jobs.queue.JobQueue.run_pending` completes it) to persist
-its current state. It upserts by ``job_id`` so the same
+after :meth:`~collapsarr.jobs.queue.JobQueue.enqueue`, and again as a worker
+runs it to completion) to persist its current state. It upserts by ``job_id`` so the same
 :class:`~collapsarr.jobs.models.JobHistory` row is updated in place across
 calls rather than duplicated.
 

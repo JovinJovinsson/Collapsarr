@@ -93,7 +93,8 @@ def test_record_job_history_persists_a_succeeded_run(session: Session) -> None:
         language_allow_list=frozenset({"eng", "jpn"}),
     )
     job = queue.enqueue("/media/movie.mkv", settings)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     history = record_job_history(session, job)
 
@@ -112,7 +113,8 @@ def test_record_job_history_persists_exit_code_and_error_on_remux_failure(
 ) -> None:
     queue = JobQueue(pipeline_runner=_stub_runner(_REMUX_FAILURE))
     job = queue.enqueue("/media/b.mkv", DownmixSettings())
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     history = record_job_history(session, job)
 
@@ -129,7 +131,8 @@ def test_record_job_history_persists_error_text_for_an_unexpected_exception(
 
     queue = JobQueue(pipeline_runner=raising_runner)
     job = queue.enqueue("/media/c.mkv", DownmixSettings())
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     history = record_job_history(session, job)
 
@@ -158,7 +161,8 @@ def test_record_job_history_upserts_the_same_row_across_lifecycle_calls(
     job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
     queued_history = record_job_history(session, job)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     finished_history = record_job_history(session, job)
 
     assert finished_history.id == queued_history.id
@@ -189,7 +193,8 @@ def test_record_job_history_keeps_priority_stable_across_lifecycle_calls(
     job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
     queued_history = record_job_history(session, job)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     finished_history = record_job_history(session, job)
 
     assert finished_history.priority == queued_history.priority == job.priority
@@ -203,7 +208,8 @@ def test_record_job_history_keeps_priority_stable_across_lifecycle_calls(
 def _record(session: Session, queue: JobQueue, file_path: str, result: PipelineResult) -> Job:
     """Enqueue, run, and persist one job for the given (single-result) queue."""
     job = queue.enqueue(file_path, DownmixSettings())
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     record_job_history(session, job)
     return job
 
@@ -285,7 +291,8 @@ def _stub_default_audio_runner(result: PipelineResult) -> DefaultAudioPipelineRu
 def _record_default_audio(session: Session, queue: JobQueue, file_path: str) -> Job:
     """Enqueue, run, and persist one SET_DEFAULT_AUDIO job for the given queue."""
     job = queue.enqueue_default_audio(file_path, _PREFERENCE)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     record_job_history(session, job)
     return job
 
@@ -295,7 +302,8 @@ def test_record_job_history_persists_a_set_default_audio_job_kind_and_preference
 ) -> None:
     queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner(_SUCCESS))
     job = queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     history = record_job_history(session, job)
 
@@ -389,7 +397,8 @@ def test_run_pending_automatically_persists_history_when_a_recorder_is_configure
     )
     job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()  # note: no record_job_history(...) call anywhere here
+    queue.start()
+    queue.wait_idle()  # note: no record_job_history(...) call anywhere here
 
     with session_factory() as read_session:
         rows = list_job_history(read_session)
@@ -444,7 +453,8 @@ def test_run_pending_persists_a_running_row_before_the_job_completes(settings: S
     queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS), history_recorder=recorder)
     queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     assert seen_statuses == [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCEEDED]
     engine.dispose()
@@ -461,7 +471,8 @@ def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> 
     )
     queue.enqueue("/media/b.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     with session_factory() as read_session:
         rows = list_job_history(read_session, status=JobStatus.FAILED)
@@ -478,11 +489,12 @@ def test_run_pending_with_no_history_recorder_persists_nothing(settings: Setting
     session_factory = create_session_factory(engine)
 
     queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))  # no history_recorder
-    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    jobs = queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
-    assert jobs[0].status is JobStatus.SUCCEEDED  # the job itself still ran fine
+    assert job.status is JobStatus.SUCCEEDED  # the job itself still ran fine
     with session_factory() as read_session:
         assert list_job_history(read_session) == []
     engine.dispose()
@@ -508,7 +520,8 @@ def test_run_pending_persists_history_for_every_concurrently_run_job(
     )
     jobs = [queue.enqueue(f"/media/{i}.mkv", DownmixSettings()) for i in range(6)]
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     with session_factory() as read_session:
         rows = list_job_history(read_session)
@@ -530,7 +543,8 @@ def test_from_settings_threads_history_recorder_through(settings: Settings) -> N
     )
     queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     with session_factory() as read_session:
         assert len(list_job_history(read_session)) == 1
@@ -551,7 +565,8 @@ def test_from_settings_with_no_history_recorder_arg_still_persists_by_default(
     queue = JobQueue.from_settings(settings, pipeline_runner=_stub_runner(_SUCCESS))
     job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     # Read back through an independent engine/session -- proves the data
     # actually landed in settings' database, not just in some in-memory
