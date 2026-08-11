@@ -17,11 +17,12 @@ from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.remux import RemuxResult
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs.failure_notify import make_failure_notifier, notify_job_failure
-from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
+from collapsarr.jobs.queue import Job, JobKind, JobQueue, JobStatus, PipelineRunner
 from collapsarr.migrations import upgrade_to_head
 from collapsarr.notify.service import update_notifier_config
 
@@ -237,6 +238,46 @@ def test_run_pending_does_not_dispatch_a_notification_for_a_succeeded_job(
     queue.run_pending()
 
     assert seen == []
+
+
+# ---------------------------------------------------------------------------
+# Job kind (COL-155): a failed SET_DEFAULT_AUDIO job reports its own
+# title/message (not "Downmix failed") and the preference as target/language.
+# ---------------------------------------------------------------------------
+
+_PREFERENCE = DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE)
+
+
+def _failed_default_audio_job(
+    *, file_path: str = "/media/movie.mkv", result: PipelineResult = _REMUX_FAILURE
+) -> Job:
+    def runner(file_path: Path, preference: DefaultAudioPreference, **_: object) -> PipelineResult:
+        return result
+
+    queue = JobQueue(default_audio_pipeline_runner=runner)
+    job = queue.enqueue_default_audio(file_path, _PREFERENCE)
+    queue.run_pending()
+    assert job.status is JobStatus.FAILED
+    assert job.kind is JobKind.SET_DEFAULT_AUDIO
+    return job
+
+
+def test_notify_job_failure_reports_a_default_audio_specific_title_and_message(
+    session: Session,
+) -> None:
+    job = _failed_default_audio_job()
+    update_notifier_config(session, webhook_url="https://example.com/hook", webhook_enabled=True)
+    transport, seen = _ok_transport()
+
+    notify_job_failure(session, job, transport=transport)
+
+    payload = json.loads(seen[0].content)
+    assert payload["event_type"] == "downmix_failure"  # unchanged machine-readable tag
+    assert payload["title"] == "Default Audio Track fix failed"
+    assert "Downmix failed" not in payload["message"]
+    details = payload["details"]
+    assert details["target"] == "5.1"
+    assert details["language"] == "eng"
 
 
 # ---------------------------------------------------------------------------

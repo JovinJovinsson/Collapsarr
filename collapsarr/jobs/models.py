@@ -12,7 +12,9 @@ Activity/History view.
 Deliberately reuses :class:`~collapsarr.jobs.queue.JobStatus` for the
 ``status`` column rather than inventing a parallel status vocabulary --
 ``JobStatus.PENDING`` is this ticket's "queued" per the acceptance criteria
-(the job is enqueued and has not started running yet).
+(the job is enqueued and has not started running yet). Likewise reuses
+:class:`~collapsarr.jobs.queue.JobKind` (COL-155) for the ``kind`` column --
+``DOWNMIX`` or ``SET_DEFAULT_AUDIO`` -- rather than a parallel vocabulary.
 
 :mod:`collapsarr.jobs.history` is the service layer (record/list/get) built
 on top of this model; nothing in this module touches a session.
@@ -23,11 +25,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from sqlalchemy import Enum as SAEnum
-from sqlalchemy import Integer, String, Text
+from sqlalchemy import Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from collapsarr.database import Base
-from collapsarr.jobs.queue import JobStatus
+from collapsarr.jobs.queue import JobKind, JobStatus
 
 
 def _utcnow() -> datetime:
@@ -52,11 +54,20 @@ class JobHistory(Base):
 
     ``target``/``language`` capture what the job was configured to do --
     the comma-joined enabled downmix targets and language allow-list from
-    the job's :class:`~collapsarr.downmix.targets.DownmixSettings` -- so
-    they're always present regardless of which stage the run reached
-    (unlike the pipeline's ``tracks_added``, which is only populated on
-    success). ``language`` is ``None`` when the job had no allow-list
-    (evaluates every language present on the file).
+    the job's :class:`~collapsarr.downmix.targets.DownmixSettings` for a
+    ``DOWNMIX`` job, or the resolved channel tier/language from the job's
+    :class:`~collapsarr.downmix.default_audio.DefaultAudioPreference` for a
+    ``SET_DEFAULT_AUDIO`` job (COL-155; see
+    :func:`~collapsarr.jobs.history.record_job_history`) -- so they're always
+    present regardless of which stage the run reached (unlike the pipeline's
+    ``tracks_added``, which is only populated on success). ``language`` is
+    ``None`` when a ``DOWNMIX`` job had no allow-list (evaluates every
+    language present on the file).
+
+    ``kind`` (COL-155) is ``DOWNMIX`` by default -- both for a freshly
+    created row and, via the migration that added this column, for every
+    pre-existing row, so old and new history reads consistently as "this was
+    a downmix job" without a manual backfill step.
     """
 
     __tablename__ = "job_history"
@@ -71,6 +82,21 @@ class JobHistory(Base):
         ),
         nullable=False,
         default=JobStatus.PENDING,
+        index=True,
+    )
+    kind: Mapped[JobKind] = mapped_column(
+        SAEnum(
+            JobKind,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        default=JobKind.DOWNMIX,
+        # DB-side server_default (matching `GlobalSettings.auto_set_default_audio`'s
+        # treatment) so the COL-155 migration can backfill every pre-existing row to
+        # `'downmix'` in the same additive `ALTER TABLE`, not just new rows going
+        # forward -- see the migration's own docstring for why that backfill value
+        # (rather than nullable/unset) is correct here.
+        server_default=text("'downmix'"),
         index=True,
     )
     started_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)

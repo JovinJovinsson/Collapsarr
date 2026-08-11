@@ -100,32 +100,70 @@ const sonarr: ArrInstance = {
   updated_at: "2026-07-01T00:00:00Z",
 };
 
-describe("InstancesSection", () => {
+const radarr: ArrInstance = {
+  id: 2,
+  name: "Radarr Prod",
+  type: "radarr",
+  base_url: "http://localhost:7878",
+  api_key: "radarr-key",
+  status: "ok",
+  status_error: null,
+  status_checked_at: "2026-07-19T00:00:00Z",
+  version: "5.0.0",
+  created_at: "2026-07-01T00:00:00Z",
+  updated_at: "2026-07-01T00:00:00Z",
+};
+
+/**
+ * Settings → Sonarr (COL-144), split off `settingsInstances.test.tsx`: the
+ * type-scoped Sonarr slice of `InstancesSection`'s CRUD behavior, minus the
+ * type-selector assertions the old combined-table create form had (there's
+ * no selector any more -- the page fixes `type="sonarr"`).
+ */
+describe("InstancesSection (Sonarr)", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
   it("lists instances from a mocked API response", async () => {
     mockInstancesApi([sonarr]);
-    render(<InstancesSection />);
+    render(<InstancesSection type="sonarr" />);
 
     expect(await screen.findByText("Sonarr Prod")).toBeInTheDocument();
     expect(screen.getByText("http://localhost:8989")).toBeInTheDocument();
     expect(screen.getByText("Connected")).toBeInTheDocument();
   });
 
-  it("renders an empty state with no instances configured", async () => {
-    mockInstancesApi([]);
-    render(<InstancesSection />);
+  it("only lists Sonarr instances, even when Radarr instances are also configured", async () => {
+    mockInstancesApi([sonarr, radarr]);
+    render(<InstancesSection type="sonarr" />);
 
-    expect(await screen.findByText(/no arr instances configured yet/i)).toBeInTheDocument();
+    expect(await screen.findByText("Sonarr Prod")).toBeInTheDocument();
+    expect(screen.queryByText("Radarr Prod")).not.toBeInTheDocument();
+  });
+
+  it("renders an empty state with no Sonarr instances configured", async () => {
+    mockInstancesApi([]);
+    render(<InstancesSection type="sonarr" />);
+
+    expect(await screen.findByText(/no sonarr instances configured yet/i)).toBeInTheDocument();
+  });
+
+  it("has no type selector on the create form", async () => {
+    mockInstancesApi([]);
+    render(<InstancesSection type="sonarr" />);
+
+    await screen.findByText(/no sonarr instances configured yet/i);
+    fireEvent.click(screen.getByRole("button", { name: /add instance/i }));
+
+    expect(screen.queryByLabelText(/^type$/i)).not.toBeInTheDocument();
   });
 
   it("shows a validation error and does not submit when required fields are blank", async () => {
     const fetchMock = mockInstancesApi([]);
-    render(<InstancesSection />);
+    render(<InstancesSection type="sonarr" />);
 
-    await screen.findByText(/no arr instances configured yet/i);
+    await screen.findByText(/no sonarr instances configured yet/i);
     fireEvent.click(screen.getByRole("button", { name: /add instance/i }));
     fireEvent.click(screen.getByRole("button", { name: /save instance/i }));
 
@@ -133,26 +171,31 @@ describe("InstancesSection", () => {
     expect(fetchMock).not.toHaveBeenCalledWith("/api/instances", expect.objectContaining({ method: "POST" }));
   });
 
-  it("creates a new instance via the form", async () => {
-    mockInstancesApi([]);
-    render(<InstancesSection />);
+  it("creates a new instance via the form, fixed to type sonarr", async () => {
+    const fetchMock = mockInstancesApi([]);
+    render(<InstancesSection type="sonarr" />);
 
-    await screen.findByText(/no arr instances configured yet/i);
+    await screen.findByText(/no sonarr instances configured yet/i);
     fireEvent.click(screen.getByRole("button", { name: /add instance/i }));
 
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Radarr Prod" } });
-    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "radarr" } });
-    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://localhost:7878" } });
-    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "radarr-key" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Sonarr Main" } });
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://localhost:8989" } });
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "sonarr-key" } });
     fireEvent.click(screen.getByRole("button", { name: /save instance/i }));
 
-    expect(await screen.findByText("Radarr Prod")).toBeInTheDocument();
-    expect(screen.getByText("http://localhost:7878")).toBeInTheDocument();
+    expect(await screen.findByText("Sonarr Main")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/instances",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining('"type":"sonarr"'),
+      }),
+    );
   });
 
   it("edits an existing instance", async () => {
     mockInstancesApi([sonarr]);
-    render(<InstancesSection />);
+    render(<InstancesSection type="sonarr" />);
 
     const row = (await screen.findByText("Sonarr Prod")).closest("tr") as HTMLElement;
     fireEvent.click(within(row).getByRole("button", { name: /^edit$/i }));
@@ -167,18 +210,18 @@ describe("InstancesSection", () => {
   it("deletes an instance after confirmation", async () => {
     vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
     mockInstancesApi([sonarr]);
-    render(<InstancesSection />);
+    render(<InstancesSection type="sonarr" />);
 
     const row = (await screen.findByText("Sonarr Prod")).closest("tr") as HTMLElement;
     fireEvent.click(within(row).getByRole("button", { name: /delete/i }));
 
-    expect(await screen.findByText(/no arr instances configured yet/i)).toBeInTheDocument();
+    expect(await screen.findByText(/no sonarr instances configured yet/i)).toBeInTheDocument();
   });
 
   it("does not delete when the confirmation is dismissed", async () => {
     vi.stubGlobal("confirm", vi.fn().mockReturnValue(false));
     mockInstancesApi([sonarr]);
-    render(<InstancesSection />);
+    render(<InstancesSection type="sonarr" />);
 
     const row = (await screen.findByText("Sonarr Prod")).closest("tr") as HTMLElement;
     fireEvent.click(within(row).getByRole("button", { name: /delete/i }));
@@ -188,7 +231,7 @@ describe("InstancesSection", () => {
 
   it("manages path mappings: adds one and shows it in the list", async () => {
     mockInstancesApi([sonarr]);
-    render(<InstancesSection />);
+    render(<InstancesSection type="sonarr" />);
 
     await screen.findByText("Sonarr Prod");
     fireEvent.click(screen.getByRole("button", { name: /manage mappings/i }));
@@ -209,12 +252,12 @@ describe("InstancesSection", () => {
     vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValueOnce(jsonResponse([]));
 
-    render(<InstancesSection />);
-    await screen.findByText(/no arr instances configured yet/i);
+    render(<InstancesSection type="sonarr" />);
+    await screen.findByText(/no sonarr instances configured yet/i);
 
     fireEvent.click(screen.getByRole("button", { name: /add instance/i }));
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Radarr" } });
-    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://localhost:7878" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Sonarr" } });
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://localhost:8989" } });
     fireEvent.change(screen.getByLabelText("API key"), { target: { value: "key" } });
     fireEvent.click(screen.getByRole("button", { name: /save instance/i }));
 

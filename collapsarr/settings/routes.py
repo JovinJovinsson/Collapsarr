@@ -68,6 +68,18 @@ the field leaves it untouched. Unlike every other field here,
 :func:`collapsarr.logging_setup.apply_log_level` after persisting it, so the
 change is live on the ``collapsarr`` logger immediately, not just on the
 Update Check scheduler's/disk-space check's next tick.
+
+``default_audio_language``/``default_audio_channel_tier``/
+``auto_set_default_audio`` (COL-151) are also read/write here -- the
+Preferred Default Audio setting a later ticket's Targets settings page
+(COL-159) will surface. ``default_audio_channel_tier`` reuses
+:class:`~collapsarr.downmix.targets.DownmixTarget` the same way
+``enabled_targets`` already does, so an unrecognised tier is rejected with a
+``422`` the same way an unrecognised downmix target already is. Like
+``language_allow_list``/``log_level``, ``null`` is a meaningful, sendable
+value for the two nullable fields (clears a configured preference); omitting
+either field leaves it untouched. ``auto_set_default_audio`` is a plain
+boolean, same treatment as ``ui_auth_enabled``/``default_tracked``.
 """
 
 from __future__ import annotations
@@ -139,6 +151,9 @@ class SettingsRead(BaseModel):
     update_channel: UpdateChannelMode
     default_tracked: bool
     log_level: LogLevelMode | None
+    default_audio_language: str | None
+    default_audio_channel_tier: DownmixTarget | None
+    auto_set_default_audio: bool
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -172,6 +187,9 @@ class SettingsUpdate(BaseModel):
     update_channel: UpdateChannelMode | None = None
     default_tracked: bool | None = None
     log_level: LogLevelMode | None = None
+    default_audio_language: str | None = None
+    default_audio_channel_tier: DownmixTarget | None = None
+    auto_set_default_audio: bool | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -204,6 +222,13 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         update_channel=settings.update_channel,
         default_tracked=settings.default_tracked,
         log_level=settings.log_level,
+        default_audio_language=settings.default_audio_language,
+        default_audio_channel_tier=(
+            DownmixTarget(settings.default_audio_channel_tier)
+            if settings.default_audio_channel_tier is not None
+            else None
+        ),
+        auto_set_default_audio=settings.auto_set_default_audio,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -272,6 +297,12 @@ def update_settings_endpoint(
         kwargs["default_tracked"] = body.default_tracked
     if "log_level" in provided:
         kwargs["log_level"] = body.log_level
+    if "default_audio_language" in provided:
+        kwargs["default_audio_language"] = body.default_audio_language
+    if "default_audio_channel_tier" in provided:
+        kwargs["default_audio_channel_tier"] = body.default_audio_channel_tier
+    if "auto_set_default_audio" in provided:
+        kwargs["auto_set_default_audio"] = body.auto_set_default_audio
 
     updated = update_global_settings(session, **kwargs)  # type: ignore[arg-type]
     if "log_level" in provided:

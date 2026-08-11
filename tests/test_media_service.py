@@ -19,6 +19,7 @@ from collapsarr.media.service import (
     list_files_missing_targets,
     list_target_statuses,
     list_tracked_media,
+    list_tracked_media_by_instance,
     record_target_processed,
     upsert_tracked_media,
 )
@@ -29,7 +30,12 @@ ALL_TARGETS = frozenset(
 
 
 def _stream(
-    *, index: int = 0, channels: int, language: str = "eng", codec: str = "flac"
+    *,
+    index: int = 0,
+    channels: int,
+    language: str = "eng",
+    codec: str = "flac",
+    is_default: bool = False,
 ) -> AudioStreamInfo:
     return AudioStreamInfo(
         index=index,
@@ -37,6 +43,7 @@ def _stream(
         channels=channels,
         channel_layout=f"{channels}ch",
         language=language,
+        is_default=is_default,
     )
 
 
@@ -172,6 +179,118 @@ def test_upsert_multi_language_tracks_evaluated_independently(session: Session) 
 
 
 # ---------------------------------------------------------------------------
+# upsert_tracked_media: current default audio track snapshot (COL-154).
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_records_current_default_track_from_the_is_default_stream(
+    session: Session,
+) -> None:
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[
+            _stream(index=0, channels=2, language="eng", is_default=False),
+            _stream(index=1, channels=6, language="dan", is_default=True),
+        ],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    assert media.current_default_language == "dan"
+    assert media.current_default_channel_layout == "6ch"
+
+
+def test_upsert_leaves_current_default_track_unset_when_no_stream_is_default(
+    session: Session,
+) -> None:
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(index=0, channels=2), _stream(index=1, channels=6)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    assert media.current_default_language is None
+    assert media.current_default_channel_layout is None
+
+
+def test_upsert_current_default_track_unset_for_a_file_with_no_audio_streams(
+    session: Session,
+) -> None:
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    assert media.current_default_language is None
+    assert media.current_default_channel_layout is None
+
+
+def test_upsert_current_default_track_prefers_lowest_index_on_multiple_defaults(
+    session: Session,
+) -> None:
+    """Malformed ffprobe metadata reporting >1 default stream: lowest index wins."""
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[
+            _stream(index=0, channels=2, language="eng", is_default=True),
+            _stream(index=1, channels=6, language="dan", is_default=True),
+        ],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    assert media.current_default_language == "eng"
+    assert media.current_default_channel_layout == "2ch"
+
+
+def test_upsert_refreshes_current_default_track_across_rescans(session: Session) -> None:
+    """A later probe with a different current default overwrites the earlier snapshot."""
+    settings = DownmixSettings(enabled_targets=ALL_TARGETS)
+    upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(index=0, channels=2, language="eng", is_default=True)],
+        settings=settings,
+    )
+
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(index=0, channels=6, language="dan", is_default=True)],
+        settings=settings,
+    )
+
+    assert media.current_default_language == "dan"
+    assert media.current_default_channel_layout == "6ch"
+
+
+def test_upsert_clears_current_default_track_when_a_rescan_finds_no_default(
+    session: Session,
+) -> None:
+    """A rescan that no longer reports a default stream clears a previous snapshot too."""
+    settings = DownmixSettings(enabled_targets=ALL_TARGETS)
+    upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(index=0, channels=2, language="eng", is_default=True)],
+        settings=settings,
+    )
+
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(index=0, channels=2, language="eng", is_default=False)],
+        settings=settings,
+    )
+
+    assert media.current_default_language is None
+    assert media.current_default_channel_layout is None
+
+
+# ---------------------------------------------------------------------------
 # upsert_tracked_media: Library-node bridge ids (COL-101).
 # ---------------------------------------------------------------------------
 
@@ -239,6 +358,41 @@ def test_upsert_ids_default_to_none_when_never_given(session: Session) -> None:
     assert media.instance_id is None
     assert media.sonarr_episode_id is None
     assert media.radarr_movie_id is None
+
+
+def test_list_tracked_media_by_instance_returns_only_that_instances_rows(
+    session: Session,
+) -> None:
+    settings = DownmixSettings(enabled_targets=ALL_TARGETS)
+    upsert_tracked_media(
+        session,
+        file_path="/media/tv/pilot.mkv",
+        streams=[_stream(channels=8)],
+        settings=settings,
+        instance_id=7,
+        sonarr_episode_id=101,
+    )
+    upsert_tracked_media(
+        session,
+        file_path="/media/movies/interstellar.mkv",
+        streams=[_stream(channels=8)],
+        settings=settings,
+        instance_id=9,
+        radarr_movie_id=1,
+    )
+    upsert_tracked_media(
+        session, file_path="/media/untracked.mkv", streams=[_stream(channels=8)], settings=settings
+    )
+
+    result = list_tracked_media_by_instance(session, 7)
+
+    assert [media.file_path for media in result] == ["/media/tv/pilot.mkv"]
+
+
+def test_list_tracked_media_by_instance_returns_empty_for_an_unknown_instance(
+    session: Session,
+) -> None:
+    assert list_tracked_media_by_instance(session, 999) == []
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +626,7 @@ def test_media_package_importable_from_package_root() -> None:
     from collapsarr.media import TrackedMediaFile as ReexportedFile
     from collapsarr.media import TrackedMediaTargetStatus as ReexportedTargetStatus
     from collapsarr.media import list_files_missing_targets as reexported_missing
+    from collapsarr.media import list_tracked_media_by_instance as reexported_by_instance
     from collapsarr.media import upsert_tracked_media as reexported_upsert
 
     assert ReexportedFile is TrackedMediaFile
@@ -479,3 +634,4 @@ def test_media_package_importable_from_package_root() -> None:
     assert ReexportedStatus is MediaTargetStatus
     assert reexported_upsert is upsert_tracked_media
     assert reexported_missing is list_files_missing_targets
+    assert reexported_by_instance is list_tracked_media_by_instance

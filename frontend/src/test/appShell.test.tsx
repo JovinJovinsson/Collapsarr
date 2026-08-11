@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppShell } from "../components/AppShell";
 import { ActivityPage } from "../pages/ActivityPage";
-import { SettingsPage } from "../pages/SettingsPage";
 import { WantedPage } from "../pages/WantedPage";
 
 // WantedPage (COL-31) fetches `/api/wanted` on mount; stub it so these
@@ -26,6 +25,12 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+// Settings (COL-144) is now an expandable NavSection group rather than a
+// single destination page (like System), so this hand-rolled shell fixture
+// no longer mounts a "settings" route -- settingsNav.test.tsx exercises the
+// real production route tree (routes/router.tsx) for Settings' link/expand/
+// redirect behavior, and settingsGeneral.test.tsx etc. cover its sub-pages'
+// content.
 function renderAt(path: string) {
   const router = createMemoryRouter(
     [
@@ -35,7 +40,6 @@ function renderAt(path: string) {
         children: [
           { path: "wanted", element: <WantedPage /> },
           { path: "activity", element: <ActivityPage /> },
-          { path: "settings", element: <SettingsPage /> },
         ],
       },
     ],
@@ -63,6 +67,11 @@ describe("app shell", () => {
       "href",
       "/activity",
     );
+    // Settings' sidebar entry is an expandable NavSection group (COL-141),
+    // like System -- its default link is the group's own base path
+    // (COL-144, once every sub-page had migrated off the old composed
+    // /settings route). See settingsNav.test.tsx for the fuller
+    // expand/collapse/redirect coverage.
     expect(within(nav).getByRole("link", { name: /settings/i })).toHaveAttribute(
       "href",
       "/settings",
@@ -83,7 +92,8 @@ describe("app shell", () => {
     renderAt("/activity");
     expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
 
-    renderAt("/settings");
-    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    // Settings no longer has a single composed page/heading to render here
+    // (COL-144) -- its sub-pages' headings are covered by their own test
+    // files (settingsGeneral.test.tsx, settingsSonarr.test.tsx, etc.).
   });
 });

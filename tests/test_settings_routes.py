@@ -50,6 +50,9 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["disk_space_error_percent"] == 2.0  # COL-79 default
     assert body["update_channel"] == "stable"  # COL-88 default
     assert body["log_level"] is None  # COL-130: unset, falls back to env at boot
+    assert body["default_audio_language"] is None  # COL-151 default
+    assert body["default_audio_channel_tier"] is None  # COL-151 default
+    assert body["auto_set_default_audio"] is False  # COL-151 default
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -400,6 +403,90 @@ def test_put_settings_log_level_applies_live_without_restart(client: TestClient)
     assert back_to_info.status_code == 200, back_to_info.text
     assert logger.level == logging.WARNING
     assert file_handler.backupCount == 6
+
+
+# --- Preferred Default Audio (COL-151) ------------------------------------------
+
+
+def test_get_settings_returns_default_audio_preference_unset_by_default(
+    client: TestClient,
+) -> None:
+    response = client.get("/api/settings", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["default_audio_language"] is None
+    assert body["default_audio_channel_tier"] is None
+    assert body["auto_set_default_audio"] is False
+
+
+def test_put_settings_sets_default_audio_preference(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={
+            "default_audio_language": "eng",
+            "default_audio_channel_tier": "5.1",
+            "auto_set_default_audio": True,
+        },
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["default_audio_language"] == "eng"
+    assert body["default_audio_channel_tier"] == "5.1"
+    assert body["auto_set_default_audio"] is True
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["default_audio_language"] == "eng"
+    assert follow_up.json()["default_audio_channel_tier"] == "5.1"
+    assert follow_up.json()["auto_set_default_audio"] is True
+
+
+def test_put_settings_rejects_an_unknown_default_audio_channel_tier(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"default_audio_channel_tier": "quadraphonic"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+def test_put_settings_leaves_default_audio_preference_untouched_when_omitted(
+    client: TestClient,
+) -> None:
+    client.put(
+        "/api/settings",
+        json={"default_audio_language": "jpn", "default_audio_channel_tier": "stereo"},
+        headers=_auth_headers(client),
+    )
+
+    client.put("/api/settings", json={"concurrency_limit": 3}, headers=_auth_headers(client))
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["default_audio_language"] == "jpn"
+    assert body["default_audio_channel_tier"] == "stereo"
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_explicit_null_clears_default_audio_preference(client: TestClient) -> None:
+    client.put(
+        "/api/settings",
+        json={"default_audio_language": "eng", "default_audio_channel_tier": "5.1"},
+        headers=_auth_headers(client),
+    )
+
+    response = client.put(
+        "/api/settings",
+        json={"default_audio_language": None, "default_audio_channel_tier": None},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["default_audio_language"] is None
+    assert body["default_audio_channel_tier"] is None
 
 
 # --- auth-required behaviour ---------------------------------------------------

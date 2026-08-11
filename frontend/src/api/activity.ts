@@ -1,4 +1,13 @@
-import type { JobHistoryEntry, ManualTriggerRequest, ManualTriggerResult } from "../types/activity";
+import type {
+  BulkSetDefaultAudioTriggerRequest,
+  BulkSetDefaultAudioTriggerResult,
+  JobHistoryEntry,
+  ManualTriggerRequest,
+  ManualTriggerResult,
+  SetDefaultAudioTriggerRequest,
+  SetDefaultAudioTriggerResult,
+} from "../types/activity";
+import type { TrackedNodeReference } from "../types/library";
 import { apiErrorMessage, apiFetch } from "./client";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -49,4 +58,62 @@ export async function triggerDownmix(input: ManualTriggerRequest): Promise<Manua
     throw new Error(await apiErrorMessage(response, `Failed to trigger downmix (${response.status})`));
   }
   return (await response.json()) as ManualTriggerResult;
+}
+
+/**
+ * Manually enqueues a `SET_DEFAULT_AUDIO` job for one file
+ * (`POST /api/jobs/trigger-default-audio`, COL-155), used by
+ * `FileDetailPage`'s "Set Default Audio Track" action (COL-157).
+ *
+ * Mirrors {@link triggerDownmix}'s request/response handling: a `202` is
+ * returned whether or not a job was enqueued -- the response's `enqueued`
+ * flag (not the HTTP status) distinguishes a queued job from a skipped
+ * file, so this only throws on a genuine error response.
+ */
+export async function triggerSetDefaultAudio(
+  input: SetDefaultAudioTriggerRequest,
+): Promise<SetDefaultAudioTriggerResult> {
+  const response = await apiFetch("/api/jobs/trigger-default-audio", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to trigger Set Default Audio Track (${response.status})`),
+    );
+  }
+  return (await response.json()) as SetDefaultAudioTriggerResult;
+}
+
+/**
+ * Manually enqueues `SET_DEFAULT_AUDIO` jobs for an arbitrary mixed-level
+ * Library selection in one request (`POST /api/jobs/trigger-default-audio/bulk`,
+ * COL-156), used by the Library page's bulk "Set Default Audio Track" action
+ * (COL-158). Mirrors `bulkUpdateTracked`'s (`api/library.ts`, COL-103) shape:
+ * `references` may hold any mix of Series/Season/Episode/Movie references,
+ * cascaded and de-duplicated down to their unique on-disk files server-side.
+ *
+ * A `202` is returned whether or not any individual file was enqueued; each
+ * result's own `enqueued` flag distinguishes queued from skipped, mirroring
+ * {@link triggerSetDefaultAudio}'s single-file skip semantics per file.
+ */
+export async function bulkTriggerSetDefaultAudio(
+  references: TrackedNodeReference[],
+): Promise<BulkSetDefaultAudioTriggerResult> {
+  const body: BulkSetDefaultAudioTriggerRequest = { references };
+  const response = await apiFetch("/api/jobs/trigger-default-audio/bulk", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(
+        response,
+        `Failed to trigger bulk Set Default Audio Track (${response.status})`,
+      ),
+    );
+  }
+  return (await response.json()) as BulkSetDefaultAudioTriggerResult;
 }

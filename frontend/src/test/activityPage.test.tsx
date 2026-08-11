@@ -10,6 +10,7 @@ const historyResponse: JobHistoryEntry[] = [
     job_id: "11111111-1111-1111-1111-111111111111",
     file_path: "/media/movies/Interstellar (2014)/Interstellar.mkv",
     status: "succeeded",
+    kind: "downmix",
     started_at: "2026-07-10T10:00:00Z",
     ended_at: "2026-07-10T10:05:00Z",
     exit_code: 0,
@@ -24,6 +25,7 @@ const historyResponse: JobHistoryEntry[] = [
     job_id: "22222222-2222-2222-2222-222222222222",
     file_path: "/media/tv/Show/Season 01/Show.S01E01.mkv",
     status: "failed",
+    kind: "set_default_audio",
     started_at: "2026-07-11T08:00:00Z",
     ended_at: "2026-07-11T08:01:00Z",
     exit_code: 1,
@@ -80,6 +82,17 @@ describe("ActivityPage", () => {
     expect(scopedFailed.getByText("ffmpeg exited with an error")).toBeInTheDocument();
     expect(scopedFailed.getByText("stereo")).toBeInTheDocument();
     expect(scopedFailed.getByText("fr")).toBeInTheDocument();
+  });
+
+  it("shows each row's job kind, including a historical downmix-kind row (COL-155, COL-157)", async () => {
+    mockFetchResolved(historyResponse);
+    render(<ActivityPage />);
+
+    const succeededRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+    expect(within(succeededRow).getByText("Downmix")).toBeInTheDocument();
+
+    const failedRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
+    expect(within(failedRow).getByText("Set Default Audio Track")).toBeInTheDocument();
   });
 
   it("filters by file path (case-insensitive substring)", async () => {
@@ -195,6 +208,7 @@ describe("ActivityPage", () => {
         job_id: "33333333-3333-3333-3333-333333333333",
         file_path: "/media/tv/Newest/Newest.S01E01.mkv",
         status: "pending",
+        kind: "downmix",
         started_at: null,
         ended_at: null,
         exit_code: null,

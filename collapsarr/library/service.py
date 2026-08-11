@@ -31,13 +31,21 @@ Four responsibilities:
 - :func:`build_tree` / :func:`build_movie_tree` -- the read paths behind
   ``GET /api/library/instances/{id}/tree``: the visible Series > Season >
   Episode tree, or the visible flat Movie list, each node carrying its
-  *resolved* Tracked value. Hidden nodes are omitted from both.
+  *resolved* Tracked value. Hidden nodes are omitted from both. Each
+  Episode/Movie leaf also carries its current-default-track snapshot
+  (COL-154), bridged from :mod:`collapsarr.media.service`'s tracked-media
+  rows the same way Tracked resolution bridges the other direction: one
+  bulk fetch of every tracked-media row for the instance
+  (:func:`~collapsarr.media.service.list_tracked_media_by_instance`), keyed
+  by the same ``sonarr_episode_id``/``radarr_movie_id`` the tree already
+  carries, rather than a per-node query.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -47,12 +55,37 @@ from collapsarr.settings.service import get_global_settings
 
 from .models import LibraryNode, LibraryNodeKind, make_node_key
 
+if TYPE_CHECKING:
+    # Deferred to a function-local import at the two call sites below (and kept
+    # here only for static typing): collapsarr.media.service itself imports
+    # this module (get_node_by_source_id/list_nodes/resolve_tracked, the
+    # Tracked-write bridge, COL-101) to reach the Library node a tracked-media
+    # row belongs to, so importing collapsarr.media.* at module scope here
+    # would be circular -- collapsarr.media.__init__ eagerly imports
+    # .service, which eagerly imports .library.service, before this module
+    # would finish defining the names media.service is trying to import.
+    from collapsarr.media.models import TrackedMediaFile
+
 
 class LibraryNodeNotFoundError(LookupError):
     """Raised when an operation targets a library-node id that does not exist."""
 
 
 # --- read DTOs ---------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TreeDefaultTrack:
+    """A file-bearing leaf node's current Default Audio Track snapshot (COL-154).
+
+    Mirrors :class:`~collapsarr.media.models.TrackedMediaFile`'s
+    ``current_default_language``/``current_default_channel_layout`` columns,
+    refreshed at every existing probe call site (scan, webhook import, manual
+    trigger). Rendered by the Library page as e.g. "Dan · 5.1".
+    """
+
+    language: str
+    channel_layout: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +99,10 @@ class TreeEpisode:
     title: str
     has_file: bool
     tracked: bool
+    #: ``None`` when the file hasn't been probed since COL-154 shipped, or
+    #: its ffprobe metadata carries no Default Audio Track disposition flag
+    #: on any stream -- both render as "unknown" on the Library page.
+    current_default_track: TreeDefaultTrack | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +143,8 @@ class TreeMovie:
     title: str
     has_file: bool
     tracked: bool
+    #: See :attr:`TreeEpisode.current_default_track` (COL-154).
+    current_default_track: TreeDefaultTrack | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +235,27 @@ def resolve_tracked(
             break
         current = nodes_by_id.get(current.parent_id)
     return default_tracked
+
+
+# --- current-default-track enrichment (COL-154) ------------------------------
+
+
+def _adapt_default_track(media: TrackedMediaFile | None) -> TreeDefaultTrack | None:
+    """Adapt a bridged :class:`~collapsarr.media.models.TrackedMediaFile`'s snapshot columns.
+
+    ``None`` when there is no bridged row at all (never probed/scanned via a
+    call site that captured this node's catalog ids), or when the row exists
+    but its snapshot columns are themselves ``NULL`` (never probed since
+    COL-154 shipped, or no stream reports the disposition flag) -- both are
+    the same "unknown" outcome from the Library page's point of view.
+    """
+    if media is None or media.current_default_language is None:
+        return None
+    assert media.current_default_channel_layout is not None  # written together, see the model
+    return TreeDefaultTrack(
+        language=media.current_default_language,
+        channel_layout=media.current_default_channel_layout,
+    )
 
 
 # --- sync --------------------------------------------------------------------
@@ -563,11 +623,22 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
     Hidden nodes are excluded from the output, but the *full* node set (hidden
     included) backs Tracked resolution so an override on a hidden ancestor still
     applies. Series are ordered by title, seasons by season number, episodes by
-    episode number.
+    episode number. Each Episode leaf also carries its current-default-track
+    snapshot (COL-154, see :func:`_adapt_default_track`), bridged from one bulk
+    fetch of the instance's tracked-media rows keyed by ``sonarr_episode_id``.
     """
+    # Local import: see the TYPE_CHECKING note above -- module-scope would be circular.
+    from collapsarr.media.service import list_tracked_media_by_instance
+
     default_tracked = get_global_settings(session).default_tracked
     nodes = list_nodes(session, instance_id)
     nodes_by_id = {node.id: node for node in nodes}
+
+    media_by_episode_id = {
+        media.sonarr_episode_id: media
+        for media in list_tracked_media_by_instance(session, instance_id)
+        if media.sonarr_episode_id is not None
+    }
 
     seasons_by_parent: dict[int, list[LibraryNode]] = defaultdict(list)
     episodes_by_parent: dict[int, list[LibraryNode]] = defaultdict(list)
@@ -611,6 +682,9 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
                         title=episode.title,
                         has_file=episode.has_file,
                         tracked=resolve_tracked(episode, nodes_by_id, default_tracked),
+                        current_default_track=_adapt_default_track(
+                            media_by_episode_id.get(episode.sonarr_episode_id)
+                        ),
                     )
                 )
             assert season.season_number is not None, (
@@ -645,14 +719,23 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
 def build_movie_tree(session: Session, instance_id: int) -> MovieLibraryTree:
     """Build the visible, flat Movie list with resolved Tracked values (COL-99).
 
-    Mirrors :func:`build_tree`'s hidden-node exclusion and Tracked resolution,
-    but flat: a Movie node has no ancestor level, so its resolved value is
-    simply its own override or the global default. Movies are ordered by
-    title.
+    Mirrors :func:`build_tree`'s hidden-node exclusion, Tracked resolution, and
+    current-default-track enrichment (COL-154), but flat: a Movie node has no
+    ancestor level, so its resolved Tracked value is simply its own override or
+    the global default. Movies are ordered by title.
     """
+    # Local import: see the TYPE_CHECKING note above -- module-scope would be circular.
+    from collapsarr.media.service import list_tracked_media_by_instance
+
     default_tracked = get_global_settings(session).default_tracked
     nodes = list_nodes(session, instance_id)
     nodes_by_id = {node.id: node for node in nodes}
+
+    media_by_movie_id = {
+        media.radarr_movie_id: media
+        for media in list_tracked_media_by_instance(session, instance_id)
+        if media.radarr_movie_id is not None
+    }
 
     movie_nodes = [n for n in nodes if n.kind is LibraryNodeKind.MOVIE and not n.hidden]
 
@@ -669,6 +752,9 @@ def build_movie_tree(session: Session, instance_id: int) -> MovieLibraryTree:
                 title=movie.title,
                 has_file=movie.has_file,
                 tracked=resolve_tracked(movie, nodes_by_id, default_tracked),
+                current_default_track=_adapt_default_track(
+                    media_by_movie_id.get(movie.radarr_movie_id)
+                ),
             )
         )
 

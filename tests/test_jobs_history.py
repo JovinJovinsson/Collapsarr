@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.remux import RemuxResult
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
@@ -35,7 +36,14 @@ from collapsarr.jobs.history import (
     record_job_history,
 )
 from collapsarr.jobs.models import JobHistory
-from collapsarr.jobs.queue import Job, JobQueue, JobStatus, PipelineRunner
+from collapsarr.jobs.queue import (
+    DefaultAudioPipelineRunner,
+    Job,
+    JobKind,
+    JobQueue,
+    JobStatus,
+    PipelineRunner,
+)
 from collapsarr.migrations import upgrade_to_head
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
@@ -70,6 +78,7 @@ def test_record_job_history_persists_a_queued_job(session: Session) -> None:
     assert history.job_id == str(job.id)
     assert history.file_path == "/media/movie.mkv"
     assert history.status is JobStatus.PENDING
+    assert history.kind is JobKind.DOWNMIX
     assert history.started_at is None
     assert history.ended_at is None
     assert history.exit_code is None
@@ -224,6 +233,74 @@ def test_list_job_history_combines_file_and_status_filters(session: Session) -> 
 
     assert len(rows) == 1
     assert rows[0].status is JobStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Job kind (COL-155): a SET_DEFAULT_AUDIO job's history row is tagged with its
+# kind and reports the preference (not DownmixSettings) as target/language.
+# ---------------------------------------------------------------------------
+
+_PREFERENCE = DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE)
+
+
+def _stub_default_audio_runner(result: PipelineResult) -> DefaultAudioPipelineRunner:
+    def runner(
+        file_path: Path, preference: DefaultAudioPreference, **_: object
+    ) -> PipelineResult:
+        return result
+
+    return runner
+
+
+def _record_default_audio(session: Session, queue: JobQueue, file_path: str) -> Job:
+    """Enqueue, run, and persist one SET_DEFAULT_AUDIO job for the given queue."""
+    job = queue.enqueue_default_audio(file_path, _PREFERENCE)
+    queue.run_pending()
+    record_job_history(session, job)
+    return job
+
+
+def test_record_job_history_persists_a_set_default_audio_job_kind_and_preference(
+    session: Session,
+) -> None:
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner(_SUCCESS))
+    job = queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
+    queue.run_pending()
+
+    history = record_job_history(session, job)
+
+    assert history.kind is JobKind.SET_DEFAULT_AUDIO
+    assert history.status is JobStatus.SUCCEEDED
+    assert history.target == "5.1"  # the preference's channel tier, not a downmix target
+    assert history.language == "eng"  # the preference's language, not an allow-list
+
+
+def test_list_job_history_filters_by_kind(session: Session) -> None:
+    downmix_queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    default_audio_queue = JobQueue(
+        default_audio_pipeline_runner=_stub_default_audio_runner(_SUCCESS)
+    )
+    _record(session, downmix_queue, "/media/a.mkv", _SUCCESS)
+    _record_default_audio(session, default_audio_queue, "/media/b.mkv")
+
+    downmix_rows = list_job_history(session, kind=JobKind.DOWNMIX)
+    default_audio_rows = list_job_history(session, kind=JobKind.SET_DEFAULT_AUDIO)
+
+    assert [row.file_path for row in downmix_rows] == ["/media/a.mkv"]
+    assert [row.file_path for row in default_audio_rows] == ["/media/b.mkv"]
+
+
+def test_list_job_history_with_no_kind_filter_returns_both_kinds(session: Session) -> None:
+    downmix_queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    default_audio_queue = JobQueue(
+        default_audio_pipeline_runner=_stub_default_audio_runner(_SUCCESS)
+    )
+    _record(session, downmix_queue, "/media/a.mkv", _SUCCESS)
+    _record_default_audio(session, default_audio_queue, "/media/b.mkv")
+
+    rows = list_job_history(session)
+
+    assert {row.file_path for row in rows} == {"/media/a.mkv", "/media/b.mkv"}
 
 
 def test_list_job_history_returns_empty_list_when_nothing_matches(session: Session) -> None:

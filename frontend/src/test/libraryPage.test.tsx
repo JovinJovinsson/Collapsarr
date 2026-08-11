@@ -70,6 +70,7 @@ const seriesTree: LibraryTreeResponse = {
               title: "Pilot",
               has_file: true,
               tracked: true,
+              current_default_track: null,
             },
             {
               id: 31,
@@ -80,6 +81,7 @@ const seriesTree: LibraryTreeResponse = {
               title: "Cat's in the Bag...",
               has_file: false,
               tracked: true,
+              current_default_track: null,
             },
           ],
         },
@@ -120,6 +122,7 @@ const twoSeriesTree: LibraryTreeResponse = {
               title: "Uno",
               has_file: true,
               tracked: true,
+              current_default_track: null,
             },
           ],
         },
@@ -165,6 +168,7 @@ const mixedTrackedTree: LibraryTreeResponse = {
               title: "Uno",
               has_file: true,
               tracked: false,
+              current_default_track: null,
             },
           ],
         },
@@ -214,6 +218,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               title: "The Target",
               has_file: true,
               tracked: true,
+              current_default_track: null,
             },
             {
               id: 34,
@@ -224,6 +229,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               title: "The Detail",
               has_file: true,
               tracked: false,
+              current_default_track: null,
             },
           ],
         },
@@ -242,6 +248,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               title: "Ebb Tide",
               has_file: true,
               tracked: true,
+              current_default_track: null,
             },
           ],
         },
@@ -253,7 +260,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
 const movieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
-    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true },
+    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true, current_default_track: null },
     {
       id: 41,
       kind: "movie",
@@ -261,6 +268,7 @@ const movieTree: MovieLibraryTreeResponse = {
       title: "Dune: Part Two",
       has_file: false,
       tracked: true,
+      current_default_track: null,
     },
   ],
 };
@@ -269,7 +277,7 @@ const movieTree: MovieLibraryTreeResponse = {
 const mixedTrackedMovieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
-    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true },
+    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true, current_default_track: null },
     {
       id: 41,
       kind: "movie",
@@ -277,6 +285,7 @@ const mixedTrackedMovieTree: MovieLibraryTreeResponse = {
       title: "Dune: Part Two",
       has_file: false,
       tracked: false,
+      current_default_track: null,
     },
   ],
 };
@@ -337,6 +346,53 @@ function mockLibraryApiWithToggle({
   };
 }
 
+/**
+ * Routes GET tree/instances requests to canned responses (mutable, same as
+ * `mockLibraryApiWithToggle`) and POST
+ * `/api/jobs/trigger-default-audio/bulk` (COL-156/COL-158) to a canned
+ * `{results: [...]}` ack -- one enqueued result per resolved reference,
+ * recording every call so a test can assert the request body.
+ */
+function mockLibraryApiWithBulkDefaultAudio({
+  instances,
+  tree,
+}: {
+  instances: ArrInstance[];
+  tree: LibraryTreeResponse | MovieLibraryTreeResponse;
+}): { fetchMock: ReturnType<typeof vi.fn>; calls: FetchCall[]; setTree: (next: typeof tree) => void } {
+  let currentTree = tree;
+  const calls: FetchCall[] = [];
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    calls.push({ url, init });
+    if (url === "/api/instances") return jsonResponse(instances);
+    if (/^\/api\/library\/instances\/\d+\/tree$/.test(url)) return jsonResponse(currentTree);
+    if (url === "/api/jobs/trigger-default-audio/bulk" && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as {
+        references: { node_id: number; node_type: string }[];
+      };
+      return jsonResponse({
+        results: body.references.map((reference) => ({
+          file_path: `/media/${reference.node_type}-${reference.node_id}.mkv`,
+          enqueued: true,
+          job: {
+            id: `job-${reference.node_id}`,
+            file_path: `/media/${reference.node_type}-${reference.node_id}.mkv`,
+            status: "pending",
+          },
+        })),
+      });
+    }
+    throw new Error(`Unhandled request in test mock: ${String(init?.method ?? "GET")} ${url}`);
+  });
+  return {
+    fetchMock,
+    calls,
+    setTree: (next) => {
+      currentTree = next;
+    },
+  };
+}
+
 describe("LibraryPage (COL-100)", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -378,6 +434,58 @@ describe("LibraryPage (COL-100)", () => {
 
     expect(within(missingRow).getByText("Missing")).toBeInTheDocument();
     expect(missingRow.className).toContain("library-tree-table__row--dimmed");
+  });
+
+  it("renders the current Default Audio Track column, with a clear unknown state (COL-154)", async () => {
+    const treeWithDefaultTrack: LibraryTreeResponse = {
+      ...seriesTree,
+      series: [
+        {
+          ...seriesTree.series[0],
+          seasons: [
+            {
+              ...seriesTree.series[0].seasons[0],
+              episodes: [
+                {
+                  ...seriesTree.series[0].seasons[0].episodes[0],
+                  current_default_track: { language: "dan", channel_layout: "5.1" },
+                },
+                seriesTree.series[0].seasons[0].episodes[1], // current_default_track: null
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: treeWithDefaultTrack }));
+    renderLibraryPage(1);
+
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+
+    const pilotRow = (await screen.findByText(/pilot/i)).closest("tr") as HTMLElement;
+    expect(within(pilotRow).getByText("Dan · 5.1")).toBeInTheDocument();
+
+    const unprobedRow = screen.getByText(/cat's in the bag/i).closest("tr") as HTMLElement;
+    expect(within(unprobedRow).getByText("Unknown")).toBeInTheDocument();
+  });
+
+  it("renders the current Default Audio Track column for a flat Movie list (COL-154)", async () => {
+    const movieTreeWithDefaultTrack: MovieLibraryTreeResponse = {
+      ...movieTree,
+      movies: [
+        { ...movieTree.movies[0], current_default_track: { language: "eng", channel_layout: "5.1" } },
+        movieTree.movies[1], // current_default_track: null
+      ],
+    };
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [radarrInstance], tree: movieTreeWithDefaultTrack }));
+    renderLibraryPage(2);
+
+    const interstellarRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+    expect(within(interstellarRow).getByText("Eng · 5.1")).toBeInTheDocument();
+
+    const duneRow = screen.getByText("Dune: Part Two").closest("tr") as HTMLElement;
+    expect(within(duneRow).getByText("Unknown")).toBeInTheDocument();
   });
 
   it("renders a Radarr instance's flat Movie list with no season/episode nesting", async () => {
@@ -591,17 +699,17 @@ describe("LibraryPage (COL-100)", () => {
     vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: seriesTree }));
     renderLibraryPage(1);
 
-    expect(screen.queryByRole("toolbar", { name: /bulk tracked actions/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("toolbar", { name: /bulk library actions/i })).not.toBeInTheDocument();
 
     const seriesCheckbox = await screen.findByRole("checkbox", { name: /select breaking bad$/i });
     fireEvent.click(seriesCheckbox);
 
-    expect(await screen.findByRole("toolbar", { name: /bulk tracked actions/i })).toBeInTheDocument();
+    expect(await screen.findByRole("toolbar", { name: /bulk library actions/i })).toBeInTheDocument();
     expect(screen.getByText(/1 row selected/i)).toBeInTheDocument();
 
     fireEvent.click(seriesCheckbox);
 
-    expect(screen.queryByRole("toolbar", { name: /bulk tracked actions/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("toolbar", { name: /bulk library actions/i })).not.toBeInTheDocument();
   });
 
   it("retains checkbox selections across different series/seasons/levels through expand/collapse (COL-103)", async () => {
@@ -706,7 +814,7 @@ describe("LibraryPage (COL-100)", () => {
 
     // Toolbar disappears -- selection cleared after a successful apply.
     await vi.waitFor(() => {
-      expect(screen.queryByRole("toolbar", { name: /bulk tracked actions/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("toolbar", { name: /bulk library actions/i })).not.toBeInTheDocument();
     });
 
     // Refetch landed without a manual refresh: the directly-selected sibling
@@ -720,6 +828,143 @@ describe("LibraryPage (COL-100)", () => {
     fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
     const unoRow = (await screen.findByText(/uno/i)).closest("tr") as HTMLElement;
     expect(within(unoRow).getByRole("button", { name: /^not tracked$/i })).toBeInTheDocument();
+  });
+
+  it("shows a 'Set Default Audio Track' bulk action alongside the Tracked actions once a row is selected (COL-158)", async () => {
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: seriesTree }));
+    renderLibraryPage(1);
+
+    expect(screen.queryByRole("button", { name: /set default audio track/i })).not.toBeInTheDocument();
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select breaking bad$/i }));
+
+    expect(await screen.findByRole("button", { name: /set default audio track/i })).toBeInTheDocument();
+  });
+
+  it("applies the bulk Set Default Audio Track action to the whole mixed-level selection in one request and honestly summarizes the trigger's own enqueued/already-correct result (COL-158)", async () => {
+    // Deliberately does NOT swap the mocked tree to an "after" state before
+    // clicking: `SET_DEFAULT_AUDIO` jobs run asynchronously (probe -> remux
+    // -> re-probe), well after the trigger request returns, so a genuinely
+    // honest test can't pretend the Default Audio column already reflects
+    // the job's outcome. What the trigger response *does* know synchronously
+    // is, per resolved file, whether a job was enqueued or the file was
+    // already correct -- that's what this test asserts gets surfaced.
+    const calls: FetchCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        if (url === "/api/instances") return jsonResponse([sonarrInstance]);
+        if (/^\/api\/library\/instances\/\d+\/tree$/.test(url)) return jsonResponse(twoSeriesTree);
+        if (url === "/api/jobs/trigger-default-audio/bulk" && init?.method === "POST") {
+          return jsonResponse({
+            results: [
+              {
+                file_path: "/media/better-call-saul-s1e1.mkv",
+                enqueued: true,
+                job: { id: "job-1", file_path: "/media/better-call-saul-s1e1.mkv", status: "pending" },
+              },
+              {
+                file_path: "/media/breaking-bad-s1e2.mkv",
+                enqueued: false,
+                job: null,
+              },
+            ],
+          });
+        }
+        throw new Error(`Unhandled request in test mock: ${String(init?.method ?? "GET")} ${url}`);
+      }),
+    );
+    renderLibraryPage(1);
+
+    // Same cross-branch, cross-level selection shape as the bulk Tracked
+    // test: the "Better Call Saul" series row plus "Breaking Bad"'s sibling
+    // episode "Cat's in the Bag...".
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select better call saul$/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select breaking bad s1e2/i }));
+
+    expect(await screen.findByText(/2 rows selected/i)).toBeInTheDocument();
+
+    // The sibling episode's Default Audio column reads its real,
+    // still-unknown value going in.
+    const siblingRowBefore = (await screen.findByText(/cat's in the bag/i)).closest("tr") as HTMLElement;
+    expect(within(siblingRowBefore).getByText("Unknown")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /set default audio track/i }));
+    });
+
+    const bulkCall = await vi.waitFor(() => {
+      const match = calls.find((call) => call.url === "/api/jobs/trigger-default-audio/bulk");
+      if (!match) throw new Error("not yet called");
+      return match;
+    });
+    expect(bulkCall.init?.method).toBe("POST");
+    const body = JSON.parse(String(bulkCall.init?.body)) as {
+      references: { node_type: string; node_id: number }[];
+    };
+    expect(body.references).toHaveLength(2);
+    expect(body.references).toEqual(
+      expect.arrayContaining([
+        { node_type: "series", node_id: 11 },
+        { node_type: "episode", node_id: 31 },
+      ]),
+    );
+
+    // Toolbar disappears -- selection cleared after a successful apply.
+    await vi.waitFor(() => {
+      expect(screen.queryByRole("toolbar", { name: /bulk library actions/i })).not.toBeInTheDocument();
+    });
+
+    // The trigger response's real, synchronously-known result is surfaced --
+    // one job enqueued, one file already correct/skipped -- not a fabricated
+    // claim that the column values already updated.
+    expect(
+      await screen.findByText(/1 job enqueued, 1 already correct or skipped/i),
+    ).toBeInTheDocument();
+
+    // The refetch landed (the tree endpoint was hit again after the trigger)
+    // but since the mocked tree never changes, the sibling episode's Default
+    // Audio column still honestly reads its real, not-yet-updated value --
+    // the enqueued job hasn't run, so there is nothing new to show yet.
+    const treeCallCount = calls.filter((call) =>
+      /^\/api\/library\/instances\/\d+\/tree$/.test(call.url),
+    ).length;
+    expect(treeCallCount).toBeGreaterThanOrEqual(2);
+    const siblingRowAfter = (await screen.findByText(/cat's in the bag/i)).closest("tr") as HTMLElement;
+    expect(within(siblingRowAfter).getByText("Unknown")).toBeInTheDocument();
+  });
+
+  it("shows an inline error, distinct from the Tracked error, when the bulk Set Default Audio Track request fails (COL-158)", async () => {
+    const { calls } = mockLibraryApiWithBulkDefaultAudio({
+      instances: [sonarrInstance],
+      tree: seriesTree,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        if (url === "/api/instances") return jsonResponse([sonarrInstance]);
+        if (/^\/api\/library\/instances\/\d+\/tree$/.test(url)) return jsonResponse(seriesTree);
+        if (url === "/api/jobs/trigger-default-audio/bulk") return jsonResponse({ detail: "boom" }, 500);
+        throw new Error(`Unhandled request in test mock: GET ${url}`);
+      }),
+    );
+    renderLibraryPage(1);
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select breaking bad$/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /set default audio track/i }));
+
+    expect(
+      await screen.findByText(/couldn't trigger set default audio track: boom/i),
+    ).toBeInTheDocument();
+    // The unrelated Tracked error never fires alongside it.
+    expect(screen.queryByText(/couldn't update tracked/i)).not.toBeInTheDocument();
+    // Selection is retained (not cleared) after a failed apply, same as a
+    // failed bulk Tracked apply -- the user can retry as-is.
+    expect(await screen.findByText(/1 row selected/i)).toBeInTheDocument();
   });
 
   it("narrows to the Series matching the search query and shows its whole subtree (COL-104)", async () => {

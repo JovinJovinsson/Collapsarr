@@ -83,6 +83,24 @@ export interface GlobalSettings {
    * resolved to at boot.
    */
   log_level: LogLevel | null;
+  /**
+   * Preferred Default Audio language code (COL-151), e.g. `"eng"`. `null`
+   * when unset -- paired with `default_audio_channel_tier` to pick which
+   * resulting downmix track becomes a file's default audio track.
+   */
+  default_audio_language: string | null;
+  /**
+   * Preferred Default Audio channel tier (COL-151). `null` when unset --
+   * paired with `default_audio_language`.
+   */
+  default_audio_channel_tier: DownmixTarget | null;
+  /**
+   * Opt-in gate (COL-151) for whether the downmix pipeline actually applies
+   * the Preferred Default Audio preference. Default `false`; only takes
+   * effect once both `default_audio_language` and
+   * `default_audio_channel_tier` are set.
+   */
+  auto_set_default_audio: boolean;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -114,4 +132,7 @@ export interface GlobalSettingsUpdateInput {
   update_channel?: UpdateChannel;
   default_tracked?: boolean;
   log_level?: LogLevel | null;
+  default_audio_language?: string | null;
+  default_audio_channel_tier?: DownmixTarget | null;
+  auto_set_default_audio?: boolean;
 }

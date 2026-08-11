@@ -11,6 +11,18 @@
  * response body itself -- see `isMovieTree`.
  */
 
+/**
+ * A file-bearing leaf node's current Default Audio Track snapshot (COL-154),
+ * matching `collapsarr.library.routes.CurrentDefaultTrack`. `null` on the
+ * owning node means "unknown" -- the file hasn't been probed since this
+ * shipped, or its ffprobe metadata carries no Default Audio Track
+ * disposition flag on any stream -- not "no audio at all".
+ */
+export interface CurrentDefaultTrack {
+  language: string;
+  channel_layout: string;
+}
+
 /** A leaf Episode node, matching `collapsarr.library.routes.EpisodeNode`. */
 export interface EpisodeNode {
   id: number;
@@ -21,6 +33,7 @@ export interface EpisodeNode {
   title: string;
   has_file: boolean;
   tracked: boolean;
+  current_default_track: CurrentDefaultTrack | null;
 }
 
 /** A Season node with its Episode children, matching `...routes.SeasonNode`. */
@@ -56,6 +69,7 @@ export interface MovieNode {
   title: string;
   has_file: boolean;
   tracked: boolean;
+  current_default_track: CurrentDefaultTrack | null;
 }
 
 /** A Radarr instance's flat Movie list (COL-99), matching `...routes.MovieLibraryTreeResponse`. */

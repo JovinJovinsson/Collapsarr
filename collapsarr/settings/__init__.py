@@ -20,6 +20,7 @@ from .env_seed import seed_auth_from_env
 from .models import SETTINGS_ID, GlobalSettings, generate_api_key, generate_session_secret
 from .passwords import hash_password, verify_password
 from .service import (
+    as_default_audio_preference,
     as_downmix_settings,
     get_global_settings,
     rotate_session_secret,
@@ -30,6 +31,7 @@ from .service import (
 __all__ = [
     "SETTINGS_ID",
     "GlobalSettings",
+    "as_default_audio_preference",
     "as_downmix_settings",
     "generate_api_key",
     "generate_session_secret",

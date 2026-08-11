@@ -153,6 +153,50 @@ def test_remux_preserves_video_and_subtitles_uncopied_and_tags_new_audio_languag
             result.temp_file_path.unlink(missing_ok=True)
 
 
+def _probe_default_dispositions(path: Path) -> list[int]:
+    """Return ``disposition.default`` (0/1) for every audio stream, in order."""
+    proc = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-select_streams",
+            "a",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [
+        int(s.get("disposition", {}).get("default", 0))
+        for s in json.loads(proc.stdout)["streams"]
+    ]
+
+
+@requires_ffmpeg
+def test_remux_lands_default_disposition_on_the_requested_output_audio_index() -> None:
+    """The disposition flags land on the correct final-layout output audio streams."""
+    fixture = FIXTURES_DIR / "multi_lang.mkv"
+    streams = probe_audio_streams(fixture)
+    settings = DownmixSettings(enabled_targets=ALL_TARGETS)
+    targets = detect_qualifying_targets(streams, settings)
+    # Final audio layout has 4 streams: orig eng stereo @ a:0, orig fre 5.1 @ a:1,
+    # new fre stereo @ a:2, new fre 2.1 @ a:3. Request default on the new fre
+    # stereo track (a:2) and expect every other audio stream cleared.
+    result = run_remux(fixture, streams, targets, settings, default_audio_index=2)
+    try:
+        assert result.success is True
+        assert result.temp_file_path is not None
+        assert _probe_default_dispositions(result.temp_file_path) == [0, 0, 1, 0]
+    finally:
+        if result.temp_file_path is not None:
+            result.temp_file_path.unlink(missing_ok=True)
+
+
 @requires_ffmpeg
 def test_remux_leaves_no_orphan_temp_file_when_ffmpeg_fails() -> None:
     """A real ffmpeg failure (nonexistent input) leaves no temp file behind."""
@@ -270,11 +314,89 @@ def test_build_remux_command_stacks_multiple_targets_at_sequential_output_indice
     assert map_indices == ["0", "0:0", "0:0"]
 
 
+def test_build_remux_command_adds_no_disposition_flags_by_default() -> None:
+    """Toggle-off path: no ``-disposition`` flags at all -> byte-for-byte unchanged."""
+    streams = [_stream(index=0, channels=6, language="eng", codec="flac")]
+    targets = [QualifyingTarget(language="eng", target=DownmixTarget.STEREO)]
+
+    command = build_remux_command("in.mkv", "out.mkv", streams, targets, DownmixSettings())
+
+    assert not any(arg.startswith("-disposition") for arg in command)
+
+
+def test_build_remux_command_sets_default_on_a_new_track_and_clears_the_rest() -> None:
+    streams = [_stream(index=0, channels=6, language="eng", codec="flac")]
+    targets = [QualifyingTarget(language="eng", target=DownmixTarget.STEREO)]
+
+    # Final audio layout: orig eng 6ch @ a:0, new eng stereo @ a:1.
+    command = build_remux_command(
+        "in.mkv", "out.mkv", streams, targets, DownmixSettings(), default_audio_index=1
+    )
+
+    assert command[command.index("-disposition:a:0") + 1] == "0"
+    assert command[command.index("-disposition:a:1") + 1] == "default"
+    # The disposition block covers exactly the two output audio streams.
+    assert "-disposition:a:2" not in command
+
+
+def test_build_remux_command_sets_default_on_an_existing_stream_and_clears_others() -> None:
+    streams = [
+        _stream(index=0, channels=2, language="eng", codec="aac"),
+        _stream(index=1, channels=6, language="eng", codec="ac3"),
+    ]
+    targets = [QualifyingTarget(language="eng", target=DownmixTarget.TWO_POINT_ONE)]
+
+    # Final audio layout: orig 2ch @ a:0, orig 6ch @ a:1, new 2.1 @ a:2.
+    command = build_remux_command(
+        "in.mkv",
+        "out.mkv",
+        streams,
+        targets,
+        DownmixSettings(enabled_targets=ALL_TARGETS),
+        default_audio_index=0,
+    )
+
+    assert command[command.index("-disposition:a:0") + 1] == "default"
+    assert command[command.index("-disposition:a:1") + 1] == "0"
+    assert command[command.index("-disposition:a:2") + 1] == "0"
+
+
+def test_build_remux_command_rejects_an_out_of_range_default_audio_index() -> None:
+    streams = [_stream(index=0, channels=6, language="eng")]
+    targets = [QualifyingTarget(language="eng", target=DownmixTarget.STEREO)]
+
+    # Only 2 output audio streams (indices 0, 1); index 2 is out of range.
+    with pytest.raises(ValueError, match="default_audio_index"):
+        build_remux_command(
+            "in.mkv", "out.mkv", streams, targets, DownmixSettings(), default_audio_index=2
+        )
+
+
 def test_build_remux_command_raises_for_empty_qualifying_targets() -> None:
     streams = [_stream(index=0, channels=6, language="eng")]
 
     with pytest.raises(ValueError, match="qualifying_targets"):
         build_remux_command("in.mkv", "out.mkv", streams, [], DownmixSettings())
+
+
+def test_build_remux_command_allows_empty_targets_when_default_audio_index_is_set() -> None:
+    """Disposition-only remux (COL-153): empty targets is legitimate with a real index."""
+    streams = [
+        _stream(index=0, channels=6, language="eng", codec="ac3"),
+        _stream(index=1, channels=2, language="fre", codec="aac"),
+    ]
+
+    command = build_remux_command(
+        "in.mkv", "out.mkv", streams, [], DownmixSettings(), default_audio_index=1
+    )
+
+    # Only the blanket `-map 0` -- no per-target `-map 0:<index>`, no `-c:a:N`
+    # codec overrides -- every stream is stream-copied, none re-encoded.
+    map_indices = [command[i + 1] for i, arg in enumerate(command) if arg == "-map"]
+    assert map_indices == ["0"]
+    assert not any(arg.startswith("-c:a:") for arg in command)
+    assert command[command.index("-disposition:a:0") + 1] == "0"
+    assert command[command.index("-disposition:a:1") + 1] == "default"
 
 
 def test_build_remux_command_raises_when_no_stream_matches_targets_language() -> None:
@@ -397,6 +519,23 @@ def test_run_remux_raises_value_error_without_creating_temp_file_for_empty_targe
     assert list(tmp_path.iterdir()) == [source]
 
 
+def test_run_remux_succeeds_with_empty_targets_when_default_audio_index_is_set(
+    tmp_path: Path,
+) -> None:
+    """Disposition-only remux (COL-153): empty targets + a real index is not an error."""
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"")
+    streams = [_stream(index=0, channels=6, language="eng")]
+    _, runner = _stub_runner(returncode=0)
+
+    result = run_remux(
+        source, streams, [], DownmixSettings(), default_audio_index=0, runner=runner  # type: ignore[arg-type]
+    )
+
+    assert result.success is True
+    assert result.temp_file_path is not None
+
+
 def test_run_remux_raises_value_error_without_creating_temp_file_for_unmatched_language(
     tmp_path: Path,
 ) -> None:
@@ -437,3 +576,19 @@ def test_run_remux_passes_ffmpeg_path_and_timeout_through_to_runner(tmp_path: Pa
     command = captured["command"]
     assert isinstance(command, list)
     assert command[0] == "/opt/homebrew/bin/ffmpeg"
+
+
+def test_run_remux_forwards_default_audio_index_into_the_command(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"")
+    streams = [_stream(index=0, channels=6, language="eng")]
+    targets = [QualifyingTarget(language="eng", target=DownmixTarget.STEREO)]
+    calls, runner = _stub_runner(returncode=0)
+
+    run_remux(
+        source, streams, targets, DownmixSettings(), default_audio_index=1, runner=runner  # type: ignore[arg-type]
+    )
+
+    command = calls[0]
+    assert command[command.index("-disposition:a:0") + 1] == "0"
+    assert command[command.index("-disposition:a:1") + 1] == "default"

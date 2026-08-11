@@ -68,6 +68,10 @@ from collapsarr.downmix.apply import (
     ApplyResult,
     apply_remux_result,
 )
+from collapsarr.downmix.default_audio import (
+    DefaultAudioPreference,
+    resolve_default_audio_output_index,
+)
 from collapsarr.downmix.probe import FfprobeError, probe_audio_streams
 from collapsarr.downmix.remux import RemuxResult, run_remux
 from collapsarr.downmix.targets import DownmixSettings, QualifyingTarget, detect_qualifying_targets
@@ -161,6 +165,8 @@ def run_downmix_pipeline(
     probe_timeout: float = _DEFAULT_PROBE_TIMEOUT,
     remux_timeout: float = _DEFAULT_REMUX_TIMEOUT,
     duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS,
+    default_audio_preference: DefaultAudioPreference | None = None,
+    auto_set_default_audio: bool = False,
     runner: _Runner | None = None,
 ) -> PipelineResult:
     """Run the full downmix pipeline for a single file, end to end.
@@ -203,6 +209,18 @@ def run_downmix_pipeline(
     On success, the original file has been atomically replaced by the
     remuxed version (all original streams intact, plus the newly added
     downmix track(s)), and ``tracks_added`` lists what was added.
+
+    The automatic in-band Default Audio Track fix (COL-152) is opt-in and off
+    by default: only when ``auto_set_default_audio`` is ``True`` *and* a
+    ``default_audio_preference`` is supplied does this resolve the winning
+    stream across the job's final layout (existing streams plus the tracks it is
+    about to encode) via
+    :func:`~collapsarr.downmix.default_audio.resolve_default_audio_output_index`
+    and fold the disposition change into the *same* remux invocation and atomic
+    swap as the downmix — never a second pass. With the toggle off (the
+    default), or when the resolver reports nothing needs changing, no
+    disposition flags are emitted and the remux command is byte-for-byte what it
+    would be without this feature.
     """
     path = Path(file_path)
 
@@ -231,6 +249,12 @@ def run_downmix_pipeline(
             logging.WARNING,
         )
 
+    default_audio_index: int | None = None
+    if auto_set_default_audio and default_audio_preference is not None:
+        default_audio_index = resolve_default_audio_output_index(
+            streams, targets, default_audio_preference
+        )
+
     remux_result = run_remux(
         path,
         streams,
@@ -238,6 +262,7 @@ def run_downmix_pipeline(
         settings,
         ffmpeg_path=ffmpeg_path,
         timeout=remux_timeout,
+        default_audio_index=default_audio_index,
         runner=runner,
     )
     if not remux_result.success:

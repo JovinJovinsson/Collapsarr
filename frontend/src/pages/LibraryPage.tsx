@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
+import { bulkTriggerSetDefaultAudio } from "../api/activity";
 import {
   bulkUpdateTracked,
   fetchLibraryTree,
@@ -10,8 +11,10 @@ import {
 import { LibraryIcon } from "../components/icons";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import { useInstances } from "../hooks/useInstances";
+import type { BulkSetDefaultAudioTriggerResult } from "../types/activity";
 import type { ArrInstance } from "../types/instances";
 import type {
+  CurrentDefaultTrack,
   EpisodeNode,
   LibraryNodeKind,
   LibraryTree,
@@ -42,6 +45,43 @@ function FileStatusBadge({ hasFile }: { hasFile: boolean }) {
       {hasFile ? "Has file" : "Missing"}
     </span>
   );
+}
+
+/** Title-cases the first character only -- "stereo" -> "Stereo", "5.1"/"unknown" pass through/normalize as-is. */
+function capitalizeFirst(value: string): string {
+  return value.length === 0 ? value : value[0].toUpperCase() + value.slice(1);
+}
+
+/**
+ * Formats a current Default Audio Track snapshot (COL-154) for display, e.g.
+ * "Dan · 5.1". Both halves come straight from the probed ffprobe metadata
+ * (a language tag, e.g. "dan", and a channel layout, e.g. "5.1"/"stereo") --
+ * only capitalized, not translated into a full language name, since the
+ * backend doesn't carry one.
+ */
+function formatCurrentDefaultTrack(track: CurrentDefaultTrack): string {
+  return `${capitalizeFirst(track.language)} · ${capitalizeFirst(track.channel_layout)}`;
+}
+
+/**
+ * The current Default Audio Track column's cell (COL-154), shared by
+ * `SeriesTree`'s episode rows and `MovieTable`'s rows -- the file-bearing
+ * leaf levels the backend actually attaches a snapshot to. `track === null`
+ * is a clear "unknown" state (dimmed, matching `FileStatusBadge`'s missing
+ * styling) -- covers both a file that hasn't been probed since this shipped
+ * and one whose ffprobe metadata carries no Default Audio Track disposition
+ * flag on any stream; both are indistinguishable to this cell and rendered
+ * the same way.
+ */
+function DefaultAudioTrackCell({ track }: { track: CurrentDefaultTrack | null }) {
+  if (track === null) {
+    return (
+      <span className="library-tree-table__default-track library-tree-table__default-track--unknown">
+        Unknown
+      </span>
+    );
+  }
+  return <span className="library-tree-table__default-track">{formatCurrentDefaultTrack(track)}</span>;
 }
 
 /**
@@ -365,6 +405,7 @@ function SeriesTree({
             <th scope="col">Select</th>
             <th scope="col">Title</th>
             <th scope="col">File</th>
+            <th scope="col">Default Audio</th>
             <th scope="col">Tracked</th>
           </tr>
         </thead>
@@ -395,6 +436,7 @@ function SeriesTree({
                       {seriesNode.title}
                     </button>
                   </td>
+                  <td />
                   <td />
                   <td>
                     <TrackedToggleButton
@@ -432,6 +474,7 @@ function SeriesTree({
                             </button>
                           </td>
                           <td />
+                          <td />
                           <td>
                             <TrackedToggleButton
                               tracked={seasonNode.tracked}
@@ -463,6 +506,9 @@ function SeriesTree({
                               </td>
                               <td>
                                 <FileStatusBadge hasFile={episode.has_file} />
+                              </td>
+                              <td>
+                                <DefaultAudioTrackCell track={episode.current_default_track} />
                               </td>
                               <td>
                                 <TrackedToggleButton
@@ -504,6 +550,7 @@ function MovieTable({
             <th scope="col">Select</th>
             <th scope="col">Title</th>
             <th scope="col">File</th>
+            <th scope="col">Default Audio</th>
             <th scope="col">Tracked</th>
           </tr>
         </thead>
@@ -525,6 +572,9 @@ function MovieTable({
                 <FileStatusBadge hasFile={movie.has_file} />
               </td>
               <td>
+                <DefaultAudioTrackCell track={movie.current_default_track} />
+              </td>
+              <td>
                 <TrackedToggleButton
                   tracked={movie.tracked}
                   pending={pendingNodeId === movie.id}
@@ -540,26 +590,34 @@ function MovieTable({
 }
 
 /**
- * The bulk-action toolbar (COL-103): appears once the cross-level selection
- * holds at least one reference, offering "Mark Tracked" / "Mark Not Tracked"
- * across the whole mixed-level selection in a single bulk-update request.
- * Renders nothing once the selection is empty, so it disappears the moment
- * the last checked row is unchecked or a successful apply clears it.
+ * The bulk-action toolbar (COL-103/COL-158): appears once the cross-level
+ * selection holds at least one reference, offering "Mark Tracked"/"Mark Not
+ * Tracked" and "Set Default Audio Track" across the whole mixed-level
+ * selection, each in a single request. Renders nothing once the selection is
+ * empty, so it disappears the moment the last checked row is unchecked or a
+ * successful apply clears it.
+ *
+ * "Set Default Audio Track" (COL-158) reuses the exact same `pending` guard
+ * and disabled styling as the Tracked actions -- `LibraryPage` only ever runs
+ * one bulk action at a time, so there's no need for the toolbar to track
+ * which specific action is in flight.
  */
 function BulkActionToolbar({
   count,
   pending,
   onApply,
+  onApplyDefaultAudio,
   onClear,
 }: {
   count: number;
   pending: boolean;
   onApply: (tracked: boolean) => void;
+  onApplyDefaultAudio: () => void;
   onClear: () => void;
 }) {
   if (count === 0) return null;
   return (
-    <div className="library-bulk-toolbar" role="toolbar" aria-label="Bulk Tracked actions">
+    <div className="library-bulk-toolbar" role="toolbar" aria-label="Bulk library actions">
       <span className="library-bulk-toolbar__count">
         {count} {count === 1 ? "row" : "rows"} selected
       </span>
@@ -573,6 +631,14 @@ function BulkActionToolbar({
         onClick={() => onApply(false)}
       >
         {pending ? "Updating…" : "Mark Not Tracked"}
+      </button>
+      <button
+        type="button"
+        className="btn btn--secondary btn--sm"
+        disabled={pending}
+        onClick={onApplyDefaultAudio}
+      >
+        {pending ? "Updating…" : "Set Default Audio Track"}
       </button>
       <button
         type="button"
@@ -608,6 +674,23 @@ function BulkActionToolbar({
  * (including any cascade to a selected Series/Season's descendants) without
  * a manual refresh. A successful bulk apply clears the selection; a failed
  * one leaves it as-is so the user can retry.
+ *
+ * The toolbar's "Set Default Audio Track" action (COL-158) sends that same
+ * selection to `POST /api/jobs/trigger-default-audio/bulk` (COL-156)
+ * instead, via `handleBulkSetDefaultAudio` -- identical selection-decoding
+ * to `handleBulkApply`, but a materially different result: unlike the
+ * Tracked bulk-update (a synchronous server-side write), this endpoint only
+ * *enqueues* `SET_DEFAULT_AUDIO` jobs; a file's Default Audio column can only
+ * actually change once its job finishes running (probe -> remux ->
+ * re-probe), well after this request returns. `loadTree()` is still called
+ * afterwards -- it's accurate for any file the trigger skipped as
+ * already-correct, it just can't show a value that doesn't exist yet for a
+ * freshly-enqueued one -- and the response's own per-file
+ * enqueued/already-correct breakdown (the only genuinely synchronous result)
+ * is shown as a summary instead, mirroring COL-157's single-file button.
+ * Separate error state from `handleBulkApply`'s, since the two actions run
+ * independently (a Tracked failure shouldn't be reported as a Default Audio
+ * Track failure or vice versa).
  *
  * "Select all" (COL-109), at the top of `SeriesTree`/`MovieTable`, adds every
  * currently-rendered (post search/Tracked-filter) node's reference to that
@@ -645,6 +728,17 @@ export function LibraryPage() {
   // references at once, independent of which branch each lives under.
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkPending, setBulkPending] = useState(false);
+  // Separate from `toggleError` (COL-101/COL-103, Tracked-specific) so a
+  // Set Default Audio Track failure (COL-158) doesn't render under a
+  // "Couldn't update Tracked" message that has nothing to do with it.
+  const [defaultAudioError, setDefaultAudioError] = useState<string | null>(null);
+  // The last bulk Set Default Audio Track trigger's response (COL-158): the
+  // only genuinely synchronous outcome of that call is its per-file
+  // enqueued/already-correct breakdown, since the jobs it enqueues run well
+  // after the response lands -- this is what gets summarized on screen
+  // instead of implying the tree's Default Audio column is already live.
+  const [defaultAudioResult, setDefaultAudioResult] =
+    useState<BulkSetDefaultAudioTriggerResult | null>(null);
   // Title search + Tracked filter (COL-104), composed via AND below.
   const [searchQuery, setSearchQuery] = useState("");
   const [trackedFilter, setTrackedFilter] = useState<TrackedFilterValue>("all");
@@ -762,6 +856,79 @@ export function LibraryPage() {
     }
   }
 
+  /**
+   * "Set Default Audio Track" bulk action (COL-158): sends the same
+   * cross-level selection `handleBulkApply` sends, decoded the same way, to
+   * `POST /api/jobs/trigger-default-audio/bulk` (COL-156) instead -- that
+   * endpoint does its own Series/Season cascade and de-dup down to each
+   * selected leaf's on-disk file, mirroring `POST /api/library/tracked`'s
+   * cascade.
+   *
+   * Unlike `handleBulkApply`'s Tracked write, this endpoint only *enqueues*
+   * `SET_DEFAULT_AUDIO` jobs -- a resolved file's Default Audio column can
+   * only actually change once its job finishes running (probe -> remux ->
+   * re-probe), which doesn't happen within this request/response cycle. So
+   * `loadTree()` alone can't honestly claim to "show the result": a file the
+   * response skipped as already-correct will show its real (unchanged, still
+   * correct) value, but a freshly-enqueued file's column simply hasn't
+   * changed yet. The response's own per-file enqueued/already-correct
+   * breakdown *is* synchronously known, though, so that's what's kept in
+   * `defaultAudioResult` and summarized on screen -- mirroring how COL-157's
+   * single-file button reports its own enqueued-vs-skipped result -- rather
+   * than the UI silently implying the column is already live-updated.
+   * Selection clears on success only, so a failed apply can be retried as-is.
+   */
+  async function handleBulkSetDefaultAudio() {
+    if (selected.size === 0) return;
+    setDefaultAudioError(null);
+    setDefaultAudioResult(null);
+    setBulkPending(true);
+    try {
+      const references: TrackedNodeReference[] = Array.from(selected).map(decodeSelectionKey);
+      const result = await bulkTriggerSetDefaultAudio(references);
+      setDefaultAudioResult(result);
+      // Still correct to refetch: any already-correct (skipped) file shows
+      // its real, unchanged value. A file with a job merely enqueued simply
+      // won't have changed yet -- that's accurate, not a bug, and is exactly
+      // what `defaultAudioResult`'s summary communicates below.
+      await loadTree();
+      handleClearSelection();
+    } catch (error: unknown) {
+      setDefaultAudioError(error instanceof Error ? error.message : "Unknown error.");
+    } finally {
+      setBulkPending(false);
+    }
+  }
+
+  /**
+   * Renders a bulk Set Default Audio Track trigger's response as plain text
+   * (COL-158): the only thing genuinely known synchronously right after
+   * `POST /api/jobs/trigger-default-audio/bulk` returns is, per resolved
+   * file, whether a `SET_DEFAULT_AUDIO` job was enqueued or the file was
+   * already correct (skipped) -- mirrors `FileDetailPage`'s single-file
+   * enqueued/skipped result text (COL-157) rather than implying the Default
+   * Audio column already reflects it.
+   */
+  function summarizeDefaultAudioResult(result: BulkSetDefaultAudioTriggerResult): string {
+    const total = result.results.length;
+    if (total === 0) {
+      return "No files resolved from the selection — nothing was triggered.";
+    }
+    const enqueuedCount = result.results.filter((entry) => entry.enqueued).length;
+    const alreadyCorrectCount = total - enqueuedCount;
+    const parts: string[] = [];
+    if (enqueuedCount > 0) {
+      parts.push(`${enqueuedCount} job${enqueuedCount === 1 ? "" : "s"} enqueued`);
+    }
+    if (alreadyCorrectCount > 0) {
+      parts.push(`${alreadyCorrectCount} already correct or skipped`);
+    }
+    const summary = parts.join(", ");
+    return enqueuedCount > 0
+      ? `${summary}. Enqueued jobs haven't run yet — their Default Audio column value will update once each job completes.`
+      : `${summary}.`;
+  }
+
   const instance =
     instancesState.status === "ready"
       ? (instancesState.instances.find((candidate) => candidate.id === instanceId) ?? null)
@@ -821,11 +988,24 @@ export function LibraryPage() {
       )}
 
       {toggleError && <p className="form-error">Couldn&apos;t update Tracked: {toggleError}</p>}
+      {defaultAudioError && (
+        <p className="form-error">Couldn&apos;t trigger Set Default Audio Track: {defaultAudioError}</p>
+      )}
+      {defaultAudioResult && (
+        <p
+          className={
+            defaultAudioResult.results.some((entry) => entry.enqueued) ? "form-success" : "form-hint"
+          }
+        >
+          {summarizeDefaultAudioResult(defaultAudioResult)}
+        </p>
+      )}
 
       <BulkActionToolbar
         count={selected.size}
         pending={bulkPending}
         onApply={(nextTracked) => void handleBulkApply(nextTracked)}
+        onApplyDefaultAudio={() => void handleBulkSetDefaultAudio()}
         onClear={handleClearSelection}
       />
 

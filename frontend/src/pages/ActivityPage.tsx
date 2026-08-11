@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchJobHistory } from "../api/activity";
 import { ActivityIcon } from "../components/icons";
 import { Modal } from "../components/Modal";
+import { JOB_KIND_LABEL } from "../types/activity";
 import type { JobHistoryEntry, JobStatus } from "../types/activity";
 
 const STATUS_LABEL: Record<JobStatus, string> = {
@@ -43,8 +44,11 @@ type LoadState =
   | { status: "ready"; entries: JobHistoryEntry[] };
 
 /**
- * The Activity/History view (COL-32): every persisted downmix job run,
- * sourced from `GET /api/jobs/history` (COL-29, `fetchJobHistory`).
+ * The Activity/History view (COL-32): every persisted downmix and
+ * set-default-audio job run, sourced from `GET /api/jobs/history` (COL-29,
+ * `fetchJobHistory`). The "Kind" column (COL-155's job history `kind`
+ * field, COL-157) distinguishes a `DOWNMIX` row from a `SET_DEFAULT_AUDIO`
+ * one -- including historical rows backfilled as `downmix` before COL-155.
  *
  * Filtering by file path (substring, case-insensitive) and status happens
  * client-side over the single fetched list -- see `fetchJobHistory` for why
@@ -170,6 +174,7 @@ export function ActivityPage() {
             <thead>
               <tr>
                 <th scope="col">File</th>
+                <th scope="col">Kind</th>
                 <th scope="col">Status</th>
                 <th scope="col">Started</th>
                 <th scope="col">Ended</th>
@@ -185,6 +190,11 @@ export function ActivityPage() {
                   <td>
                     <div className="activity-table__title">{titleFromPath(entry.file_path)}</div>
                     <div className="activity-table__path">{entry.file_path}</div>
+                  </td>
+                  <td>
+                    <span className={`activity-table__kind activity-table__kind--${entry.kind}`}>
+                      {JOB_KIND_LABEL[entry.kind]}
+                    </span>
                   </td>
                   <td>
                     <span

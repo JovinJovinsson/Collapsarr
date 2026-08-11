@@ -777,6 +777,27 @@ a {
   background: var(--c-surface-raised);
 }
 
+/* Job kind badge (COL-155/COL-157): distinguishes a Downmix row from a Set
+   Default Audio Track row in File Detail's and Activity's Job History
+   tables. Same pill shape as `.activity-table__status`, neutral by default,
+   with a distinct tint per kind. */
+.activity-table__kind {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+  color: var(--c-text-muted);
+  background: var(--c-surface-raised);
+}
+
+.activity-table__kind--set_default_audio {
+  color: var(--c-accent-hover);
+  background: var(--c-accent-tint);
+}
+
 /* ---- Buttons ----------------------------------------------------------- */
 
 .btn {
@@ -1323,6 +1344,19 @@ a {
   background: var(--c-surface-raised);
 }
 
+/* Current Default Audio Track column (COL-154): plain text, not a pill --
+   this is read-only informational data, not a status affordance like the
+   file badge/Tracked toggle above. The unknown state is dimmed the same way
+   .library-tree-table__file-badge--missing dims a missing file. */
+.library-tree-table__default-track {
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+.library-tree-table__default-track--unknown {
+  color: var(--c-text-muted);
+}
+
 /* The Tracked toggle (COL-101), shared by LibraryPage's rows and
    FileDetailPage's Tracked panel (components/TrackedToggleButton.tsx):
    mirrors the file badge's pill shape so both status affordances on a row
@@ -1494,14 +1528,11 @@ a {
 
 /* ---- System nav section + Backups page (COL-63) ------------------------ */
 
-.sidebar__section {
+/* System (COL-141) renders through `NavSection` now, styled like every other
+   `sidebar__nav-group`; this modifier just keeps the visual gap the old
+   always-visible `.sidebar__section` label gave it above the primary items. */
+.sidebar__nav-group--system {
   margin-top: var(--sp-4);
-  padding: var(--sp-1) var(--sp-3);
-  color: var(--c-text-faint);
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 
 /* Header variant that seats page-level actions beside the title block. */
