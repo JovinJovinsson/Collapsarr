@@ -263,12 +263,16 @@ def _resolve_default_audio_leaf_files(
     doesn't match that node's actual kind.
 
     A Series/Season reference then cascades to its descendant Episode/Movie
-    nodes, the same ``parent_id``-stack walk
-    :func:`~collapsarr.library.service.set_tracked` uses to cascade a
-    Tracked write to descendants; an Episode/Movie reference is already a
-    leaf. Leaves are deduplicated by node id first (so a file reachable via
-    two references -- e.g. a Series reference and a standalone Episode
-    reference inside it -- is only counted once), then each leaf is bridged
+    nodes, the same ``parent_id``-stack walk over
+    :func:`~collapsarr.library.service.list_nodes`'s full (hidden-included)
+    node set that :func:`~collapsarr.library.service.set_tracked` uses to
+    cascade a Tracked write to descendants -- a hidden descendant
+    (soft-hidden by a later sync, not deleted) still has a real on-disk file
+    and a ``tracked_override`` that can resolve, so it stays in scope here
+    too; an Episode/Movie reference is already a leaf. Leaves are
+    deduplicated by node id first (so a file reachable via two references --
+    e.g. a Series reference and a standalone Episode reference inside it --
+    is only counted once), then each leaf is bridged
     to its known on-disk file path via the same Library-to-tracked-media
     bridge :func:`~collapsarr.library.service.build_tree`/
     :func:`~collapsarr.library.service.build_movie_tree` use for the
@@ -307,9 +311,7 @@ def _resolve_default_audio_leaf_files(
 
         # Series/Season: cascade to descendant Episode leaves.
         if root.instance_id not in nodes_by_instance:
-            nodes_by_instance[root.instance_id] = list_nodes(
-                session, root.instance_id, include_hidden=False
-            )
+            nodes_by_instance[root.instance_id] = list_nodes(session, root.instance_id)
         children_by_parent: dict[int, list[LibraryNode]] = defaultdict(list)
         for candidate in nodes_by_instance[root.instance_id]:
             if candidate.parent_id is not None:
