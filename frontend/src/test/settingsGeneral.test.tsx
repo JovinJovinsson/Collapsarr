@@ -31,6 +31,7 @@ const baseSettings: GlobalSettings = {
   default_audio_language: null,
   default_audio_channel_tier: null,
   auto_set_default_audio: false,
+  recently_processed_window_minutes: 360,
   auto_queue_paused: false,
   api_key: "server-generated-key",
   created_at: "2026-07-01T00:00:00Z",
@@ -323,6 +324,66 @@ describe("GeneralSection", () => {
     renderGeneralSection();
 
     expect(await screen.findByText(/couldn't load settings: network down/i)).toBeInTheDocument();
+  });
+
+  it("displays the recently-processed window from a mocked GET", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    expect(await screen.findByLabelText(/recently-processed window/i)).toHaveValue(360);
+  });
+
+  it("saves the recently-processed window via PUT with the edited value", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const windowInput = await screen.findByLabelText(/recently-processed window/i);
+    fireEvent.change(windowInput, { target: { value: "120" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.recently_processed_window_minutes).toBe(120);
+  });
+
+  it("allows 0 as a valid value for the recently-processed window", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const windowInput = await screen.findByLabelText(/recently-processed window/i);
+    fireEvent.change(windowInput, { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.recently_processed_window_minutes).toBe(0);
+  });
+
+  it("validates the recently-processed window before saving", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    const windowInput = await screen.findByLabelText(/recently-processed window/i);
+    fireEvent.change(windowInput, { target: { value: "-10" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/recently-processed window must be a whole number of 0 or more/i)).toBeInTheDocument();
   });
 });
 
