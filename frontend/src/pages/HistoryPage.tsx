@@ -120,27 +120,40 @@ function describeBulkRequeueResult(result: BulkRequeueFailedResult): string {
  * instead of the row itself changing, and there is nothing to re-fetch.
  *
  * COL-179 adds a page-level "Requeue all failed" control in the header, next
- * to the title -- mirrors `QueuePage`'s (COL-181) "Clear queue" pattern
- * exactly: visible only while at least one row is `failed` (nothing to
- * requeue otherwise), and -- unlike the per-row action above, which is a
- * single, easily-scoped action -- this is a batch action across every
- * currently-failed file, so it sits behind an inline confirm step (the same
- * `.view__confirm` markup `QueuePage`'s "Clear queue" uses) rather than
- * firing immediately. On confirm, `requeueAllFailed` (`POST
- * /api/jobs/requeue-failed`, COL-172) is called; its `requeued`/`skipped`
- * split is rendered verbatim via {@link describeBulkRequeueResult} -- never a
- * bare "done" message -- since `skipped` (files whose most recent failure
- * falls inside the Recently-Processed Window -- surfaced to the operator as
- * the "deduplication window", the friendlier UI-facing name for the same
+ * to the title -- mirrors `QueuePage`'s (COL-181) "Clear queue" pattern for
+ * everything except its confirm button's styling: visible only while at
+ * least one row is `failed` (nothing to requeue otherwise), and -- unlike
+ * the per-row action above, which is a single, easily-scoped action -- this
+ * is a batch action across every currently-failed file, so it sits behind an
+ * inline confirm step (the same `.view__confirm` markup `QueuePage`'s "Clear
+ * queue" uses) rather than firing immediately. One deliberate divergence
+ * from that cited pattern: `QueuePage`'s confirm button is `btn--danger`
+ * (cancelling queued work is destructive); this page's confirm button is
+ * `btn--secondary` -- requeuing failed files is comparatively
+ * non-destructive (it only adds a new job; nothing already queued or
+ * completed is discarded), so it doesn't warrant destructive styling. On
+ * confirm, `requeueAllFailed` (`POST /api/jobs/requeue-failed`, COL-172) is
+ * called; its `requeued`/`skipped` split is rendered verbatim via
+ * {@link describeBulkRequeueResult} -- never a bare "done" message -- since
+ * `skipped` (files whose most recent failure falls inside the
+ * Recently-Processed Window -- surfaced to the operator as the
+ * "deduplication window", the friendlier UI-facing name for the same
  * mechanism -- or that are otherwise not requeueable right now) means the
- * request didn't fully land. Unlike the
- * per-row action's "nothing to re-fetch" note above, this *does* re-fetch job
- * history on success -- a batch action can enqueue many new (`pending`) jobs
- * at once, and re-fetching (mirroring `QueuePage`'s `refreshQueueSoon`) keeps
- * this page's own state in sync with the server without waiting on a manual
- * reload, even though the terminal `failed` rows themselves are untouched
- * (same brand-new-row semantics as the per-row action) and so remain visible
- * until superseded by a later poll showing their retry's own outcome.
+ * request didn't fully land. Unlike the per-row action's "nothing to
+ * re-fetch" note above, this *does* re-fetch job history on success
+ * (mirroring `QueuePage`'s `refreshQueueSoon`) -- but that refetch cannot
+ * "keep this page in sync" with the newly-`pending` jobs the requeue just
+ * created, and doesn't try to: this page is terminal-only (COL-176), so each
+ * freshly-requeued job comes back from the refetch as `pending`, and the
+ * `terminalEntries` filter above drops it from view exactly like it would
+ * any other non-terminal row in the unfiltered response -- it only
+ * (re)appears here once it later terminates again. Watching a requeued job's
+ * `pending`/`running` progress is `QueuePage`'s (COL-178) job, not this
+ * page's; what the refetch actually buys this page is picking up any other
+ * terminal-row changes that happened server-side since the last fetch. The
+ * `failed` rows just acted on are themselves untouched by any of this (same
+ * brand-new-row semantics as the per-row action) and remain visible exactly
+ * as they were until a later poll shows their retry's own eventual outcome.
  */
 export function HistoryPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
