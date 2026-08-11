@@ -1,7 +1,8 @@
 """Contract tests for the job history & trigger REST endpoints (COL-29).
 
 Covers request/response shape and the API-key-required behaviour (COL-26) for
-``GET /api/jobs/history``, ``POST /api/jobs/scan``, and ``POST /api/jobs/trigger``.
+``GET /api/jobs/history``, ``POST /api/jobs/scan``, ``POST /api/jobs/trigger``,
+and ``POST /api/jobs/requeue`` (COL-170).
 
 History rows are seeded through the real :class:`~collapsarr.jobs.models.JobHistory`
 model into the same SQLite file the ``client`` app reads (via the shared
@@ -73,6 +74,7 @@ class _FakeScheduler:
         *,
         scan_jobs: list[Job] | None = None,
         trigger_job: Job | None = None,
+        requeue_job: Job | None = None,
         default_audio_trigger_job: Job | None = None,
         default_audio_trigger_jobs_by_file: dict[str, Job | None] | None = None,
         cancel_result: bool | None = True,
@@ -80,6 +82,10 @@ class _FakeScheduler:
     ) -> None:
         self._scan_jobs = scan_jobs or []
         self._trigger_job = trigger_job
+        #: COL-170's ``requeue_file`` result -- the per-row Requeue endpoint's
+        #: fixed return value. Defaults to ``None`` (skipped) so a test that
+        #: doesn't care still gets a sane, unenqueued response.
+        self._requeue_job = requeue_job
         self._default_audio_trigger_job = default_audio_trigger_job
         #: Per-file override for the bulk endpoint's tests, where a fixed
         #: single job/None (the field above) can't tell different resolved
@@ -97,7 +103,8 @@ class _FakeScheduler:
         #: (bumped), ``False`` (too late). Defaults to ``True`` so a test
         #: that doesn't care about bump behaviour still gets a sane value.
         self._bump_result = bump_result
-        self.trigger_calls: list[tuple[str, frozenset[str]]] = []
+        self.trigger_calls: list[tuple[str, frozenset[str], bool]] = []
+        self.requeue_calls: list[str] = []
         self.default_audio_trigger_calls: list[str] = []
         self.cancel_calls: list[UUID] = []
         self.bump_calls: list[UUID] = []
@@ -111,11 +118,20 @@ class _FakeScheduler:
         *,
         extra_languages: Iterable[str] | None = None,
         session: Session | None = None,
+        bypass_dedup_window: bool = False,
     ) -> Job | None:
         self.trigger_calls.append(
-            (file_path, frozenset(extra_languages) if extra_languages is not None else frozenset())
+            (
+                file_path,
+                frozenset(extra_languages) if extra_languages is not None else frozenset(),
+                bypass_dedup_window,
+            )
         )
         return self._trigger_job
+
+    def requeue_file(self, file_path: str, *, session: Session | None = None) -> Job | None:
+        self.requeue_calls.append(file_path)
+        return self._requeue_job
 
     def trigger_set_default_audio(
         self,
@@ -316,7 +332,7 @@ def test_trigger_enqueues_a_job_and_returns_it(client: TestClient) -> None:
     assert body["enqueued"] is True
     assert body["job"]["file_path"] == "/media/movie.mkv"
     assert body["job"]["status"] == "pending"
-    assert fake.trigger_calls == [("/media/movie.mkv", frozenset())]
+    assert fake.trigger_calls == [("/media/movie.mkv", frozenset(), True)]
 
 
 def test_trigger_threads_extra_languages_as_the_bypass_option(client: TestClient) -> None:
@@ -334,7 +350,26 @@ def test_trigger_threads_extra_languages_as_the_bypass_option(client: TestClient
         app.dependency_overrides.clear()
 
     assert response.status_code == 202, response.text
-    assert fake.trigger_calls == [("/media/movie.mkv", frozenset({"jpn", "kor"}))]
+    assert fake.trigger_calls == [("/media/movie.mkv", frozenset({"jpn", "kor"}), True)]
+
+
+def test_trigger_always_bypasses_the_recently_processed_window(client: TestClient) -> None:
+    """COL-170: every explicit trigger now bypasses the window (a behavior change)."""
+    fake = _FakeScheduler(trigger_job=_job("/media/movie.mkv"))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        client.post(
+            "/api/jobs/trigger",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    [(_, _extra_languages, bypass_dedup_window)] = fake.trigger_calls
+    assert bypass_dedup_window is True
 
 
 def test_trigger_reports_not_enqueued_when_the_file_is_skipped(client: TestClient) -> None:
@@ -372,6 +407,112 @@ def test_trigger_rejects_unknown_body_fields(client: TestClient) -> None:
         app.dependency_overrides.clear()
 
     assert response.status_code == 422, response.text
+
+
+# --- POST /api/jobs/requeue (COL-170) -----------------------------------------
+
+
+def test_requeue_enqueues_a_job_and_returns_it(client: TestClient) -> None:
+    fake = _FakeScheduler(requeue_job=_job("/media/movie.mkv"))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is True
+    assert body["job"]["file_path"] == "/media/movie.mkv"
+    assert body["job"]["status"] == "pending"
+    assert fake.requeue_calls == ["/media/movie.mkv"]
+
+
+def test_requeue_reports_not_enqueued_when_the_file_is_skipped(client: TestClient) -> None:
+    fake = _FakeScheduler(requeue_job=None)  # duplicate / unprobeable / nothing to do
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is False
+    assert body["job"] is None
+
+
+def test_requeue_rejects_unknown_body_fields(client: TestClient) -> None:
+    fake = _FakeScheduler(requeue_job=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/movie.mkv", "bogus": True},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422, response.text
+
+
+def test_requeue_rejects_an_extra_languages_field(client: TestClient) -> None:
+    """Unlike ``/api/jobs/trigger``, requeue has no allow-list-bypass option at all."""
+    fake = _FakeScheduler(requeue_job=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/movie.mkv", "extra_languages": ["jpn"]},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422, response.text
+
+
+def test_requeue_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> requeue fails loudly, not silently."""
+    response = client.post(
+        "/api/jobs/requeue",
+        json={"file_path": "/media/movie.mkv"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 503
+
+
+def test_requeue_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, unprobeable file -> skipped, not an error."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/does-not-exist.mkv"},
+            headers=_auth_headers(client),
+        )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is False
+    assert body["job"] is None
 
 
 # --- POST /api/jobs/trigger-default-audio (COL-155) --------------------------
@@ -1142,6 +1283,12 @@ def test_scan_endpoint_requires_the_api_key(client: TestClient, session: Session
 def test_trigger_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     response = client.post("/api/jobs/trigger", json={"file_path": "/media/movie.mkv"})
+    assert response.status_code == 401
+
+
+def test_requeue_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post("/api/jobs/requeue", json={"file_path": "/media/movie.mkv"})
     assert response.status_code == 401
 
 

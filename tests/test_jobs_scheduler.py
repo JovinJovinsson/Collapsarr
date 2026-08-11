@@ -698,6 +698,119 @@ def test_trigger_file_skips_a_file_with_nothing_to_do_even_with_extra_languages(
 
 
 # ---------------------------------------------------------------------------
+# bypass_dedup_window (COL-170)
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_file_bypass_dedup_window_ignores_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """``bypass_dedup_window=True`` skips the recently-processed half of the check."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        # Without the bypass this would be skipped (see
+        # test_enqueue_file_skips_a_recently_processed_file).
+        job = scheduler.enqueue_file(
+            "/media/movie.mkv", session=session, bypass_dedup_window=True
+        )
+    assert job is not None
+
+
+def test_enqueue_file_bypass_dedup_window_still_treats_an_active_job_as_a_duplicate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """The bypass only skips the *recently processed* half -- not "already active"."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file("/media/movie.mkv")
+    assert job is not None  # still PENDING -> active
+
+    second = scheduler.enqueue_file("/media/movie.mkv", bypass_dedup_window=True)
+
+    assert second is None
+    assert len(scheduler._queue.list_jobs()) == 1
+
+
+def test_trigger_file_bypass_dedup_window_ignores_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """``trigger_file``'s ``bypass_dedup_window`` threads straight through to ``enqueue_file``."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        job = scheduler.trigger_file(
+            "/media/movie.mkv", session=session, bypass_dedup_window=True
+        )
+    assert job is not None
+
+
+def test_trigger_file_defaults_to_respecting_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Without the flag, ``trigger_file`` still respects the window (unchanged default)."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        assert scheduler.trigger_file("/media/movie.mkv", session=session) is None
+
+
+# ---------------------------------------------------------------------------
+# requeue_file (COL-170)
+# ---------------------------------------------------------------------------
+
+
+def test_requeue_file_enqueues_despite_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A per-row Requeue always bypasses the Recently-Processed Window."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        job = scheduler.requeue_file("/media/movie.mkv", session=session)
+
+    assert job is not None
+    assert job.file_path == Path("/media/movie.mkv")
+
+
+def test_requeue_file_still_treats_an_active_job_as_a_duplicate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Requeue bypasses the window, not the "already active" duplicate check."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    first = scheduler.requeue_file("/media/movie.mkv")
+    assert first is not None  # still PENDING -> active
+
+    second = scheduler.requeue_file("/media/movie.mkv")
+
+    assert second is None
+    assert len(scheduler._queue.list_jobs()) == 1
+
+
+def test_requeue_file_skips_a_file_with_nothing_to_do(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Bypassing the window never means "enqueue even a file with no qualifying target"."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_STEREO_ONLY))
+
+    assert scheduler.requeue_file("/media/movie.mkv") is None
+    assert scheduler._queue.list_jobs() == []
+
+
+# ---------------------------------------------------------------------------
 # cancel_job (COL-168)
 # ---------------------------------------------------------------------------
 

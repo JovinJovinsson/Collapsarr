@@ -101,6 +101,23 @@ The dedup check plus the enqueue are performed under a lock so the webhook
 thread and the scan thread can't both pass the "not a duplicate" check for the
 same file and each enqueue it.
 
+**Bypassing the window explicitly (COL-170).** :meth:`enqueue_file` (and so
+:meth:`trigger_file`, which wraps it) takes a ``bypass_dedup_window`` flag
+that skips only the "recently processed" half above -- the "already queued"
+half is never bypassable, since two enqueues for a file that's genuinely
+in-flight right now would be a real concurrent duplicate, not a cooldown to
+override. It defaults to ``False`` everywhere except :meth:`requeue_file`
+(the per-row "Requeue" action, always ``True``) and, as of COL-170,
+``POST /api/jobs/trigger`` (:mod:`collapsarr.jobs.routes`, also always
+``True`` now -- a behavior change from before COL-170, when it respected the
+window like every other trigger). The rationale: every *single, explicit*
+requeue/trigger action is a human asking for this file, right now -- the
+cooldown exists to stop *automatic* re-attempts (scan/webhook) from
+hammering a persistently-failing file, not to second-guess a deliberate
+manual retry. Only a true *batch* action (COL-172's "Requeue all failed")
+still respects the window, since a bulk retry of every failed file is closer
+in spirit to the automatic paths this cooldown protects against.
+
 Threads, not asyncio: this matches :mod:`collapsarr.jobs.queue`'s rationale --
 the pipeline shells out to blocking ``ffprobe``/``ffmpeg`` subprocesses -- and
 avoids pulling in an external scheduler dependency (there is none in
@@ -295,6 +312,7 @@ class JobScheduler:
         sonarr_episode_id: int | None = None,
         radarr_movie_id: int | None = None,
         respect_tracked: bool = True,
+        bypass_dedup_window: bool = False,
     ) -> Job | None:
         """Enqueue a downmix job for ``file_path`` unless it should be skipped.
 
@@ -304,6 +322,18 @@ class JobScheduler:
         downmix target, or cannot be probed. ``session`` (when given) is reused
         for the history-based dedup lookup and the tracked-media upsert below;
         otherwise a short-lived one is opened.
+
+        ``bypass_dedup_window`` (COL-170) skips only the Recently-Processed
+        Window half of the duplicate check (:meth:`_is_duplicate`) -- a file
+        with an already-queued/running job is still always treated as a
+        duplicate. Defaults to ``False`` (every automatic path --
+        :meth:`on_file_ready`, :meth:`scan_once` -- and :meth:`trigger_file`
+        by default); :meth:`requeue_file` passes ``True`` unconditionally, and
+        :meth:`trigger_file` threads its own ``bypass_dedup_window`` argument
+        through here for the ``POST /api/jobs/trigger`` endpoint, which now
+        always passes ``True`` too (COL-170: every single, explicit action
+        bypasses the window -- only a true batch action, COL-172, respects
+        it).
 
         ``respect_tracked`` (COL-102) gates the enqueue on the file's resolved
         **Tracked** value (``CONTEXT.md``): when ``True`` (the automatic paths --
@@ -351,7 +381,7 @@ class JobScheduler:
         path = Path(file_path)
         effective_settings = settings if settings is not None else self._downmix_settings
 
-        if self._is_duplicate(path, session):
+        if self._is_duplicate(path, session, bypass_dedup_window=bypass_dedup_window):
             return None
 
         try:
@@ -390,7 +420,7 @@ class JobScheduler:
             return None
 
         with self._enqueue_lock:
-            if self._is_duplicate(path, session):
+            if self._is_duplicate(path, session, bypass_dedup_window=bypass_dedup_window):
                 return None
             return self._queue.enqueue(path, effective_settings)
 
@@ -518,6 +548,7 @@ class JobScheduler:
         *,
         extra_languages: Iterable[str] | None = None,
         session: Session | None = None,
+        bypass_dedup_window: bool = False,
     ) -> Job | None:
         """Manually trigger a downmix job for one file on demand (COL-23).
 
@@ -541,18 +572,32 @@ class JobScheduler:
 
         Bypasses the **Tracked** gate (COL-102): a manual trigger is an
         explicit user action, so it downmixes even a Not-Tracked file (Tracked
-        gates only *automatic* enqueueing -- ``CONTEXT.md``). It still goes
-        through the same dedup and qualifying-target detection as the automatic
-        triggers -- the acceptance criteria ask to bypass the *language
-        allow-list* (and Tracked) specifically, not dedup or "does this file
-        actually need downmixing". Returns the created
-        :class:`~collapsarr.jobs.queue.Job`, or ``None`` for the same reasons
-        :meth:`enqueue_file` would (duplicate, unprobeable, or still no
-        qualifying target even with the extra languages included).
+        gates only *automatic* enqueueing -- ``CONTEXT.md``).
+
+        ``bypass_dedup_window`` (COL-170) is threaded straight through to
+        :meth:`enqueue_file` -- see there for exactly what it does and does
+        not skip. It defaults to ``False`` (the historic behavior, still used
+        internally by :meth:`trigger_set_default_audio`'s sibling shape and
+        by direct callers that want the window respected), but
+        ``POST /api/jobs/trigger`` (:mod:`collapsarr.jobs.routes`) now always
+        passes ``True``: every single, explicit trigger bypasses the window
+        going forward, matching :meth:`requeue_file`'s per-row Requeue action
+        -- only a true batch action (COL-172's "Requeue all failed") respects
+        it. It still goes through the same qualifying-target detection as the
+        automatic triggers regardless of this flag -- bypassing the window
+        never means "enqueue even a file with nothing to do"; that gate is
+        untouched. Returns the created :class:`~collapsarr.jobs.queue.Job`,
+        or ``None`` for the same reasons :meth:`enqueue_file` would
+        (duplicate, unprobeable, or still no qualifying target even with the
+        extra languages included).
         """
         settings = self._settings_with_extra_languages(extra_languages)
         return self.enqueue_file(
-            file_path, session=session, settings=settings, respect_tracked=False
+            file_path,
+            session=session,
+            settings=settings,
+            respect_tracked=False,
+            bypass_dedup_window=bypass_dedup_window,
         )
 
     def _settings_with_extra_languages(
@@ -670,10 +715,26 @@ class JobScheduler:
             stream.is_default for stream in streams if stream is not winner
         )
 
-    def _is_duplicate(self, path: Path, session: Session | None) -> bool:
-        """Whether ``path`` is already queued/running or was recently processed."""
+    def _is_duplicate(
+        self, path: Path, session: Session | None, *, bypass_dedup_window: bool = False
+    ) -> bool:
+        """Whether ``path`` is already queued/running, or was recently processed.
+
+        ``bypass_dedup_window`` (COL-170) skips only the second half of that
+        check -- the persisted "recently processed" history lookup
+        (:meth:`_is_recently_processed`, the Recently-Processed Window,
+        COL-167) -- for an explicit single-file requeue action (see
+        :meth:`enqueue_file`/:meth:`trigger_file`/:meth:`requeue_file`'s own
+        ``bypass_dedup_window`` parameter). It never skips the "already
+        active" half (:meth:`_is_active`): two enqueues for a file that is
+        still ``PENDING``/``RUNNING`` right now would create a genuine
+        concurrent duplicate, not a cooldown a user might reasonably want to
+        override, so that half of de-duplication is never bypassable.
+        """
         if self._is_active(path):
             return True
+        if bypass_dedup_window:
+            return False
         if session is not None:
             return self._is_recently_processed(path, session)
         with self._session_factory() as owned_session:
@@ -840,6 +901,43 @@ class JobScheduler:
         if self._queue.get_job(job_id) is None:
             return None
         return self._queue.bump_to_front(job_id)
+
+    # -- Requeue (COL-170) ----------------------------------------------------
+
+    def requeue_file(self, file_path: str | Path, *, session: Session | None = None) -> Job | None:
+        """Requeue one specific file -- typically a previously-failed one -- on demand (COL-170).
+
+        The entry point the per-row "Requeue" REST endpoint
+        (:mod:`collapsarr.jobs.routes`) calls, mirroring :meth:`cancel_job`/
+        :meth:`bump_job_to_front`'s shape: one dedicated scheduler method the
+        route wraps directly, rather than the route reaching into
+        :meth:`trigger_file` with a bypass flag itself.
+
+        Delegates entirely to :meth:`trigger_file` with
+        ``bypass_dedup_window=True`` -- a per-row Requeue is, by definition,
+        an explicit single-file action a human clicked, exactly the case the
+        Recently-Processed Window (COL-167) exists to *not* block: that
+        window exists to stop a failing file from being silently re-attempted
+        every scan/webhook faster than once per cooldown, not to stop a user
+        who is deliberately asking for one right now. Bypassing the window is
+        the only thing this changes -- it still goes through
+        :meth:`trigger_file`'s own "already active" duplicate check and
+        :func:`~collapsarr.downmix.targets.detect_qualifying_targets`
+        qualifying-target detection unchanged, so a file with nothing to do
+        (already fully downmixed) is still skipped, and a file with a
+        job already ``PENDING``/``RUNNING`` right now is still a duplicate --
+        requeuing is about overriding the *cooldown*, not "does this file
+        need work" or "is one already in flight". No ``extra_languages``
+        override: unlike :meth:`trigger_file`'s direct callers, a Requeue
+        action retries against the standing language allow-list, not a
+        one-off widened one.
+
+        Returns the created :class:`~collapsarr.jobs.queue.Job`, or ``None``
+        for the same reasons :meth:`trigger_file` would (duplicate --
+        active-only, since the window is bypassed --, unprobeable, or no
+        qualifying target).
+        """
+        return self.trigger_file(file_path, session=session, bypass_dedup_window=True)
 
     # -- Periodic full-library scan -----------------------------------------
 

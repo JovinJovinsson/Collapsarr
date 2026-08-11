@@ -6,7 +6,7 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Seven endpoints, each wrapping an existing service without adding new job logic:
+Eight endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
@@ -20,7 +20,26 @@ Seven endpoints, each wrapping an existing service without adding new job logic:
   file (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_file`, COL-23). The
   optional ``extra_languages`` list is the allow-list-bypass option: those
   languages are forced past the scheduler's ``language_allow_list`` for this one
-  call, letting a user downmix a language they normally don't auto-process.
+  call, letting a user downmix a language they normally don't auto-process. As of
+  COL-170 it also always bypasses the Recently-Processed Window (COL-167) --
+  a behavior change from before, when it respected the window like every other
+  trigger: every single, explicit trigger is now treated as a deliberate
+  request that overrides the cooldown, matching ``POST /api/jobs/requeue``
+  below. It still goes through the same qualifying-target detection either
+  way -- a file with nothing to do is still skipped.
+- ``POST /api/jobs/requeue`` -- the per-row "Requeue" action (COL-170):
+  manually enqueues a downmix job for one specific file -- typically a
+  previously-failed one a user is retrying from the Activity/History view --
+  via :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_file`, which
+  always bypasses the Recently-Processed Window. Same response shape as
+  ``POST /api/jobs/trigger``; the only difference is the window is *always*
+  bypassed here (there is no honour-the-window option), and there is no
+  ``extra_languages`` override -- a requeue retries against the standing
+  language allow-list, not a one-off widened one. The window bypass is the
+  only thing it changes: the same qualifying-target detection still applies,
+  so a file with nothing to do (already fully downmixed) is still skipped,
+  and a file with a job already ``PENDING``/``RUNNING`` right now is still
+  reported as not enqueued.
 - ``POST /api/jobs/trigger-default-audio`` -- manually enqueues a
   ``SET_DEFAULT_AUDIO`` job for one specific file
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`,
@@ -181,6 +200,39 @@ class ManualTriggerResult(BaseModel):
     duplicate (already queued / recently processed), unprobeable, or with no
     qualifying target even after ``extra_languages`` -- mirroring
     :meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_file` returning ``None``.
+    """
+
+    enqueued: bool
+    job: EnqueuedJob | None
+
+
+class RequeueFileRequest(BaseModel):
+    """Request body for ``POST /api/jobs/requeue`` (COL-170).
+
+    ``file_path`` names the (host-local) file to requeue -- typically one
+    with a ``FAILED`` job-history row a user is retrying from the
+    Activity/History view, though nothing here validates that; it goes
+    through the same probe/qualifying-target sequence as any other trigger.
+    Unlike :class:`ManualTriggerRequest`, there is no ``extra_languages``
+    option -- a requeue retries against the standing language allow-list,
+    not a one-off widened one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str
+
+
+class RequeueFileResult(BaseModel):
+    """Response for ``POST /api/jobs/requeue`` (COL-170).
+
+    ``enqueued`` is ``True`` with the created ``job`` when a downmix job was
+    queued. It is ``False`` with ``job`` ``null`` when the file was skipped --
+    a duplicate (already queued/running -- the Recently-Processed Window is
+    always bypassed here, so it can never be the reason), unprobeable, or
+    with no qualifying target -- mirroring
+    :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_file` returning
+    ``None``.
     """
 
     enqueued: bool
@@ -458,14 +510,47 @@ def manual_trigger_endpoint(
     through as the allow-list-bypass. A ``202`` is returned whether or not a job
     was enqueued; the ``enqueued`` flag distinguishes the two (a skipped file --
     duplicate/unprobeable/nothing to do -- is not an error).
+
+    Always passes ``bypass_dedup_window=True`` (COL-170) -- a behavior change
+    from before COL-170, when this endpoint respected the Recently-Processed
+    Window like every other trigger: every single, explicit trigger is now
+    treated as a deliberate request that overrides the cooldown (matching
+    ``POST /api/jobs/requeue`` below). The window is the only thing bypassed;
+    the qualifying-target gate is unchanged, so a file with nothing to do is
+    still skipped.
     """
     job = scheduler.trigger_file(
         body.file_path,
         extra_languages=body.extra_languages or None,
+        bypass_dedup_window=True,
     )
     if job is None:
         return ManualTriggerResult(enqueued=False, job=None)
     return ManualTriggerResult(enqueued=True, job=EnqueuedJob.from_job(job))
+
+
+@router.post("/jobs/requeue", response_model=RequeueFileResult, status_code=202)
+def requeue_file_endpoint(
+    body: RequeueFileRequest,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+) -> RequeueFileResult:
+    """Requeue one specific file -- the per-row "Requeue" action (COL-170).
+
+    Wraps :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_file`, which
+    always bypasses the Recently-Processed Window (COL-167) regardless of its
+    current value -- the intended use is a user clicking "Requeue" on a
+    specific failed file from the Activity/History view, an explicit request
+    that should never be silently swallowed by the cooldown. It still goes
+    through the same qualifying-target detection as every other trigger, so a
+    file with nothing to do (already fully downmixed) is still skipped, and a
+    file with a job already ``PENDING``/``RUNNING`` right now is still a
+    duplicate. A ``202`` is returned whether or not a job was enqueued; the
+    ``enqueued`` flag distinguishes the two.
+    """
+    job = scheduler.requeue_file(body.file_path)
+    if job is None:
+        return RequeueFileResult(enqueued=False, job=None)
+    return RequeueFileResult(enqueued=True, job=EnqueuedJob.from_job(job))
 
 
 @router.post(
