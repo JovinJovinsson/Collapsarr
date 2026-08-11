@@ -16,7 +16,7 @@ import threading
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -1161,6 +1161,169 @@ def test_bump_job_to_front_repeated_calls_move_each_new_bump_strictly_ahead(
     assert scheduler.bump_job_to_front(job_b.id) is True
 
     assert job_b.priority < job_a.priority
+
+
+# ---------------------------------------------------------------------------
+# clear_queue (COL-173)
+# ---------------------------------------------------------------------------
+
+
+def test_clear_queue_cancels_every_pending_job_and_deletes_its_history(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    jobs = [scheduler.trigger_file(f"/media/{i}.mkv") for i in range(3)]
+    assert all(job is not None for job in jobs)
+    with session_factory() as session:
+        # _make_scheduler's queue has no history_recorder wired -- seed each
+        # PENDING row a real history_recorder would already have written on
+        # enqueue, mirroring the cancel_job tests above.
+        for job in jobs:
+            assert job is not None
+            record_job_history(session, job)
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == 3
+    assert result.already_running == 0
+    assert scheduler._queue.list_jobs() == []
+    with session_factory() as session:
+        for job in jobs:
+            assert job is not None
+            assert get_job_history(session, job.id) is None
+
+
+def test_clear_queue_is_a_valid_zero_cancelled_result_for_an_empty_queue(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: clearing an already-empty queue is not an error."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == 0
+    assert result.already_running == 0
+
+
+def test_clear_queue_ignores_a_job_already_running_before_the_pass_starts(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A Job that's RUNNING before the snapshot is taken is simply never in scope."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    pending_job = scheduler.trigger_file("/media/pending.mkv")
+    running_job = scheduler.trigger_file("/media/running.mkv")
+    assert pending_job is not None
+    assert running_job is not None
+    running_job.status = JobStatus.RUNNING  # simulate a worker having already claimed it
+    with session_factory() as session:
+        record_job_history(session, pending_job)
+        record_job_history(session, running_job)
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == 1
+    assert result.already_running == 0  # never snapshotted -- not "raced," simply out of scope
+    assert scheduler._queue.get_job(pending_job.id) is None
+    still_there = scheduler._queue.get_job(running_job.id)
+    assert still_there is not None
+    assert still_there.status is JobStatus.RUNNING
+
+
+def test_clear_queue_reports_a_job_that_races_to_running_mid_pass(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: some snapshotted jobs may already have started running by the time they're
+    individually cancelled -- reported as ``already_running``, left alone, not an error."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job_a = scheduler.trigger_file("/media/a.mkv")
+    job_b = scheduler.trigger_file("/media/b.mkv")
+    job_c = scheduler.trigger_file("/media/c.mkv")
+    assert job_a is not None
+    assert job_b is not None
+    assert job_c is not None
+    with session_factory() as session:
+        for job in (job_a, job_b, job_c):
+            record_job_history(session, job)
+
+    # Simulate a worker claiming job_b for real -- flip it PENDING -> RUNNING
+    # right in between this pass snapshotting it as PENDING and this pass's
+    # own cancel attempt for it (there is no push mechanism to freeze the
+    # live queue mid-request, only polling -- the queue's worker pool keeps
+    # running concurrently the whole time).
+    original_cancel = scheduler._queue.cancel
+
+    def racy_cancel(job_id: UUID) -> bool:
+        if job_id == job_b.id:
+            job_b.status = JobStatus.RUNNING
+        return original_cancel(job_id)
+
+    monkeypatch.setattr(scheduler._queue, "cancel", racy_cancel)
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == 2
+    assert result.already_running == 1
+    # job_a/job_c: genuinely cancelled -- gone from the live queue, no history left.
+    assert scheduler._queue.get_job(job_a.id) is None
+    assert scheduler._queue.get_job(job_c.id) is None
+    with session_factory() as session:
+        assert get_job_history(session, job_a.id) is None
+        assert get_job_history(session, job_c.id) is None
+    # job_b: raced to RUNNING -- left exactly as it was, history row intact.
+    still_there = scheduler._queue.get_job(job_b.id)
+    assert still_there is not None
+    assert still_there.status is JobStatus.RUNNING
+    with session_factory() as session:
+        assert get_job_history(session, job_b.id) is not None
+
+
+def test_clear_queue_tops_up_the_auto_queue_limit_exactly_once_after_the_whole_batch(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: after clearing, the Auto-Queue Limit's top-up runs -- pending returns toward the
+    limit from Wanted, same as after any other cancellation -- but only once for the whole
+    batch, not once per cancellation (which would churn: top up, then immediately re-cancel
+    the freshly topped-up job on a later loop iteration)."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path=f"/tv/wanted{i}.mkv"
+                )
+                for i in range(AUTO_QUEUE_LIMIT)
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    seeded = _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+    top_up_calls: list[None] = []
+    original_top_up = scheduler.top_up
+
+    def counting_top_up(*, session: Session | None = None) -> list[Job]:
+        top_up_calls.append(None)
+        return original_top_up(session=session)
+
+    monkeypatch.setattr(scheduler, "top_up", counting_top_up)
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == AUTO_QUEUE_LIMIT
+    assert result.already_running == 0
+    assert len(top_up_calls) == 1  # once for the whole batch, not once per cancellation
+    # The pending budget is refilled from Wanted, same as after any other cancellation.
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+    jobs = scheduler._queue.list_jobs()
+    assert all(job.file_path not in {seed.file_path for seed in seeded} for job in jobs)
+    assert all(str(job.file_path).startswith("/tv/wanted") for job in jobs)
 
 
 # ---------------------------------------------------------------------------

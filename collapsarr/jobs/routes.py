@@ -6,7 +6,7 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Nine endpoints, each wrapping an existing service without adding new job logic:
+Ten endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
@@ -87,6 +87,24 @@ Nine endpoints, each wrapping an existing service without adding new job logic:
   (see :class:`CancelJobResult`) rather than erroring or silently pretending
   success. A ``job_id`` not present in the live queue at all -- unknown,
   malformed, or already gone -- is a ``404``.
+- ``POST /api/jobs/clear`` -- the batch "Clear queue" cancel action (COL-173):
+  cancels every currently-``PENDING`` Job in one call via
+  :meth:`collapsarr.jobs.scheduler.JobScheduler.clear_queue` (the bulk
+  counterpart of ``DELETE /api/jobs/{job_id}`` above, mirroring ``POST
+  /api/jobs/requeue-failed``'s "one dedicated scheduler method, thin route"
+  shape). Unlike that per-row cancel, the response reports *counts* rather
+  than a single boolean -- ``cancelled`` (how many were actually removed
+  from the live queue) vs. ``already_running`` (how many had already been
+  claimed by a worker, or otherwise progressed past ``PENDING``, by the time
+  their own cancel ran, and so were left alone) -- since the queue's worker
+  pool keeps running concurrently with no push mechanism to freeze it
+  mid-request, only polling. Because cancelling frees a slot exactly like
+  any other cancellation or completion, the Auto-Queue Limit's top-up
+  (COL-171) runs once, immediately after the whole batch -- clearing the
+  queue is not a pause, it simply resets to whatever the scanner refills
+  next (Auto-Queuing Pause, COL-174, is the dedicated lever for that, not
+  implemented here). Clearing an already-empty queue is not an error -- a
+  valid ``cancelled=0``/``already_running=0`` response.
 - ``POST /api/jobs/{job_id}/bump`` -- bumps one still-``PENDING`` Job to the
   front of the queue (COL-169)
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front`), the only
@@ -376,6 +394,26 @@ class CancelJobResult(BaseModel):
     """
 
     cancelled: bool
+
+
+class ClearQueueResult(BaseModel):
+    """Response for ``POST /api/jobs/clear`` (COL-173).
+
+    ``cancelled`` is how many currently-``PENDING`` Jobs, out of every one
+    snapshotted at the start of the pass, this call actually cancelled.
+    ``already_running`` is how many of that same snapshot had already been
+    claimed by a worker (or otherwise progressed past ``PENDING``) by the
+    time their individual cancel ran, and so were left alone -- reported
+    rather than silently ignored, mirroring
+    :meth:`collapsarr.jobs.scheduler.JobScheduler.clear_queue`'s
+    same-named fields (see there for the full ``ClearQueueResult`` contract).
+    Every snapshotted Job lands in exactly one of the two counts. Clearing
+    an already-empty queue is not an error -- a valid
+    ``cancelled=0``/``already_running=0`` response.
+    """
+
+    cancelled: int
+    already_running: int
 
 
 class BumpJobResult(BaseModel):
@@ -713,6 +751,34 @@ def cancel_job_endpoint(
     if outcome is None:
         raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
     return CancelJobResult(cancelled=outcome)
+
+
+# --- POST /api/jobs/clear (COL-173) -------------------------------------------
+
+
+@router.post("/jobs/clear", response_model=ClearQueueResult, status_code=202)
+def clear_queue_endpoint(
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+    session: Session = Depends(get_session),
+) -> ClearQueueResult:
+    """Cancel every currently-``PENDING`` Job in one call -- "Clear queue" (COL-173).
+
+    Wraps :meth:`collapsarr.jobs.scheduler.JobScheduler.clear_queue`, the
+    batch counterpart of ``DELETE /api/jobs/{job_id}`` above. Every Job that
+    is ``PENDING`` at the moment this pass starts is cancelled unless a
+    worker claims it first (the queue keeps running concurrently -- there is
+    no push mechanism to freeze it mid-request, only polling); the
+    response's ``cancelled``/``already_running`` split reports exactly what
+    happened to that snapshot, so a race is surfaced rather than silently
+    swallowed. Because cancelling frees a slot exactly like any other
+    cancellation, the Auto-Queue Limit's top-up (COL-171) runs once,
+    immediately after the whole batch -- clearing the queue is not a pause,
+    it simply resets to whatever the scanner refills next. A ``202`` is
+    returned even when the queue was already empty (``cancelled=0``,
+    ``already_running=0`` is a valid outcome, not an error).
+    """
+    outcome = scheduler.clear_queue(session=session)
+    return ClearQueueResult(cancelled=outcome.cancelled, already_running=outcome.already_running)
 
 
 @router.post("/jobs/{job_id}/bump", response_model=BumpJobResult)

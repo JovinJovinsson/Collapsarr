@@ -125,13 +125,19 @@ Jobs from Wanted at once -- this is the root-cause fix for "dozens of movies
 queued at once": before COL-171, both the periodic scan and ``POST
 /api/jobs/scan`` ("Scan now") enqueued *every* qualifying file in one pass.
 :meth:`top_up` is the one shared method every auto-enqueue hook point calls to
-enforce this, rather than four separate ad-hoc implementations: (1) a Job
+enforce this, rather than five separate ad-hoc implementations: (1) a Job
 completing, success or failure alike, via the job-terminal hook wired onto
 ``queue`` in :meth:`__init__` (:meth:`~collapsarr.jobs.queue.JobQueue.
 set_job_terminal_hook`); (2) a Job being cancelled (COL-168, :meth:`cancel_job`);
-(3) the periodic background scan (:meth:`scan_once`); and (4) ``POST
-/api/jobs/scan`` (:meth:`scan_now`, an alias for :meth:`scan_once`). A manual
-trigger or requeue (:meth:`trigger_file`/:meth:`requeue_file`/
+(3) the periodic background scan (:meth:`scan_once`); (4) ``POST
+/api/jobs/scan`` (:meth:`scan_now`, an alias for :meth:`scan_once`); and (5) the
+bulk "Clear queue" cancel (COL-173, :meth:`clear_queue`) -- which calls
+:meth:`top_up` exactly once, after the whole batch of cancellations, not per
+cancelled Job (see :meth:`clear_queue`'s own docstring for why: a top-up
+after every single cancellation in a loop would immediately re-fill, then
+immediately re-cancel, the same slot on the next iteration if the newly
+topped-up Job also fell inside the same in-flight batch -- pure churn). A
+manual trigger or requeue (:meth:`trigger_file`/:meth:`requeue_file`/
 :meth:`requeue_all_failed`) is never blocked by the limit -- it simply
 consumes the same shared ``PENDING``-count budget :meth:`top_up` watches.
 See :meth:`top_up`'s own docstring for the algorithm and its
@@ -248,6 +254,34 @@ class BulkRequeueResult:
 
     requeued: list[Job]
     skipped: list[str]
+
+
+@dataclass(slots=True, frozen=True)
+class ClearQueueResult:
+    """The outcome of one :meth:`JobScheduler.clear_queue` pass (COL-173).
+
+    ``cancelled`` is how many Jobs, out of every currently-``PENDING`` Job
+    snapshotted at the start of this pass, were still ``PENDING`` -- and so
+    actually cancelled (removed from the live queue, ``JobHistory`` row
+    deleted) -- by the time their individual cancel ran, the same success
+    outcome a single :meth:`~JobScheduler.cancel_job` call reports as
+    ``True``. ``already_running`` is how many of that same snapshot were no
+    longer ``PENDING`` by then -- a worker had already claimed one (or, more
+    rarely, it had already reached a terminal status, or vanished from the
+    live queue entirely) -- and so were left alone, exactly like a single
+    :meth:`~JobScheduler.cancel_job` call's ``False``/``None`` outcome.
+    Every snapshotted Job lands in exactly one of the two counts -- never
+    dropped -- since the live queue's worker pool keeps running
+    concurrently while this pass is in flight and there is no push
+    mechanism to freeze it mid-request, only polling (the same reason
+    :meth:`~JobScheduler.cancel_job` itself reports, rather than silently
+    ignores, a too-late single cancel). A queue with no ``PENDING`` Job at
+    all when the pass starts is not an error -- a valid
+    ``cancelled=0``/``already_running=0`` result.
+    """
+
+    cancelled: int
+    already_running: int
 
 
 class JobScheduler:
@@ -919,25 +953,52 @@ class JobScheduler:
 
         A successful cancel (``True``) frees a slot in the Auto-Queue Limit's
         budget, so it also runs :meth:`top_up` immediately afterward (COL-171)
-        -- the second of the four top-up hook points (see :meth:`top_up`'s
+        -- the second of the five top-up hook points (see :meth:`top_up`'s
         docstring). A ``False``/``None`` outcome leaves the live ``PENDING``
         count unchanged, so no top-up runs for either.
+
+        Delegates the actual cancel to :meth:`_cancel_one` -- the same
+        get/cancel/delete-history primitive :meth:`clear_queue` (COL-173)
+        reuses for its own bulk pass -- and runs :meth:`top_up` right after a
+        success, same as always. :meth:`clear_queue` deliberately does *not*
+        call this method directly for that reason: it needs the cancel
+        primitive without a top-up after every individual cancellation (see
+        its own docstring for why), so it calls :meth:`_cancel_one` itself
+        and runs :meth:`top_up` once, after its whole batch, instead.
 
         Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
         when the caller has one open (the route always does), else opens a
         short-lived one for the ``JobHistory`` delete and the top-up.
         """
+        if session is not None:
+            outcome = self._cancel_one(job_id, session)
+            if outcome:
+                self.top_up(session=session)
+            return outcome
+        with self._session_factory() as owned_session:
+            outcome = self._cancel_one(job_id, owned_session)
+            if outcome:
+                self.top_up(session=owned_session)
+            return outcome
+
+    def _cancel_one(self, job_id: UUID, session: Session) -> bool | None:
+        """Cancel one still-``PENDING`` Job by id, without running :meth:`top_up` (COL-168/COL-173).
+
+        The shared primitive :meth:`cancel_job` and :meth:`clear_queue` both
+        build on: get/cancel/delete-history, nothing else. Matches
+        :meth:`cancel_job`'s own ``None``/``True``/``False`` contract (see
+        its docstring for the full meaning of each) -- the only difference
+        from calling :meth:`cancel_job` directly is that *this* method never
+        touches the Auto-Queue Limit budget, leaving that entirely to the
+        caller: :meth:`cancel_job` runs :meth:`top_up` once per call (right
+        after this returns ``True``), while :meth:`clear_queue` runs it once
+        for its whole batch instead.
+        """
         if self._queue.get_job(job_id) is None:
             return None
         if not self._queue.cancel(job_id):
             return False
-        if session is not None:
-            delete_job_history(session, job_id)
-            self.top_up(session=session)
-        else:
-            with self._session_factory() as owned_session:
-                delete_job_history(owned_session, job_id)
-                self.top_up(session=owned_session)
+        delete_job_history(session, job_id)
         return True
 
     # -- Bump to front (COL-169) -----------------------------------------------
@@ -1105,6 +1166,79 @@ class JobScheduler:
             else:
                 requeued.append(job)
         return BulkRequeueResult(requeued=requeued, skipped=skipped)
+
+    # -- Bulk "Clear queue" cancel (COL-173) -----------------------------------
+
+    def clear_queue(self, *, session: Session | None = None) -> ClearQueueResult:
+        """Cancel every currently-``PENDING`` Job in one call -- "Clear queue" (COL-173).
+
+        The entry point ``POST /api/jobs/clear`` (:mod:`collapsarr.jobs.
+        routes`) calls -- the bulk counterpart of :meth:`cancel_job`'s
+        per-row Cancel action, mirroring :meth:`requeue_all_failed`'s shape:
+        one dedicated scheduler method doing the whole batch orchestration,
+        with a thin route wrapping it.
+
+        Snapshots every currently-``PENDING`` Job id
+        (:meth:`~collapsarr.jobs.queue.JobQueue.list_jobs`) up front, then
+        cancels each one via :meth:`_cancel_one` -- the same
+        get/cancel/delete-history primitive :meth:`cancel_job` itself uses --
+        rather than calling :meth:`cancel_job` directly. That distinction
+        matters: :meth:`cancel_job` also runs :meth:`top_up` after every
+        single successful cancel, and calling it in a loop here would
+        immediately re-fill the budget from Wanted after each cancellation,
+        only to immediately cancel that freshly-topped-up Job again on a
+        later iteration if it happened to land inside this same snapshot --
+        real, wasteful top-up-then-immediately-cancelled-again churn.
+        Instead :meth:`top_up` is called exactly **once**, after the whole
+        batch has been cancelled -- the fifth of :meth:`top_up`'s hook
+        points (see its own docstring) -- since cancelling frees a slot
+        exactly like any other cancellation or completion (COL-171): clearing
+        the queue is not a pause, it simply resets to whatever the scanner
+        refills next (Auto-Queuing Pause, COL-174, is the dedicated lever for
+        actually stopping that -- out of scope here).
+
+        Because the queue's worker pool keeps running concurrently while
+        this pass is in flight -- there is no push mechanism to freeze it
+        mid-request, only polling, the same reason :meth:`cancel_job` itself
+        reports rather than silently ignores a too-late single cancel -- a
+        Job snapshotted here as ``PENDING`` may have already been claimed by
+        a worker (or, more rarely, already reached a terminal status, or
+        been removed by a concurrent cancel) by the time its own
+        :meth:`_cancel_one` call runs a moment later. :class:`ClearQueueResult`
+        reports the full split -- ``cancelled`` vs. ``already_running`` --
+        rather than silently ignoring the too-late ones; every snapshotted
+        Job id lands in exactly one of the two counts.
+
+        Clearing an already-empty queue (no ``PENDING`` Job at all when the
+        pass starts) is not an error -- a valid, zero-cancelled
+        :class:`ClearQueueResult`; :meth:`top_up` still runs afterward (a
+        no-op if the budget is already at :data:`AUTO_QUEUE_LIMIT`, same as
+        any other call to it).
+
+        Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
+        when the caller has one open (the route always does), else opens a
+        short-lived one -- shared across every :meth:`_cancel_one` call and
+        the trailing :meth:`top_up` in this pass, so the whole batch acts
+        against one consistent session rather than one that could shift
+        mid-pass across several short-lived ones.
+        """
+        if session is not None:
+            return self._clear_queue_in(session)
+        with self._session_factory() as owned_session:
+            return self._clear_queue_in(owned_session)
+
+    def _clear_queue_in(self, session: Session) -> ClearQueueResult:
+        """The body of :meth:`clear_queue`, run against an already-open ``session``."""
+        pending_ids = [job.id for job in self._queue.list_jobs() if job.status is JobStatus.PENDING]
+        cancelled = 0
+        already_running = 0
+        for job_id in pending_ids:
+            if self._cancel_one(job_id, session):
+                cancelled += 1
+            else:
+                already_running += 1
+        self.top_up(session=session)
+        return ClearQueueResult(cancelled=cancelled, already_running=already_running)
 
     # -- Auto-Queue Limit / top-up (COL-171) -----------------------------------
 

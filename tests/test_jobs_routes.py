@@ -21,6 +21,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -32,14 +33,16 @@ from collapsarr.arr.catalog import (
     RadarrCatalog,
     SonarrCatalog,
 )
+from collapsarr.arr.files import MonitoredFile
 from collapsarr.arr.models import ArrInstance, InstanceType
 from collapsarr.config import Settings
 from collapsarr.downmix.probe import AudioStreamInfo
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
+from collapsarr.jobs import scheduler as scheduler_module
 from collapsarr.jobs.models import JobHistory
-from collapsarr.jobs.queue import Job, JobKind, JobStatus
+from collapsarr.jobs.queue import Job, JobKind, JobQueue, JobStatus
 from collapsarr.jobs.routes import get_job_scheduler
-from collapsarr.jobs.scheduler import BulkRequeueResult
+from collapsarr.jobs.scheduler import BulkRequeueResult, ClearQueueResult, JobScheduler
 from collapsarr.library.models import LibraryNodeKind, make_node_key
 from collapsarr.library.service import list_nodes, sync_library
 from collapsarr.main import create_app
@@ -82,6 +85,7 @@ class _FakeScheduler:
         default_audio_trigger_jobs_by_file: dict[str, Job | None] | None = None,
         cancel_result: bool | None = True,
         bump_result: bool | None = True,
+        clear_queue_result: ClearQueueResult | None = None,
     ) -> None:
         self._scan_jobs = scan_jobs or []
         self._trigger_job = trigger_job
@@ -113,12 +117,20 @@ class _FakeScheduler:
         #: (bumped), ``False`` (too late). Defaults to ``True`` so a test
         #: that doesn't care about bump behaviour still gets a sane value.
         self._bump_result = bump_result
+        #: COL-173's ``clear_queue`` result -- the bulk "Clear queue" cancel
+        #: endpoint's fixed return value. Defaults to a zero-cancelled,
+        #: zero-already-running split so a test that doesn't care still gets
+        #: a well-formed, empty-queue-shaped response.
+        self._clear_queue_result = clear_queue_result or ClearQueueResult(
+            cancelled=0, already_running=0
+        )
         self.trigger_calls: list[tuple[str, frozenset[str], bool]] = []
         self.requeue_calls: list[str] = []
         self.requeue_all_failed_calls: int = 0
         self.default_audio_trigger_calls: list[str] = []
         self.cancel_calls: list[UUID] = []
         self.bump_calls: list[UUID] = []
+        self.clear_queue_calls: int = 0
 
     def scan_now(self) -> list[Job]:
         return self._scan_jobs
@@ -166,6 +178,10 @@ class _FakeScheduler:
     def bump_job_to_front(self, job_id: UUID) -> bool | None:
         self.bump_calls.append(job_id)
         return self._bump_result
+
+    def clear_queue(self, *, session: Session | None = None) -> ClearQueueResult:
+        self.clear_queue_calls += 1
+        return self._clear_queue_result
 
 
 def _job(file_path: str) -> Job:
@@ -1298,6 +1314,166 @@ def test_cancel_job_wires_through_a_real_scheduler(settings: Settings) -> None:
     assert response.status_code == 404
 
 
+# --- POST /api/jobs/clear (COL-173) -------------------------------------------
+#
+# The empty/full-split shape and the id -> scheduler.clear_queue() call are
+# HTTP-contract tests via the same fake-scheduler dependency_overrides pattern
+# as every other endpoint above. The real batch cancel/history-delete/skip
+# logic (JobScheduler._clear_queue_in`) is exercised directly, with a real
+# queue/session, in tests/test_jobs_scheduler.py. The final test below drives
+# the whole thing end to end through this HTTP endpoint against a real
+# JobScheduler + JobQueue (a stub probe/pipeline_runner standing in for the
+# ffmpeg/ffprobe boundary, same pattern as test_wanted_pipeline_integration.py)
+# to cover the two behaviours this ticket's AC calls out explicitly: a
+# simulated race (a snapshotted PENDING job transitions to RUNNING before its
+# own cancel lands) and the post-clear Auto-Queue Limit top-up.
+
+
+def test_clear_queue_reports_a_full_cancel_split_when_nothing_races(client: TestClient) -> None:
+    fake = _FakeScheduler(clear_queue_result=ClearQueueResult(cancelled=3, already_running=0))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 3, "already_running": 0}
+    assert fake.clear_queue_calls == 1
+
+
+def test_clear_queue_reports_an_already_running_split_when_some_jobs_raced(
+    client: TestClient,
+) -> None:
+    """A too-late-to-cancel Job is surfaced in ``already_running``, not silently dropped."""
+    fake = _FakeScheduler(clear_queue_result=ClearQueueResult(cancelled=2, already_running=1))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 2, "already_running": 1}
+
+
+def test_clear_queue_reports_a_zero_cancelled_split_for_an_empty_queue(
+    client: TestClient,
+) -> None:
+    """AC: clearing an already-empty queue is not an error -- a valid, zero-cancelled result."""
+    fake = _FakeScheduler()  # default: ClearQueueResult(cancelled=0, already_running=0)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 0, "already_running": 0}
+
+
+def test_clear_queue_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> clear fails loudly, not silently."""
+    response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+    assert response.status_code == 503
+
+
+def test_clear_queue_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, empty queue -> a valid zero-cancelled result."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 0, "already_running": 0}
+
+
+def test_clear_queue_reports_a_mid_request_race_and_tops_up_after(
+    client: TestClient, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end through the real HTTP endpoint, against a real JobScheduler + JobQueue.
+
+    Three PENDING Jobs are seeded; one (``b``) is made to race PENDING ->
+    RUNNING in between the request snapshotting it and its own individual
+    cancel attempt landing (there is no push mechanism to freeze the live
+    queue mid-request, only polling -- the queue's worker pool keeps running
+    concurrently the whole time). The response must report that split rather
+    than silently ignoring it, and -- since cancelling frees a slot exactly
+    like any other cancellation -- the Auto-Queue Limit's top-up (COL-171)
+    must have run immediately after, pulling a Wanted file back in.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+
+    with session_factory() as session:
+        instance = ArrInstance(
+            name="inst", type=InstanceType.SONARR, base_url="http://arr.local", api_key="k"
+        )
+        session.add(instance)
+        session.commit()
+        session.refresh(instance)
+        instance_id = instance.id
+
+    def fake_fetch(instance: ArrInstance, **_: object) -> list[MonitoredFile]:
+        return [
+            MonitoredFile(instance_id=instance_id, media_title="Show", file_path="/tv/extra.mkv")
+        ]
+
+    monkeypatch.setattr(scheduler_module, "fetch_monitored_files", fake_fetch)
+
+    surround_stream = [
+        AudioStreamInfo(
+            index=0, codec="ac3", channels=6, channel_layout="5.1(side)", language="eng"
+        )
+    ]
+
+    def stub_probe(path: Path) -> list[AudioStreamInfo]:
+        return surround_stream
+
+    queue = JobQueue()  # pipeline never actually runs -- every seeded Job stays PENDING/RUNNING
+    scheduler = JobScheduler(queue, session_factory, settings, probe=stub_probe)
+    app.state.job_scheduler = scheduler
+
+    job_a = scheduler.trigger_file("/media/a.mkv")
+    job_b = scheduler.trigger_file("/media/b.mkv")
+    job_c = scheduler.trigger_file("/media/c.mkv")
+    assert job_a is not None
+    assert job_b is not None
+    assert job_c is not None
+
+    original_cancel = queue.cancel
+
+    def racy_cancel(job_id: UUID) -> bool:
+        if job_id == job_b.id:
+            job_b.status = JobStatus.RUNNING  # simulate a worker claiming it, mid-request
+        return original_cancel(job_id)
+
+    monkeypatch.setattr(queue, "cancel", racy_cancel)
+
+    response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 2, "already_running": 1}
+
+    # a/c: genuinely cancelled -- gone from the live queue.
+    assert queue.get_job(job_a.id) is None
+    assert queue.get_job(job_c.id) is None
+    # b: raced to RUNNING -- left exactly as it was, not cancelled.
+    still_there = queue.get_job(job_b.id)
+    assert still_there is not None
+    assert still_there.status is JobStatus.RUNNING
+
+    # Post-clear top-up (COL-171): the freed slots pulled a Wanted file back in.
+    assert any(job.file_path == Path("/tv/extra.mkv") for job in queue.list_jobs())
+
+
 # --- POST /api/jobs/{job_id}/bump (COL-169) -----------------------------------
 #
 # These are HTTP-contract tests only -- request/response shape, the id ->
@@ -1453,4 +1629,10 @@ def test_cancel_job_endpoint_requires_the_api_key(client: TestClient, session: S
 def test_bump_job_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     response = client.post(f"/api/jobs/{uuid4()}/bump")
+    assert response.status_code == 401
+
+
+def test_clear_queue_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post("/api/jobs/clear")
     assert response.status_code == 401
