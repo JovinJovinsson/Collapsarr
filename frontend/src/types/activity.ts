@@ -141,3 +141,36 @@ export interface FileSetDefaultAudioResult {
 export interface BulkSetDefaultAudioTriggerResult {
   results: FileSetDefaultAudioResult[];
 }
+
+/**
+ * Response for `DELETE /api/jobs/{job_id}` (COL-168, `CancelJobResult`) --
+ * `QueuePage`'s (COL-180) per-row "Cancel" action.
+ *
+ * `cancelled` is `true` when the Job was still `pending` and has now been
+ * removed from the live queue (its `JobHistory` row deleted too -- a
+ * cancelled Job leaves no trace). It is `false` -- not an error -- when a
+ * worker already claimed the Job, or it already reached a terminal status,
+ * before the request landed: "too late" to cancel, distinct from a generic
+ * failure; the Job runs (or has run) to completion unaffected. A `job_id`
+ * not present in the live queue at all is a `404` instead, surfaced by
+ * `api/activity.ts`'s `cancelJob` as a thrown error, not this shape.
+ */
+export interface CancelJobResult {
+  cancelled: boolean;
+}
+
+/**
+ * Response for `POST /api/jobs/{job_id}/bump` (COL-169, `BumpJobResult`) --
+ * `QueuePage`'s (COL-180) per-row "Process next" action.
+ *
+ * `bumped` is `true` when the Job was still `pending` and has now been
+ * reassigned a priority ahead of every other currently-pending Job -- it is
+ * the very next Job a free worker claims. It is `false` -- not an error --
+ * when a worker already claimed the Job, or it already reached a terminal
+ * status, before the request landed: "too late" to bump, unaffected.
+ * Mirrors {@link CancelJobResult}'s shape exactly. A `job_id` not present
+ * in the live queue at all is a `404` instead, surfaced as a thrown error.
+ */
+export interface BumpJobResult {
+  bumped: boolean;
+}

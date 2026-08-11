@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { fetchJobQueue } from "../api/activity";
+import { bumpJobToFront, cancelJob, fetchJobQueue } from "../api/activity";
 import { ActivityIcon } from "../components/icons";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { JobHistoryEntry, JobStatus } from "../types/activity";
@@ -43,6 +43,29 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ready"; entries: JobHistoryEntry[] };
 
+/** A per-row action `QueuePage` (COL-180) can run. */
+type RowActionKind = "bump" | "cancel";
+
+/**
+ * Which per-row action is currently in flight, keyed by `job_id` (COL-180).
+ * A single row can only have one action in flight at a time (its own two
+ * buttons disable together while either is pending), but different rows'
+ * actions are independent -- clicking "Cancel" on one row while another
+ * row's "Process next" is still in flight doesn't touch the first row's
+ * pending state, unlike a single shared "currently pending job" slot would.
+ */
+type PendingActions = Partial<Record<string, RowActionKind>>;
+
+/**
+ * A message surfaced after a per-row action settles (COL-180). `"hint"` is
+ * the "too late" race outcome -- `bumped`/`cancelled` came back `false`,
+ * which the backend documents as a normal, non-error outcome (the Job
+ * simply started running, or finished, before the request landed) -- styled
+ * the same muted way `FileDetailPage`'s skipped-trigger outcome is.
+ * `"error"` is a genuine failure (network error, `404`, etc).
+ */
+type ActionNotice = { tone: "hint" | "error"; text: string } | null;
+
 /**
  * The live Queue view (COL-178, repurposing the old combined Activity/History
  * page): every currently `running`/`pending` Job, sourced from `GET
@@ -65,13 +88,27 @@ type LoadState =
  * failed poll surfaces the error but keeps retrying at the idle cadence
  * rather than giving up for good.
  *
- * No per-row or page-level actions yet (COL-180 adds "Process next"/"Cancel"
- * per pending row; COL-181 adds "Clear queue" and the auto-queue pause
- * toggle) -- this is read-only.
+ * COL-180 adds per-row "Process next" (`bumpJobToFront`, `POST
+ * /api/jobs/{job_id}/bump`, COL-169) and "Cancel" (`cancelJob`, `DELETE
+ * /api/jobs/{job_id}`, COL-168) actions to every `pending` row -- `running`
+ * rows get neither, there's nothing to reorder or cancel once a worker has
+ * claimed a Job. Both endpoints report a would-be "too late" race (the Job
+ * started running, or finished, between render and click) as a normal
+ * `bumped`/`cancelled: false` result rather than an error, so a click that
+ * loses that race surfaces a muted inline notice instead of leaving the row
+ * looking broken or stuck; a genuine error (e.g. the Job vanished
+ * entirely -- `404`) surfaces as a page-level error notice instead. Either
+ * way the queue is re-fetched immediately after the action settles, rather
+ * than waiting on the next scheduled poll, so the row's fate (moved to
+ * front / removed / unaffected) is reflected right away. No confirm dialog
+ * -- these are single-item, easily-reversible actions per the plan (only
+ * page-level bulk actions, COL-181, get a confirm dialog).
  */
 export function QueuePage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [fileFilter, setFileFilter] = useState("");
+  const [pendingActions, setPendingActions] = useState<PendingActions>({});
+  const [actionNotice, setActionNotice] = useState<ActionNotice>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -105,6 +142,80 @@ export function QueuePage() {
     };
   }, []);
 
+  /**
+   * Best-effort immediate refresh, used right after a per-row action
+   * settles so its outcome (row moved to front / removed / unaffected) is
+   * reflected without waiting for the next scheduled poll. Deliberately
+   * swallows its own failure -- the regular poll loop above already owns
+   * surfacing/retrying a broken queue fetch; a refresh failure here would
+   * otherwise stomp on the {@link ActionNotice} the action itself just set.
+   */
+  async function refreshQueueSoon(): Promise<void> {
+    try {
+      const entries = await fetchJobQueue();
+      setState({ status: "ready", entries });
+    } catch {
+      // Swallowed -- see doc comment above.
+    }
+  }
+
+  /**
+   * Shared shape behind both per-row actions (COL-180): mark the row
+   * pending, clear any stale notice, run `call` (resolving `true` on
+   * success, `false` on the documented "too late" race), surface whichever
+   * outcome happened, clear the row's pending state, then refresh. Only the
+   * verb (`kind`), the request itself, and the two message strings differ
+   * between "Process next" and "Cancel".
+   */
+  async function runRowAction(
+    entry: JobHistoryEntry,
+    kind: RowActionKind,
+    call: () => Promise<boolean>,
+    tooLateText: string,
+    failureFallback: string,
+  ): Promise<void> {
+    setPendingActions((prev) => ({ ...prev, [entry.job_id]: kind }));
+    setActionNotice(null);
+    try {
+      const succeeded = await call();
+      if (!succeeded) {
+        setActionNotice({ tone: "hint", text: tooLateText });
+      }
+    } catch (error) {
+      setActionNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : failureFallback,
+      });
+    } finally {
+      setPendingActions((prev) => {
+        const next = { ...prev };
+        delete next[entry.job_id];
+        return next;
+      });
+    }
+    await refreshQueueSoon();
+  }
+
+  async function handleProcessNext(entry: JobHistoryEntry): Promise<void> {
+    await runRowAction(
+      entry,
+      "bump",
+      async () => (await bumpJobToFront(entry.job_id)).bumped,
+      `"${titleFromPath(entry.file_path)}" already started running before it could be moved to the front.`,
+      "Failed to move job to the front of the queue.",
+    );
+  }
+
+  async function handleCancel(entry: JobHistoryEntry): Promise<void> {
+    await runRowAction(
+      entry,
+      "cancel",
+      async () => (await cancelJob(entry.job_id)).cancelled,
+      `"${titleFromPath(entry.file_path)}" already started running before it could be cancelled.`,
+      "Failed to cancel job.",
+    );
+  }
+
   const filtered = useMemo(() => {
     if (state.status !== "ready") return [];
     const needle = fileFilter.trim().toLowerCase();
@@ -134,6 +245,10 @@ export function QueuePage() {
             onChange={(event) => setFileFilter(event.target.value)}
           />
         </div>
+      )}
+
+      {actionNotice && (
+        <p className={actionNotice.tone === "error" ? "view__error" : "form-hint"}>{actionNotice.text}</p>
       )}
 
       {state.status === "loading" && (
@@ -182,32 +297,59 @@ export function QueuePage() {
                 <th scope="col">Started</th>
                 <th scope="col">Target</th>
                 <th scope="col">Language</th>
+                <th scope="col">Actions</th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map((entry) => (
-                <tr key={entry.id}>
-                  <td>
-                    <div className="activity-table__title">{titleFromPath(entry.file_path)}</div>
-                    <div className="activity-table__path">{entry.file_path}</div>
-                  </td>
-                  <td>
-                    <span className={`activity-table__kind activity-table__kind--${entry.kind}`}>
-                      {JOB_KIND_LABEL[entry.kind]}
-                    </span>
-                  </td>
-                  <td>
-                    <span
-                      className={`activity-table__status activity-table__status--${entry.status}`}
-                    >
-                      {STATUS_LABEL[entry.status]}
-                    </span>
-                  </td>
-                  <td>{formatTimestamp(entry.started_at)}</td>
-                  <td>{entry.target ?? "—"}</td>
-                  <td>{entry.language ?? "—"}</td>
-                </tr>
-              ))}
+              {filtered.map((entry) => {
+                const isPendingRow = entry.status === "pending";
+                const rowAction = pendingActions[entry.job_id] ?? null;
+                return (
+                  <tr key={entry.id}>
+                    <td>
+                      <div className="activity-table__title">{titleFromPath(entry.file_path)}</div>
+                      <div className="activity-table__path">{entry.file_path}</div>
+                    </td>
+                    <td>
+                      <span className={`activity-table__kind activity-table__kind--${entry.kind}`}>
+                        {JOB_KIND_LABEL[entry.kind]}
+                      </span>
+                    </td>
+                    <td>
+                      <span
+                        className={`activity-table__status activity-table__status--${entry.status}`}
+                      >
+                        {STATUS_LABEL[entry.status]}
+                      </span>
+                    </td>
+                    <td>{formatTimestamp(entry.started_at)}</td>
+                    <td>{entry.target ?? "—"}</td>
+                    <td>{entry.language ?? "—"}</td>
+                    <td className="data-table__actions">
+                      {isPendingRow && (
+                        <>
+                          <button
+                            type="button"
+                            className="btn btn--secondary btn--sm"
+                            onClick={() => void handleProcessNext(entry)}
+                            disabled={rowAction !== null}
+                          >
+                            {rowAction === "bump" ? "Processing…" : "Process next"}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn--danger btn--sm"
+                            onClick={() => void handleCancel(entry)}
+                            disabled={rowAction !== null}
+                          >
+                            {rowAction === "cancel" ? "Cancelling…" : "Cancel"}
+                          </button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

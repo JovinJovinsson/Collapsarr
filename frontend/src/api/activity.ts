@@ -1,6 +1,8 @@
 import type {
   BulkSetDefaultAudioTriggerRequest,
   BulkSetDefaultAudioTriggerResult,
+  BumpJobResult,
+  CancelJobResult,
   JobHistoryEntry,
   ManualTriggerRequest,
   ManualTriggerResult,
@@ -135,4 +137,50 @@ export async function bulkTriggerSetDefaultAudio(
     );
   }
   return (await response.json()) as BulkSetDefaultAudioTriggerResult;
+}
+
+/**
+ * Bumps one pending Job to the front of the queue (`POST /api/jobs/{job_id}/bump`,
+ * COL-169) -- `QueuePage`'s (COL-180) per-row "Process next" action.
+ *
+ * A `200` is returned whether or not the bump actually took effect -- the
+ * response's `bumped` flag (not the HTTP status) distinguishes success from
+ * "too late" (the Job was no longer `pending` by the time the request
+ * landed, e.g. a worker already claimed it), so this only throws on a
+ * genuine error response (e.g. `404` when the job is no longer in the live
+ * queue at all).
+ */
+export async function bumpJobToFront(jobId: string): Promise<BumpJobResult> {
+  const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/bump`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to move job to the front of the queue (${response.status})`),
+    );
+  }
+  return (await response.json()) as BumpJobResult;
+}
+
+/**
+ * Cancels one pending Job (`DELETE /api/jobs/{job_id}`, COL-168) --
+ * `QueuePage`'s (COL-180) per-row "Cancel" action. "Cancel" is deletion: on
+ * success the Job is removed from the live queue and its `JobHistory` row
+ * is deleted too, leaving no trace.
+ *
+ * A `200` is returned whether or not the cancel actually took effect -- the
+ * response's `cancelled` flag (not the HTTP status) distinguishes success
+ * from "too late" (a worker already claimed the Job, or it already reached
+ * a terminal status, by the time the request landed), so this only throws
+ * on a genuine error response (e.g. `404` when the job is no longer in the
+ * live queue at all).
+ */
+export async function cancelJob(jobId: string): Promise<CancelJobResult> {
+  const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to cancel job (${response.status})`));
+  }
+  return (await response.json()) as CancelJobResult;
 }

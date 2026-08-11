@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueuePage } from "../pages/QueuePage";
@@ -78,6 +78,31 @@ function mockFetchQueue(responses: unknown[]) {
 
 function mockFetchRejected(error: Error) {
   const fetchMock = vi.fn().mockRejectedValue(error);
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+/**
+ * Routes `GET /api/jobs/queue` through the same call-indexed sequence
+ * {@link mockFetchQueue} uses, and everything else (the per-row action
+ * endpoints) through `actionHandler`, which inspects the URL/method itself
+ * -- lets a single test drive both the background poll and a button click
+ * against different responses.
+ */
+function mockFetchWithAction(
+  queueResponses: unknown[],
+  actionHandler: (url: string, init?: RequestInit) => { ok: boolean; status?: number; body: unknown },
+) {
+  let call = 0;
+  const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    if (typeof url === "string" && url.includes("/api/jobs/queue")) {
+      const body = queueResponses[Math.min(call, queueResponses.length - 1)];
+      call += 1;
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+    }
+    const { ok, status = 200, body } = actionHandler(url, init);
+    return Promise.resolve({ ok, status, json: () => Promise.resolve(body) });
+  });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
@@ -198,6 +223,103 @@ describe("QueuePage", () => {
     render(<QueuePage />);
 
     expect(await screen.findByText(/failed to load queue \(500\)/i)).toBeInTheDocument();
+  });
+
+  describe("per-row actions (COL-180)", () => {
+    it("shows \"Process next\" and \"Cancel\" only on pending rows, not running rows", async () => {
+      mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      expect(within(runningRow).queryByRole("button", { name: /process next/i })).not.toBeInTheDocument();
+      expect(within(runningRow).queryByRole("button", { name: /^cancel$/i })).not.toBeInTheDocument();
+
+      const pendingRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
+      expect(within(pendingRow).getByRole("button", { name: /process next/i })).toBeInTheDocument();
+      expect(within(pendingRow).getByRole("button", { name: /^cancel$/i })).toBeInTheDocument();
+    });
+
+    it("\"Process next\" calls the bump endpoint for that job and refreshes the queue on success", async () => {
+      const refreshedQueue = [pendingJobHigherPriority, runningJob, pendingJobLowerPriority];
+      const fetchMock = mockFetchWithAction([queueResponse, refreshedQueue], (url, init) => {
+        expect(url).toContain(`/api/jobs/${pendingJobHigherPriority.job_id}/bump`);
+        expect(init?.method).toBe("POST");
+        return { ok: true, body: { bumped: true } };
+      });
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Other.S01E02")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process next/i }));
+
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      const titles = await screen.findAllByRole("row");
+      const firstDataRowTitle = titles[1].querySelector(".activity-table__title")?.textContent;
+      expect(firstDataRowTitle).toBe("Other.S01E02");
+    });
+
+    it("\"Process next\" shows a graceful notice, not a stuck row, when the job started running first (too-late race)", async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: true,
+        body: { bumped: false },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Other.S01E02")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process next/i }));
+
+      expect(await screen.findByText(/already started running/i)).toBeInTheDocument();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      // The row is still there, not stuck mid-action -- the button is back to its normal label.
+      expect(within(pendingRow).getByRole("button", { name: /process next/i })).not.toBeDisabled();
+    });
+
+    it("\"Cancel\" calls the DELETE endpoint for that job, and the row disappears once cancelled", async () => {
+      const afterCancel = [runningJob, pendingJobHigherPriority];
+      const fetchMock = mockFetchWithAction([queueResponse, afterCancel], (url, init) => {
+        expect(url).toContain(`/api/jobs/${pendingJobLowerPriority.job_id}`);
+        expect(url).not.toContain("bump");
+        expect(init?.method).toBe("DELETE");
+        return { ok: true, body: { cancelled: true } };
+      });
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /^cancel$/i }));
+
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      await waitFor(() => expect(screen.queryByText("Show.S01E01")).not.toBeInTheDocument());
+    });
+
+    it("\"Cancel\" shows a graceful notice, not a stuck row, when the job started running first (too-late race)", async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: true,
+        body: { cancelled: false },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /^cancel$/i }));
+
+      expect(await screen.findByText(/already started running/i)).toBeInTheDocument();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      // Still there, not stuck -- the row survives (it never left `pending` server-side).
+      expect(screen.getByText("Show.S01E01")).toBeInTheDocument();
+    });
+
+    it("surfaces a clear message, not a stuck row, when the cancel target is already gone (404)", async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: false,
+        status: 404,
+        body: { detail: "No such job: 22222222-2222-2222-2222-222222222222" },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /^cancel$/i }));
+
+      expect(await screen.findByText(/no such job/i)).toBeInTheDocument();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    });
   });
 
   describe("polling", () => {
