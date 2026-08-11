@@ -143,6 +143,28 @@ export interface BulkSetDefaultAudioTriggerResult {
 }
 
 /**
+ * Request body for `POST /api/jobs/requeue` (COL-170, `RequeueFileRequest`)
+ * -- `HistoryPage`'s (COL-176) per-row "Requeue" action on a `failed` row.
+ *
+ * Unlike {@link ManualTriggerRequest} there is no `extra_languages` option --
+ * a requeue retries against the standing language allow-list, not a one-off
+ * widened one.
+ */
+export interface RequeueFileRequest {
+  file_path: string;
+}
+
+/**
+ * Response for `POST /api/jobs/requeue` (COL-170, `RequeueFileResult`). Same
+ * shape as {@link ManualTriggerResult}: `enqueued` is `true` with the created
+ * `job` when a downmix job was queued, `false` with `job` `null` when the
+ * file was skipped -- a duplicate (already `PENDING`/`RUNNING`), unprobeable,
+ * or with no qualifying target. The Recently-Processed Window is always
+ * bypassed for a requeue, so it is never the skip reason.
+ */
+export type RequeueFileResult = ManualTriggerResult;
+
+/**
  * Response for `DELETE /api/jobs/{job_id}` (COL-168, `CancelJobResult`) --
  * `QueuePage`'s (COL-180) per-row "Cancel" action.
  *

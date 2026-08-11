@@ -14,6 +14,7 @@ import {
 } from "../components/icons";
 import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
+import { HistoryPage } from "../pages/HistoryPage";
 import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { LogsPage } from "../pages/LogsPage";
 import { QueuePage } from "../pages/QueuePage";
@@ -106,6 +107,10 @@ export const navItems: NavItem[] = [
   // repurposed this route into the live-only Queue view; COL-176 gives
   // terminal (succeeded/failed) job history its own dedicated page/nav entry.
   { to: "/queue", label: "Queue", icon: <ActivityIcon />, element: <QueuePage /> },
+  // Terminal (succeeded/failed) job history (COL-176) -- the other half of
+  // the old combined Activity table, split out into its own nav entry
+  // distinct from "Queue" above (live pending/running rows only).
+  { to: "/history", label: "History", icon: <ActivityIcon />, element: <HistoryPage /> },
 ];
 
 /**

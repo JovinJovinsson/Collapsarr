@@ -7,6 +7,8 @@ import type {
   JobHistoryEntry,
   ManualTriggerRequest,
   ManualTriggerResult,
+  RequeueFileRequest,
+  RequeueFileResult,
   SetDefaultAudioTriggerRequest,
   SetDefaultAudioTriggerResult,
 } from "../types/activity";
@@ -23,11 +25,12 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
  * (COL-178's `QueuePage`, sourced from {@link fetchJobQueue} instead) used to
  * fetch the full list unfiltered and filter client-side -- the server's
  * `file` filter is exact-match only, a poor fit for an interactive text
- * filter -- and the upcoming History page (COL-176) will take over that
- * fetch-all-and-filter-client-side role for terminal (succeeded/failed)
- * rows. `FileDetailPage` (COL-34) already knows the exact file path it wants
- * history for, so it passes `filePath` to use the server-side filter
- * directly instead of fetching and filtering the whole table.
+ * filter -- and `HistoryPage` (COL-176) is this fetch's remaining consumer,
+ * taking over that same fetch-all-and-filter-client-side role for terminal
+ * (succeeded/failed) rows. `FileDetailPage` (COL-34) already knows the exact
+ * file path it wants history for, so it passes `filePath` to use the
+ * server-side filter directly instead of fetching and filtering the whole
+ * table.
  *
  * Uses a relative URL -- per `frontend/README.md`, the backend eventually
  * serves this bundle from its own origin, so no base URL is needed. Routed
@@ -184,6 +187,33 @@ export async function cancelJob(jobId: string): Promise<CancelJobResult> {
     throw new Error(await apiErrorMessage(response, `Failed to cancel job (${response.status})`));
   }
   return (await response.json()) as CancelJobResult;
+}
+
+/**
+ * Requeues one specific file (`POST /api/jobs/requeue`, COL-170) --
+ * `HistoryPage`'s (COL-176) per-row "Requeue" action on a `failed` row.
+ *
+ * A `202` is returned whether or not a job was actually enqueued -- the
+ * response's `enqueued` flag (not the HTTP status) distinguishes a queued
+ * job from a skipped file (already `PENDING`/`RUNNING`, unprobeable, or no
+ * qualifying target), so this only throws on a genuine error response.
+ * Unlike {@link cancelJob}/{@link bumpJobToFront}, the requeued file's
+ * existing (terminal) `JobHistoryEntry` row is untouched -- the backend
+ * creates a brand-new `Job`/history row for the requeue rather than mutating
+ * the old one, so the failed row stays visible in `HistoryPage` exactly as
+ * it was.
+ */
+export async function requeueFile(filePath: string): Promise<RequeueFileResult> {
+  const body: RequeueFileRequest = { file_path: filePath };
+  const response = await apiFetch("/api/jobs/requeue", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to requeue file (${response.status})`));
+  }
+  return (await response.json()) as RequeueFileResult;
 }
 
 /**
