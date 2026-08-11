@@ -9,6 +9,17 @@
 /** Matches `collapsarr.downmix.targets.DownmixTarget`'s enum values. */
 export type DownmixTarget = "stereo" | "2.1" | "5.1";
 
+/**
+ * Shared value/label pairs for every `DownmixTarget` picker in Settings
+ * (Targets' enabled-targets toggles, Preferred Default Audio's channel-tier
+ * picker) -- one source of truth for the display label per target.
+ */
+export const DOWNMIX_TARGET_OPTIONS: { value: DownmixTarget; label: string }[] = [
+  { value: "stereo", label: "Stereo (2.0)" },
+  { value: "2.1", label: "2.1" },
+  { value: "5.1", label: "5.1" },
+];
+
 /** One `(language, target)` pair still missing on a wanted file. */
 export interface WantedTarget {
   language: string;

@@ -1,18 +1,13 @@
 import { useEffect, useState } from "react";
 
 import { fetchSettings, updateSettings } from "../../api/settings";
+import { DOWNMIX_TARGET_OPTIONS } from "../../types/wanted";
 import type { DownmixTarget } from "../../types/wanted";
 
 type LoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "ready" };
-
-const TARGET_OPTIONS: { value: DownmixTarget; label: string }[] = [
-  { value: "stereo", label: "Stereo (2.0)" },
-  { value: "2.1", label: "2.1" },
-  { value: "5.1", label: "5.1" },
-];
 
 /** Parses a comma-separated language-code field into a sorted array, or `null` when blank (allow all). */
 function parseLanguageList(text: string): string[] | null {
@@ -110,7 +105,7 @@ export function TargetsSection() {
         <div className="panel settings-form">
           <fieldset className="checkbox-group">
             <legend>Enabled targets</legend>
-            {TARGET_OPTIONS.map((option) => (
+            {DOWNMIX_TARGET_OPTIONS.map((option) => (
               <label key={option.value} className="checkbox-row">
                 <input
                   type="checkbox"
