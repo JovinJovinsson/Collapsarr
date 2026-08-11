@@ -265,7 +265,6 @@ class JobScheduler:
             )
             return
         logger.info("webhook: enqueued job %s for %s", job.id, file.file_path)
-        self._wake.set()
 
     def enqueue_file(
         self,
