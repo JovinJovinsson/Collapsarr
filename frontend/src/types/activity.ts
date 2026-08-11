@@ -4,6 +4,8 @@
  * since there's no shared schema generation yet.
  */
 
+import type { TrackedNodeReference } from "./library";
+
 /** Matches `collapsarr.jobs.queue.JobStatus`'s enum values. */
 export type JobStatus = "pending" | "running" | "succeeded" | "failed";
 
@@ -92,3 +94,42 @@ export interface SetDefaultAudioTriggerRequest {
  * preference configured, a duplicate, unprobeable, or already correct.
  */
 export type SetDefaultAudioTriggerResult = ManualTriggerResult;
+
+/**
+ * Request body for `POST /api/jobs/trigger-default-audio/bulk` (COL-156,
+ * `BulkSetDefaultAudioTriggerRequest`) -- the Library page's bulk "Set
+ * Default Audio Track" action (COL-158). `references` reuses
+ * {@link TrackedNodeReference} (`types/library.ts`, COL-101) rather than
+ * defining an identical type of its own: the backend's own
+ * `DefaultAudioNodeReference` is documented as "identical shape to
+ * `TrackedNodeReference`" for the same reason
+ * (`collapsarr/jobs/routes.py`), and this is the same mixed Series/Season/
+ * Episode/Movie selection `POST /api/library/tracked`'s bulk Tracked update
+ * already takes.
+ */
+export interface BulkSetDefaultAudioTriggerRequest {
+  references: TrackedNodeReference[];
+}
+
+/**
+ * One resolved file's outcome within a bulk trigger response (COL-156,
+ * `FileSetDefaultAudioResult`). Mirrors {@link SetDefaultAudioTriggerResult}'s
+ * `enqueued`/`job` pair, per file, plus the `file_path` identifying which
+ * resolved file this result belongs to -- a bulk selection can cascade to
+ * several files, so there's no other way to attribute an outcome back to one.
+ */
+export interface FileSetDefaultAudioResult {
+  file_path: string;
+  enqueued: boolean;
+  job: EnqueuedJob | null;
+}
+
+/**
+ * Response for `POST /api/jobs/trigger-default-audio/bulk` (COL-156,
+ * `BulkSetDefaultAudioTriggerResult`) -- one {@link FileSetDefaultAudioResult}
+ * per unique file the request's references resolved to (after the backend's
+ * own Series/Season cascade and de-dup).
+ */
+export interface BulkSetDefaultAudioTriggerResult {
+  results: FileSetDefaultAudioResult[];
+}

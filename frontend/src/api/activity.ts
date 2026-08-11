@@ -1,10 +1,13 @@
 import type {
+  BulkSetDefaultAudioTriggerRequest,
+  BulkSetDefaultAudioTriggerResult,
   JobHistoryEntry,
   ManualTriggerRequest,
   ManualTriggerResult,
   SetDefaultAudioTriggerRequest,
   SetDefaultAudioTriggerResult,
 } from "../types/activity";
+import type { TrackedNodeReference } from "../types/library";
 import { apiErrorMessage, apiFetch } from "./client";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -81,4 +84,36 @@ export async function triggerSetDefaultAudio(
     );
   }
   return (await response.json()) as SetDefaultAudioTriggerResult;
+}
+
+/**
+ * Manually enqueues `SET_DEFAULT_AUDIO` jobs for an arbitrary mixed-level
+ * Library selection in one request (`POST /api/jobs/trigger-default-audio/bulk`,
+ * COL-156), used by the Library page's bulk "Set Default Audio Track" action
+ * (COL-158). Mirrors `bulkUpdateTracked`'s (`api/library.ts`, COL-103) shape:
+ * `references` may hold any mix of Series/Season/Episode/Movie references,
+ * cascaded and de-duplicated down to their unique on-disk files server-side.
+ *
+ * A `202` is returned whether or not any individual file was enqueued; each
+ * result's own `enqueued` flag distinguishes queued from skipped, mirroring
+ * {@link triggerSetDefaultAudio}'s single-file skip semantics per file.
+ */
+export async function bulkTriggerSetDefaultAudio(
+  references: TrackedNodeReference[],
+): Promise<BulkSetDefaultAudioTriggerResult> {
+  const body: BulkSetDefaultAudioTriggerRequest = { references };
+  const response = await apiFetch("/api/jobs/trigger-default-audio/bulk", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(
+        response,
+        `Failed to trigger bulk Set Default Audio Track (${response.status})`,
+      ),
+    );
+  }
+  return (await response.json()) as BulkSetDefaultAudioTriggerResult;
 }

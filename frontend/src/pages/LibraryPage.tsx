@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
+import { bulkTriggerSetDefaultAudio } from "../api/activity";
 import {
   bulkUpdateTracked,
   fetchLibraryTree,
@@ -588,26 +589,34 @@ function MovieTable({
 }
 
 /**
- * The bulk-action toolbar (COL-103): appears once the cross-level selection
- * holds at least one reference, offering "Mark Tracked" / "Mark Not Tracked"
- * across the whole mixed-level selection in a single bulk-update request.
- * Renders nothing once the selection is empty, so it disappears the moment
- * the last checked row is unchecked or a successful apply clears it.
+ * The bulk-action toolbar (COL-103/COL-158): appears once the cross-level
+ * selection holds at least one reference, offering "Mark Tracked"/"Mark Not
+ * Tracked" and "Set Default Audio Track" across the whole mixed-level
+ * selection, each in a single request. Renders nothing once the selection is
+ * empty, so it disappears the moment the last checked row is unchecked or a
+ * successful apply clears it.
+ *
+ * "Set Default Audio Track" (COL-158) reuses the exact same `pending` guard
+ * and disabled styling as the Tracked actions -- `LibraryPage` only ever runs
+ * one bulk action at a time, so there's no need for the toolbar to track
+ * which specific action is in flight.
  */
 function BulkActionToolbar({
   count,
   pending,
   onApply,
+  onApplyDefaultAudio,
   onClear,
 }: {
   count: number;
   pending: boolean;
   onApply: (tracked: boolean) => void;
+  onApplyDefaultAudio: () => void;
   onClear: () => void;
 }) {
   if (count === 0) return null;
   return (
-    <div className="library-bulk-toolbar" role="toolbar" aria-label="Bulk Tracked actions">
+    <div className="library-bulk-toolbar" role="toolbar" aria-label="Bulk library actions">
       <span className="library-bulk-toolbar__count">
         {count} {count === 1 ? "row" : "rows"} selected
       </span>
@@ -621,6 +630,14 @@ function BulkActionToolbar({
         onClick={() => onApply(false)}
       >
         {pending ? "Updating…" : "Mark Not Tracked"}
+      </button>
+      <button
+        type="button"
+        className="btn btn--secondary btn--sm"
+        disabled={pending}
+        onClick={onApplyDefaultAudio}
+      >
+        {pending ? "Updating…" : "Set Default Audio Track"}
       </button>
       <button
         type="button"
@@ -656,6 +673,14 @@ function BulkActionToolbar({
  * (including any cascade to a selected Series/Season's descendants) without
  * a manual refresh. A successful bulk apply clears the selection; a failed
  * one leaves it as-is so the user can retry.
+ *
+ * The toolbar's "Set Default Audio Track" action (COL-158) sends that same
+ * selection to `POST /api/jobs/trigger-default-audio/bulk` (COL-156)
+ * instead, via `handleBulkSetDefaultAudio` -- identical selection-decoding
+ * and refetch-after-apply UX to `handleBulkApply`, just a different
+ * endpoint/error state, since the two actions run independently (a Tracked
+ * failure shouldn't be reported as a Default Audio Track failure or vice
+ * versa).
  *
  * "Select all" (COL-109), at the top of `SeriesTree`/`MovieTable`, adds every
  * currently-rendered (post search/Tracked-filter) node's reference to that
@@ -693,6 +718,10 @@ export function LibraryPage() {
   // references at once, independent of which branch each lives under.
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkPending, setBulkPending] = useState(false);
+  // Separate from `toggleError` (COL-101/COL-103, Tracked-specific) so a
+  // Set Default Audio Track failure (COL-158) doesn't render under a
+  // "Couldn't update Tracked" message that has nothing to do with it.
+  const [defaultAudioError, setDefaultAudioError] = useState<string | null>(null);
   // Title search + Tracked filter (COL-104), composed via AND below.
   const [searchQuery, setSearchQuery] = useState("");
   const [trackedFilter, setTrackedFilter] = useState<TrackedFilterValue>("all");
@@ -810,6 +839,33 @@ export function LibraryPage() {
     }
   }
 
+  /**
+   * "Set Default Audio Track" bulk action (COL-158): sends the same
+   * cross-level selection `handleBulkApply` sends, decoded the same way, to
+   * `POST /api/jobs/trigger-default-audio/bulk` (COL-156) instead -- that
+   * endpoint does its own Series/Season cascade and de-dup down to each
+   * selected leaf's on-disk file, mirroring `POST /api/library/tracked`'s
+   * cascade. Same refetch-after-apply pattern as `handleBulkApply` reflects
+   * the result (e.g. an updated Default Audio column value once a triggered
+   * job completes) without a manual page refresh, and clears the selection
+   * on success only, so a failed apply can be retried as-is.
+   */
+  async function handleBulkSetDefaultAudio() {
+    if (selected.size === 0) return;
+    setDefaultAudioError(null);
+    setBulkPending(true);
+    try {
+      const references: TrackedNodeReference[] = Array.from(selected).map(decodeSelectionKey);
+      await bulkTriggerSetDefaultAudio(references);
+      await loadTree();
+      handleClearSelection();
+    } catch (error: unknown) {
+      setDefaultAudioError(error instanceof Error ? error.message : "Unknown error.");
+    } finally {
+      setBulkPending(false);
+    }
+  }
+
   const instance =
     instancesState.status === "ready"
       ? (instancesState.instances.find((candidate) => candidate.id === instanceId) ?? null)
@@ -869,11 +925,15 @@ export function LibraryPage() {
       )}
 
       {toggleError && <p className="form-error">Couldn&apos;t update Tracked: {toggleError}</p>}
+      {defaultAudioError && (
+        <p className="form-error">Couldn&apos;t trigger Set Default Audio Track: {defaultAudioError}</p>
+      )}
 
       <BulkActionToolbar
         count={selected.size}
         pending={bulkPending}
         onApply={(nextTracked) => void handleBulkApply(nextTracked)}
+        onApplyDefaultAudio={() => void handleBulkSetDefaultAudio()}
         onClear={handleClearSelection}
       />
 
