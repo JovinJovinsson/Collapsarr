@@ -58,18 +58,33 @@ const pendingJobHigherPriority: JobHistoryEntry = {
 /** Running-first, then pending ordered ascending by priority -- matches `GET /api/jobs/queue`'s (COL-175) contract. */
 const queueResponse: JobHistoryEntry[] = [runningJob, pendingJobLowerPriority, pendingJobHigherPriority];
 
-function mockFetch(handler: () => { ok: boolean; status?: number; body: unknown }) {
-  const fetchMock = vi.fn().mockImplementation(() => {
-    const { ok, status = 200, body } = handler();
+/**
+ * Default `GET /api/settings` body for tests that don't care about the
+ * Auto-Queuing Pause toggle (COL-181, COL-174) -- every helper below routes
+ * `/api/settings` here unless a test overrides it, so the toggle's mount-time
+ * load doesn't have to be threaded through every queue-only test.
+ */
+const DEFAULT_SETTINGS_RESPONSE = { auto_queue_paused: false };
+
+function mockFetch(handler: (url: string, init?: RequestInit) => { ok: boolean; status?: number; body: unknown }) {
+  const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    const { ok, status = 200, body } = handler(url, init);
     return Promise.resolve({ ok, status, json: () => Promise.resolve(body) });
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
 
-function mockFetchQueue(responses: unknown[]) {
+/**
+ * Routes `GET /api/jobs/queue` through the call-indexed `responses` sequence
+ * and `GET /api/settings` to `settings` (default {@link DEFAULT_SETTINGS_RESPONSE}).
+ */
+function mockFetchQueue(responses: unknown[], settings: unknown = DEFAULT_SETTINGS_RESPONSE) {
   let call = 0;
-  return mockFetch(() => {
+  return mockFetch((url) => {
+    if (typeof url === "string" && url.includes("/api/settings")) {
+      return { ok: true, body: settings };
+    }
     const body = responses[Math.min(call, responses.length - 1)];
     call += 1;
     return { ok: true, body };
@@ -84,14 +99,18 @@ function mockFetchRejected(error: Error) {
 
 /**
  * Routes `GET /api/jobs/queue` through the same call-indexed sequence
- * {@link mockFetchQueue} uses, and everything else (the per-row action
- * endpoints) through `actionHandler`, which inspects the URL/method itself
- * -- lets a single test drive both the background poll and a button click
+ * {@link mockFetchQueue} uses, `GET /api/settings` to `settings` (same
+ * default as {@link mockFetchQueue}), and everything else -- the per-row
+ * action endpoints, `POST /api/jobs/clear` (COL-181's "Clear queue"), and
+ * `PUT /api/settings` (COL-181's "Pause auto-queuing" write) -- through
+ * `actionHandler`, which inspects the URL/method itself. Lets a single test
+ * drive the background poll and the settings load alongside a button click
  * against different responses.
  */
 function mockFetchWithAction(
   queueResponses: unknown[],
   actionHandler: (url: string, init?: RequestInit) => { ok: boolean; status?: number; body: unknown },
+  settings: unknown = DEFAULT_SETTINGS_RESPONSE,
 ) {
   let call = 0;
   const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
@@ -99,6 +118,13 @@ function mockFetchWithAction(
       const body = queueResponses[Math.min(call, queueResponses.length - 1)];
       call += 1;
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+    }
+    if (
+      typeof url === "string" &&
+      url.includes("/api/settings") &&
+      (!init?.method || init.method === "GET")
+    ) {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(settings) });
     }
     const { ok, status = 200, body } = actionHandler(url, init);
     return Promise.resolve({ ok, status, json: () => Promise.resolve(body) });
@@ -251,7 +277,8 @@ describe("QueuePage", () => {
       const pendingRow = (await screen.findByText("Other.S01E02")).closest("tr") as HTMLElement;
       fireEvent.click(within(pendingRow).getByRole("button", { name: /process next/i }));
 
-      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      // Mount: queue poll + settings load; then the bump POST + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
       const titles = await screen.findAllByRole("row");
       const firstDataRowTitle = titles[1].querySelector(".activity-table__title")?.textContent;
       expect(firstDataRowTitle).toBe("Other.S01E02");
@@ -268,7 +295,8 @@ describe("QueuePage", () => {
       fireEvent.click(within(pendingRow).getByRole("button", { name: /process next/i }));
 
       expect(await screen.findByText(/already started running/i)).toBeInTheDocument();
-      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      // Mount: queue poll + settings load; then the bump POST + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
       // The row is still there, not stuck mid-action -- the button is back to its normal label.
       expect(within(pendingRow).getByRole("button", { name: /process next/i })).not.toBeDisabled();
     });
@@ -286,7 +314,8 @@ describe("QueuePage", () => {
       const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
       fireEvent.click(within(pendingRow).getByRole("button", { name: /^cancel$/i }));
 
-      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      // Mount: queue poll + settings load; then the DELETE + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
       await waitFor(() => expect(screen.queryByText("Show.S01E01")).not.toBeInTheDocument());
     });
 
@@ -301,7 +330,8 @@ describe("QueuePage", () => {
       fireEvent.click(within(pendingRow).getByRole("button", { name: /^cancel$/i }));
 
       expect(await screen.findByText(/already started running/i)).toBeInTheDocument();
-      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      // Mount: queue poll + settings load; then the DELETE + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
       // Still there, not stuck -- the row survives (it never left `pending` server-side).
       expect(screen.getByText("Show.S01E01")).toBeInTheDocument();
     });
@@ -318,7 +348,8 @@ describe("QueuePage", () => {
       fireEvent.click(within(pendingRow).getByRole("button", { name: /^cancel$/i }));
 
       expect(await screen.findByText(/no such job/i)).toBeInTheDocument();
-      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      // Mount: queue poll + settings load; then the failed DELETE + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
     });
   });
 
@@ -331,15 +362,17 @@ describe("QueuePage", () => {
       const fetchMock = mockFetchQueue([queueResponse, queueResponse]);
       render(<QueuePage />);
 
+      // +1 vs. the queue call alone: the one-shot Auto-Queuing Pause settings
+      // load (COL-181) also fires on mount.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(5_000);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
     });
 
     it("slows polling once the queue is empty, instead of continuing at the active 5s cadence", async () => {
@@ -349,19 +382,19 @@ describe("QueuePage", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
 
       // Not due yet at the active cadence.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(5_000);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
 
       // Due at the slower idle cadence.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(15_000);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
     });
 
     it("resumes the active 5s cadence once new work appears after an idle poll", async () => {
@@ -371,14 +404,14 @@ describe("QueuePage", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
 
       // First poll was empty -> idle cadence (20s) brings the second poll,
       // which returns non-empty content.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(20_000);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
       // Fake timers are active -- `findBy*`'s internal polling relies on real
       // timers, so assert synchronously; the state update above already
       // landed inside the `act` call.
@@ -388,7 +421,7 @@ describe("QueuePage", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(5_000);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
     });
 
     it("stops polling once the component unmounts", async () => {
@@ -398,14 +431,175 @@ describe("QueuePage", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
 
       unmount();
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(30_000);
       });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('"Clear queue" (COL-181)', () => {
+    it('shows "Clear queue" when the queue has a pending job', async () => {
+      mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      expect(await screen.findByRole("button", { name: /clear queue/i })).toBeInTheDocument();
+    });
+
+    it('hides "Clear queue" when there is no pending job', async () => {
+      mockFetchQueue([[runningJob]]);
+      render(<QueuePage />);
+
+      await screen.findByText("Interstellar");
+      expect(screen.queryByRole("button", { name: /clear queue/i })).not.toBeInTheDocument();
+    });
+
+    it("shows an inline confirm step before calling the bulk cancel endpoint", async () => {
+      const fetchMock = mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /clear queue/i }));
+
+      const confirmPanel = (await screen.findByText(/clear the queue\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+      expect(
+        within(confirmPanel).getByRole("button", { name: /confirm clear queue/i }),
+      ).toBeInTheDocument();
+      // Only the mount-time queue poll + settings load have happened so far --
+      // the bulk cancel endpoint itself hasn't been called yet.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('dismisses the confirm step via "Cancel" without calling the endpoint', async () => {
+      const fetchMock = mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /clear queue/i }));
+      const confirmPanel = (await screen.findByText(/clear the queue\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /^cancel$/i }));
+
+      expect(screen.queryByText(/clear the queue\?/i)).not.toBeInTheDocument();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("calls POST /api/jobs/clear on confirm and reports the cancelled/already_running split", async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, []], (url, init) => {
+        expect(url).toContain("/api/jobs/clear");
+        expect(init?.method).toBe("POST");
+        return { ok: true, body: { cancelled: 2, already_running: 1 } };
+      });
+      render(<QueuePage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /clear queue/i }));
+      const confirmPanel = (await screen.findByText(/clear the queue\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /confirm clear queue/i }));
+
+      expect(
+        await screen.findByText(
+          /cancelled 2 pending jobs\. 1 job had already progressed past pending and could not be cancelled\./i,
+        ),
+      ).toBeInTheDocument();
+      // The confirm step is dismissed once the endpoint call succeeds.
+      expect(screen.queryByText(/clear the queue\?/i)).not.toBeInTheDocument();
+      // Mount (queue poll + settings load) + the clear POST + the post-clear refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    });
+
+    it("reports a plain cancelled-count message when nothing was already running", async () => {
+      mockFetchWithAction([queueResponse, []], () => ({
+        ok: true,
+        body: { cancelled: 3, already_running: 0 },
+      }));
+      render(<QueuePage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /clear queue/i }));
+      const confirmPanel = (await screen.findByText(/clear the queue\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /confirm clear queue/i }));
+
+      expect(await screen.findByText(/^cancelled 3 pending jobs\.$/i)).toBeInTheDocument();
+    });
+
+    it("keeps the confirm step open and shows an error notice when the clear request fails", async () => {
+      mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: false,
+        status: 500,
+        body: { detail: "boom" },
+      }));
+      render(<QueuePage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /clear queue/i }));
+      const confirmPanel = (await screen.findByText(/clear the queue\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /confirm clear queue/i }));
+
+      expect(await screen.findByText(/boom/i)).toBeInTheDocument();
+      // Still open for a retry, unlike the success path above.
+      expect(screen.getByText(/clear the queue\?/i)).toBeInTheDocument();
+    });
+  });
+
+  describe('"Pause auto-queuing" toggle (COL-181)', () => {
+    it("reflects the active state on load", async () => {
+      mockFetchQueue([queueResponse], { auto_queue_paused: false });
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-queuing: active/i });
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("reflects the paused state on load", async () => {
+      mockFetchQueue([queueResponse], { auto_queue_paused: true });
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-queuing: paused/i });
+      expect(toggle).toHaveAttribute("aria-pressed", "true");
+    });
+
+    it("flips the setting via PUT /api/settings when clicked, and reflects the response", async () => {
+      mockFetchWithAction(
+        [queueResponse],
+        (url, init) => {
+          expect(url).toContain("/api/settings");
+          expect(init?.method).toBe("PUT");
+          expect(JSON.parse(init?.body as string)).toEqual({ auto_queue_paused: true });
+          return { ok: true, body: { auto_queue_paused: true } };
+        },
+        { auto_queue_paused: false },
+      );
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-queuing: active/i });
+      fireEvent.click(toggle);
+
+      expect(await screen.findByRole("button", { name: /auto-queuing: paused/i })).toBeInTheDocument();
+    });
+
+    it("surfaces a page-level error notice and keeps the prior state when the write fails", async () => {
+      mockFetchWithAction(
+        [queueResponse],
+        () => ({ ok: false, status: 500, body: { detail: "settings boom" } }),
+        { auto_queue_paused: false },
+      );
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-queuing: active/i });
+      fireEvent.click(toggle);
+
+      expect(await screen.findByText(/settings boom/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /auto-queuing: active/i })).toBeInTheDocument();
     });
   });
 });

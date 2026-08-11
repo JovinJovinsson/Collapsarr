@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { bumpJobToFront, cancelJob, fetchJobQueue } from "../api/activity";
+import { bumpJobToFront, cancelJob, clearQueue, fetchJobQueue } from "../api/activity";
+import { fetchSettings, updateSettings } from "../api/settings";
 import { ActivityIcon } from "../components/icons";
 import { JOB_KIND_LABEL } from "../types/activity";
-import type { JobHistoryEntry, JobStatus } from "../types/activity";
+import type { ClearQueueResult, JobHistoryEntry, JobStatus } from "../types/activity";
 
 const STATUS_LABEL: Record<JobStatus, string> = {
   pending: "Pending",
@@ -66,6 +67,42 @@ type PendingActions = Partial<Record<string, RowActionKind>>;
  */
 type ActionNotice = { tone: "hint" | "error"; text: string } | null;
 
+/** Load state for the persisted Auto-Queuing Pause setting (COL-181, COL-174). */
+type SettingsLoadState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; autoQueuePaused: boolean };
+
+/**
+ * Result notice for the page-level "Clear queue" action (COL-181, COL-173).
+ * `"success"` always reports the endpoint's `cancelled`/`already_running`
+ * split via {@link describeClearQueueResult} -- never a generic "done"
+ * message -- since a non-zero `already_running` means the operator's request
+ * didn't fully land and that's worth surfacing, not just the count that did.
+ */
+type ClearQueueNotice = { tone: "success" | "error"; text: string } | null;
+
+/**
+ * Renders `POST /api/jobs/clear`'s (COL-173) `cancelled`/`already_running`
+ * split as a sentence, instead of a bare "success" message -- the split is
+ * the entire point of the endpoint's response shape (see
+ * `ClearQueueResult`'s doc comment, `types/activity.ts`). Deliberately says
+ * "progressed past pending", not "started running": the backend's
+ * `already_running` count (`collapsarr/jobs/routes.py`'s `ClearQueueResult`)
+ * covers any Job a worker claimed *or* that otherwise left `pending` between
+ * the endpoint's snapshot and its own cancel -- including one that finished
+ * outright in that window, not only one still actively running.
+ */
+function describeClearQueueResult(result: ClearQueueResult): string {
+  const cancelledText = `Cancelled ${result.cancelled} pending job${result.cancelled === 1 ? "" : "s"}.`;
+  if (result.already_running === 0) return cancelledText;
+  const alreadyRunningText =
+    result.already_running === 1
+      ? "1 job had already progressed past pending and could not be cancelled."
+      : `${result.already_running} jobs had already progressed past pending and could not be cancelled.`;
+  return `${cancelledText} ${alreadyRunningText}`;
+}
+
 /**
  * The live Queue view (COL-178, repurposing the old combined Activity/History
  * page): every currently `running`/`pending` Job, sourced from `GET
@@ -103,12 +140,37 @@ type ActionNotice = { tone: "hint" | "error"; text: string } | null;
  * front / removed / unaffected) is reflected right away. No confirm dialog
  * -- these are single-item, easily-reversible actions per the plan (only
  * page-level bulk actions, COL-181, get a confirm dialog).
+ *
+ * COL-181 adds two page-level controls, both in the header next to the
+ * title:
+ *
+ * - "Clear queue" (`clearQueue`, `POST /api/jobs/clear`, COL-173): visible
+ *   only while at least one row is `pending` (nothing to clear otherwise).
+ *   Unlike the per-row actions above, this is destructive across the whole
+ *   queue, so it sits behind an inline confirm step (mirrors `BackupsPage`'s
+ *   `.view__confirm` pattern) rather than firing immediately. On response,
+ *   the `cancelled`/`already_running` split is rendered verbatim via
+ *   {@link describeClearQueueResult} -- never a bare "done" message -- since
+ *   `already_running` (a worker claimed some Jobs between the endpoint's
+ *   snapshot and their own cancel) means the request didn't fully land.
+ * - "Pause auto-queuing" (`fetchSettings`/`updateSettings`,
+ *   `GET`/`PUT /api/settings`'s `auto_queue_paused`, COL-174): a toggle
+ *   button reflecting the persisted setting on load and flipping it via the
+ *   settings `PUT`. Styled with its own on/off palette
+ *   (`.auto-queue-toggle--active`/`--paused`) so paused vs. active reads
+ *   unambiguously at a glance, the same way `TrackedToggleButton`'s
+ *   `.tracked-toggle--on`/`--off` does for the Tracked toggle.
  */
 export function QueuePage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [fileFilter, setFileFilter] = useState("");
   const [pendingActions, setPendingActions] = useState<PendingActions>({});
   const [actionNotice, setActionNotice] = useState<ActionNotice>(null);
+  const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
+  const [pauseTogglePending, setPauseTogglePending] = useState(false);
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const [clearingQueue, setClearingQueue] = useState(false);
+  const [clearQueueNotice, setClearQueueNotice] = useState<ClearQueueNotice>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -139,6 +201,34 @@ export function QueuePage() {
     return () => {
       cancelled = true;
       if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, []);
+
+  /**
+   * Loads the persisted Auto-Queuing Pause setting once on mount (COL-181,
+   * COL-174) -- a single one-shot `GET /api/settings`, not part of the queue
+   * poll loop above: the setting doesn't change on its own (only this page's
+   * own toggle, or another client, writes it), so there's nothing to poll
+   * for -- {@link handleToggleAutoQueuePause} updates local state directly
+   * from its own `PUT` response instead.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const settings = await fetchSettings();
+        if (cancelled) return;
+        setSettingsState({ status: "ready", autoQueuePaused: settings.auto_queue_paused });
+      } catch (error) {
+        if (cancelled) return;
+        setSettingsState({
+          status: "error",
+          message: error instanceof Error ? error.message : "Failed to load auto-queuing setting.",
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -216,6 +306,69 @@ export function QueuePage() {
     );
   }
 
+  /**
+   * Flips the persisted Auto-Queuing Pause setting (COL-181, COL-174) via
+   * `PUT /api/settings`. Unlike the per-row actions' optimistic-free "wait
+   * for the server, then refetch" shape, this applies the `PUT` response's
+   * own `auto_queue_paused` value directly -- there's no snapshot/race to
+   * reconcile the way a queue row has, it's a single scalar this page is the
+   * only writer of (besides another client). A failure surfaces through the
+   * shared {@link ActionNotice} banner and leaves the toggle at its last
+   * known-good state rather than guessing.
+   */
+  async function handleToggleAutoQueuePause(): Promise<void> {
+    if (settingsState.status !== "ready" || pauseTogglePending) return;
+    const next = !settingsState.autoQueuePaused;
+    setPauseTogglePending(true);
+    try {
+      const updated = await updateSettings({ auto_queue_paused: next });
+      setSettingsState({ status: "ready", autoQueuePaused: updated.auto_queue_paused });
+    } catch (error) {
+      setActionNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to update auto-queuing setting.",
+      });
+    } finally {
+      setPauseTogglePending(false);
+    }
+  }
+
+  /** Opens the inline "Clear queue" confirm step (COL-181), clearing any stale result notice. */
+  function handleClearQueueClick(): void {
+    setClearQueueNotice(null);
+    setConfirmingClear(true);
+  }
+
+  /** Dismisses the "Clear queue" confirm step without calling the endpoint. */
+  function handleCancelClearQueue(): void {
+    setConfirmingClear(false);
+  }
+
+  /**
+   * Calls the bulk cancel endpoint (`clearQueue`, `POST /api/jobs/clear`,
+   * COL-173) and surfaces its `cancelled`/`already_running` split verbatim
+   * (see {@link describeClearQueueResult}) rather than a generic success
+   * message. Mirrors `BackupsPage`'s per-row delete confirm: the confirm
+   * step is dismissed only on success, so a failure leaves it open for a
+   * retry instead of silently discarding the operator's confirmation.
+   */
+  async function handleConfirmClearQueue(): Promise<void> {
+    setClearingQueue(true);
+    try {
+      const result = await clearQueue();
+      setConfirmingClear(false);
+      setClearQueueNotice({ tone: "success", text: describeClearQueueResult(result) });
+      await refreshQueueSoon();
+    } catch (error) {
+      setClearQueueNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to clear the queue.",
+      });
+    } finally {
+      setClearingQueue(false);
+    }
+  }
+
   const filtered = useMemo(() => {
     if (state.status !== "ready") return [];
     const needle = fileFilter.trim().toLowerCase();
@@ -224,15 +377,82 @@ export function QueuePage() {
   }, [state, fileFilter]);
 
   const hasEntries = state.status === "ready" && state.entries.length > 0;
+  const hasPendingJob = state.status === "ready" && state.entries.some((entry) => entry.status === "pending");
 
   return (
     <section className="view">
-      <header className="view__header">
-        <h1 className="view__title">Queue</h1>
-        <p className="view__summary">
-          Live view of running and pending downmix jobs — refreshes automatically.
-        </p>
+      <header className="view__header view__header--row">
+        <div>
+          <h1 className="view__title">Queue</h1>
+          <p className="view__summary">
+            Live view of running and pending downmix jobs — refreshes automatically.
+          </p>
+        </div>
+        <div className="view__actions">
+          {settingsState.status === "ready" && (
+            <button
+              type="button"
+              className={
+                settingsState.autoQueuePaused
+                  ? "auto-queue-toggle auto-queue-toggle--paused"
+                  : "auto-queue-toggle auto-queue-toggle--active"
+              }
+              onClick={() => void handleToggleAutoQueuePause()}
+              disabled={pauseTogglePending}
+              aria-pressed={settingsState.autoQueuePaused}
+            >
+              {pauseTogglePending
+                ? "Updating…"
+                : settingsState.autoQueuePaused
+                  ? "Auto-queuing: Paused"
+                  : "Auto-queuing: Active"}
+            </button>
+          )}
+          {settingsState.status === "error" && (
+            <span className="form-hint">
+              Couldn&apos;t load auto-queuing setting: {settingsState.message}
+            </span>
+          )}
+          {hasPendingJob && !confirmingClear && (
+            <button type="button" className="btn btn--danger" onClick={handleClearQueueClick}>
+              Clear queue
+            </button>
+          )}
+        </div>
       </header>
+
+      {confirmingClear && (
+        <div className="panel view__confirm" role="status">
+          <p>
+            Clear the queue? This cancels every pending job. Jobs already running are not
+            affected and will finish normally.
+          </p>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="btn btn--danger"
+              onClick={() => void handleConfirmClearQueue()}
+              disabled={clearingQueue}
+            >
+              {clearingQueue ? "Clearing…" : "Confirm clear queue"}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={handleCancelClearQueue}
+              disabled={clearingQueue}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {clearQueueNotice && (
+        <p className={clearQueueNotice.tone === "error" ? "view__error" : "view__notice"} role="status">
+          {clearQueueNotice.text}
+        </p>
+      )}
 
       {hasEntries && (
         <div className="activity-filters">

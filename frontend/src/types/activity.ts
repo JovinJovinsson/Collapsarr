@@ -174,3 +174,21 @@ export interface CancelJobResult {
 export interface BumpJobResult {
   bumped: boolean;
 }
+
+/**
+ * Response for `POST /api/jobs/clear` (COL-173, `ClearQueueResult`) --
+ * `QueuePage`'s (COL-181) page-level "Clear queue" action.
+ *
+ * `cancelled` is how many currently-`pending` Jobs, out of every one
+ * snapshotted when the pass started, were actually cancelled. `already_running`
+ * is how many of that same snapshot had already been claimed by a worker (or
+ * otherwise progressed past `pending`) by the time their own cancel ran, and
+ * so were left alone -- reported rather than silently dropped, so the UI can
+ * show the split instead of a single generic success count. Every snapshotted
+ * Job lands in exactly one of the two counts; clearing an already-empty queue
+ * is a valid `cancelled: 0`/`already_running: 0` response, not an error.
+ */
+export interface ClearQueueResult {
+  cancelled: number;
+  already_running: number;
+}

@@ -1393,6 +1393,42 @@ a {
   border-color: var(--c-border);
 }
 
+/* The "Pause auto-queuing" toggle (COL-181, QueuePage's page-level control
+   over the persisted `auto_queue_paused` setting, COL-174): same pill
+   shape/pending-disabled treatment as .tracked-toggle above, but its own
+   on/off palette -- amber (--c-warning) for "paused" rather than the Tracked
+   toggle's muted "off" state, since a paused auto-queue is an operator-chosen
+   condition worth noticing at a glance, not a quiet default. */
+.auto-queue-toggle {
+  display: inline-flex;
+  align-items: center;
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.auto-queue-toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.auto-queue-toggle--active {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+  border-color: var(--c-success-tint);
+}
+
+.auto-queue-toggle--paused {
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+  border-color: var(--c-warning-tint);
+}
+
 /* Row-level Select checkbox (COL-103): first column of every Library
    tree/table row, backing the cross-level bulk selection. */
 .library-tree-table__select {

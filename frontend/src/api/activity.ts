@@ -3,6 +3,7 @@ import type {
   BulkSetDefaultAudioTriggerResult,
   BumpJobResult,
   CancelJobResult,
+  ClearQueueResult,
   JobHistoryEntry,
   ManualTriggerRequest,
   ManualTriggerResult,
@@ -183,4 +184,24 @@ export async function cancelJob(jobId: string): Promise<CancelJobResult> {
     throw new Error(await apiErrorMessage(response, `Failed to cancel job (${response.status})`));
   }
   return (await response.json()) as CancelJobResult;
+}
+
+/**
+ * Cancels every currently-`pending` Job in one call (`POST /api/jobs/clear`,
+ * COL-173) -- `QueuePage`'s (COL-181) page-level "Clear queue" action, unlike
+ * {@link cancelJob}'s single-row scope.
+ *
+ * A `202` is always returned, even when the queue was already empty. Rather
+ * than a single boolean/count, the response reports the `cancelled`/
+ * `already_running` split so the caller can surface exactly what happened to
+ * the pending-Job snapshot instead of a generic success message -- some of
+ * that snapshot may have been claimed by a worker between the snapshot and
+ * their own individual cancel, and that's reported, not swallowed.
+ */
+export async function clearQueue(): Promise<ClearQueueResult> {
+  const response = await apiFetch("/api/jobs/clear", { method: "POST" });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to clear queue (${response.status})`));
+  }
+  return (await response.json()) as ClearQueueResult;
 }
