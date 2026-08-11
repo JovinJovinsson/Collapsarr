@@ -1,8 +1,9 @@
 /**
- * ISO 639-2/B codes, matching the convention already used by
- * `language_allow_list`'s free-text codes (`GlobalSettings`) and by ffmpeg's
- * own stream-language tags -- the same codes the Preferred Default Audio
- * picker (COL-159) sends as `default_audio_language`.
+ * ISO 639-2/B codes -- matching ffmpeg's own stream-language tags, the
+ * format `language_allow_list`'s free-text hint also points at ("e.g. eng,
+ * fre"), though that field enforces no fixed code set itself. These are the
+ * codes the Preferred Default Audio picker (COL-159) sends as
+ * `default_audio_language`.
  */
 export const LANGUAGE_OPTIONS: { value: string; label: string }[] = [
   { value: "eng", label: "English (eng)" },

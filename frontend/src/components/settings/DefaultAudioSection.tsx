@@ -119,6 +119,15 @@ export function DefaultAudioSection() {
               onChange={(event) => handleLanguageChange(event.target.value)}
             >
               <option value="">None</option>
+              {/*
+                A value saved before this ticket (free text) or written
+                directly via the API can be a code outside LANGUAGE_OPTIONS.
+                Render it as an extra option rather than silently falling
+                back to "None" while the real value is still saved.
+              */}
+              {language !== "" && !LANGUAGE_OPTIONS.some((option) => option.value === language) && (
+                <option value={language}>{language} (not in list)</option>
+              )}
               {LANGUAGE_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
