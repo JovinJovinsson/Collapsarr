@@ -208,11 +208,14 @@ def test_already_versioned_database_runs_only_pending_deltas(settings: Settings)
 #: Columns a *post-baseline* migration adds (COL-66's backup schedule knobs,
 #: COL-79's disk-space thresholds, COL-101's Library-node bridge ids, COL-151's
 #: Preferred Default Audio setting, COL-154's current-default-track snapshot,
-#: COL-155's job-history ``kind``, COL-163's job-history ``priority``).
-#: ``create_all`` below always builds the table from the live
-#: ``Base.metadata`` -- i.e. with these columns already present -- so they are
-#: dropped by raw DDL afterwards to de-evolve the stand-in back to what a real
-#: pre-COL-66/pre-COL-79/pre-COL-101/pre-COL-151/pre-COL-154/pre-COL-155/pre-COL-163
+#: COL-155's job-history ``kind``, COL-163's job-history ``priority``, COL-167's
+#: recently-processed dedup window, COL-174's Auto-Queuing Pause toggle).
+#: ``create_all`` below always builds the
+#: table from the live ``Base.metadata`` -- i.e. with these columns already
+#: present -- so they are dropped by raw DDL afterwards to de-evolve the
+#: stand-in back to what a real
+#: pre-COL-66/pre-COL-79/pre-COL-101/pre-COL-151/pre-COL-154/pre-COL-155/
+#: pre-COL-163/pre-COL-167/pre-COL-174
 #: create_all-era release actually had on disk. This mirrors the ``DROP
 #: INDEX`` idiom just below for the same reason: the unversioned DB this
 #: function fabricates predates every post-baseline delta, not just the
@@ -228,6 +231,8 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "default_audio_language"),
     ("global_settings", "default_audio_channel_tier"),
     ("global_settings", "auto_set_default_audio"),
+    ("global_settings", "recently_processed_window_minutes"),
+    ("global_settings", "auto_queue_paused"),
     ("tracked_media_files", "instance_id"),
     ("tracked_media_files", "sonarr_episode_id"),
     ("tracked_media_files", "radarr_movie_id"),

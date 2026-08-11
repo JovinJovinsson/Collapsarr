@@ -20,6 +20,13 @@ every job run gets persisted automatically as it completes rather than
 relying on a caller to remember to call :func:`record_job_history`. This
 module (not :mod:`collapsarr.jobs.queue`, which cannot import this module
 back without a cycle) owns that bridge.
+
+:func:`delete_job_history` (COL-168) is the one write path that removes a
+row outright rather than upserting one -- used by the single-job Cancel
+endpoint (:mod:`collapsarr.jobs.routes`) so a cancelled ``PENDING`` Job
+leaves no audit row at all (and so no cooldown interaction with the
+Recently-Processed Window, :mod:`collapsarr.jobs.scheduler`), rather than
+lingering as a ``PENDING`` row nothing will ever move to a terminal status.
 """
 
 from __future__ import annotations
@@ -118,6 +125,28 @@ def get_job_history(session: Session, job_id: UUID | str) -> JobHistory | None:
     return session.scalars(
         select(JobHistory).where(JobHistory.job_id == str(job_id))
     ).one_or_none()
+
+
+def delete_job_history(session: Session, job_id: UUID | str) -> bool:
+    """Delete ``job_id``'s persisted history row outright, if one exists (COL-168).
+
+    Unlike every other write path in this module, this does not upsert --
+    it removes the row entirely, for the single-job Cancel endpoint
+    (:mod:`collapsarr.jobs.routes`): a cancelled Job is meant to leave no
+    trace, not a ``PENDING`` row frozen forever since nothing will ever run
+    it to a terminal status. Returns ``True`` if a row was found and
+    deleted, ``False`` (not an error) if none existed for ``job_id`` --
+    callers that already confirmed the row's existence via
+    :func:`get_job_history` (or the live queue) can treat this as a
+    formality, but a caller that hasn't is not punished for calling it on an
+    already-gone row.
+    """
+    history = get_job_history(session, job_id)
+    if history is None:
+        return False
+    session.delete(history)
+    session.commit()
+    return True
 
 
 def list_job_history(

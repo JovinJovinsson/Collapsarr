@@ -16,6 +16,7 @@ import threading
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -32,7 +33,7 @@ from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs import scheduler as scheduler_module
-from collapsarr.jobs.history import record_job_history
+from collapsarr.jobs.history import get_job_history, record_job_history
 from collapsarr.jobs.queue import (
     DefaultAudioPipelineRunner,
     Job,
@@ -41,10 +42,11 @@ from collapsarr.jobs.queue import (
     JobStatus,
     PipelineRunner,
 )
-from collapsarr.jobs.scheduler import JobScheduler
+from collapsarr.jobs.scheduler import AUTO_QUEUE_LIMIT, JobScheduler
 from collapsarr.library.service import set_tracked, upsert_series_episode_node
 from collapsarr.media.service import get_tracked_media
 from collapsarr.migrations import upgrade_to_head
+from collapsarr.settings.models import DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES
 from collapsarr.settings.service import update_global_settings
 
 # A 5.1 stream: with default (Stereo) settings, Stereo (2ch < 6ch, not present)
@@ -58,6 +60,7 @@ _STEREO_ONLY: list[AudioStreamInfo] = [
 ]
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
+_FAILURE = PipelineResult(outcome=PipelineOutcome.REMUX_FAILED, success=False, detail="boom")
 _FIXED_NOW = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
 
 
@@ -242,10 +245,70 @@ def test_enqueue_file_skips_a_recently_processed_file(
 def test_enqueue_file_re_enqueues_a_file_processed_before_the_window(
     settings: Settings, session_factory: sessionmaker[Session]
 ) -> None:
-    # Default window is scan_interval_hours (6h); 7h ago is outside it.
+    # Default window is recently_processed_window_minutes (COL-167; 360min =
+    # 6h); 7h ago is outside it.
     ended = _FIXED_NOW - timedelta(hours=7)
     with session_factory() as session:
         _record_terminal(session, "/media/movie.mkv", ended_at=ended)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        job = scheduler.enqueue_file("/media/movie.mkv", session=session)
+    assert job is not None
+
+
+def test_enqueue_file_respects_a_configured_recently_processed_window(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """COL-167: the dedup window is a settings-driven value, not scan_interval_hours."""
+    with session_factory() as session:
+        update_global_settings(session, recently_processed_window_minutes=30)
+        # 45 minutes ago is outside a 30-minute window, even though it's well
+        # inside the default 360-minute (6h) window -- proving the check uses
+        # the configured value, not the default.
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW - timedelta(minutes=45))
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        job = scheduler.enqueue_file("/media/movie.mkv", session=session)
+    assert job is not None
+
+
+def test_enqueue_file_recently_processed_window_reloads_live_without_restart(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """COL-167: a PATCH-style settings change is visible on the *next* check --
+
+    no scheduler reconstruction, and the value is not cached at ``__init__``.
+    """
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW - timedelta(minutes=45))
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    # Default window (360min) still covers a 45-minute-old terminal row.
+    with session_factory() as session:
+        assert scheduler.enqueue_file("/media/movie.mkv", session=session) is None
+
+    # Simulate the PATCH settings endpoint narrowing the window -- same
+    # scheduler instance, no reconstruction.
+    with session_factory() as session:
+        update_global_settings(session, recently_processed_window_minutes=30)
+
+    with session_factory() as session:
+        job = scheduler.enqueue_file("/media/movie.mkv", session=session)
+    assert job is not None
+
+
+def test_enqueue_file_recently_processed_window_zero_disables_the_cooldown(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """COL-167: ``0`` means "no cooldown, always allow retry" -- even seconds-old."""
+    with session_factory() as session:
+        update_global_settings(session, recently_processed_window_minutes=0)
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW - timedelta(seconds=1))
 
     scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
 
@@ -636,6 +699,634 @@ def test_trigger_file_skips_a_file_with_nothing_to_do_even_with_extra_languages(
 
 
 # ---------------------------------------------------------------------------
+# bypass_dedup_window (COL-170)
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_file_bypass_dedup_window_ignores_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """``bypass_dedup_window=True`` skips the recently-processed half of the check."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        # Without the bypass this would be skipped (see
+        # test_enqueue_file_skips_a_recently_processed_file).
+        job = scheduler.enqueue_file(
+            "/media/movie.mkv", session=session, bypass_dedup_window=True
+        )
+    assert job is not None
+
+
+def test_enqueue_file_bypass_dedup_window_still_treats_an_active_job_as_a_duplicate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """The bypass only skips the *recently processed* half -- not "already active"."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.enqueue_file("/media/movie.mkv")
+    assert job is not None  # still PENDING -> active
+
+    second = scheduler.enqueue_file("/media/movie.mkv", bypass_dedup_window=True)
+
+    assert second is None
+    assert len(scheduler._queue.list_jobs()) == 1
+
+
+def test_trigger_file_bypass_dedup_window_ignores_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """``trigger_file``'s ``bypass_dedup_window`` threads straight through to ``enqueue_file``."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        job = scheduler.trigger_file(
+            "/media/movie.mkv", session=session, bypass_dedup_window=True
+        )
+    assert job is not None
+
+
+def test_trigger_file_defaults_to_respecting_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Without the flag, ``trigger_file`` still respects the window (unchanged default)."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        assert scheduler.trigger_file("/media/movie.mkv", session=session) is None
+
+
+# ---------------------------------------------------------------------------
+# requeue_file (COL-170)
+# ---------------------------------------------------------------------------
+
+
+def test_requeue_file_enqueues_despite_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A per-row Requeue always bypasses the Recently-Processed Window."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        job = scheduler.requeue_file("/media/movie.mkv", session=session)
+
+    assert job is not None
+    assert job.file_path == Path("/media/movie.mkv")
+
+
+def test_requeue_file_still_treats_an_active_job_as_a_duplicate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Requeue bypasses the window, not the "already active" duplicate check."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    first = scheduler.requeue_file("/media/movie.mkv")
+    assert first is not None  # still PENDING -> active
+
+    second = scheduler.requeue_file("/media/movie.mkv")
+
+    assert second is None
+    assert len(scheduler._queue.list_jobs()) == 1
+
+
+def test_requeue_file_skips_a_file_with_nothing_to_do(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Bypassing the window never means "enqueue even a file with no qualifying target"."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_STEREO_ONLY))
+
+    assert scheduler.requeue_file("/media/movie.mkv") is None
+    assert scheduler._queue.list_jobs() == []
+
+
+# ---------------------------------------------------------------------------
+# requeue_all_failed (COL-172)
+# ---------------------------------------------------------------------------
+
+
+def test_requeue_all_failed_requeues_every_currently_failed_file(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: full success -- every currently-FAILED file outside the window is requeued."""
+    ended = _FIXED_NOW - timedelta(hours=7)  # outside the default 360min window
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.FAILED)
+        _record_terminal(session, "/media/b.mkv", ended_at=ended, status=JobStatus.FAILED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert {job.file_path for job in outcome.requeued} == {
+        Path("/media/a.mkv"),
+        Path("/media/b.mkv"),
+    }
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_skips_files_inside_the_recently_processed_window(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: partial skip -- unlike requeue_file, the bulk action respects the window."""
+    with session_factory() as session:
+        # Inside the default 360min window -> skipped.
+        _record_terminal(session, "/media/a.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+        # Outside it -> requeued.
+        _record_terminal(
+            session,
+            "/media/b.mkv",
+            ended_at=_FIXED_NOW - timedelta(hours=7),
+            status=JobStatus.FAILED,
+        )
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert [job.file_path for job in outcome.requeued] == [Path("/media/b.mkv")]
+    assert outcome.skipped == ["/media/a.mkv"]
+
+
+def test_requeue_all_failed_all_skipped_is_a_valid_empty_requeued_result(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: every currently-FAILED file inside the window -> all-skipped is not an error."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+        _record_terminal(session, "/media/b.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert sorted(outcome.skipped) == ["/media/a.mkv", "/media/b.mkv"]
+
+
+def test_requeue_all_failed_returns_an_empty_result_when_nothing_is_failed(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_ignores_non_failed_history_rows(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.SUCCEEDED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_ignores_a_failed_set_default_audio_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A FAILED SET_DEFAULT_AUDIO row is out of scope -- trigger_file only ever
+
+    creates DOWNMIX jobs, so retrying it here would silently substitute the
+    wrong kind of job. It belongs to its own bulk endpoint
+    (``POST /api/jobs/trigger-default-audio/bulk``, COL-156), not this one --
+    so it's excluded entirely rather than surfaced as "skipped".
+    """
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        job = Job(
+            file_path=Path("/media/a.mkv"),
+            settings=DownmixSettings(),
+            kind=JobKind.SET_DEFAULT_AUDIO,
+            status=JobStatus.FAILED,
+            started_at=ended,
+            ended_at=ended,
+        )
+        record_job_history(session, job)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_deduplicates_multiple_failed_rows_for_the_same_file(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A file that has failed more than once has more than one FAILED row, but one retry."""
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        job = Job(
+            file_path=Path("/media/a.mkv"),
+            settings=DownmixSettings(),
+            status=JobStatus.FAILED,
+            started_at=ended,
+            ended_at=ended,
+        )
+        record_job_history(session, job)
+        another = Job(
+            file_path=Path("/media/a.mkv"),
+            settings=DownmixSettings(),
+            status=JobStatus.FAILED,
+            started_at=ended,
+            ended_at=ended,
+        )
+        record_job_history(session, another)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert len(outcome.requeued) == 1
+    assert outcome.requeued[0].file_path == Path("/media/a.mkv")
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_still_treats_an_active_job_as_a_duplicate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A currently-FAILED file with an already-active retry in flight is skipped, not doubled."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    active = scheduler.enqueue_file("/media/a.mkv")
+    assert active is not None  # still PENDING -> active
+
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.FAILED)
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == ["/media/a.mkv"]
+
+
+def test_requeue_all_failed_skips_a_file_with_nothing_left_to_do(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A stale FAILED row for a since-fixed file is skipped, not force-requeued."""
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.FAILED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_STEREO_ONLY))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == ["/media/a.mkv"]
+
+
+def test_requeue_all_failed_is_not_blocked_by_the_auto_queue_limit(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: a bulk requeue that pushes pending above the limit is never blocked either (COL-171)."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        _record_terminal(session, "/media/extra.mkv", ended_at=ended, status=JobStatus.FAILED)
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert [job.file_path for job in outcome.requeued] == [Path("/media/extra.mkv")]
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT + 1
+
+
+# ---------------------------------------------------------------------------
+# cancel_job (COL-168)
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_job_removes_a_pending_job_and_deletes_its_history(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    with session_factory() as session:
+        # _make_scheduler's queue has no history_recorder wired (unlike the
+        # production JobQueue.from_settings path) -- seed the row a real
+        # history_recorder would already have written on enqueue.
+        record_job_history(session, job)
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(job.id, session=session)
+
+    assert outcome is True
+    assert scheduler._queue.get_job(job.id) is None
+    with session_factory() as session:
+        assert get_job_history(session, job.id) is None
+
+
+def test_cancel_job_reports_too_late_for_a_job_no_longer_pending(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    # Simulate a worker having already claimed the job before the cancel request lands.
+    job.status = JobStatus.RUNNING
+    with session_factory() as session:
+        record_job_history(session, job)
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(job.id, session=session)
+
+    assert outcome is False
+    # Left exactly as it was: still in the live queue, history row untouched.
+    assert scheduler._queue.get_job(job.id) is not None
+    with session_factory() as session:
+        assert get_job_history(session, job.id) is not None
+
+
+def test_cancel_job_returns_none_for_an_id_not_in_the_live_queue(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(uuid4(), session=session)
+
+    assert outcome is None
+
+
+def test_cancel_job_opens_its_own_session_when_none_is_given(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Mirrors ``_is_duplicate``'s session handling: works without a caller-supplied session."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    with session_factory() as session:
+        record_job_history(session, job)
+
+    outcome = scheduler.cancel_job(job.id)
+
+    assert outcome is True
+    with session_factory() as session:
+        assert get_job_history(session, job.id) is None
+
+
+# ---------------------------------------------------------------------------
+# bump_job_to_front (COL-169)
+# ---------------------------------------------------------------------------
+
+
+def test_bump_job_to_front_reassigns_priority_ahead_of_every_other_pending_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    first = scheduler.trigger_file("/media/first.mkv")
+    second = scheduler.trigger_file("/media/second.mkv")
+    assert first is not None
+    assert second is not None
+
+    outcome = scheduler.bump_job_to_front(second.id)
+
+    assert outcome is True
+    assert second.priority < first.priority
+
+
+def test_bump_job_to_front_reports_too_late_for_a_job_no_longer_pending(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    # Simulate a worker having already claimed the job before the bump request lands.
+    job.status = JobStatus.RUNNING
+    original_priority = job.priority
+
+    outcome = scheduler.bump_job_to_front(job.id)
+
+    assert outcome is False
+    # Left exactly as it was: still in the live queue, priority untouched.
+    assert scheduler._queue.get_job(job.id) is not None
+    assert job.priority == original_priority
+
+
+def test_bump_job_to_front_returns_none_for_an_id_not_in_the_live_queue(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    outcome = scheduler.bump_job_to_front(uuid4())
+
+    assert outcome is None
+
+
+def test_bump_job_to_front_repeated_calls_move_each_new_bump_strictly_ahead(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: bump A, then bump B -> B ends up strictly ahead of (would run before) A."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job_a = scheduler.trigger_file("/media/a.mkv")
+    job_b = scheduler.trigger_file("/media/b.mkv")
+    assert job_a is not None
+    assert job_b is not None
+
+    assert scheduler.bump_job_to_front(job_a.id) is True
+    assert scheduler.bump_job_to_front(job_b.id) is True
+
+    assert job_b.priority < job_a.priority
+
+
+# ---------------------------------------------------------------------------
+# clear_queue (COL-173)
+# ---------------------------------------------------------------------------
+
+
+def test_clear_queue_cancels_every_pending_job_and_deletes_its_history(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    jobs = [scheduler.trigger_file(f"/media/{i}.mkv") for i in range(3)]
+    assert all(job is not None for job in jobs)
+    with session_factory() as session:
+        # _make_scheduler's queue has no history_recorder wired -- seed each
+        # PENDING row a real history_recorder would already have written on
+        # enqueue, mirroring the cancel_job tests above.
+        for job in jobs:
+            assert job is not None
+            record_job_history(session, job)
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == 3
+    assert result.already_running == 0
+    assert scheduler._queue.list_jobs() == []
+    with session_factory() as session:
+        for job in jobs:
+            assert job is not None
+            assert get_job_history(session, job.id) is None
+
+
+def test_clear_queue_is_a_valid_zero_cancelled_result_for_an_empty_queue(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: clearing an already-empty queue is not an error."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == 0
+    assert result.already_running == 0
+
+
+def test_clear_queue_ignores_a_job_already_running_before_the_pass_starts(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A Job that's RUNNING before the snapshot is taken is simply never in scope."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    pending_job = scheduler.trigger_file("/media/pending.mkv")
+    running_job = scheduler.trigger_file("/media/running.mkv")
+    assert pending_job is not None
+    assert running_job is not None
+    running_job.status = JobStatus.RUNNING  # simulate a worker having already claimed it
+    with session_factory() as session:
+        record_job_history(session, pending_job)
+        record_job_history(session, running_job)
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == 1
+    assert result.already_running == 0  # never snapshotted -- not "raced," simply out of scope
+    assert scheduler._queue.get_job(pending_job.id) is None
+    still_there = scheduler._queue.get_job(running_job.id)
+    assert still_there is not None
+    assert still_there.status is JobStatus.RUNNING
+
+
+def test_clear_queue_reports_a_job_that_races_to_running_mid_pass(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: some snapshotted jobs may already have started running by the time they're
+    individually cancelled -- reported as ``already_running``, left alone, not an error."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job_a = scheduler.trigger_file("/media/a.mkv")
+    job_b = scheduler.trigger_file("/media/b.mkv")
+    job_c = scheduler.trigger_file("/media/c.mkv")
+    assert job_a is not None
+    assert job_b is not None
+    assert job_c is not None
+    with session_factory() as session:
+        for job in (job_a, job_b, job_c):
+            record_job_history(session, job)
+
+    # Simulate a worker claiming job_b for real -- flip it PENDING -> RUNNING
+    # right in between this pass snapshotting it as PENDING and this pass's
+    # own cancel attempt for it (there is no push mechanism to freeze the
+    # live queue mid-request, only polling -- the queue's worker pool keeps
+    # running concurrently the whole time).
+    original_cancel = scheduler._queue.cancel
+
+    def racy_cancel(job_id: UUID) -> bool:
+        if job_id == job_b.id:
+            job_b.status = JobStatus.RUNNING
+        return original_cancel(job_id)
+
+    monkeypatch.setattr(scheduler._queue, "cancel", racy_cancel)
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == 2
+    assert result.already_running == 1
+    # job_a/job_c: genuinely cancelled -- gone from the live queue, no history left.
+    assert scheduler._queue.get_job(job_a.id) is None
+    assert scheduler._queue.get_job(job_c.id) is None
+    with session_factory() as session:
+        assert get_job_history(session, job_a.id) is None
+        assert get_job_history(session, job_c.id) is None
+    # job_b: raced to RUNNING -- left exactly as it was, history row intact.
+    still_there = scheduler._queue.get_job(job_b.id)
+    assert still_there is not None
+    assert still_there.status is JobStatus.RUNNING
+    with session_factory() as session:
+        assert get_job_history(session, job_b.id) is not None
+
+
+def test_clear_queue_tops_up_the_auto_queue_limit_exactly_once_after_the_whole_batch(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: after clearing, the Auto-Queue Limit's top-up runs -- pending returns toward the
+    limit from Wanted, same as after any other cancellation -- but only once for the whole
+    batch, not once per cancellation (which would churn: top up, then immediately re-cancel
+    the freshly topped-up job on a later loop iteration)."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path=f"/tv/wanted{i}.mkv"
+                )
+                for i in range(AUTO_QUEUE_LIMIT)
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    seeded = _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+    top_up_calls: list[None] = []
+    original_top_up = scheduler.top_up
+
+    def counting_top_up(*, session: Session | None = None) -> list[Job]:
+        top_up_calls.append(None)
+        return original_top_up(session=session)
+
+    monkeypatch.setattr(scheduler, "top_up", counting_top_up)
+
+    with session_factory() as session:
+        result = scheduler.clear_queue(session=session)
+
+    assert result.cancelled == AUTO_QUEUE_LIMIT
+    assert result.already_running == 0
+    assert len(top_up_calls) == 1  # once for the whole batch, not once per cancellation
+    # The pending budget is refilled from Wanted, same as after any other cancellation.
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+    jobs = scheduler._queue.list_jobs()
+    assert all(job.file_path not in {seed.file_path for seed in seeded} for job in jobs)
+    assert all(str(job.file_path).startswith("/tv/wanted") for job in jobs)
+
+
+# ---------------------------------------------------------------------------
 # Background loop: triggering + lifecycle.
 # ---------------------------------------------------------------------------
 
@@ -643,7 +1334,18 @@ def test_trigger_file_skips_a_file_with_nothing_to_do_even_with_extra_languages(
 def test_start_runs_an_initial_scan_and_drains_the_queue(
     settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Starting the loop triggers a scan and runs what it enqueues."""
+    """Starting the loop triggers a scan and runs what it enqueues.
+
+    Uses a probe that qualifies only on its first call (COL-171): a Job
+    completing now triggers an immediate :meth:`~collapsarr.jobs.scheduler.
+    JobScheduler.top_up` pass, and ``fake_fetch`` unconditionally re-reports
+    the same single file every call -- mirroring that in a real deployment a
+    successful downmix rewrites the file, so the *next* probe correctly finds
+    nothing left to do (see the module docstring's Recently-Processed Window
+    rationale). Without this, the stub pipeline's no-op "success" plus a
+    probe that never changes its answer would make ``top_up`` re-enqueue the
+    same file forever.
+    """
     _add_instance(session_factory)
     scanned = threading.Event()
 
@@ -654,8 +1356,14 @@ def test_start_runs_an_initial_scan_and_drains_the_queue(
     monkeypatch.setattr(scheduler_module, "fetch_monitored_files", fake_fetch)
     queue = JobQueue(pipeline_runner=_stub_runner())
     queue.start()
+    probe_calls = {"n": 0}
+
+    def probe_once_then_nothing_to_do(path: Path) -> Sequence[AudioStreamInfo]:
+        probe_calls["n"] += 1
+        return _SURROUND if probe_calls["n"] == 1 else _STEREO_ONLY
+
     scheduler = _make_scheduler(
-        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+        settings, session_factory, probe=probe_once_then_nothing_to_do, queue=queue
     )
 
     scheduler.start()
@@ -792,7 +1500,9 @@ def test_enqueue_file_logs_not_tracked_skip_again_after_dedup_window(
     )
 
     scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
-    clock["now"] = _FIXED_NOW + timedelta(hours=settings.scan_interval_hours, seconds=1)
+    clock["now"] = _FIXED_NOW + timedelta(
+        minutes=DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES, seconds=1
+    )
     caplog.clear()
     scheduler.enqueue_file("/tv/a.mkv", instance_id=instance.id, sonarr_episode_id=101)
 
@@ -1198,3 +1908,499 @@ def test_trigger_set_default_audio_re_enqueues_after_a_terminal_downmix_job(
 
     assert result is not None
     assert len(scheduler._queue.list_jobs()) == 2
+
+
+# ---------------------------------------------------------------------------
+# Auto-Queue Limit / top-up (COL-171)
+# ---------------------------------------------------------------------------
+
+
+def _seed_pending(scheduler: JobScheduler, count: int) -> list[Job]:
+    """Fill ``scheduler``'s live queue with ``count`` distinct manually-triggered PENDING Jobs.
+
+    Each seeded file is outside any configured instance's Wanted list, so
+    ``top_up`` never rediscovers/re-probes it -- these exist purely to
+    occupy budget slots.
+    """
+    jobs: list[Job] = []
+    for i in range(count):
+        job = scheduler.trigger_file(f"/media/seed{i}.mkv")
+        assert job is not None
+        jobs.append(job)
+    return jobs
+
+
+def test_top_up_runs_on_job_completion_success(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: a Job completing (success) tops up the budget when pending count is below the limit.
+
+    A probe that qualifies a given path only on its *first* call (mirroring
+    a real downmix rewriting the file, so the next probe finds nothing left
+    to do -- see the module docstring's Recently-Processed Window rationale)
+    keeps this deterministic without needing a ``history_recorder``: once the
+    topped-up Wanted file's own Job also completes, ``top_up`` stops
+    re-enqueuing it rather than looping forever.
+    """
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    seen: dict[Path, int] = {}
+
+    def probe_qualifies_once_per_path(path: Path) -> Sequence[AudioStreamInfo]:
+        seen[path] = seen.get(path, 0) + 1
+        return _SURROUND if seen[path] == 1 else _STEREO_ONLY
+
+    queue = JobQueue(pipeline_runner=_stub_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=probe_qualifies_once_per_path, queue=queue
+    )
+
+    for i in range(AUTO_QUEUE_LIMIT - 1):
+        queue.enqueue(Path(f"/filler{i}.mkv"), DownmixSettings())
+    trigger_job = scheduler.trigger_file("/media/trigger.mkv")
+    assert trigger_job is not None
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+    queue.start()
+    try:
+        assert queue.wait_idle(timeout=5.0)
+    finally:
+        queue.shutdown()
+
+    jobs = queue.list_jobs()
+    assert any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+    assert len(jobs) == AUTO_QUEUE_LIMIT + 1  # every filler + trigger + the topped-up extra
+    assert all(job.status is JobStatus.SUCCEEDED for job in jobs)
+
+
+def test_top_up_runs_on_job_completion_failure(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: a Job completing with a FAILURE also tops up the budget, same as a success."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    seen: dict[Path, int] = {}
+
+    def probe_qualifies_once_per_path(path: Path) -> Sequence[AudioStreamInfo]:
+        seen[path] = seen.get(path, 0) + 1
+        return _SURROUND if seen[path] == 1 else _STEREO_ONLY
+
+    queue = JobQueue(pipeline_runner=_stub_runner(_FAILURE))
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=probe_qualifies_once_per_path, queue=queue
+    )
+
+    for i in range(AUTO_QUEUE_LIMIT - 1):
+        queue.enqueue(Path(f"/filler{i}.mkv"), DownmixSettings())
+    trigger_job = scheduler.trigger_file("/media/trigger.mkv")
+    assert trigger_job is not None
+
+    queue.start()
+    try:
+        assert queue.wait_idle(timeout=5.0)
+    finally:
+        queue.shutdown()
+
+    jobs = queue.list_jobs()
+    assert any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+    assert all(job.status is JobStatus.FAILED for job in jobs)
+
+
+def test_top_up_runs_on_cancellation(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: cancelling a PENDING Job (COL-168) frees a slot and immediately tops it back up."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    seeded = _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+    with session_factory() as session:
+        # No history_recorder wired on this queue -- seed the PENDING row
+        # cancel_job's history delete expects, mirroring the other cancel_job
+        # tests above.
+        record_job_history(session, seeded[0])
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(seeded[0].id, session=session)
+
+    assert outcome is True
+    jobs = scheduler._queue.list_jobs()
+    assert any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT  # the cancelled slot was refilled
+
+
+def test_trigger_file_is_not_blocked_by_the_auto_queue_limit(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: a manual trigger that pushes pending above the limit is never blocked or rejected."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+    extra = scheduler.trigger_file("/media/one_more.mkv")
+
+    assert extra is not None
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT + 1
+
+
+def test_requeue_file_is_not_blocked_by_the_auto_queue_limit(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: a requeue (COL-170) that pushes pending above the limit is never blocked either."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+
+    extra = scheduler.requeue_file("/media/one_more.mkv")
+
+    assert extra is not None
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT + 1
+
+
+def test_scan_now_enqueues_at_most_the_auto_queue_limit(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: ``scan_now`` ("Scan now") enqueues at most the limit, not every qualifying file."""
+    instance = _add_instance(session_factory)
+    files = [
+        MonitoredFile(instance_id=instance.id, media_title="Show", file_path=f"/tv/{i}.mkv")
+        for i in range(AUTO_QUEUE_LIMIT + 3)
+    ]
+    _patch_fetch(monkeypatch, {instance.id: files})
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_now()
+
+    assert len(enqueued) == AUTO_QUEUE_LIMIT
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+
+def test_scan_once_applies_the_same_limit_as_scan_now(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the periodic background scan (`scan_once`) applies the same limit."""
+    instance = _add_instance(session_factory)
+    files = [
+        MonitoredFile(instance_id=instance.id, media_title="Show", file_path=f"/tv/{i}.mkv")
+        for i in range(AUTO_QUEUE_LIMIT + 3)
+    ]
+    _patch_fetch(monkeypatch, {instance.id: files})
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_once()
+
+    assert len(enqueued) == AUTO_QUEUE_LIMIT
+
+
+def test_scan_once_stops_when_wanted_is_exhausted_below_the_limit(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: fewer than the limit's worth of not-yet-queued Wanted entries is a silent no-op."""
+    instance = _add_instance(session_factory)
+    files = [
+        MonitoredFile(instance_id=instance.id, media_title="Show", file_path=f"/tv/{i}.mkv")
+        for i in range(AUTO_QUEUE_LIMIT - 2)  # fewer than the limit -- Wanted exhausts first
+    ]
+    _patch_fetch(monkeypatch, {instance.id: files})
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_once()
+
+    assert len(enqueued) == AUTO_QUEUE_LIMIT - 2
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT - 2
+
+
+def test_top_up_is_a_no_op_once_already_at_the_limit(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the scheduler never auto-enqueues more than the limit's worth of PENDING Jobs."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+
+    result = scheduler.top_up()
+
+    assert result == []
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Auto-Queuing Pause (COL-174).
+# ---------------------------------------------------------------------------
+
+
+def test_scan_once_does_not_auto_enqueue_when_paused(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: when set, the periodic scan's auto-enqueue-from-Wanted does not run."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_once()
+
+    assert enqueued == []
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_scan_now_does_not_auto_enqueue_when_paused(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: "Scan now" is an alias for scan_once, so it inherits the pause too."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_now()
+
+    assert enqueued == []
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_top_up_is_a_no_op_when_paused_even_with_qualifying_wanted_entries(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A direct ``top_up()`` call is also a no-op while paused, not just the scan wrappers."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    result = scheduler.top_up()
+
+    assert result == []
+    assert scheduler._count_pending() == 0
+
+
+def test_top_up_does_not_run_on_job_completion_when_paused(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the Auto-Queue Limit's completion-triggered top-up does not run while paused."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+
+    queue = JobQueue(pipeline_runner=_stub_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+    )
+    # A manual trigger still works while paused (see below) -- used here purely
+    # to give the queue something to complete and fire the terminal hook.
+    trigger_job = scheduler.trigger_file("/media/trigger.mkv")
+    assert trigger_job is not None
+
+    queue.start()
+    try:
+        assert queue.wait_idle(timeout=5.0)
+    finally:
+        queue.shutdown()
+
+    jobs = queue.list_jobs()
+    assert len(jobs) == 1  # only the manual trigger -- no top-up-discovered extra
+    assert not any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+
+
+def test_top_up_does_not_run_on_cancellation_when_paused(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the Auto-Queue Limit's cancellation-triggered top-up does not run while paused."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    seeded = _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+    with session_factory() as session:
+        # No history_recorder wired on this queue -- seed the PENDING row
+        # cancel_job's history delete expects, mirroring the other cancel_job
+        # tests above.
+        record_job_history(session, seeded[0])
+        update_global_settings(session, auto_queue_paused=True)
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(seeded[0].id, session=session)
+
+    assert outcome is True
+    jobs = scheduler._queue.list_jobs()
+    assert not any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT - 1  # the freed slot stayed empty
+
+
+def test_pending_and_running_jobs_continue_to_completion_while_paused(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: pausing auto-fill never stops an already-PENDING/RUNNING Job from finishing."""
+    queue = JobQueue(pipeline_runner=_stub_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+    )
+    job = scheduler.trigger_file("/media/already-queued.mkv")
+    assert job is not None
+
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+
+    queue.start()
+    try:
+        assert queue.wait_idle(timeout=5.0)
+    finally:
+        queue.shutdown()
+
+    jobs = queue.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].status is JobStatus.SUCCEEDED
+
+
+def test_trigger_file_still_works_while_paused(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: manual single-file trigger keeps working while auto-fill is paused."""
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.trigger_file("/media/movie.mkv")
+
+    assert job is not None
+
+
+def test_requeue_file_still_works_while_paused(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: manual single-file requeue keeps working while auto-fill is paused."""
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.requeue_file("/media/movie.mkv")
+
+    assert job is not None
+
+
+def test_requeue_all_failed_still_works_while_paused(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: bulk 'Requeue all failed' keeps working while auto-fill is paused."""
+    ended = _FIXED_NOW - timedelta(hours=7)  # outside the default 360min window
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.FAILED)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert {job.file_path for job in outcome.requeued} == {Path("/media/a.mkv")}
+    assert outcome.skipped == []
+
+
+def test_auto_queue_paused_survives_a_fresh_scheduler_construction(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the value survives a process restart.
+
+    A brand-new :class:`JobScheduler` instance -- carrying no in-memory state
+    from any prior one -- built against a database where the flag is already
+    set stays paused, since the check reads the persisted row live rather
+    than a value cached at construction.
+    """
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_once()
+
+    assert enqueued == []
+    assert scheduler._queue.list_jobs() == []

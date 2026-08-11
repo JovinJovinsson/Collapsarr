@@ -53,6 +53,8 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["default_audio_language"] is None  # COL-151 default
     assert body["default_audio_channel_tier"] is None  # COL-151 default
     assert body["auto_set_default_audio"] is False  # COL-151 default
+    assert body["recently_processed_window_minutes"] == 360  # COL-167 default
+    assert body["auto_queue_paused"] is False  # COL-174 default
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -279,6 +281,66 @@ def test_put_settings_rejects_a_disk_space_error_percent_above_100(client: TestC
     assert response.status_code == 422
 
 
+# --- recently-processed window (COL-167) ----------------------------------------
+
+
+def test_put_settings_updates_recently_processed_window(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"recently_processed_window_minutes": 90},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["recently_processed_window_minutes"] == 90
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["recently_processed_window_minutes"] == 90
+
+
+def test_put_settings_recently_processed_window_accepts_zero(client: TestClient) -> None:
+    """COL-167: 0 is a valid value ('no cooldown'), not rejected like the gt=0 knobs."""
+    response = client.put(
+        "/api/settings",
+        json={"recently_processed_window_minutes": 0},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["recently_processed_window_minutes"] == 0
+
+
+def test_put_settings_leaves_recently_processed_window_untouched_when_omitted(
+    client: TestClient,
+) -> None:
+    client.put(
+        "/api/settings",
+        json={"recently_processed_window_minutes": 45},
+        headers=_auth_headers(client),
+    )
+
+    client.put(
+        "/api/settings",
+        json={"concurrency_limit": 3},
+        headers=_auth_headers(client),
+    )
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["recently_processed_window_minutes"] == 45
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_rejects_a_negative_recently_processed_window(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"recently_processed_window_minutes": -1},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
 # --- update channel (COL-88) -----------------------------------------------------
 
 
@@ -487,6 +549,47 @@ def test_put_settings_explicit_null_clears_default_audio_preference(client: Test
     body = response.json()
     assert body["default_audio_language"] is None
     assert body["default_audio_channel_tier"] is None
+
+
+# --- Auto-Queuing Pause (COL-174) -----------------------------------------------
+
+
+def test_put_settings_sets_auto_queue_paused(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"auto_queue_paused": True},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["auto_queue_paused"] is True
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["auto_queue_paused"] is True
+
+
+def test_put_settings_auto_queue_paused_is_switchable_back_off(client: TestClient) -> None:
+    client.put("/api/settings", json={"auto_queue_paused": True}, headers=_auth_headers(client))
+
+    response = client.put(
+        "/api/settings",
+        json={"auto_queue_paused": False},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["auto_queue_paused"] is False
+
+
+def test_put_settings_leaves_auto_queue_paused_untouched_when_omitted(client: TestClient) -> None:
+    client.put("/api/settings", json={"auto_queue_paused": True}, headers=_auth_headers(client))
+
+    client.put("/api/settings", json={"concurrency_limit": 3}, headers=_auth_headers(client))
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["auto_queue_paused"] is True
+    assert body["concurrency_limit"] == 3
 
 
 # --- auth-required behaviour ---------------------------------------------------
