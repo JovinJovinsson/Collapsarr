@@ -27,6 +27,20 @@ Four endpoints, each wrapping an existing service without adding new job logic:
   COL-155), mirroring ``POST /api/jobs/trigger``'s shape: same request
   (a bare ``file_path``), same response shape (``enqueued`` + the job, or
   ``enqueued=False``/``job=null`` when the file needs no change).
+- ``POST /api/jobs/trigger-default-audio/bulk`` -- the multi-select
+  counterpart of the above (COL-156): accepts one or more Library
+  ``{node_type, node_id}`` references (the same shape
+  ``POST /api/library/tracked``'s bulk Tracked-update endpoint takes,
+  :mod:`collapsarr.library.routes`, COL-101), cascades any Series/Season
+  reference down to its descendant Episode/Movie leaves exactly the way that
+  endpoint's underlying :func:`~collapsarr.library.service.set_tracked`
+  cascades, resolves each leaf to its known file path (COL-154's
+  Library-to-tracked-media bridge), de-duplicates (a file reachable via more
+  than one selected reference is only triggered once), and calls
+  :meth:`~collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`
+  once per resulting file -- always against the current global Preferred
+  Default Audio setting; there is no per-call override, unlike
+  ``trigger``'s ``extra_languages``.
 
 The scan/trigger endpoints operate on the live
 :class:`~collapsarr.jobs.scheduler.JobScheduler` the app wired onto
@@ -38,13 +52,17 @@ dependency raises ``503`` rather than silently doing nothing.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from ..database import get_session
+from ..library.models import LibraryNode, LibraryNodeKind
+from ..library.service import get_node, list_nodes
+from ..media.service import list_tracked_media_by_instance
 from .history import list_job_history
 from .models import JobHistory
 from .queue import Job, JobKind, JobStatus
@@ -176,7 +194,161 @@ class SetDefaultAudioTriggerResult(BaseModel):
     job: EnqueuedJob | None
 
 
+class DefaultAudioNodeReference(BaseModel):
+    """One ``{node_type, node_id}`` reference in a bulk trigger request (COL-156).
+
+    Identical shape to :class:`~collapsarr.library.routes.TrackedNodeReference`
+    (COL-101) -- a client-side ``node_type``/actual-kind mismatch is a
+    ``422``, not silently corrected, for the same reason: it usually means
+    the caller is pointing at the wrong node entirely.
+    """
+
+    node_type: LibraryNodeKind
+    node_id: int
+
+
+class BulkSetDefaultAudioTriggerRequest(BaseModel):
+    """Body for ``POST /api/jobs/trigger-default-audio/bulk`` (COL-156).
+
+    One or more Library node references. Unlike
+    :class:`SetDefaultAudioTriggerRequest`, there is no ``file_path`` option
+    and no override of any kind -- every resolved file is triggered against
+    whatever the current global Preferred Default Audio setting is at
+    request time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    references: list[DefaultAudioNodeReference] = Field(min_length=1)
+
+
+class FileSetDefaultAudioResult(BaseModel):
+    """One resolved file's outcome within a bulk trigger response (COL-156).
+
+    Mirrors :class:`SetDefaultAudioTriggerResult`'s ``enqueued``/``job``
+    pair, per file, plus the ``file_path`` identifying which resolved file
+    this result belongs to (the bulk response has no other way to attribute
+    an outcome back to a specific file).
+    """
+
+    file_path: str
+    enqueued: bool
+    job: EnqueuedJob | None
+
+
+class BulkSetDefaultAudioTriggerResult(BaseModel):
+    """Response for ``POST /api/jobs/trigger-default-audio/bulk`` (COL-156).
+
+    One :class:`FileSetDefaultAudioResult` per unique file the request's
+    references resolved to -- see
+    :func:`_resolve_default_audio_leaf_files` for how references cascade and
+    de-duplicate down to that file set.
+    """
+
+    results: list[FileSetDefaultAudioResult]
+
+
 # --- endpoints ---------------------------------------------------------------
+
+
+def _resolve_default_audio_leaf_files(
+    session: Session, references: list[DefaultAudioNodeReference]
+) -> list[str]:
+    """Resolve a bulk request's node references down to their unique file paths (COL-156).
+
+    Mirrors ``POST /api/library/tracked``'s bulk Tracked-update endpoint
+    (:mod:`collapsarr.library.routes`, COL-101): every reference is resolved
+    and validated *before* anything else happens -- ``404`` if any
+    ``node_id`` doesn't exist, ``422`` if any reference's ``node_type``
+    doesn't match that node's actual kind.
+
+    A Series/Season reference then cascades to its descendant Episode/Movie
+    nodes, the same ``parent_id``-stack walk
+    :func:`~collapsarr.library.service.set_tracked` uses to cascade a
+    Tracked write to descendants; an Episode/Movie reference is already a
+    leaf. Leaves are deduplicated by node id first (so a file reachable via
+    two references -- e.g. a Series reference and a standalone Episode
+    reference inside it -- is only counted once), then each leaf is bridged
+    to its known on-disk file path via the same Library-to-tracked-media
+    bridge :func:`~collapsarr.library.service.build_tree`/
+    :func:`~collapsarr.library.service.build_movie_tree` use for the
+    current-default-track column (COL-154): one bulk
+    :func:`~collapsarr.media.service.list_tracked_media_by_instance` fetch
+    per distinct instance among the resolved leaves, keyed by
+    ``sonarr_episode_id``/``radarr_movie_id``. A leaf with no bridged row --
+    never scanned/imported, so no on-disk file is known yet -- contributes
+    nothing to the result; there is no file path to trigger against.
+
+    Returns the unique file paths, in first-seen order.
+    """
+    roots: list[LibraryNode] = []
+    for reference in references:
+        node = get_node(session, reference.node_id)
+        if node is None:
+            raise HTTPException(
+                status_code=404, detail=f"No library node with id={reference.node_id}"
+            )
+        if node.kind is not reference.node_type:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"node_id={reference.node_id} is a {node.kind.value!r} node, "
+                    f"not {reference.node_type.value!r}"
+                ),
+            )
+        roots.append(node)
+
+    leaves_by_id: dict[int, LibraryNode] = {}
+    nodes_by_instance: dict[int, list[LibraryNode]] = {}
+    for root in roots:
+        if root.kind in (LibraryNodeKind.EPISODE, LibraryNodeKind.MOVIE):
+            leaves_by_id[root.id] = root
+            continue
+
+        # Series/Season: cascade to descendant Episode leaves.
+        if root.instance_id not in nodes_by_instance:
+            nodes_by_instance[root.instance_id] = list_nodes(
+                session, root.instance_id, include_hidden=False
+            )
+        children_by_parent: dict[int, list[LibraryNode]] = defaultdict(list)
+        for candidate in nodes_by_instance[root.instance_id]:
+            if candidate.parent_id is not None:
+                children_by_parent[candidate.parent_id].append(candidate)
+
+        stack = list(children_by_parent[root.id])
+        while stack:
+            descendant = stack.pop()
+            if descendant.kind in (LibraryNodeKind.EPISODE, LibraryNodeKind.MOVIE):
+                leaves_by_id[descendant.id] = descendant
+            else:
+                stack.extend(children_by_parent[descendant.id])
+
+    media_by_instance: dict[int, dict[int, str]] = {}
+    file_paths: dict[str, None] = {}  # insertion-ordered de-dup set
+    for leaf in leaves_by_id.values():
+        if leaf.instance_id not in media_by_instance:
+            by_source_id: dict[int, str] = {}
+            for media in list_tracked_media_by_instance(session, leaf.instance_id):
+                if media.sonarr_episode_id is not None:
+                    by_source_id[media.sonarr_episode_id] = media.file_path
+                elif media.radarr_movie_id is not None:
+                    by_source_id[media.radarr_movie_id] = media.file_path
+            media_by_instance[leaf.instance_id] = by_source_id
+
+        if leaf.sonarr_episode_id is not None:
+            source_id: int | None = leaf.sonarr_episode_id
+        elif leaf.radarr_movie_id is not None:
+            source_id = leaf.radarr_movie_id
+        else:
+            source_id = None
+        if source_id is None:
+            continue
+
+        file_path = media_by_instance[leaf.instance_id].get(source_id)
+        if file_path is not None:
+            file_paths.setdefault(file_path, None)
+
+    return list(file_paths)
 
 
 @router.get("/jobs/history", response_model=list[JobHistoryRead])
@@ -256,3 +428,49 @@ def manual_set_default_audio_trigger_endpoint(
     if job is None:
         return SetDefaultAudioTriggerResult(enqueued=False, job=None)
     return SetDefaultAudioTriggerResult(enqueued=True, job=EnqueuedJob.from_job(job))
+
+
+@router.post(
+    "/jobs/trigger-default-audio/bulk",
+    response_model=BulkSetDefaultAudioTriggerResult,
+    status_code=202,
+)
+def bulk_set_default_audio_trigger_endpoint(
+    body: BulkSetDefaultAudioTriggerRequest,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+    session: Session = Depends(get_session),
+) -> BulkSetDefaultAudioTriggerResult:
+    """Manually enqueue ``SET_DEFAULT_AUDIO`` jobs for one or more Library selections (COL-156).
+
+    ``body.references`` is resolved and cascaded down to its unique set of
+    file-bearing leaves by :func:`_resolve_default_audio_leaf_files` -- see
+    there for the cascade/de-dup/bridge algorithm, which mirrors
+    ``POST /api/library/tracked``'s bulk Tracked-update endpoint
+    (:mod:`collapsarr.library.routes`, COL-101). ``404``/``422`` from that
+    resolution (an unknown ``node_id``, or a ``node_type`` that doesn't match
+    the referenced node's actual kind) propagate as this endpoint's own
+    response, same as the Tracked-update endpoint.
+
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`
+    is then called once per resolved file, against the current global
+    Preferred Default Audio setting -- there is no per-call override, unlike
+    ``POST /api/jobs/trigger``'s ``extra_languages``. A ``202`` is returned
+    whether any individual file was enqueued or skipped; each result's own
+    ``enqueued`` flag distinguishes the two, mirroring the single-file
+    endpoint's skip semantics per file.
+    """
+    file_paths = _resolve_default_audio_leaf_files(session, body.references)
+
+    results: list[FileSetDefaultAudioResult] = []
+    for file_path in file_paths:
+        job = scheduler.trigger_set_default_audio(file_path, session=session)
+        if job is None:
+            results.append(FileSetDefaultAudioResult(file_path=file_path, enqueued=False, job=None))
+        else:
+            results.append(
+                FileSetDefaultAudioResult(
+                    file_path=file_path, enqueued=True, job=EnqueuedJob.from_job(job)
+                )
+            )
+
+    return BulkSetDefaultAudioTriggerResult(results=results)
