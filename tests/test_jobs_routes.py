@@ -66,8 +66,13 @@ def _seed_history(
     file_path: str,
     status: JobStatus,
     kind: JobKind = JobKind.DOWNMIX,
+    priority: int = 0,
 ) -> None:
-    session.add(JobHistory(job_id=job_id, file_path=file_path, status=status, kind=kind))
+    session.add(
+        JobHistory(
+            job_id=job_id, file_path=file_path, status=status, kind=kind, priority=priority
+        )
+    )
     session.commit()
 
 
@@ -198,7 +203,9 @@ def test_history_is_empty_when_nothing_recorded(client: TestClient) -> None:
 
 
 def test_history_lists_rows_with_full_shape(client: TestClient, session: Session) -> None:
-    _seed_history(session, job_id="job-1", file_path="/media/a.mkv", status=JobStatus.SUCCEEDED)
+    _seed_history(
+        session, job_id="job-1", file_path="/media/a.mkv", status=JobStatus.SUCCEEDED, priority=7
+    )
 
     response = client.get("/api/jobs/history", headers=_auth_headers(client))
 
@@ -210,6 +217,7 @@ def test_history_lists_rows_with_full_shape(client: TestClient, session: Session
     assert row["file_path"] == "/media/a.mkv"
     assert row["status"] == "succeeded"
     assert row["kind"] == "downmix"  # COL-155: a bare JobHistory() row defaults to DOWNMIX
+    assert row["priority"] == 7  # COL-175: priority is exposed in the response shape
     for key in (
         "id",
         "started_at",
@@ -303,6 +311,104 @@ def test_history_rejects_an_unknown_kind_value(client: TestClient) -> None:
         "/api/jobs/history", params={"kind": "bogus"}, headers=_auth_headers(client)
     )
     assert response.status_code == 422
+
+
+# --- GET /api/jobs/queue: multi-status filter + priority ordering (COL-175) --
+
+
+def test_queue_is_empty_when_nothing_is_running_or_pending(client: TestClient) -> None:
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+
+
+def test_queue_excludes_terminal_jobs(client: TestClient, session: Session) -> None:
+    _seed_history(session, job_id="j-ok", file_path="/media/a.mkv", status=JobStatus.SUCCEEDED)
+    _seed_history(session, job_id="j-bad", file_path="/media/b.mkv", status=JobStatus.FAILED)
+    _seed_history(session, job_id="j-pending", file_path="/media/c.mkv", status=JobStatus.PENDING)
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-pending"]
+
+
+def test_queue_orders_running_jobs_before_pending_jobs(
+    client: TestClient, session: Session
+) -> None:
+    # Seeded pending-first, with a lower priority than the running job, to
+    # prove ordering isn't just "insertion order" or "priority order" alone.
+    _seed_history(
+        session, job_id="j-pending", file_path="/media/a.mkv", status=JobStatus.PENDING, priority=0
+    )
+    _seed_history(
+        session, job_id="j-running", file_path="/media/b.mkv", status=JobStatus.RUNNING, priority=5
+    )
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-running", "j-pending"]
+
+
+def test_queue_orders_pending_jobs_by_ascending_priority(
+    client: TestClient, session: Session
+) -> None:
+    _seed_history(
+        session, job_id="j-third", file_path="/media/c.mkv", status=JobStatus.PENDING, priority=9
+    )
+    _seed_history(
+        session, job_id="j-first", file_path="/media/a.mkv", status=JobStatus.PENDING, priority=1
+    )
+    _seed_history(
+        session, job_id="j-second", file_path="/media/b.mkv", status=JobStatus.PENDING, priority=4
+    )
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-first", "j-second", "j-third"]
+
+
+def test_queue_orders_same_status_same_priority_ties_by_insertion_id(
+    client: TestClient, session: Session
+) -> None:
+    # Two RUNNING rows with equal priority don't otherwise carry a meaningful
+    # relative order -- proves the `id` (insertion order) tiebreaker documented
+    # on `list_queue_jobs` actually holds, not just that running sorts first.
+    _seed_history(
+        session, job_id="j-first", file_path="/media/a.mkv", status=JobStatus.RUNNING, priority=0
+    )
+    _seed_history(
+        session, job_id="j-second", file_path="/media/b.mkv", status=JobStatus.RUNNING, priority=0
+    )
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-first", "j-second"]
+
+
+def test_queue_rows_include_priority_and_full_shape(
+    client: TestClient, session: Session
+) -> None:
+    _seed_history(
+        session, job_id="j-1", file_path="/media/a.mkv", status=JobStatus.RUNNING, priority=3
+    )
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["job_id"] == "j-1"
+    assert row["status"] == "running"
+    assert row["priority"] == 3
 
 
 # --- POST /api/jobs/scan -----------------------------------------------------
@@ -1572,6 +1678,11 @@ def test_bump_job_wires_through_a_real_scheduler(settings: Settings) -> None:
 def test_history_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     assert client.get("/api/jobs/history").status_code == 401
+
+
+def test_queue_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    assert client.get("/api/jobs/queue").status_code == 401
 
 
 def test_scan_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:

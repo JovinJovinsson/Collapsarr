@@ -101,6 +101,22 @@ export interface GlobalSettings {
    * `default_audio_channel_tier` are set.
    */
   auto_set_default_audio: boolean;
+  /**
+   * Recently-processed window for the scheduler's dedup cooldown (COL-167).
+   * In minutes; `0` disables the cooldown entirely (always eligible for
+   * retry). Default 360 (6 hours). Read live on every dedup check -- no
+   * restart needed after saving.
+   */
+  recently_processed_window_minutes: number;
+  /**
+   * Auto-Queuing Pause (COL-174). When `true`, the scanner's Wanted-driven
+   * auto-fill (the periodic scan's initial enqueue and the Auto-Queue
+   * Limit's completion/cancellation-triggered top-up) stops running;
+   * already-`pending`/`running` Jobs and every manual trigger are
+   * unaffected. `QueuePage`'s (COL-181) page-level toggle reads/writes this
+   * field. Default `false`.
+   */
+  auto_queue_paused: boolean;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -135,4 +151,6 @@ export interface GlobalSettingsUpdateInput {
   default_audio_language?: string | null;
   default_audio_channel_tier?: DownmixTarget | null;
   auto_set_default_audio?: boolean;
+  recently_processed_window_minutes?: number;
+  auto_queue_paused?: boolean;
 }

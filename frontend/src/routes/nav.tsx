@@ -12,11 +12,12 @@ import {
   UpdateIcon,
   WantedIcon,
 } from "../components/icons";
-import { ActivityPage } from "../pages/ActivityPage";
 import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
+import { HistoryPage } from "../pages/HistoryPage";
 import { LibrariesIndexPage } from "../pages/LibrariesIndexPage";
 import { LogsPage } from "../pages/LogsPage";
+import { QueuePage } from "../pages/QueuePage";
 import { SettingsConnectPage } from "../pages/SettingsConnectPage";
 import { SettingsGeneralPage } from "../pages/SettingsGeneralPage";
 import { SettingsLoggingPage } from "../pages/SettingsLoggingPage";
@@ -102,7 +103,14 @@ export interface NavItem {
 export const navItems: NavItem[] = [
   { to: "/wanted", label: "Wanted", icon: <WantedIcon />, element: <WantedPage /> },
   { to: LIBRARIES_PATH, label: "Libraries", icon: <LibraryIcon />, element: <LibrariesIndexPage /> },
-  { to: "/activity", label: "Activity", icon: <ActivityIcon />, element: <ActivityPage /> },
+  // Was "Activity" (the combined live-queue + history table). COL-178
+  // repurposed this route into the live-only Queue view; COL-176 gives
+  // terminal (succeeded/failed) job history its own dedicated page/nav entry.
+  { to: "/queue", label: "Queue", icon: <ActivityIcon />, element: <QueuePage /> },
+  // Terminal (succeeded/failed) job history (COL-176) -- the other half of
+  // the old combined Activity table, split out into its own nav entry
+  // distinct from "Queue" above (live pending/running rows only).
+  { to: "/history", label: "History", icon: <ActivityIcon />, element: <HistoryPage /> },
 ];
 
 /**
