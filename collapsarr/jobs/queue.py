@@ -29,6 +29,22 @@ shutdown) use :meth:`wait_idle`; :meth:`shutdown` stops the pool, letting any
 in-flight Job finish first. These are internal ``JobQueue``-level Python APIs;
 the HTTP/bulk layer that builds on them is a later slice (COL-161).
 
+**Restart-durable rehydration (COL-166).** The in-memory ``_jobs`` map above
+starts empty on every process restart, but a ``PENDING`` ``JobHistory`` row
+written before the restart survives (it is a durable DB row) with nothing
+left to run it -- a "ghost pending row." :func:`~collapsarr.jobs.rehydrate.
+rehydrate_pending_jobs` (a separate module -- see the note on this module's
+own imports below for why) fixes that at startup: it reads every ``PENDING``
+row, ordered by persisted ``priority``, rebuilds each as a live Job with
+settings/preference re-derived fresh from the *current*
+:class:`~collapsarr.settings.models.GlobalSettings` row (never replayed from
+the row's stored ``target``/``language`` summary, which may now be stale),
+and pushes the result onto a queue via :meth:`JobQueue.rehydrate` --
+preserving each Job's original ``priority`` rather than renumbering it. It
+also seeds :attr:`JobQueue._next_priority` first, via :meth:`JobQueue.
+seed_next_priority` -- see that method's docstring, and the comment on
+``_next_priority``'s own definition below, for why.
+
 Each job's execution invokes the pipeline synchronously in a worker thread
 and captures whatever it returns (or, as a safety net, whatever it raises)
 onto the :class:`Job` itself -- ``status`` plus ``result``/``error``. When a
@@ -107,7 +123,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -381,11 +397,15 @@ class JobQueue:
         #: lower means enqueued earlier. Only ever moves forward;
         #: :meth:`bump_to_front` reorders by lowering a Job's own ``priority``,
         #: never by rewinding this counter. This is *process-local* only: it
-        #: resets to 0 on every restart and is **not** seeded from the
-        #: persisted ``priority`` column, so across a restart it can hand out
-        #: values that collide with rows already on disk. COL-166's restart
-        #: rehydration will need to seed this from ``max(persisted priority) +
-        #: 1`` before handing out any new value.
+        #: resets to 0 on construction, so on a fresh restart it would hand out
+        #: values that collide with rows already on disk unless seeded first.
+        #: :meth:`seed_next_priority` (COL-166) is how a caller doing restart
+        #: rehydration fixes that -- called with ``max(persisted priority) + 1``
+        #: across *every* ``JobHistory`` row (not just the ``PENDING`` ones
+        #: being rehydrated, since a completed/failed row may carry a higher
+        #: priority than any pending one) before any post-restart job is
+        #: enqueued, so freshly-submitted work always sorts *after* every
+        #: rehydrated job rather than wrongly jumping the queue.
         self._next_priority = 0
         #: The persistent worker pool (COL-164). Started explicitly by a
         #: :meth:`start` call (never implicitly on enqueue), then lives until
@@ -736,6 +756,56 @@ class JobQueue:
             job.priority = min_pending - 1
             self._cond.notify_all()
             return True
+
+    def seed_next_priority(self, min_value: int) -> None:
+        """Raise :attr:`_next_priority` to at least ``min_value`` (COL-166).
+
+        Called once, at process startup, by restart rehydration
+        (:func:`~collapsarr.jobs.rehydrate.rehydrate_pending_jobs`) with
+        ``max(persisted priority) + 1`` across *every* persisted
+        ``JobHistory`` row -- not only the still-``PENDING`` ones being
+        rehydrated onto this queue, since a completed/failed row can carry a
+        higher ``priority`` than any pending one, and this counter must clear
+        every value already written to disk, not just the ones coming back as
+        live Jobs. Never lowers the counter -- a no-op if ``min_value`` is not
+        greater than the current value, so calling this on an already-used
+        queue (or with a stale/smaller value) can't rewind priorities that
+        were already handed out.
+        """
+        with self._lock:
+            if min_value > self._next_priority:
+                self._next_priority = min_value
+
+    def rehydrate(self, jobs: Iterable[Job]) -> None:
+        """Insert already-constructed, still-``PENDING`` Jobs directly into the queue (COL-166).
+
+        Unlike :meth:`enqueue`/:meth:`enqueue_default_audio` (which funnel
+        through :meth:`_enqueue` to assign a fresh join-order ``priority``),
+        this trusts each ``job.priority`` as given -- restart rehydration
+        (:func:`~collapsarr.jobs.rehydrate.rehydrate_pending_jobs`) builds
+        ``jobs`` from persisted ``JobHistory`` rows and needs their *original*
+        priority order preserved relative to each other, not renumbered as if
+        they were just enqueued. Callers must seed :attr:`_next_priority`
+        past every persisted priority first (:meth:`seed_next_priority`) so a
+        subsequent fresh :meth:`enqueue` never collides with -- or wrongly
+        sorts ahead of -- a rehydrated Job's priority.
+
+        Does not call ``history_recorder``: every rehydrated Job already has a
+        matching ``PENDING`` ``JobHistory`` row (that's precisely where it was
+        read from), so there is nothing new to persist here -- the row is
+        brought up to date automatically the next time this Job actually runs
+        (:meth:`_run_job` records it again on the ``RUNNING`` transition and
+        again on completion, each time recomputing ``target``/``language``
+        from the Job's live ``settings``/``preference``).
+
+        Wakes any worker already waiting on a claimable Job (harmless, and a
+        no-op, if the pool hasn't been started yet -- the ordinary case, since
+        rehydration runs before :meth:`start` at process startup).
+        """
+        with self._cond:
+            for job in jobs:
+                self._jobs[job.id] = job
+            self._cond.notify_all()
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Block until no job is ``PENDING`` or ``RUNNING`` (COL-164).

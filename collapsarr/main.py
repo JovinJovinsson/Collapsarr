@@ -47,6 +47,7 @@ from .health import (
 )
 from .health.routes import router as health_checks_router
 from .jobs.queue import JobQueue
+from .jobs.rehydrate import rehydrate_pending_jobs
 from .jobs.routes import router as jobs_router
 from .jobs.scheduler import JobScheduler
 from .library.routes import router as library_router
@@ -240,6 +241,16 @@ def create_app(
         job_queue: JobQueue | None = None
         if on_file_ready is None and enable_scheduler:
             job_queue = JobQueue.from_settings(resolved_settings)
+            # Restart-durable rehydration (COL-166): reconstruct every still-
+            # PENDING JobHistory row (left behind by whatever process was
+            # running before this one) as a live Job, in persisted priority
+            # order, *before* the worker pool below starts claiming work --
+            # otherwise a PENDING row survives on disk forever with nothing
+            # left to run it. Reuses this app's own session_factory rather
+            # than from_settings()'s private one (see its docstring); same
+            # on-disk SQLite database either way.
+            with session_factory() as rehydrate_session:
+                rehydrate_pending_jobs(rehydrate_session, job_queue)
             job_queue.start()  # spin up the persistent worker pool (COL-164)
             scheduler = JobScheduler(job_queue, session_factory, resolved_settings)
             app.state.job_queue = job_queue
