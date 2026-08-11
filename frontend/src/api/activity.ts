@@ -1,4 +1,10 @@
-import type { JobHistoryEntry, ManualTriggerRequest, ManualTriggerResult } from "../types/activity";
+import type {
+  JobHistoryEntry,
+  ManualTriggerRequest,
+  ManualTriggerResult,
+  SetDefaultAudioTriggerRequest,
+  SetDefaultAudioTriggerResult,
+} from "../types/activity";
 import { apiErrorMessage, apiFetch } from "./client";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -49,4 +55,30 @@ export async function triggerDownmix(input: ManualTriggerRequest): Promise<Manua
     throw new Error(await apiErrorMessage(response, `Failed to trigger downmix (${response.status})`));
   }
   return (await response.json()) as ManualTriggerResult;
+}
+
+/**
+ * Manually enqueues a `SET_DEFAULT_AUDIO` job for one file
+ * (`POST /api/jobs/trigger-default-audio`, COL-155), used by
+ * `FileDetailPage`'s "Set Default Audio Track" action (COL-157).
+ *
+ * Mirrors {@link triggerDownmix}'s request/response handling: a `202` is
+ * returned whether or not a job was enqueued -- the response's `enqueued`
+ * flag (not the HTTP status) distinguishes a queued job from a skipped
+ * file, so this only throws on a genuine error response.
+ */
+export async function triggerSetDefaultAudio(
+  input: SetDefaultAudioTriggerRequest,
+): Promise<SetDefaultAudioTriggerResult> {
+  const response = await apiFetch("/api/jobs/trigger-default-audio", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to trigger Set Default Audio Track (${response.status})`),
+    );
+  }
+  return (await response.json()) as SetDefaultAudioTriggerResult;
 }

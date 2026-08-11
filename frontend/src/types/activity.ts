@@ -7,12 +7,28 @@
 /** Matches `collapsarr.jobs.queue.JobStatus`'s enum values. */
 export type JobStatus = "pending" | "running" | "succeeded" | "failed";
 
-/** One persisted job-history row: a single downmix job run (COL-21). */
+/**
+ * Matches `collapsarr.jobs.queue.JobKind`'s enum values (COL-155). `downmix`
+ * is the original pipeline and the default for every job/history row that
+ * predates this kind (including backfilled historical rows);
+ * `set_default_audio` is the manual/bulk Default Audio Track fix (COL-153's
+ * disposition-only pipeline).
+ */
+export type JobKind = "downmix" | "set_default_audio";
+
+/** Display label for a {@link JobKind}, shared by File Detail's and Activity's Job History tables (COL-157). */
+export const JOB_KIND_LABEL: Record<JobKind, string> = {
+  downmix: "Downmix",
+  set_default_audio: "Set Default Audio Track",
+};
+
+/** One persisted job-history row: a single downmix or set-default-audio job run (COL-21, COL-155). */
 export interface JobHistoryEntry {
   id: number;
   job_id: string;
   file_path: string;
   status: JobStatus;
+  kind: JobKind;
   started_at: string | null;
   ended_at: string | null;
   exit_code: number | null;
@@ -56,3 +72,23 @@ export interface ManualTriggerResult {
   enqueued: boolean;
   job: EnqueuedJob | null;
 }
+
+/**
+ * Request body for `POST /api/jobs/trigger-default-audio` (COL-155,
+ * `SetDefaultAudioTriggerRequest`).
+ *
+ * Unlike {@link ManualTriggerRequest} there is no allow-list-bypass option --
+ * the Default Audio Track fix isn't gated by a language allow-list at all.
+ */
+export interface SetDefaultAudioTriggerRequest {
+  file_path: string;
+}
+
+/**
+ * Response for `POST /api/jobs/trigger-default-audio` (COL-155,
+ * `SetDefaultAudioTriggerResult`). Same shape as {@link ManualTriggerResult}:
+ * `enqueued` is `true` with the created `job` when a `SET_DEFAULT_AUDIO` job
+ * was queued, `false` with `job` `null` when the file was skipped -- no
+ * preference configured, a duplicate, unprobeable, or already correct.
+ */
+export type SetDefaultAudioTriggerResult = ManualTriggerResult;
