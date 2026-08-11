@@ -9,7 +9,8 @@ DB session -- see ``conftest.py``).
 The "automatic persistence" tests below (bottom section) instead wire
 :func:`~collapsarr.jobs.history.make_history_recorder` into
 :class:`~collapsarr.jobs.queue.JobQueue` itself and prove history shows up
-after :meth:`~collapsarr.jobs.queue.JobQueue.run_pending` *without* the test
+once the worker pool has drained (:meth:`~collapsarr.jobs.queue.JobQueue.start`
+then :meth:`~collapsarr.jobs.queue.JobQueue.wait_idle`) *without* the test
 ever calling ``record_job_history`` -- those build their own engine/session
 factory (via the ``settings`` fixture) rather than the single shared
 ``session`` fixture, since they need a ``sessionmaker`` to hand to
@@ -383,10 +384,10 @@ def test_job_history_importable_from_package_root() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_pending_automatically_persists_history_when_a_recorder_is_configured(
+def test_worker_pool_automatically_persists_history_when_a_recorder_is_configured(
     settings: Settings,
 ) -> None:
-    """Every job run is persisted by run_pending() itself -- no manual call."""
+    """Every job run is persisted by the worker pool itself -- no manual call."""
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
@@ -416,7 +417,7 @@ def test_run_pending_automatically_persists_history_when_a_recorder_is_configure
 
 
 def test_enqueue_immediately_persists_a_pending_job(settings: Settings) -> None:
-    """A job is queryable in history the instant it's enqueued, before run_pending()."""
+    """A job is queryable in history the instant it's enqueued, before the pool runs it."""
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
@@ -438,7 +439,7 @@ def test_enqueue_immediately_persists_a_pending_job(settings: Settings) -> None:
     engine.dispose()
 
 
-def test_run_pending_persists_a_running_row_before_the_job_completes(settings: Settings) -> None:
+def test_worker_pool_persists_a_running_row_before_the_job_completes(settings: Settings) -> None:
     """The recorder observes RUNNING, not just terminal, as the job executes."""
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
@@ -460,7 +461,7 @@ def test_run_pending_persists_a_running_row_before_the_job_completes(settings: S
     engine.dispose()
 
 
-def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> None:
+def test_worker_pool_automatically_persists_a_failed_job(settings: Settings) -> None:
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
@@ -482,8 +483,8 @@ def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> 
     assert rows[0].error_text == _REMUX_FAILURE.detail
 
 
-def test_run_pending_with_no_history_recorder_persists_nothing(settings: Settings) -> None:
-    """No history_recorder configured -> run_pending works, nothing persisted."""
+def test_worker_pool_with_no_history_recorder_persists_nothing(settings: Settings) -> None:
+    """No history_recorder configured -> the worker pool works, nothing persisted."""
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
@@ -500,7 +501,7 @@ def test_run_pending_with_no_history_recorder_persists_nothing(settings: Setting
     engine.dispose()
 
 
-def test_run_pending_persists_history_for_every_concurrently_run_job(
+def test_worker_pool_persists_history_for_every_concurrently_run_job(
     settings: Settings,
 ) -> None:
     """A stronger proof that make_history_recorder is safe under real concurrency:

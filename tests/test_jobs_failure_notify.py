@@ -187,11 +187,11 @@ def test_notify_job_failure_swallows_an_http_error_status(session: Session) -> N
 
 # ---------------------------------------------------------------------------
 # End-to-end: JobQueue(failure_notifier=make_failure_notifier(...)) fires
-# automatically from run_pending(), with no explicit notify_job_failure call.
+# automatically from the worker pool, with no explicit notify_job_failure call.
 # ---------------------------------------------------------------------------
 
 
-def test_run_pending_automatically_dispatches_a_notification_when_wired_via_make_failure_notifier(
+def test_worker_pool_automatically_dispatches_a_notification_when_wired_via_make_failure_notifier(
     settings: Settings,
 ) -> None:
     engine = create_engine_from_settings(settings)
@@ -219,7 +219,7 @@ def test_run_pending_automatically_dispatches_a_notification_when_wired_via_make
     assert details["error"] == _REMUX_FAILURE.detail
 
 
-def test_run_pending_does_not_dispatch_a_notification_for_a_succeeded_job(
+def test_worker_pool_does_not_dispatch_a_notification_for_a_succeeded_job(
     settings: Settings,
 ) -> None:
     engine = create_engine_from_settings(settings)

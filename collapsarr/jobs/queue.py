@@ -379,12 +379,18 @@ class JobQueue:
         #: ``enqueue_default_audio``), so "priority" reads as join order:
         #: lower means enqueued earlier. Only ever moves forward;
         #: :meth:`bump_to_front` reorders by lowering a Job's own ``priority``,
-        #: never by rewinding this counter (COL-164 keeps it collision-free for
-        #: COL-166's restart rehydration).
+        #: never by rewinding this counter. This is *process-local* only: it
+        #: resets to 0 on every restart and is **not** seeded from the
+        #: persisted ``priority`` column, so across a restart it can hand out
+        #: values that collide with rows already on disk. COL-166's restart
+        #: rehydration will need to seed this from ``max(persisted priority) +
+        #: 1`` before handing out any new value.
         self._next_priority = 0
-        #: The persistent worker pool (COL-164). Started once, on the first
-        #: :meth:`_enqueue`, then lives until :meth:`shutdown` (or process
-        #: exit -- the threads are daemons).
+        #: The persistent worker pool (COL-164). Started explicitly by a
+        #: :meth:`start` call (never implicitly on enqueue), then lives until
+        #: :meth:`shutdown` (or process exit -- the threads are daemons).
+        #: :meth:`_enqueue` does *not* start it; it only ``notify_all``s to
+        #: wake any workers already waiting for a claimable Job.
         self._workers: list[threading.Thread] = []
         self._started = False
         #: Set by :meth:`shutdown`; tells every idle worker to exit its loop.

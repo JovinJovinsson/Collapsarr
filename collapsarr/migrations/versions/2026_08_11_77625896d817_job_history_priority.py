@@ -8,8 +8,8 @@ Additive migration for COL-163: a persisted ``priority`` column on
 ``job_history``, so job ordering survives a process restart and is available
 for the priority-pull worker pool (COL-164, currently blocked on this ticket)
 to build on. This is a pure prefactor -- nothing yet reads the column back to
-change execution order; :meth:`~collapsarr.jobs.queue.JobQueue.run_pending`
-is untouched.
+change execution order; the worker pool (:meth:`~collapsarr.jobs.queue.JobQueue.start`
+and its ``_worker_loop`` claim path) is untouched.
 
 Three-phase, unlike the single-shot ``server_default`` used by the COL-155
 ``kind`` migration: ``priority`` needs a **per-row** backfill value (its
