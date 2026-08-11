@@ -384,4 +384,126 @@ describe("HistoryPage", () => {
       expect(within(failedRow).getByText("Failed")).toBeInTheDocument();
     });
   });
+
+  describe('"Requeue all failed" action (COL-179, COL-172)', () => {
+    it('shows "Requeue all failed" when at least one row is failed', async () => {
+      mockFetchResolved(historyResponse);
+      render(<HistoryPage />);
+
+      expect(await screen.findByRole("button", { name: /requeue all failed/i })).toBeInTheDocument();
+    });
+
+    it('hides "Requeue all failed" when there is no failed row', async () => {
+      mockFetchResolved([succeededJob]);
+      render(<HistoryPage />);
+
+      await screen.findByText("Interstellar");
+      expect(screen.queryByRole("button", { name: /requeue all failed/i })).not.toBeInTheDocument();
+    });
+
+    it("shows an inline confirm step before calling the bulk requeue endpoint", async () => {
+      const fetchMock = mockFetchResolved(historyResponse);
+      render(<HistoryPage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /requeue all failed/i }));
+
+      const confirmPanel = (await screen.findByText(/requeue every failed job\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+      expect(
+        within(confirmPanel).getByRole("button", { name: /confirm requeue all failed/i }),
+      ).toBeInTheDocument();
+      // Only the mount-time history fetch has happened so far -- the bulk
+      // requeue endpoint itself hasn't been called yet.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('dismisses the confirm step via "Cancel" without calling the endpoint', async () => {
+      const fetchMock = mockFetchResolved(historyResponse);
+      render(<HistoryPage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /requeue all failed/i }));
+      const confirmPanel = (await screen.findByText(/requeue every failed job\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /^cancel$/i }));
+
+      expect(screen.queryByText(/requeue every failed job\?/i)).not.toBeInTheDocument();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("calls POST /api/jobs/requeue-failed on confirm, reports the requeued/skipped split, and re-fetches history", async () => {
+      const fetchMock = mockFetchWithAction(historyResponse, (url, init) => {
+        expect(url).toContain("/api/jobs/requeue-failed");
+        expect(init?.method).toBe("POST");
+        return {
+          ok: true,
+          body: {
+            requeued: Array.from({ length: 12 }, (_, i) => ({
+              id: `job-${i}`,
+              file_path: `/media/${i}.mkv`,
+              status: "pending",
+            })),
+            skipped: ["/media/a.mkv", "/media/b.mkv", "/media/c.mkv"],
+          },
+        };
+      });
+      render(<HistoryPage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /requeue all failed/i }));
+      const confirmPanel = (await screen.findByText(/requeue every failed job\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /confirm requeue all failed/i }));
+
+      expect(
+        await screen.findByText(
+          /12 of 15 requeued, 3 skipped — inside the deduplication window, check logs and requeue individually\./i,
+        ),
+      ).toBeInTheDocument();
+      // The confirm step is dismissed once the endpoint call succeeds.
+      expect(screen.queryByText(/requeue every failed job\?/i)).not.toBeInTheDocument();
+      // Initial history fetch + the requeue-failed POST + the post-action history refetch.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    });
+
+    it("reports a plain requeued-count message when nothing was skipped", async () => {
+      mockFetchWithAction(historyResponse, () => ({
+        ok: true,
+        body: {
+          requeued: [{ id: "job-1", file_path: failedJob.file_path, status: "pending" }],
+          skipped: [],
+        },
+      }));
+      render(<HistoryPage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /requeue all failed/i }));
+      const confirmPanel = (await screen.findByText(/requeue every failed job\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /confirm requeue all failed/i }));
+
+      expect(await screen.findByText(/^1 of 1 requeued\.$/i)).toBeInTheDocument();
+    });
+
+    it("keeps the confirm step open and shows an error notice when the bulk requeue request fails", async () => {
+      mockFetchWithAction(historyResponse, () => ({
+        ok: false,
+        status: 500,
+        body: { detail: "boom" },
+      }));
+      render(<HistoryPage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /requeue all failed/i }));
+      const confirmPanel = (await screen.findByText(/requeue every failed job\?/i)).closest(
+        ".view__confirm",
+      ) as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /confirm requeue all failed/i }));
+
+      expect(await screen.findByText(/boom/i)).toBeInTheDocument();
+      // Still open for a retry, unlike the success path above.
+      expect(screen.getByText(/requeue every failed job\?/i)).toBeInTheDocument();
+    });
+  });
 });

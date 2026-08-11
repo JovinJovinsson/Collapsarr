@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { fetchJobHistory, requeueFile } from "../api/activity";
+import { fetchJobHistory, requeueAllFailed, requeueFile } from "../api/activity";
 import { ActivityIcon } from "../components/icons";
 import { Modal } from "../components/Modal";
 import { JOB_KIND_LABEL } from "../types/activity";
-import type { JobHistoryEntry, JobStatus } from "../types/activity";
+import type { BulkRequeueFailedResult, JobHistoryEntry, JobStatus } from "../types/activity";
 
 const STATUS_LABEL: Record<JobStatus, string> = {
   pending: "Pending",
@@ -67,6 +67,32 @@ type PendingRequeues = Partial<Record<string, boolean>>;
 type RequeueNotice = { tone: "success" | "hint" | "error"; text: string } | null;
 
 /**
+ * Result notice for the page-level "Requeue all failed" action (COL-179,
+ * COL-172). Always reports the endpoint's `requeued`/`skipped` split via
+ * {@link describeBulkRequeueResult} on success -- never a generic "done"
+ * message -- since a non-zero `skipped` count means some currently-failed
+ * files weren't retried and that's worth surfacing, not just the count that
+ * was.
+ */
+type BulkRequeueNotice = { tone: "success" | "error"; text: string } | null;
+
+/**
+ * Renders `POST /api/jobs/requeue-failed`'s (COL-172) `requeued`/`skipped`
+ * split as a sentence, instead of a bare "success" message -- the split is
+ * the entire point of the endpoint's response shape (see
+ * `BulkRequeueFailedResult`'s doc comment, `types/activity.ts`). Mirrors
+ * `QueuePage`'s `describeClearQueueResult` shape.
+ */
+function describeBulkRequeueResult(result: BulkRequeueFailedResult): string {
+  const total = result.requeued.length + result.skipped.length;
+  const requeuedText = `${result.requeued.length} of ${total} requeued`;
+  if (result.skipped.length === 0) {
+    return `${requeuedText}.`;
+  }
+  return `${requeuedText}, ${result.skipped.length} skipped — inside the deduplication window, check logs and requeue individually.`;
+}
+
+/**
  * The History view (COL-176): every terminal (`succeeded`/`failed`) Job,
  * newest first -- this is the old combined Activity table's content, minus
  * the live `pending`/`running` rows, which moved to the dedicated Queue view
@@ -92,6 +118,29 @@ type RequeueNotice = { tone: "success" | "hint" | "error"; text: string } | null
  * clicked row, so the failed row this page shows stays exactly as it was --
  * a page-level notice (see {@link RequeueNotice}) reports the outcome
  * instead of the row itself changing, and there is nothing to re-fetch.
+ *
+ * COL-179 adds a page-level "Requeue all failed" control in the header, next
+ * to the title -- mirrors `QueuePage`'s (COL-181) "Clear queue" pattern
+ * exactly: visible only while at least one row is `failed` (nothing to
+ * requeue otherwise), and -- unlike the per-row action above, which is a
+ * single, easily-scoped action -- this is a batch action across every
+ * currently-failed file, so it sits behind an inline confirm step (the same
+ * `.view__confirm` markup `QueuePage`'s "Clear queue" uses) rather than
+ * firing immediately. On confirm, `requeueAllFailed` (`POST
+ * /api/jobs/requeue-failed`, COL-172) is called; its `requeued`/`skipped`
+ * split is rendered verbatim via {@link describeBulkRequeueResult} -- never a
+ * bare "done" message -- since `skipped` (files whose most recent failure
+ * falls inside the Recently-Processed Window -- surfaced to the operator as
+ * the "deduplication window", the friendlier UI-facing name for the same
+ * mechanism -- or that are otherwise not requeueable right now) means the
+ * request didn't fully land. Unlike the
+ * per-row action's "nothing to re-fetch" note above, this *does* re-fetch job
+ * history on success -- a batch action can enqueue many new (`pending`) jobs
+ * at once, and re-fetching (mirroring `QueuePage`'s `refreshQueueSoon`) keeps
+ * this page's own state in sync with the server without waiting on a manual
+ * reload, even though the terminal `failed` rows themselves are untouched
+ * (same brand-new-row semantics as the per-row action) and so remain visible
+ * until superseded by a later poll showing their retry's own outcome.
  */
 export function HistoryPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
@@ -100,6 +149,9 @@ export function HistoryPage() {
   const [expandedError, setExpandedError] = useState<JobHistoryEntry | null>(null);
   const [pendingRequeues, setPendingRequeues] = useState<PendingRequeues>({});
   const [requeueNotice, setRequeueNotice] = useState<RequeueNotice>(null);
+  const [confirmingRequeueAllFailed, setConfirmingRequeueAllFailed] = useState(false);
+  const [requeuingAllFailed, setRequeuingAllFailed] = useState(false);
+  const [bulkRequeueNotice, setBulkRequeueNotice] = useState<BulkRequeueNotice>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -125,6 +177,23 @@ export function HistoryPage() {
   }, []);
 
   /**
+   * Best-effort re-fetch of job history, used right after "Requeue all
+   * failed" (COL-179) settles so any newly-created `pending` jobs (and
+   * anything else that changed server-side) are reflected without waiting
+   * for a manual reload. Deliberately swallows its own failure -- mirrors
+   * `QueuePage`'s `refreshQueueSoon`: a refresh failure here shouldn't stomp
+   * on the {@link BulkRequeueNotice} the action itself just set.
+   */
+  async function refetchHistorySoon(): Promise<void> {
+    try {
+      const entries = await fetchJobHistory();
+      setState({ status: "ready", entries });
+    } catch {
+      // Swallowed -- see doc comment above.
+    }
+  }
+
+  /**
    * Every terminal (`succeeded`/`failed`) row, newest first. `fetchJobHistory`
    * returns oldest-first (matching the backend's insertion-order query,
    * which `FileDetailPage`'s per-target status resolution depends on) --
@@ -145,6 +214,7 @@ export function HistoryPage() {
   }, [terminalEntries, fileFilter, statusFilter]);
 
   const hasEntries = terminalEntries.length > 0;
+  const hasFailedEntries = terminalEntries.some((entry) => entry.status === "failed");
 
   async function handleRequeue(entry: JobHistoryEntry): Promise<void> {
     setPendingRequeues((prev) => ({ ...prev, [entry.job_id]: true }));
@@ -176,12 +246,91 @@ export function HistoryPage() {
     }
   }
 
+  /** Opens the inline "Requeue all failed" confirm step (COL-179), clearing any stale result notice. */
+  function handleRequeueAllFailedClick(): void {
+    setBulkRequeueNotice(null);
+    setConfirmingRequeueAllFailed(true);
+  }
+
+  /** Dismisses the "Requeue all failed" confirm step without calling the endpoint. */
+  function handleCancelRequeueAllFailed(): void {
+    setConfirmingRequeueAllFailed(false);
+  }
+
+  /**
+   * Calls the bulk requeue endpoint (`requeueAllFailed`, `POST
+   * /api/jobs/requeue-failed`, COL-172) and surfaces its `requeued`/`skipped`
+   * split verbatim (see {@link describeBulkRequeueResult}) rather than a
+   * generic success message. Mirrors `QueuePage`'s "Clear queue" confirm
+   * flow: the confirm step is dismissed only on success, so a failure leaves
+   * it open for a retry instead of silently discarding the operator's
+   * confirmation.
+   */
+  async function handleConfirmRequeueAllFailed(): Promise<void> {
+    setRequeuingAllFailed(true);
+    try {
+      const result = await requeueAllFailed();
+      setConfirmingRequeueAllFailed(false);
+      setBulkRequeueNotice({ tone: "success", text: describeBulkRequeueResult(result) });
+      await refetchHistorySoon();
+    } catch (error) {
+      setBulkRequeueNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to requeue failed jobs.",
+      });
+    } finally {
+      setRequeuingAllFailed(false);
+    }
+  }
+
   return (
     <section className="view">
-      <header className="view__header">
-        <h1 className="view__title">History</h1>
-        <p className="view__summary">History of completed downmix jobs — succeeded and failed.</p>
+      <header className="view__header view__header--row">
+        <div>
+          <h1 className="view__title">History</h1>
+          <p className="view__summary">History of completed downmix jobs — succeeded and failed.</p>
+        </div>
+        {hasFailedEntries && !confirmingRequeueAllFailed && (
+          <div className="view__actions">
+            <button type="button" className="btn btn--secondary" onClick={handleRequeueAllFailedClick}>
+              Requeue all failed
+            </button>
+          </div>
+        )}
       </header>
+
+      {confirmingRequeueAllFailed && (
+        <div className="panel view__confirm" role="status">
+          <p>
+            Requeue every failed job? Files whose most recent failure is inside the deduplication
+            window are skipped, not requeued.
+          </p>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="btn btn--secondary"
+              onClick={() => void handleConfirmRequeueAllFailed()}
+              disabled={requeuingAllFailed}
+            >
+              {requeuingAllFailed ? "Requeuing…" : "Confirm requeue all failed"}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={handleCancelRequeueAllFailed}
+              disabled={requeuingAllFailed}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {bulkRequeueNotice && (
+        <p className={bulkRequeueNotice.tone === "error" ? "view__error" : "view__notice"} role="status">
+          {bulkRequeueNotice.text}
+        </p>
+      )}
 
       {hasEntries && (
         <div className="activity-filters">

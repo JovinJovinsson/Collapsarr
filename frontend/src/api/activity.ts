@@ -1,4 +1,5 @@
 import type {
+  BulkRequeueFailedResult,
   BulkSetDefaultAudioTriggerRequest,
   BulkSetDefaultAudioTriggerResult,
   BumpJobResult,
@@ -214,6 +215,28 @@ export async function requeueFile(filePath: string): Promise<RequeueFileResult> 
     throw new Error(await apiErrorMessage(response, `Failed to requeue file (${response.status})`));
   }
   return (await response.json()) as RequeueFileResult;
+}
+
+/**
+ * Requeues every currently-`failed` Job in one call (`POST
+ * /api/jobs/requeue-failed`, COL-172) -- `HistoryPage`'s (COL-179) page-level
+ * "Requeue all failed" action, the batch counterpart of {@link requeueFile}'s
+ * single-row scope.
+ *
+ * A `202` is always returned, even when nothing was skipped or nothing was
+ * requeued. Rather than a single boolean/count, the response reports the
+ * `requeued`/`skipped` split so the caller can surface exactly what happened
+ * to every currently-failed file instead of a generic success message --
+ * unlike {@link requeueFile}, this respects the Recently-Processed Window, so
+ * a file whose most recent failure is too recent lands in `skipped` rather
+ * than being requeued.
+ */
+export async function requeueAllFailed(): Promise<BulkRequeueFailedResult> {
+  const response = await apiFetch("/api/jobs/requeue-failed", { method: "POST" });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to requeue failed jobs (${response.status})`));
+  }
+  return (await response.json()) as BulkRequeueFailedResult;
 }
 
 /**

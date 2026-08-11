@@ -165,6 +165,25 @@ export interface RequeueFileRequest {
 export type RequeueFileResult = ManualTriggerResult;
 
 /**
+ * Response for `POST /api/jobs/requeue-failed` (COL-172, `BulkRequeueFailedResult`)
+ * -- `HistoryPage`'s (COL-179) page-level "Requeue all failed" action, the
+ * batch counterpart of {@link RequeueFileResult}'s per-row scope.
+ *
+ * `requeued` lists every newly created job for a currently-`failed` file this
+ * pass did not skip. `skipped` lists every currently-`failed` file's path
+ * this pass did not requeue -- most commonly because its most recent
+ * terminal history row falls inside the Recently-Processed Window (COL-167),
+ * but also any other reason a trigger might decline a file (already active,
+ * unprobeable, or nothing left to do). Every currently-failed file lands in
+ * exactly one of the two lists -- never a silent partial success, so an
+ * all-skipped response is a valid, fully-reported outcome, not an error.
+ */
+export interface BulkRequeueFailedResult {
+  requeued: EnqueuedJob[];
+  skipped: string[];
+}
+
+/**
  * Response for `DELETE /api/jobs/{job_id}` (COL-168, `CancelJobResult`) --
  * `QueuePage`'s (COL-180) per-row "Cancel" action.
  *
