@@ -114,9 +114,10 @@ window like every other trigger). The rationale: every *single, explicit*
 requeue/trigger action is a human asking for this file, right now -- the
 cooldown exists to stop *automatic* re-attempts (scan/webhook) from
 hammering a persistently-failing file, not to second-guess a deliberate
-manual retry. Only a true *batch* action (COL-172's "Requeue all failed")
-still respects the window, since a bulk retry of every failed file is closer
-in spirit to the automatic paths this cooldown protects against.
+manual retry. Only a true *batch* action -- :meth:`requeue_all_failed`
+(COL-172's "Requeue all failed") -- still respects the window, since a bulk
+retry of every failed file is closer in spirit to the automatic paths this
+cooldown protects against.
 
 **Auto-Queue Limit (COL-171).** The scanner never auto-enqueues more than
 :data:`AUTO_QUEUE_LIMIT` (fixed at 5, not user-configurable) total ``PENDING``
@@ -130,10 +131,11 @@ completing, success or failure alike, via the job-terminal hook wired onto
 set_job_terminal_hook`); (2) a Job being cancelled (COL-168, :meth:`cancel_job`);
 (3) the periodic background scan (:meth:`scan_once`); and (4) ``POST
 /api/jobs/scan`` (:meth:`scan_now`, an alias for :meth:`scan_once`). A manual
-trigger or requeue (:meth:`trigger_file`/:meth:`requeue_file`) is never
-blocked by the limit -- it simply consumes the same shared ``PENDING``-count
-budget :meth:`top_up` watches. See :meth:`top_up`'s own docstring for the
-algorithm and its thread-safety/re-entrancy analysis.
+trigger or requeue (:meth:`trigger_file`/:meth:`requeue_file`/
+:meth:`requeue_all_failed`) is never blocked by the limit -- it simply
+consumes the same shared ``PENDING``-count budget :meth:`top_up` watches.
+See :meth:`top_up`'s own docstring for the algorithm and its
+thread-safety/re-entrancy analysis.
 
 Threads, not asyncio: this matches :mod:`collapsarr.jobs.queue`'s rationale --
 the pipeline shells out to blocking ``ffprobe``/``ffmpeg`` subprocesses -- and
@@ -152,7 +154,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -176,7 +178,7 @@ from collapsarr.downmix.default_audio import DefaultAudioPreference, resolve_def
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_streams
 from collapsarr.downmix.targets import DownmixSettings, detect_qualifying_targets
 from collapsarr.jobs.history import delete_job_history, list_job_history
-from collapsarr.jobs.queue import Job, JobQueue, JobStatus
+from collapsarr.jobs.queue import Job, JobKind, JobQueue, JobStatus
 from collapsarr.library.service import (
     get_node_by_source_id,
     list_nodes,
@@ -225,6 +227,27 @@ AUTO_QUEUE_LIMIT = 5
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+@dataclass(slots=True, frozen=True)
+class BulkRequeueResult:
+    """The outcome of one :meth:`JobScheduler.requeue_all_failed` pass (COL-172).
+
+    ``requeued`` is every newly created :class:`Job` -- one per currently-``FAILED``
+    ``DOWNMIX`` file :meth:`~JobScheduler.trigger_file` did *not* decline.
+    ``skipped`` is every currently-``FAILED`` ``DOWNMIX`` file's path
+    :meth:`~JobScheduler.trigger_file` declined to requeue this pass (most
+    commonly: inside the Recently-Processed Window, COL-167; see
+    :meth:`JobScheduler.requeue_all_failed` for the full list of reasons, and
+    for why a ``SET_DEFAULT_AUDIO`` failure is out of scope entirely rather
+    than appearing in either list). Every currently-failed ``DOWNMIX`` file
+    lands in exactly one of the two -- there is no third, ambiguous outcome,
+    so a caller never has to guess what happened to a file that isn't in
+    ``requeued``.
+    """
+
+    requeued: list[Job]
+    skipped: list[str]
 
 
 class JobScheduler:
@@ -376,8 +399,8 @@ class JobScheduler:
         :meth:`trigger_file` threads its own ``bypass_dedup_window`` argument
         through here for the ``POST /api/jobs/trigger`` endpoint, which now
         always passes ``True`` too (COL-170: every single, explicit action
-        bypasses the window -- only a true batch action, COL-172, respects
-        it).
+        bypasses the window -- only a true batch action, :meth:`requeue_all_failed`
+        (COL-172), respects it).
 
         ``respect_tracked`` (COL-102) gates the enqueue on the file's resolved
         **Tracked** value (``CONTEXT.md``): when ``True`` (the automatic paths --
@@ -626,8 +649,9 @@ class JobScheduler:
         ``POST /api/jobs/trigger`` (:mod:`collapsarr.jobs.routes`) now always
         passes ``True``: every single, explicit trigger bypasses the window
         going forward, matching :meth:`requeue_file`'s per-row Requeue action
-        -- only a true batch action (COL-172's "Requeue all failed") respects
-        it. It still goes through the same qualifying-target detection as the
+        -- only a true batch action (:meth:`requeue_all_failed`, COL-172's
+        "Requeue all failed") respects it. It still goes through the same
+        qualifying-target detection as the
         automatic triggers regardless of this flag -- bypassing the window
         never means "enqueue even a file with nothing to do"; that gate is
         untouched. Returns the created :class:`~collapsarr.jobs.queue.Job`,
@@ -990,6 +1014,97 @@ class JobScheduler:
         qualifying target).
         """
         return self.trigger_file(file_path, session=session, bypass_dedup_window=True)
+
+    # -- Bulk requeue-all-failed (COL-172) -------------------------------------
+
+    def requeue_all_failed(self, *, session: Session | None = None) -> BulkRequeueResult:
+        """Requeue every currently-``FAILED`` Job in one call (COL-172).
+
+        The entry point ``POST /api/jobs/requeue-failed``
+        (:mod:`collapsarr.jobs.routes`) calls -- the batch counterpart of
+        :meth:`requeue_file`'s per-row "Requeue" action, mirroring
+        :meth:`cancel_job`/:meth:`bump_job_to_front`/:meth:`requeue_file`'s
+        shape: one dedicated scheduler method doing the whole batch
+        orchestration, with a thin route wrapping it.
+
+        Every persisted :class:`~collapsarr.jobs.models.JobHistory` row whose
+        ``status`` is currently ``FAILED`` **and** whose ``kind`` is
+        ``DOWNMIX`` (:func:`~collapsarr.jobs.history.list_job_history`) names
+        a currently-failed file this action is scoped to. The ``kind`` filter
+        matters: :meth:`trigger_file` (below) only ever creates a ``DOWNMIX``
+        job, so a ``SET_DEFAULT_AUDIO`` failure (COL-155/COL-156's separate
+        Default Audio Track fix) is deliberately excluded rather than
+        silently retried as the wrong kind of job -- it has its own bulk
+        entry point (``POST /api/jobs/trigger-default-audio/bulk``) and
+        simply isn't "Requeue all failed"'s concern, the same way that
+        endpoint never touches a ``DOWNMIX`` failure. Rows are then
+        de-duplicated by file path -- a file that has failed more than once
+        has more than one ``FAILED`` row (each with its own ``job_id``, see
+        that module), but only needs one requeue attempt here -- and, for
+        each distinct file, in the order its first ``FAILED`` row was
+        encountered, :meth:`trigger_file` is called with
+        ``bypass_dedup_window=False`` (its own default).
+
+        This is the one deliberate divergence from :meth:`requeue_file`
+        (always ``True``): a *batch* retry of every failed file is closer in
+        spirit to the automatic paths the Recently-Processed Window (COL-167)
+        exists to protect -- a scan/webhook hammering a persistently-failing
+        file -- than to one human explicitly asking for one specific file
+        right now, so this action *respects* the window. A file whose most
+        recent terminal history row falls inside it is skipped, not
+        requeued -- see the module docstring's "Bypassing the window
+        explicitly" section. :meth:`trigger_file` still goes through its own
+        "already active" duplicate check and
+        :func:`~collapsarr.downmix.targets.detect_qualifying_targets`
+        qualifying-target detection unchanged, so a file that's already
+        ``PENDING``/``RUNNING`` right now, or one with nothing left to do
+        (e.g. a stale ``FAILED`` row for a file a later manual trigger
+        already fixed), is *also* skipped here -- every reason
+        :meth:`trigger_file` might return ``None`` folds into ``skipped``,
+        not just the window. No ``extra_languages`` override, matching
+        :meth:`requeue_file`: every file retries against the standing
+        language allow-list.
+
+        Never blocked by the Auto-Queue Limit (COL-171, :data:`AUTO_QUEUE_LIMIT`)
+        -- like :meth:`trigger_file`/:meth:`requeue_file`, this simply
+        consumes the same shared ``PENDING``-count budget :meth:`top_up`
+        watches, and never calls :meth:`top_up` itself.
+
+        Returns a :class:`BulkRequeueResult` reporting the full split: every
+        currently-failed file's path lands in exactly one of ``requeued``
+        (with the newly created :class:`Job`) or ``skipped`` (the bare file
+        path, since nothing was created for it) -- never silently dropped.
+        An all-skipped result (e.g. every failed file failed too recently) is
+        not an error -- a valid, fully-reported outcome, same as any other
+        trigger's ``None`` result isn't.
+
+        Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
+        when the caller has one open (the route always does), else opens a
+        short-lived one -- shared across every ``list_job_history``/
+        :meth:`trigger_file` call in this pass, so the whole batch reads and
+        acts against one consistent snapshot rather than one that could shift
+        mid-pass across several short-lived sessions.
+        """
+        if session is not None:
+            return self._requeue_all_failed_in(session)
+        with self._session_factory() as owned_session:
+            return self._requeue_all_failed_in(owned_session)
+
+    def _requeue_all_failed_in(self, session: Session) -> BulkRequeueResult:
+        """The body of :meth:`requeue_all_failed`, run against an already-open ``session``."""
+        requeued: list[Job] = []
+        skipped: list[str] = []
+        seen: set[str] = set()
+        for row in list_job_history(session, status=JobStatus.FAILED, kind=JobKind.DOWNMIX):
+            if row.file_path in seen:
+                continue
+            seen.add(row.file_path)
+            job = self.trigger_file(row.file_path, session=session, bypass_dedup_window=False)
+            if job is None:
+                skipped.append(row.file_path)
+            else:
+                requeued.append(job)
+        return BulkRequeueResult(requeued=requeued, skipped=skipped)
 
     # -- Auto-Queue Limit / top-up (COL-171) -----------------------------------
 

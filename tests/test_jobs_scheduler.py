@@ -812,6 +812,219 @@ def test_requeue_file_skips_a_file_with_nothing_to_do(
 
 
 # ---------------------------------------------------------------------------
+# requeue_all_failed (COL-172)
+# ---------------------------------------------------------------------------
+
+
+def test_requeue_all_failed_requeues_every_currently_failed_file(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: full success -- every currently-FAILED file outside the window is requeued."""
+    ended = _FIXED_NOW - timedelta(hours=7)  # outside the default 360min window
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.FAILED)
+        _record_terminal(session, "/media/b.mkv", ended_at=ended, status=JobStatus.FAILED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert {job.file_path for job in outcome.requeued} == {
+        Path("/media/a.mkv"),
+        Path("/media/b.mkv"),
+    }
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_skips_files_inside_the_recently_processed_window(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: partial skip -- unlike requeue_file, the bulk action respects the window."""
+    with session_factory() as session:
+        # Inside the default 360min window -> skipped.
+        _record_terminal(session, "/media/a.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+        # Outside it -> requeued.
+        _record_terminal(
+            session,
+            "/media/b.mkv",
+            ended_at=_FIXED_NOW - timedelta(hours=7),
+            status=JobStatus.FAILED,
+        )
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert [job.file_path for job in outcome.requeued] == [Path("/media/b.mkv")]
+    assert outcome.skipped == ["/media/a.mkv"]
+
+
+def test_requeue_all_failed_all_skipped_is_a_valid_empty_requeued_result(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: every currently-FAILED file inside the window -> all-skipped is not an error."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+        _record_terminal(session, "/media/b.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert sorted(outcome.skipped) == ["/media/a.mkv", "/media/b.mkv"]
+
+
+def test_requeue_all_failed_returns_an_empty_result_when_nothing_is_failed(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_ignores_non_failed_history_rows(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.SUCCEEDED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_ignores_a_failed_set_default_audio_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A FAILED SET_DEFAULT_AUDIO row is out of scope -- trigger_file only ever
+
+    creates DOWNMIX jobs, so retrying it here would silently substitute the
+    wrong kind of job. It belongs to its own bulk endpoint
+    (``POST /api/jobs/trigger-default-audio/bulk``, COL-156), not this one --
+    so it's excluded entirely rather than surfaced as "skipped".
+    """
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        job = Job(
+            file_path=Path("/media/a.mkv"),
+            settings=DownmixSettings(),
+            kind=JobKind.SET_DEFAULT_AUDIO,
+            status=JobStatus.FAILED,
+            started_at=ended,
+            ended_at=ended,
+        )
+        record_job_history(session, job)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_deduplicates_multiple_failed_rows_for_the_same_file(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A file that has failed more than once has more than one FAILED row, but one retry."""
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        job = Job(
+            file_path=Path("/media/a.mkv"),
+            settings=DownmixSettings(),
+            status=JobStatus.FAILED,
+            started_at=ended,
+            ended_at=ended,
+        )
+        record_job_history(session, job)
+        another = Job(
+            file_path=Path("/media/a.mkv"),
+            settings=DownmixSettings(),
+            status=JobStatus.FAILED,
+            started_at=ended,
+            ended_at=ended,
+        )
+        record_job_history(session, another)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert len(outcome.requeued) == 1
+    assert outcome.requeued[0].file_path == Path("/media/a.mkv")
+    assert outcome.skipped == []
+
+
+def test_requeue_all_failed_still_treats_an_active_job_as_a_duplicate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A currently-FAILED file with an already-active retry in flight is skipped, not doubled."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    active = scheduler.enqueue_file("/media/a.mkv")
+    assert active is not None  # still PENDING -> active
+
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.FAILED)
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == ["/media/a.mkv"]
+
+
+def test_requeue_all_failed_skips_a_file_with_nothing_left_to_do(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A stale FAILED row for a since-fixed file is skipped, not force-requeued."""
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.FAILED)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_STEREO_ONLY))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert outcome.requeued == []
+    assert outcome.skipped == ["/media/a.mkv"]
+
+
+def test_requeue_all_failed_is_not_blocked_by_the_auto_queue_limit(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: a bulk requeue that pushes pending above the limit is never blocked either (COL-171)."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+
+    ended = _FIXED_NOW - timedelta(hours=7)
+    with session_factory() as session:
+        _record_terminal(session, "/media/extra.mkv", ended_at=ended, status=JobStatus.FAILED)
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert [job.file_path for job in outcome.requeued] == [Path("/media/extra.mkv")]
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT + 1
+
+
+# ---------------------------------------------------------------------------
 # cancel_job (COL-168)
 # ---------------------------------------------------------------------------
 

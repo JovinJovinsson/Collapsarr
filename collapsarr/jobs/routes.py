@@ -6,7 +6,7 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Eight endpoints, each wrapping an existing service without adding new job logic:
+Nine endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
@@ -42,6 +42,20 @@ Eight endpoints, each wrapping an existing service without adding new job logic:
   so a file with nothing to do (already fully downmixed) is still skipped,
   and a file with a job already ``PENDING``/``RUNNING`` right now is still
   reported as not enqueued.
+- ``POST /api/jobs/requeue-failed`` -- the batch "Requeue all failed" action
+  (COL-172): requeues every currently-``FAILED`` ``DOWNMIX`` Job in one call
+  via :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_all_failed` (a
+  ``SET_DEFAULT_AUDIO`` failure is out of scope -- ``POST
+  /api/jobs/trigger-default-audio/bulk`` above is its own bulk retry entry
+  point). Unlike ``POST /api/jobs/requeue`` above, this *respects* the
+  Recently-Processed Window (COL-167) -- a bulk retry of every failed file is
+  closer in spirit to the automatic paths that window protects against than
+  to one explicit single-file action, so a file whose most recent terminal
+  history row falls inside the window is skipped, not requeued. The response
+  reports the full split -- every currently-failed file's path lands in
+  either ``requeued`` (with its newly created job) or ``skipped`` -- so an
+  all-skipped pass (e.g. every failed file failed too recently) is a valid,
+  fully-reported outcome, not an error.
 - ``POST /api/jobs/trigger-default-audio`` -- manually enqueues a
   ``SET_DEFAULT_AUDIO`` job for one specific file
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`,
@@ -239,6 +253,26 @@ class RequeueFileResult(BaseModel):
 
     enqueued: bool
     job: EnqueuedJob | None
+
+
+class BulkRequeueFailedResult(BaseModel):
+    """Response for ``POST /api/jobs/requeue-failed`` (COL-172).
+
+    ``requeued`` lists every newly created job for a currently-``FAILED``
+    file this pass did *not* skip. ``skipped`` lists every currently-``FAILED``
+    file's path this pass did *not* requeue -- most commonly because its most
+    recent terminal history row falls inside the Recently-Processed Window
+    (COL-167), but also any other reason
+    :meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_file` might decline
+    a file (already active, unprobeable, or nothing left to do). Every
+    currently-failed file lands in exactly one of the two lists -- never a
+    silent partial success -- so an all-skipped response (e.g. every failed
+    file failed too recently) is a valid, fully-reported outcome rather than
+    an error.
+    """
+
+    requeued: list[EnqueuedJob]
+    skipped: list[str]
 
 
 class SetDefaultAudioTriggerRequest(BaseModel):
@@ -553,6 +587,35 @@ def requeue_file_endpoint(
     if job is None:
         return RequeueFileResult(enqueued=False, job=None)
     return RequeueFileResult(enqueued=True, job=EnqueuedJob.from_job(job))
+
+
+@router.post(
+    "/jobs/requeue-failed",
+    response_model=BulkRequeueFailedResult,
+    status_code=202,
+)
+def requeue_all_failed_endpoint(
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+    session: Session = Depends(get_session),
+) -> BulkRequeueFailedResult:
+    """Requeue every currently-``FAILED`` Job in one call -- "Requeue all failed" (COL-172).
+
+    Wraps :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_all_failed`,
+    the batch counterpart of ``POST /api/jobs/requeue`` above. Unlike that
+    per-row action (which always bypasses the Recently-Processed Window),
+    this one *respects* it -- a file whose most recent terminal history row
+    falls inside the window is skipped, not requeued, since a bulk retry of
+    every failed file is closer in spirit to the automatic paths the window
+    protects against. A ``202`` is returned whether anything was actually
+    requeued or not; the response's ``requeued``/``skipped`` split reports
+    exactly what happened to every currently-failed file, so an all-skipped
+    pass is a valid outcome, not an error or a silent partial success.
+    """
+    outcome = scheduler.requeue_all_failed(session=session)
+    return BulkRequeueFailedResult(
+        requeued=[EnqueuedJob.from_job(job) for job in outcome.requeued],
+        skipped=outcome.skipped,
+    )
 
 
 @router.post(

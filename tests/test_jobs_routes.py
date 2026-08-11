@@ -2,7 +2,8 @@
 
 Covers request/response shape and the API-key-required behaviour (COL-26) for
 ``GET /api/jobs/history``, ``POST /api/jobs/scan``, ``POST /api/jobs/trigger``,
-and ``POST /api/jobs/requeue`` (COL-170).
+``POST /api/jobs/requeue`` (COL-170), and ``POST /api/jobs/requeue-failed``
+(COL-172).
 
 History rows are seeded through the real :class:`~collapsarr.jobs.models.JobHistory`
 model into the same SQLite file the ``client`` app reads (via the shared
@@ -38,6 +39,7 @@ from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs.models import JobHistory
 from collapsarr.jobs.queue import Job, JobKind, JobStatus
 from collapsarr.jobs.routes import get_job_scheduler
+from collapsarr.jobs.scheduler import BulkRequeueResult
 from collapsarr.library.models import LibraryNodeKind, make_node_key
 from collapsarr.library.service import list_nodes, sync_library
 from collapsarr.main import create_app
@@ -75,6 +77,7 @@ class _FakeScheduler:
         scan_jobs: list[Job] | None = None,
         trigger_job: Job | None = None,
         requeue_job: Job | None = None,
+        requeue_all_failed_result: BulkRequeueResult | None = None,
         default_audio_trigger_job: Job | None = None,
         default_audio_trigger_jobs_by_file: dict[str, Job | None] | None = None,
         cancel_result: bool | None = True,
@@ -86,6 +89,13 @@ class _FakeScheduler:
         #: fixed return value. Defaults to ``None`` (skipped) so a test that
         #: doesn't care still gets a sane, unenqueued response.
         self._requeue_job = requeue_job
+        #: COL-172's ``requeue_all_failed`` result -- the bulk "Requeue all
+        #: failed" endpoint's fixed return value. Defaults to an empty
+        #: all-skipped-nothing-to-do split so a test that doesn't care still
+        #: gets a well-formed, empty response.
+        self._requeue_all_failed_result = requeue_all_failed_result or BulkRequeueResult(
+            requeued=[], skipped=[]
+        )
         self._default_audio_trigger_job = default_audio_trigger_job
         #: Per-file override for the bulk endpoint's tests, where a fixed
         #: single job/None (the field above) can't tell different resolved
@@ -105,6 +115,7 @@ class _FakeScheduler:
         self._bump_result = bump_result
         self.trigger_calls: list[tuple[str, frozenset[str], bool]] = []
         self.requeue_calls: list[str] = []
+        self.requeue_all_failed_calls: int = 0
         self.default_audio_trigger_calls: list[str] = []
         self.cancel_calls: list[UUID] = []
         self.bump_calls: list[UUID] = []
@@ -132,6 +143,10 @@ class _FakeScheduler:
     def requeue_file(self, file_path: str, *, session: Session | None = None) -> Job | None:
         self.requeue_calls.append(file_path)
         return self._requeue_job
+
+    def requeue_all_failed(self, *, session: Session | None = None) -> BulkRequeueResult:
+        self.requeue_all_failed_calls += 1
+        return self._requeue_all_failed_result
 
     def trigger_set_default_audio(
         self,
@@ -513,6 +528,114 @@ def test_requeue_wires_through_a_real_scheduler(settings: Settings) -> None:
     body = response.json()
     assert body["enqueued"] is False
     assert body["job"] is None
+
+
+# --- POST /api/jobs/requeue-failed (COL-172) ----------------------------------
+#
+# Contract-only: request/response shape and the pass-through to
+# JobScheduler.requeue_all_failed(), via the same fake-scheduler
+# dependency_overrides pattern as every other endpoint above. The real
+# window-respecting split logic (JobScheduler._requeue_all_failed_in`) is
+# exercised directly, with a real queue/session, in tests/test_jobs_scheduler.py.
+
+
+def test_requeue_all_failed_reports_a_full_success_split(client: TestClient) -> None:
+    """Every currently-failed file was requeued -> an empty ``skipped`` list."""
+    jobs = [_job("/media/a.mkv"), _job("/media/b.mkv")]
+    fake = _FakeScheduler(
+        requeue_all_failed_result=BulkRequeueResult(requeued=jobs, skipped=[])
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert [j["file_path"] for j in body["requeued"]] == ["/media/a.mkv", "/media/b.mkv"]
+    assert all(j["status"] == "pending" for j in body["requeued"])
+    assert body["skipped"] == []
+    assert fake.requeue_all_failed_calls == 1
+
+
+def test_requeue_all_failed_reports_a_partial_skip_split(client: TestClient) -> None:
+    """Some currently-failed files requeued, others skipped -- both surfaced, never silent."""
+    fake = _FakeScheduler(
+        requeue_all_failed_result=BulkRequeueResult(
+            requeued=[_job("/media/a.mkv")], skipped=["/media/b.mkv", "/media/c.mkv"]
+        )
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert [j["file_path"] for j in body["requeued"]] == ["/media/a.mkv"]
+    assert body["skipped"] == ["/media/b.mkv", "/media/c.mkv"]
+
+
+def test_requeue_all_failed_reports_an_all_skipped_split_as_a_valid_response(
+    client: TestClient,
+) -> None:
+    """Every currently-failed file was skipped (e.g. all inside the window) -> not an error."""
+    fake = _FakeScheduler(
+        requeue_all_failed_result=BulkRequeueResult(
+            requeued=[], skipped=["/media/a.mkv", "/media/b.mkv"]
+        )
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["requeued"] == []
+    assert body["skipped"] == ["/media/a.mkv", "/media/b.mkv"]
+
+
+def test_requeue_all_failed_reports_an_empty_split_when_nothing_is_failed(
+    client: TestClient,
+) -> None:
+    """No currently-failed Job at all -> both lists empty, still a 202."""
+    fake = _FakeScheduler()  # default: BulkRequeueResult(requeued=[], skipped=[])
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"requeued": [], "skipped": []}
+
+
+def test_requeue_all_failed_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> the bulk requeue fails loudly, not silently."""
+    response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    assert response.status_code == 503
+
+
+def test_requeue_all_failed_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, no failed history -> an empty split."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"requeued": [], "skipped": []}
 
 
 # --- POST /api/jobs/trigger-default-audio (COL-155) --------------------------
@@ -1289,6 +1412,14 @@ def test_trigger_endpoint_requires_the_api_key(client: TestClient, session: Sess
 def test_requeue_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     response = client.post("/api/jobs/requeue", json={"file_path": "/media/movie.mkv"})
+    assert response.status_code == 401
+
+
+def test_requeue_all_failed_endpoint_requires_the_api_key(
+    client: TestClient, session: Session
+) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post("/api/jobs/requeue-failed")
     assert response.status_code == 401
 
 
