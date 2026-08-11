@@ -841,12 +841,40 @@ describe("LibraryPage (COL-100)", () => {
     expect(await screen.findByRole("button", { name: /set default audio track/i })).toBeInTheDocument();
   });
 
-  it("applies the bulk Set Default Audio Track action to the whole mixed-level selection in one request and reflects the result without a manual refresh (COL-158)", async () => {
-    const { fetchMock, calls, setTree } = mockLibraryApiWithBulkDefaultAudio({
-      instances: [sonarrInstance],
-      tree: twoSeriesTree,
-    });
-    vi.stubGlobal("fetch", fetchMock);
+  it("applies the bulk Set Default Audio Track action to the whole mixed-level selection in one request and honestly summarizes the trigger's own enqueued/already-correct result (COL-158)", async () => {
+    // Deliberately does NOT swap the mocked tree to an "after" state before
+    // clicking: `SET_DEFAULT_AUDIO` jobs run asynchronously (probe -> remux
+    // -> re-probe), well after the trigger request returns, so a genuinely
+    // honest test can't pretend the Default Audio column already reflects
+    // the job's outcome. What the trigger response *does* know synchronously
+    // is, per resolved file, whether a job was enqueued or the file was
+    // already correct -- that's what this test asserts gets surfaced.
+    const calls: FetchCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        if (url === "/api/instances") return jsonResponse([sonarrInstance]);
+        if (/^\/api\/library\/instances\/\d+\/tree$/.test(url)) return jsonResponse(twoSeriesTree);
+        if (url === "/api/jobs/trigger-default-audio/bulk" && init?.method === "POST") {
+          return jsonResponse({
+            results: [
+              {
+                file_path: "/media/better-call-saul-s1e1.mkv",
+                enqueued: true,
+                job: { id: "job-1", file_path: "/media/better-call-saul-s1e1.mkv", status: "pending" },
+              },
+              {
+                file_path: "/media/breaking-bad-s1e2.mkv",
+                enqueued: false,
+                job: null,
+              },
+            ],
+          });
+        }
+        throw new Error(`Unhandled request in test mock: ${String(init?.method ?? "GET")} ${url}`);
+      }),
+    );
     renderLibraryPage(1);
 
     // Same cross-branch, cross-level selection shape as the bulk Tracked
@@ -859,30 +887,10 @@ describe("LibraryPage (COL-100)", () => {
 
     expect(await screen.findByText(/2 rows selected/i)).toBeInTheDocument();
 
-    // Server-side result of the refetch this bulk action triggers: the
-    // directly-selected episode's Default Audio column updates.
-    const afterBulk: LibraryTreeResponse = {
-      instance_id: 1,
-      series: [
-        {
-          ...twoSeriesTree.series[0],
-          seasons: [
-            {
-              ...twoSeriesTree.series[0].seasons[0],
-              episodes: [
-                twoSeriesTree.series[0].seasons[0].episodes[0],
-                {
-                  ...twoSeriesTree.series[0].seasons[0].episodes[1],
-                  current_default_track: { language: "eng", channel_layout: "5.1" },
-                },
-              ],
-            },
-          ],
-        },
-        twoSeriesTree.series[1],
-      ],
-    };
-    setTree(afterBulk);
+    // The sibling episode's Default Audio column reads its real,
+    // still-unknown value going in.
+    const siblingRowBefore = (await screen.findByText(/cat's in the bag/i)).closest("tr") as HTMLElement;
+    expect(within(siblingRowBefore).getByText("Unknown")).toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /set default audio track/i }));
@@ -910,10 +918,23 @@ describe("LibraryPage (COL-100)", () => {
       expect(screen.queryByRole("toolbar", { name: /bulk library actions/i })).not.toBeInTheDocument();
     });
 
-    // Refetch landed without a manual refresh: the triggered episode's
-    // Default Audio column now reflects the updated snapshot.
-    const siblingRow = (await screen.findByText(/cat's in the bag/i)).closest("tr") as HTMLElement;
-    expect(within(siblingRow).getByText("Eng · 5.1")).toBeInTheDocument();
+    // The trigger response's real, synchronously-known result is surfaced --
+    // one job enqueued, one file already correct/skipped -- not a fabricated
+    // claim that the column values already updated.
+    expect(
+      await screen.findByText(/1 job enqueued, 1 already correct or skipped/i),
+    ).toBeInTheDocument();
+
+    // The refetch landed (the tree endpoint was hit again after the trigger)
+    // but since the mocked tree never changes, the sibling episode's Default
+    // Audio column still honestly reads its real, not-yet-updated value --
+    // the enqueued job hasn't run, so there is nothing new to show yet.
+    const treeCallCount = calls.filter((call) =>
+      /^\/api\/library\/instances\/\d+\/tree$/.test(call.url),
+    ).length;
+    expect(treeCallCount).toBeGreaterThanOrEqual(2);
+    const siblingRowAfter = (await screen.findByText(/cat's in the bag/i)).closest("tr") as HTMLElement;
+    expect(within(siblingRowAfter).getByText("Unknown")).toBeInTheDocument();
   });
 
   it("shows an inline error, distinct from the Tracked error, when the bulk Set Default Audio Track request fails (COL-158)", async () => {
