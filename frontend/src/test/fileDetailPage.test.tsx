@@ -29,6 +29,7 @@ const historyResponse: JobHistoryEntry[] = [
     file_path: FILE_PATH,
     status: "succeeded",
     kind: "downmix",
+    priority: 0,
     started_at: "2026-07-10T10:00:00Z",
     ended_at: "2026-07-10T10:05:00Z",
     exit_code: 0,

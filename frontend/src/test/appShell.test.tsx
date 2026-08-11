@@ -3,7 +3,7 @@ import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppShell } from "../components/AppShell";
-import { ActivityPage } from "../pages/ActivityPage";
+import { QueuePage } from "../pages/QueuePage";
 import { WantedPage } from "../pages/WantedPage";
 
 // WantedPage (COL-31) fetches `/api/wanted` on mount; stub it so these
@@ -39,7 +39,7 @@ function renderAt(path: string) {
         element: <AppShell />,
         children: [
           { path: "wanted", element: <WantedPage /> },
-          { path: "activity", element: <ActivityPage /> },
+          { path: "queue", element: <QueuePage /> },
         ],
       },
     ],
@@ -63,9 +63,9 @@ describe("app shell", () => {
       "href",
       "/wanted",
     );
-    expect(within(nav).getByRole("link", { name: /activity/i })).toHaveAttribute(
+    expect(within(nav).getByRole("link", { name: /queue/i })).toHaveAttribute(
       "href",
-      "/activity",
+      "/queue",
     );
     // Settings' sidebar entry is an expandable NavSection group (COL-141),
     // like System -- its default link is the group's own base path
@@ -79,9 +79,9 @@ describe("app shell", () => {
   });
 
   it("marks the current route active", async () => {
-    renderAt("/activity");
+    renderAt("/queue");
     const nav = await screen.findByRole("navigation", { name: /primary/i });
-    const active = within(nav).getByRole("link", { name: /activity/i });
+    const active = within(nav).getByRole("link", { name: /queue/i });
     expect(active.className).toContain("sidebar__link--active");
   });
 
@@ -89,8 +89,8 @@ describe("app shell", () => {
     renderAt("/wanted");
     expect(await screen.findByRole("heading", { name: "Wanted" })).toBeInTheDocument();
 
-    renderAt("/activity");
-    expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
+    renderAt("/queue");
+    expect(await screen.findByRole("heading", { name: "Queue" })).toBeInTheDocument();
 
     // Settings no longer has a single composed page/heading to render here
     // (COL-144) -- its sub-pages' headings are covered by their own test

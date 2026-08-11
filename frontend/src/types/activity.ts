@@ -31,6 +31,14 @@ export interface JobHistoryEntry {
   file_path: string;
   status: JobStatus;
   kind: JobKind;
+  /**
+   * Join-order sequence number -- a lower value means "earlier"/"next in
+   * line" (COL-163, exposed in the response as of COL-175). `GET
+   * /api/jobs/queue` (COL-175, `fetchJobQueue`) orders its pending rows by
+   * this field ascending; `QueuePage` (COL-178) relies on the server's
+   * ordering rather than re-sorting client-side.
+   */
+  priority: number;
   started_at: string | null;
   ended_at: string | null;
   exit_code: number | null;

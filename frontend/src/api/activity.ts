@@ -16,10 +16,13 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
  * Fetches persisted job history (`GET /api/jobs/history`, COL-29).
  *
  * The endpoint accepts optional `file` (exact path match) and `status`
- * query params for server-side filtering. `ActivityPage` fetches the full
- * list unfiltered and filters client-side (the server's `file` filter is
- * exact-match only, a poor fit for its interactive text filter), but
- * `FileDetailPage` (COL-34) already knows the exact file path it wants
+ * query params for server-side filtering. The now-repurposed `ActivityPage`
+ * (COL-178's `QueuePage`, sourced from {@link fetchJobQueue} instead) used to
+ * fetch the full list unfiltered and filter client-side -- the server's
+ * `file` filter is exact-match only, a poor fit for an interactive text
+ * filter -- and the upcoming History page (COL-176) will take over that
+ * fetch-all-and-filter-client-side role for terminal (succeeded/failed)
+ * rows. `FileDetailPage` (COL-34) already knows the exact file path it wants
  * history for, so it passes `filePath` to use the server-side filter
  * directly instead of fetching and filtering the whole table.
  *
@@ -33,6 +36,22 @@ export async function fetchJobHistory(filePath?: string): Promise<JobHistoryEntr
   const response = await apiFetch(url);
   if (!response.ok) {
     throw new Error(await apiErrorMessage(response, `Failed to load job history (${response.status})`));
+  }
+  return (await response.json()) as JobHistoryEntry[];
+}
+
+/**
+ * Fetches the live queue (`GET /api/jobs/queue`, COL-175): every currently
+ * `running`/`pending` Job, ordered running-first then pending by ascending
+ * `priority`. Used by `QueuePage` (COL-178) instead of {@link fetchJobHistory}
+ * -- unlike that fetch-everything-and-filter-client-side approach, this
+ * endpoint already returns exactly (and only) the rows the Queue view wants,
+ * in the order it wants them displayed, so there's no client-side re-sort.
+ */
+export async function fetchJobQueue(): Promise<JobHistoryEntry[]> {
+  const response = await apiFetch("/api/jobs/queue");
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to load queue (${response.status})`));
   }
   return (await response.json()) as JobHistoryEntry[];
 }
