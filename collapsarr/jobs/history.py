@@ -13,6 +13,10 @@ runs it to completion) to persist its current state. It upserts by ``job_id`` so
 calls rather than duplicated.
 
 :func:`list_job_history` and :func:`get_job_history` are the read path.
+:func:`list_queue_jobs` (COL-175) is a third read path purpose-built for a
+live queue view: every currently ``running``/``pending`` Job, ordered
+running-first then pending by ascending ``priority``, rather than
+:func:`list_job_history`'s insertion-order listing.
 
 :func:`make_history_recorder` bridges this module to
 :class:`~collapsarr.jobs.queue.JobQueue`'s ``history_recorder`` hook, so
@@ -34,7 +38,7 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import JobHistory
@@ -172,6 +176,33 @@ def list_job_history(
         stmt = stmt.where(JobHistory.status == status)
     if kind is not None:
         stmt = stmt.where(JobHistory.kind == kind)
+    return list(session.scalars(stmt))
+
+
+def list_queue_jobs(session: Session) -> list[JobHistory]:
+    """Return every currently ``running``/``pending`` Job, queue-ordered (COL-175).
+
+    Purpose-built for a live queue view (the Queue page, COL-176) rather
+    than :func:`list_job_history`'s general-purpose, insertion-ordered
+    listing: only ``RUNNING`` and ``PENDING`` rows are included -- a
+    terminal (``SUCCEEDED``/``FAILED``) row has left the queue entirely --
+    and the result is ordered **running first**, then **pending ordered by
+    ascending** :attr:`JobHistory.priority` (lower priority value == earlier
+    join-order sequence number, i.e. next in line -- see
+    :attr:`JobHistory.priority`'s docstring), with ``id`` (insertion order)
+    as the final tiebreaker for determinism within each group -- most
+    relevant among concurrently-``RUNNING`` rows, which don't otherwise carry
+    a meaningful relative order.
+    """
+    # No `else_` beyond PENDING -- the `.where()` below already restricts rows
+    # to RUNNING/PENDING, so a third rank would be dead code for a status that
+    # can't occur in this query's results.
+    status_rank = case((JobHistory.status == JobStatus.RUNNING, 0), else_=1)
+    stmt = (
+        select(JobHistory)
+        .where(JobHistory.status.in_((JobStatus.RUNNING, JobStatus.PENDING)))
+        .order_by(status_rank, JobHistory.priority, JobHistory.id)
+    )
     return list(session.scalars(stmt))
 
 

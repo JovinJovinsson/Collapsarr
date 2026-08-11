@@ -6,12 +6,20 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Ten endpoints, each wrapping an existing service without adding new job logic:
+Eleven endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
   ``file`` (exact file path) and/or ``status`` (a :class:`~collapsarr.jobs.queue.
   JobStatus` value). Mirrors Sonarr/Radarr's ``/history`` view.
+- ``GET /api/jobs/queue`` -- lists every currently ``running``/``pending`` Job
+  together (COL-175, :func:`collapsarr.jobs.history.list_queue_jobs`),
+  ordered running-first then pending by ascending ``priority`` -- the shape
+  the Queue page (COL-176) needs and ``GET /api/jobs/history`` deliberately
+  doesn't provide (that endpoint's ``status`` filter is single-valued and its
+  ordering is insertion order, unchanged for the existing History page's
+  ``fetchJobHistory`` contract). Same response shape as ``GET
+  /api/jobs/history`` (:class:`JobHistoryRead`, now including ``priority``).
 - ``POST /api/jobs/scan`` -- triggers an immediate full-library scan
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.scan_now`, COL-23), enqueuing a
   downmix job for enough monitored files with a qualifying missing target to
@@ -139,7 +147,7 @@ from ..database import get_session
 from ..library.models import LibraryNode, LibraryNodeKind
 from ..library.service import get_node, list_nodes
 from ..media.service import list_tracked_media_by_instance
-from .history import list_job_history
+from .history import list_job_history, list_queue_jobs
 from .models import JobHistory
 from .queue import Job, JobKind, JobStatus
 from .scheduler import JobScheduler
@@ -172,7 +180,14 @@ def get_job_scheduler(request: Request) -> JobScheduler:
 
 
 class JobHistoryRead(BaseModel):
-    """Response shape for one persisted job-history row (COL-21)."""
+    """Response shape for one persisted job-history row (COL-21).
+
+    ``priority`` (COL-163, exposed here as of COL-175) mirrors the
+    originating :class:`~collapsarr.jobs.queue.Job`'s
+    :attr:`~collapsarr.jobs.queue.Job.priority` -- the join-order sequence
+    number a lower value means "earlier"/"next in line". It's what
+    ``GET /api/jobs/queue`` (COL-175) orders pending Jobs by.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -181,6 +196,7 @@ class JobHistoryRead(BaseModel):
     file_path: str
     status: JobStatus
     kind: JobKind
+    priority: int
     started_at: datetime | None
     ended_at: datetime | None
     exit_code: int | None
@@ -557,6 +573,22 @@ def list_job_history_endpoint(
     omitting all returns every row, ordered by insertion.
     """
     return list_job_history(session, file_path=file, status=status, kind=kind)
+
+
+@router.get("/jobs/queue", response_model=list[JobHistoryRead])
+def list_job_queue_endpoint(session: Session = Depends(get_session)) -> list[JobHistory]:
+    """List every currently ``running``/``pending`` Job together, queue-ordered (COL-175).
+
+    Wraps :func:`collapsarr.jobs.history.list_queue_jobs`: only
+    ``RUNNING``/``PENDING`` rows are returned (a terminal row has left the
+    queue), ordered **running first**, then **pending ordered by ascending
+    priority** -- the shape the Queue page (COL-176) needs. This is a
+    separate, additive endpoint rather than a change to ``GET
+    /api/jobs/history``'s existing single-status filter/insertion-order
+    contract, so ``fetchJobHistory`` (the History page's fetch-all-and-filter
+    client-side approach) is unaffected.
+    """
+    return list_queue_jobs(session)
 
 
 @router.post("/jobs/scan", response_model=ScanResult, status_code=202)
