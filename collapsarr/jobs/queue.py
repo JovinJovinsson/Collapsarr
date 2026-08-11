@@ -82,13 +82,13 @@ of ``max_concurrency`` worker threads gives genuine bounded parallelism (the
 GIL is released for the whole ``subprocess.run`` call) without pulling the
 rest of this synchronous codebase onto an event loop.
 
-``max_concurrency`` is a plain constructor argument, the same "Settings-
-shaped stand-in" pattern :class:`~collapsarr.downmix.targets.DownmixSettings`
-already uses -- there is no persisted Settings model yet. It defaults to 1,
-and :meth:`JobQueue.from_settings` sources it from
-:class:`~collapsarr.config.Settings`'s ``job_max_concurrency`` (env
-``COLLAPSARR_JOB_MAX_CONCURRENCY``), which is the closest thing this repo has
-to a Settings store today.
+``max_concurrency`` is a plain constructor argument. It defaults to 1, and
+:meth:`JobQueue.from_settings` sources it from the persisted
+:class:`~collapsarr.settings.models.GlobalSettings` row's
+``concurrency_limit`` field (COL-165, editable from the Settings UI) --
+read once, at construction time, so a change made in the UI takes effect
+only after a restart (the pool is a fixed-size thread pool for its whole
+process lifetime; there is no live resizing, see :meth:`JobQueue.from_settings`).
 
 :meth:`JobQueue._run_job` also logs the job lifecycle (COL-129), via a
 module logger -- so it lands in the rotating log file COL-128 wires up: an
@@ -112,16 +112,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
-
-from sqlalchemy.orm import Session, sessionmaker
 
 from collapsarr.config import Settings, get_settings
 from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.default_audio_pipeline import run_default_audio_pipeline
 from collapsarr.downmix.pipeline import PipelineResult, run_downmix_pipeline
 from collapsarr.downmix.targets import DownmixSettings
+
+if TYPE_CHECKING:
+    from collapsarr.settings.models import GlobalSettings
 
 logger = logging.getLogger(__name__)
 
@@ -415,12 +416,19 @@ class JobQueue:
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
     ) -> JobQueue:
-        """Build a :class:`JobQueue` whose concurrency cap comes from Settings.
+        """Build a :class:`JobQueue` whose concurrency cap comes from persisted Settings.
 
         ``settings`` defaults to the process-wide cached
-        :func:`~collapsarr.config.get_settings`. Its ``job_max_concurrency``
-        (default 1, env ``COLLAPSARR_JOB_MAX_CONCURRENCY``) becomes
-        ``max_concurrency``.
+        :func:`~collapsarr.config.get_settings`, used here only to resolve the
+        database to read from. ``max_concurrency`` itself comes from the
+        persisted :class:`~collapsarr.settings.models.GlobalSettings` row's
+        ``concurrency_limit`` (default 1, editable from the Settings UI,
+        COL-165) -- read once here, at construction time, the same as every
+        other field this factory reads off that row. Changing it in the
+        Settings UI does not resize an already-running pool: the new value
+        only takes effect the next time the process (and so this factory)
+        starts, since the worker pool is a fixed-size thread pool for its
+        whole process lifetime (live resizing is out of scope).
 
         Unlike the raw :meth:`__init__` (where ``history_recorder``/
         ``failure_notifier``/``tracked_media_recorder`` default to ``None``
@@ -495,10 +503,18 @@ class JobQueue:
             create_session_factory,
         )
         from collapsarr.migrations import upgrade_to_head
+        from collapsarr.settings.service import get_global_settings
 
         upgrade_to_head(resolved)
         engine = create_engine_from_settings(resolved)
         session_factory = create_session_factory(engine)
+
+        # Read once here, at construction time: concurrency_limit (COL-165)
+        # sizes the pool below, and auto_set_default_audio (COL-152) feeds
+        # _resolve_pipeline_kwargs -- both come off this same singleton row,
+        # so one read serves both rather than opening a second session.
+        with session_factory() as session:
+            global_settings = get_global_settings(session)
 
         resolved_history_recorder = history_recorder
         if resolved_history_recorder is None:
@@ -519,9 +535,9 @@ class JobQueue:
             resolved_tracked_media_recorder = make_tracked_media_recorder(session_factory)
 
         return cls(
-            max_concurrency=resolved.job_max_concurrency,
+            max_concurrency=global_settings.concurrency_limit,
             pipeline_runner=pipeline_runner,
-            pipeline_kwargs=cls._resolve_pipeline_kwargs(pipeline_kwargs, session_factory),
+            pipeline_kwargs=cls._resolve_pipeline_kwargs(pipeline_kwargs, global_settings),
             default_audio_pipeline_runner=default_audio_pipeline_runner,
             history_recorder=resolved_history_recorder,
             failure_notifier=resolved_failure_notifier,
@@ -531,13 +547,15 @@ class JobQueue:
     @staticmethod
     def _resolve_pipeline_kwargs(
         pipeline_kwargs: Mapping[str, Any] | None,
-        session_factory: sessionmaker[Session],
+        global_settings: GlobalSettings,
     ) -> dict[str, Any]:
         """Fold the persisted Default Audio Track preference into ``pipeline_kwargs`` (COL-152).
 
-        Reads the singleton :class:`~collapsarr.settings.models.GlobalSettings`
-        row from ``session_factory`` (the same DB the recorders above bind to)
-        and, **only** when its opt-in ``auto_set_default_audio`` toggle is on,
+        Takes ``global_settings`` -- the same singleton
+        :class:`~collapsarr.settings.models.GlobalSettings` row
+        :meth:`from_settings` already reads once for ``concurrency_limit``
+        (COL-165), reused here rather than opening a second session -- and,
+        **only** when its opt-in ``auto_set_default_audio`` toggle is on,
         threads ``auto_set_default_audio=True`` plus the adapted
         ``default_audio_preference`` (:func:`~collapsarr.settings.service.
         as_default_audio_preference`) into the kwargs every enqueued downmix job
@@ -551,18 +569,13 @@ class JobQueue:
         keys already present are never overwritten -- so a test (or a future
         alternate wiring) can still pin its own values.
 
-        The imports below are deferred, matching the surrounding factory: the
+        The import below is deferred, matching the surrounding factory: the
         settings service pulls in the ORM/adapters, which don't need to load for
         a lightweight :meth:`__init__` construction that never touches Settings.
         """
-        from collapsarr.settings.service import (
-            as_default_audio_preference,
-            get_global_settings,
-        )
+        from collapsarr.settings.service import as_default_audio_preference
 
         resolved = dict(pipeline_kwargs or {})
-        with session_factory() as session:
-            global_settings = get_global_settings(session)
         if global_settings.auto_set_default_audio:
             resolved.setdefault("auto_set_default_audio", True)
             resolved.setdefault(

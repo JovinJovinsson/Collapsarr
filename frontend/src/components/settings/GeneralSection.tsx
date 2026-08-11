@@ -367,7 +367,9 @@ export function GeneralSection() {
                 value={form.concurrencyLimit}
                 onChange={(event) => setForm({ ...form, concurrencyLimit: event.target.value })}
               />
-              <p className="form-hint">Maximum downmix jobs running at once.</p>
+              <p className="form-hint">
+                Maximum downmix jobs running at once. Restart Collapsarr for a change to take effect.
+              </p>
             </div>
           </div>
 

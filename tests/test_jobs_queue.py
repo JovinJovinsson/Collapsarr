@@ -240,14 +240,31 @@ def test_a_job_enqueued_while_workers_are_busy_is_picked_up_when_one_frees() -> 
     assert runner.order == ["gate", "later"]
 
 
-def test_from_settings_reads_max_concurrency_from_settings(tmp_path: Path) -> None:
+def _write_global_settings(settings: Settings, **fields: object) -> None:
+    """Persist arbitrary ``GlobalSettings`` fields into ``settings``' database.
+
+    Runs the migration chain (the same schema ``from_settings`` will find)
+    then writes the singleton row via :func:`update_global_settings`, so a
+    subsequent ``JobQueue.from_settings`` reads exactly these values back.
+    Shared by every test in this module that needs a real persisted
+    ``GlobalSettings`` row rather than the raw ``JobQueue(...)`` constructor's
+    plain keyword arguments.
+    """
+    upgrade_to_head(settings)
+    engine = create_engine_from_settings(settings)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        update_global_settings(session, **fields)  # type: ignore[arg-type]
+    engine.dispose()
+
+
+def test_from_settings_reads_max_concurrency_from_global_settings(tmp_path: Path) -> None:
     # database_path must point somewhere writable: from_settings() defaults
     # history_recorder to a real one (COL-21) when none is passed, which
     # opens a real engine against it -- the bare Settings() default
     # (/config/collapsarr.db) isn't writable outside a container.
-    settings = Settings(
-        _env_file=None, job_max_concurrency=5, database_path=str(tmp_path / "collapsarr.db")
-    )
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    _write_global_settings(settings, concurrency_limit=5)
 
     queue = JobQueue.from_settings(settings, pipeline_runner=_stub_runner(_SUCCESS))
 
@@ -255,6 +272,7 @@ def test_from_settings_reads_max_concurrency_from_settings(tmp_path: Path) -> No
 
 
 def test_from_settings_defaults_to_one(tmp_path: Path) -> None:
+    """No GlobalSettings row written yet -- from_settings creates it with its documented default."""
     settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
 
     queue = JobQueue.from_settings(settings, pipeline_runner=_stub_runner(_SUCCESS))
@@ -640,21 +658,15 @@ def _write_default_audio_settings(
 ) -> None:
     """Persist the Default Audio Track settings into ``settings``' database.
 
-    Runs the migration chain (the same schema from_settings will find) then
-    writes the singleton GlobalSettings row, so a subsequent
-    ``JobQueue.from_settings`` reads exactly these values back.
+    A thin, named wrapper around :func:`_write_global_settings` for this
+    module's Default Audio Track tests (COL-152).
     """
-    upgrade_to_head(settings)
-    engine = create_engine_from_settings(settings)
-    session_factory = create_session_factory(engine)
-    with session_factory() as session:
-        update_global_settings(
-            session,
-            default_audio_language=default_audio_language,
-            default_audio_channel_tier=default_audio_channel_tier,
-            auto_set_default_audio=auto_set_default_audio,
-        )
-    engine.dispose()
+    _write_global_settings(
+        settings,
+        default_audio_language=default_audio_language,
+        default_audio_channel_tier=default_audio_channel_tier,
+        auto_set_default_audio=auto_set_default_audio,
+    )
 
 
 def test_from_settings_threads_default_audio_preference_when_toggle_on(tmp_path: Path) -> None:

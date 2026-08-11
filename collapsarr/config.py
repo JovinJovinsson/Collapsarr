@@ -16,7 +16,6 @@ Environment variable                Default                    Description
 ``COLLAPSARR_HOST``                  ``0.0.0.0``                API server bind address.
 ``COLLAPSARR_PORT``                  ``8282``                   API server bind port.
 ``COLLAPSARR_LOG_LEVEL``             ``INFO``                   Log level (passed to uvicorn).
-``COLLAPSARR_JOB_MAX_CONCURRENCY``   ``1``                      Max concurrent downmix jobs.
 ``COLLAPSARR_SCAN_INTERVAL_HOURS``   ``6.0``                    Hours between periodic scans.
 ``COLLAPSARR_AUTH_USERNAME``         *(unset)*                  First-boot seed: UI username.
 ``COLLAPSARR_AUTH_PASSWORD``         *(unset)*                  First-boot seed: UI password.
@@ -117,14 +116,6 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", description="API server bind address.")
     port: int = Field(default=8282, description="API server bind port.")
     log_level: str = Field(default="INFO", description="Log level for the server.")
-    job_max_concurrency: int = Field(
-        default=1,
-        ge=1,
-        description=(
-            "Maximum number of downmix jobs the job queue (collapsarr.jobs) runs "
-            "concurrently. Read by JobQueue.from_settings()."
-        ),
-    )
     scan_interval_hours: float = Field(
         default=6.0,
         gt=0,

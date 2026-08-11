@@ -172,8 +172,9 @@ class GlobalSettings(Base):
     Defaults match the PRD exactly: Stereo enabled by default with 2.1/5.1
     opt-in (``enabled_targets`` defaults to just ``"stereo"``), AAC for the
     Stereo target, AC3 @ 448kbps for the surround targets, a concurrency
-    limit of 1 (matching :attr:`collapsarr.config.Settings.job_max_concurrency`'s
-    own default), and UI auth disabled.
+    limit of 1 (the worker pool's own size, read from this field once at
+    startup by :meth:`collapsarr.jobs.queue.JobQueue.from_settings`,
+    COL-165), and UI auth disabled.
 
     ``language_allow_list`` of ``None`` (the default) means "no allow-list --
     evaluate every language present on a file", matching
