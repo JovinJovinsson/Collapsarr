@@ -62,6 +62,33 @@ describe("DefaultAudioSection", () => {
     expect(autoSetCheckbox).not.toBeDisabled();
   });
 
+  it("renders the preferred language as a picker (select), not free text", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    render(<DefaultAudioSection />);
+
+    const languageField = await screen.findByLabelText(/preferred language/i);
+    expect(languageField.tagName).toBe("SELECT");
+    expect(screen.getByRole("option", { name: /english \(eng\)/i })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /french \(fre\)/i })).toBeInTheDocument();
+  });
+
+  it("shows a saved language not in LANGUAGE_OPTIONS instead of silently falling back to None", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse({
+          ...baseSettings,
+          default_audio_language: "wel",
+          default_audio_channel_tier: "stereo",
+        }),
+      ),
+    );
+    render(<DefaultAudioSection />);
+
+    expect(await screen.findByLabelText(/preferred language/i)).toHaveValue("wel");
+    expect(screen.getByRole("option", { name: /wel \(not in list\)/i })).toBeInTheDocument();
+  });
+
   it("renders unset language/channel-tier and a disabled, unchecked auto-set checkbox by default", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
     render(<DefaultAudioSection />);

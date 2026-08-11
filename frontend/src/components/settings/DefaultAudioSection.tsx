@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { fetchSettings, updateSettings } from "../../api/settings";
+import { LANGUAGE_OPTIONS } from "../../types/languages";
 import { DOWNMIX_TARGET_OPTIONS } from "../../types/wanted";
 import type { DownmixTarget } from "../../types/wanted";
 
@@ -112,14 +113,27 @@ export function DefaultAudioSection() {
         <div className="panel settings-form">
           <div className="form-field form-field--narrow">
             <label htmlFor="default-audio-language">Preferred language</label>
-            <input
+            <select
               id="default-audio-language"
-              type="text"
-              placeholder="e.g. eng"
               value={language}
               onChange={(event) => handleLanguageChange(event.target.value)}
-            />
-            <p className="form-hint">A single language code.</p>
+            >
+              <option value="">None</option>
+              {/*
+                A value saved before this ticket (free text) or written
+                directly via the API can be a code outside LANGUAGE_OPTIONS.
+                Render it as an extra option rather than silently falling
+                back to "None" while the real value is still saved.
+              */}
+              {language !== "" && !LANGUAGE_OPTIONS.some((option) => option.value === language) && (
+                <option value={language}>{language} (not in list)</option>
+              )}
+              {LANGUAGE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </div>
 
           <div className="form-field form-field--narrow">
