@@ -89,9 +89,11 @@ Threads, not asyncio: this matches :mod:`collapsarr.jobs.queue`'s rationale --
 the pipeline shells out to blocking ``ffprobe``/``ffmpeg`` subprocesses -- and
 avoids pulling in an external scheduler dependency (there is none in
 ``pyproject.toml``). The loop is a plain sleep/wake ``threading`` loop: it wakes
-either on the scan-interval timeout (run a full scan, then drain) or early when
-a webhook enqueues work (:attr:`_wake`) so a freshly-enqueued job is drained
-promptly rather than waiting out the whole interval.
+on the scan-interval timeout to run a full scan, or early (:attr:`_wake`) to
+break the wait on shutdown. It does not run jobs itself -- since COL-164 the
+:class:`~collapsarr.jobs.queue.JobQueue`'s persistent worker pool runs each job
+as soon as it is enqueued (whether by a scan or a webhook), so there is no
+separate drain step to trigger.
 """
 
 from __future__ import annotations
@@ -167,7 +169,7 @@ class JobScheduler:
     """Enqueue downmix jobs from webhooks and a periodic scan, de-duplicating both.
 
     ``queue`` is the shared :class:`~collapsarr.jobs.queue.JobQueue` both
-    triggers enqueue onto (and that the background loop drains). ``session_factory``
+    triggers enqueue onto (its worker pool runs them, COL-164). ``session_factory``
     opens sessions for reading configured instances, path mappings, and job
     history. ``settings`` supplies ``scan_interval_hours`` (both the loop period
     and the dedup window).
@@ -243,7 +245,7 @@ class JobScheduler:
         path mappings by :func:`~collapsarr.arr.webhooks.resolve_webhook_file`,
         so it is a host-local path ready to probe. Enqueuing a job (rather than
         running the pipeline inline) keeps the webhook response fast; the
-        background loop, woken here, drains it promptly.
+        queue's worker pool picks it up as soon as a worker is free.
 
         Passes ``file``'s ``instance_id``/``sonarr_episode_id``/
         ``radarr_movie_id`` (COL-101) through to :meth:`enqueue_file` so the
@@ -263,7 +265,6 @@ class JobScheduler:
             )
             return
         logger.info("webhook: enqueued job %s for %s", job.id, file.file_path)
-        self._wake.set()
 
     def enqueue_file(
         self,
@@ -821,7 +822,7 @@ class JobScheduler:
     # -- Background loop lifecycle ------------------------------------------
 
     def start(self) -> None:
-        """Start the background scan/drain loop in a daemon thread.
+        """Start the background scan loop in a daemon thread.
 
         Runs an initial scan immediately, then repeats every
         ``scan_interval_hours``. Idempotency is the caller's responsibility --
@@ -846,7 +847,15 @@ class JobScheduler:
         self._thread = None
 
     def _run(self) -> None:
-        """Sleep/wake loop: full scan on the interval, prompt drain when woken."""
+        """Sleep/wake loop: run a full scan on the interval, then wait for the next one.
+
+        No longer drains the queue itself: since COL-164 the
+        :class:`~collapsarr.jobs.queue.JobQueue` runs a persistent worker pool,
+        so a job starts running the instant :meth:`scan_once` (or a webhook)
+        enqueues it -- there is no batch for this loop to kick off. The loop's
+        sole remaining job is the periodic scan; ``_wake`` now serves only to
+        break the wait promptly on :meth:`stop`.
+        """
         next_scan = time.monotonic()  # scan immediately on the first iteration
         while not self._stop.is_set():
             if time.monotonic() >= next_scan:
@@ -855,15 +864,7 @@ class JobScheduler:
                 except Exception:  # noqa: BLE001 - one bad scan must not kill the loop
                     logger.exception("scheduled library scan failed")
                 next_scan = time.monotonic() + self._interval_seconds
-            self._drain()
             if self._stop.is_set():
                 break
             self._wake.wait(timeout=max(0.0, next_scan - time.monotonic()))
             self._wake.clear()
-
-    def _drain(self) -> None:
-        """Run every pending job to completion, capturing (not raising) failures."""
-        try:
-            self._queue.run_pending()
-        except Exception:  # noqa: BLE001 - a drain failure must not kill the loop
-            logger.exception("draining the job queue failed")

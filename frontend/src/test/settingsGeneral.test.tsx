@@ -71,6 +71,14 @@ describe("GeneralSection", () => {
     expect(screen.getByLabelText(/critical threshold/i)).toHaveValue(2);
   });
 
+  it("shows a restart-required hint under the concurrency limit field", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    await screen.findByLabelText(/concurrency limit/i);
+    expect(screen.getByText(/restart collapsarr for a change to take effect/i)).toBeInTheDocument();
+  });
+
   it("saves the disk-space thresholds via PUT with the edited values", async () => {
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
       if ((init?.method ?? "GET") === "PUT") {
