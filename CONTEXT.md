@@ -162,4 +162,28 @@ plus a manual "Run now" trigger. Distinct from a **Job** (an individual
 downmix work item queued and drained by `JobQueue`/`JobScheduler`) — a
 Scheduled Task is the recurring *activity*, not a unit of work it produces.
 The library-scan Scheduled Task, for example, is what *enqueues* Jobs; it
-is not one itself.
+is not one itself. Log rotation (P7) is deliberately **not** a Scheduled
+Task despite also being a recurring background mechanism: it triggers
+reactively on write (size-based), has no cadence or next-run time, and
+never appears on `/system/tasks`.
+
+## Default Audio Track
+
+The container-level disposition flag (MKV/MP4 `disposition:default=1`) on
+one audio stream of a media file, marking which stream a player
+auto-selects on playback. Purely a player-behavior concern — distinct from
+a downmix **Target** (which stream tiers exist at all) and from
+**Tracked** (whether Collapsarr acts on the file automatically). Exactly
+one audio stream should carry it at a time.
+
+## Preferred Default Audio
+
+The user's global `(language, channel tier)` preference (the channel tier
+reusing `DownmixTarget` — Stereo/2.1/5.1) for which existing audio stream
+on a file should carry the **Default Audio Track** disposition. Resolved
+per file in strict order: (1) a stream matching both language and tier
+exactly; (2) if no stream matches the tier, the best-available tier
+within the matched language; (3) if the preferred language isn't present
+on the file at all (a foreign-only-audio file), the best-available tier
+in whatever language the file has. Case (3) is expected fallback
+behavior, not a gap — a foreign-only file is never "wrong."
