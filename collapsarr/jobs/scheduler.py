@@ -1311,6 +1311,26 @@ class JobScheduler:
         when the caller already has one open (:meth:`scan_once` does), else
         opens a short-lived one (the completion hook and :meth:`cancel_job`
         typically don't).
+
+        **Auto-Queuing Pause (COL-174).** Before any of the above,
+        :meth:`_top_up_locked` reads ``GlobalSettings.auto_queue_paused``
+        live -- like ``recently_processed_window_minutes`` (COL-167), not
+        cached at :meth:`__init__` -- and returns ``[]`` immediately when it
+        is set, without counting pending or walking Wanted at all. Because
+        every one of the four hook points above calls this method rather
+        than reimplementing the walk itself, this single check pauses all of
+        them at once: the periodic scan's initial enqueue, "Scan now", a Job
+        completing, and a cancellation, all become no-ops for the auto-fill
+        half of their work. It does **not** touch anything else those
+        callers do -- :meth:`scan_once`'s library-mirror sync still runs
+        uncapped, and a cancellation still actually cancels the Job -- only
+        the *re-fill* is skipped. Already-``PENDING``/``RUNNING`` Jobs keep
+        running to completion regardless (this method only ever adds new
+        Jobs, never touches existing ones), and no manual trigger
+        (:meth:`trigger_file`/:meth:`requeue_file`/:meth:`requeue_all_failed`)
+        is affected either, since none of them call :meth:`top_up` -- they
+        enqueue directly via :meth:`enqueue_file`, so the pause never enters
+        their path at all.
         """
         with self._top_up_lock:
             if session is not None:
@@ -1340,8 +1360,16 @@ class JobScheduler:
         return sum(1 for job in self._queue.list_jobs() if job.status is JobStatus.PENDING)
 
     def _top_up_locked(self, session: Session) -> list[Job]:
-        """The body of :meth:`top_up`, run with :attr:`_top_up_lock` already held."""
+        """The body of :meth:`top_up`, run with :attr:`_top_up_lock` already held.
+
+        Checks ``GlobalSettings.auto_queue_paused`` (COL-174, "Auto-Queuing
+        Pause") first, live, and returns ``[]`` without walking Wanted at all
+        when it is set -- see :meth:`top_up`'s own docstring for why this one
+        check is sufficient to gate every auto-fill hook point at once.
+        """
         enqueued: list[Job] = []
+        if get_global_settings(session).auto_queue_paused:
+            return enqueued
         pending = self._count_pending()
         if pending >= AUTO_QUEUE_LIMIT:
             return enqueued

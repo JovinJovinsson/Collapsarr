@@ -2160,3 +2160,247 @@ def test_top_up_is_a_no_op_once_already_at_the_limit(
 
     assert result == []
     assert scheduler._count_pending() == AUTO_QUEUE_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Auto-Queuing Pause (COL-174).
+# ---------------------------------------------------------------------------
+
+
+def test_scan_once_does_not_auto_enqueue_when_paused(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: when set, the periodic scan's auto-enqueue-from-Wanted does not run."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_once()
+
+    assert enqueued == []
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_scan_now_does_not_auto_enqueue_when_paused(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: "Scan now" is an alias for scan_once, so it inherits the pause too."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_now()
+
+    assert enqueued == []
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_top_up_is_a_no_op_when_paused_even_with_qualifying_wanted_entries(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A direct ``top_up()`` call is also a no-op while paused, not just the scan wrappers."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    result = scheduler.top_up()
+
+    assert result == []
+    assert scheduler._count_pending() == 0
+
+
+def test_top_up_does_not_run_on_job_completion_when_paused(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the Auto-Queue Limit's completion-triggered top-up does not run while paused."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+
+    queue = JobQueue(pipeline_runner=_stub_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+    )
+    # A manual trigger still works while paused (see below) -- used here purely
+    # to give the queue something to complete and fire the terminal hook.
+    trigger_job = scheduler.trigger_file("/media/trigger.mkv")
+    assert trigger_job is not None
+
+    queue.start()
+    try:
+        assert queue.wait_idle(timeout=5.0)
+    finally:
+        queue.shutdown()
+
+    jobs = queue.list_jobs()
+    assert len(jobs) == 1  # only the manual trigger -- no top-up-discovered extra
+    assert not any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+
+
+def test_top_up_does_not_run_on_cancellation_when_paused(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the Auto-Queue Limit's cancellation-triggered top-up does not run while paused."""
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(
+                    instance_id=instance.id, media_title="Show", file_path="/tv/extra.mkv"
+                )
+            ]
+        },
+    )
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    seeded = _seed_pending(scheduler, AUTO_QUEUE_LIMIT)
+    with session_factory() as session:
+        # No history_recorder wired on this queue -- seed the PENDING row
+        # cancel_job's history delete expects, mirroring the other cancel_job
+        # tests above.
+        record_job_history(session, seeded[0])
+        update_global_settings(session, auto_queue_paused=True)
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(seeded[0].id, session=session)
+
+    assert outcome is True
+    jobs = scheduler._queue.list_jobs()
+    assert not any(job.file_path == Path("/tv/extra.mkv") for job in jobs)
+    assert scheduler._count_pending() == AUTO_QUEUE_LIMIT - 1  # the freed slot stayed empty
+
+
+def test_pending_and_running_jobs_continue_to_completion_while_paused(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: pausing auto-fill never stops an already-PENDING/RUNNING Job from finishing."""
+    queue = JobQueue(pipeline_runner=_stub_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+    )
+    job = scheduler.trigger_file("/media/already-queued.mkv")
+    assert job is not None
+
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+
+    queue.start()
+    try:
+        assert queue.wait_idle(timeout=5.0)
+    finally:
+        queue.shutdown()
+
+    jobs = queue.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].status is JobStatus.SUCCEEDED
+
+
+def test_trigger_file_still_works_while_paused(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: manual single-file trigger keeps working while auto-fill is paused."""
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.trigger_file("/media/movie.mkv")
+
+    assert job is not None
+
+
+def test_requeue_file_still_works_while_paused(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: manual single-file requeue keeps working while auto-fill is paused."""
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW, status=JobStatus.FAILED)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.requeue_file("/media/movie.mkv")
+
+    assert job is not None
+
+
+def test_requeue_all_failed_still_works_while_paused(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: bulk 'Requeue all failed' keeps working while auto-fill is paused."""
+    ended = _FIXED_NOW - timedelta(hours=7)  # outside the default 360min window
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+        _record_terminal(session, "/media/a.mkv", ended_at=ended, status=JobStatus.FAILED)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    with session_factory() as session:
+        outcome = scheduler.requeue_all_failed(session=session)
+
+    assert {job.file_path for job in outcome.requeued} == {Path("/media/a.mkv")}
+    assert outcome.skipped == []
+
+
+def test_auto_queue_paused_survives_a_fresh_scheduler_construction(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC: the value survives a process restart.
+
+    A brand-new :class:`JobScheduler` instance -- carrying no in-memory state
+    from any prior one -- built against a database where the flag is already
+    set stays paused, since the check reads the persisted row live rather
+    than a value cached at construction.
+    """
+    instance = _add_instance(session_factory)
+    _patch_fetch(
+        monkeypatch,
+        {
+            instance.id: [
+                MonitoredFile(instance_id=instance.id, media_title="Show", file_path="/tv/a.mkv")
+            ]
+        },
+    )
+    with session_factory() as session:
+        update_global_settings(session, auto_queue_paused=True)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    enqueued = scheduler.scan_once()
+
+    assert enqueued == []
+    assert scheduler._queue.list_jobs() == []

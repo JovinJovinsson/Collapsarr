@@ -119,6 +119,14 @@ fresh install should do without the operator first configuring
 ``default_audio_language``/``default_audio_channel_tier`` and turning it on
 deliberately."""
 
+DEFAULT_AUTO_QUEUE_PAUSED = False
+"""Default :attr:`GlobalSettings.auto_queue_paused` for a fresh install / an
+existing row backfilled by the additive migration (COL-174). Off by default,
+same rationale as :data:`DEFAULT_AUTO_SET_DEFAULT_AUDIO`: pausing auto-fill
+is a deliberate operator action, not something a fresh install should start
+doing on its own. See :attr:`GlobalSettings.auto_queue_paused`'s own
+docstring for exactly what it does and does not gate."""
+
 LOG_LEVEL_DEBUG = "DEBUG"
 LOG_LEVEL_INFO = "INFO"
 LOG_LEVEL_WARNING = "WARNING"
@@ -309,6 +317,27 @@ class GlobalSettings(Base):
     ``auto_set_default_audio`` above) so the additive migration backfills
     existing installs to the documented default rather than leaving the
     column ``NULL``.
+
+    ``auto_queue_paused`` (COL-174, "Auto-Queuing Pause") halts only the
+    scanner's Wanted-driven auto-fill -- both the periodic/manual scan's
+    initial enqueue and the Auto-Queue Limit's (COL-171) completion/
+    cancellation-triggered top-up -- by short-circuiting
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up` (see its
+    docstring), the one method every one of those hook points already funnels
+    through. It does **not** stop already-``PENDING``/``RUNNING`` Jobs from
+    running to completion, and it does **not** gate any manual, explicit
+    trigger (:meth:`~collapsarr.jobs.scheduler.JobScheduler.trigger_file`/
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.requeue_file`/
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.requeue_all_failed`) --
+    those never call :meth:`top_up` in the first place, so they are
+    unaffected by construction, not by an extra check. Read live from this
+    row on every :meth:`top_up` call, same treatment as
+    ``recently_processed_window_minutes`` above, so a ``PUT /api/settings``
+    change takes effect on the very next auto-fill attempt with no restart
+    or scheduler reconstruction. Carries a DB-side ``server_default`` so the
+    additive migration backfills existing installs to ``False`` (auto-fill
+    stays on unless an operator explicitly pauses it) rather than leaving the
+    column ``NULL``.
     """
 
     __tablename__ = "global_settings"
@@ -411,6 +440,13 @@ class GlobalSettings(Base):
         nullable=False,
         default=DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES,
         server_default=text(str(DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES)),
+    )
+
+    auto_queue_paused: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=DEFAULT_AUTO_QUEUE_PAUSED,
+        server_default=text("0"),
     )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)

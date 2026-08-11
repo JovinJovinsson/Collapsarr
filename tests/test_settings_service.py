@@ -754,6 +754,54 @@ def test_update_global_settings_recently_processed_window_persists_across_a_fres
 
 
 # ---------------------------------------------------------------------------
+# Auto-Queuing Pause (COL-174).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_auto_queue_paused_to_false(session: Session) -> None:
+    """AC: the new toggle defaults to off -- auto-fill runs unless paused explicitly."""
+    settings = get_global_settings(session)
+
+    assert settings.auto_queue_paused is False
+
+
+def test_update_global_settings_updates_auto_queue_paused(session: Session) -> None:
+    updated = update_global_settings(session, auto_queue_paused=True)
+
+    assert updated.auto_queue_paused is True
+
+
+def test_update_global_settings_auto_queue_paused_is_switchable_back_off(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    updated = update_global_settings(session, auto_queue_paused=False)
+
+    assert updated.auto_queue_paused is False
+
+
+def test_update_global_settings_omitting_auto_queue_paused_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.auto_queue_paused is True
+
+
+def test_update_global_settings_auto_queue_paused_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    reread = get_global_settings(session)
+
+    assert reread.auto_queue_paused is True
+
+
+# ---------------------------------------------------------------------------
 # Adapting to DownmixSettings.
 # ---------------------------------------------------------------------------
 
