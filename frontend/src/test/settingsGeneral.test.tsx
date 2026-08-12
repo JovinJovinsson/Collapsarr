@@ -1,10 +1,19 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getStoredApiKey } from "../api/client";
+import { recheckUpdateStatus } from "../api/updates";
 import { GeneralSection } from "../components/settings/GeneralSection";
 import type { GlobalSettings } from "../types/settings";
+
+// COL-196: `recheckUpdateStatus` is mocked at the module level rather than
+// via the raw `fetch` mock used elsewhere in this file, so the assertion
+// below is "was the recheck triggered", not "which URL got hit" -- keeps the
+// test decoupled from the recheck endpoint's own request shape.
+vi.mock("../api/updates", () => ({
+  recheckUpdateStatus: vi.fn(),
+}));
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
@@ -51,6 +60,16 @@ function renderGeneralSection() {
 describe("GeneralSection", () => {
   beforeEach(() => {
     localStorage.clear();
+    vi.mocked(recheckUpdateStatus).mockReset().mockResolvedValue({
+      running_version: "1.2.3",
+      latest_version: "v1.2.3",
+      latest_version_label: "v1.2.3",
+      changelog: null,
+      checked_at: "2026-08-02T10:00:00Z",
+      update_available: false,
+      dismissed_at: null,
+      is_docker: false,
+    });
   });
 
   afterEach(() => {
@@ -224,6 +243,44 @@ describe("GeneralSection", () => {
     const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
     const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
     expect(putBody.update_channel).toBe("beta");
+  });
+
+  it("triggers an immediate update recheck when a save changes the release channel (COL-196)", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const channelSelect = await screen.findByLabelText(/release channel/i);
+    fireEvent.change(channelSelect, { target: { value: "beta" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    await waitFor(() => expect(recheckUpdateStatus).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not trigger an update recheck when General settings save without a channel change (COL-196)", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const concurrencyInput = await screen.findByLabelText(/concurrency limit/i);
+    fireEvent.change(concurrencyInput, { target: { value: "4" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    expect(recheckUpdateStatus).not.toHaveBeenCalled();
   });
 
   it("saves the browser-stored API key to localStorage", async () => {

@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { changePassword, logoutEverywhere } from "../../api/auth";
 import { getStoredApiKey, redirectToLogin, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
+import { recheckUpdateStatus } from "../../api/updates";
 import type { AuthMethod, AuthRequiredMode, UpdateChannel } from "../../types/settings";
 
 type LoadState =
@@ -104,10 +105,20 @@ export function GeneralSection() {
   const [loggingOutEverywhere, setLoggingOutEverywhere] = useState(false);
   const [logoutEverywhereError, setLogoutEverywhereError] = useState<string | null>(null);
 
+  // Last known persisted release channel (COL-196): tracked separately from
+  // `form.updateChannel`, which flips the moment the user touches the select
+  // -- before the save has actually persisted anything. `null` until the
+  // initial GET resolves (there's no real "last known" value yet, so this
+  // doesn't guess one); re-seeded after every successful save. Lets
+  // `handleSave` tell "did this save actually change the channel" from "is
+  // beta merely selected in the form right now".
+  const lastKnownChannelRef = useRef<UpdateChannel | null>(null);
+
   useEffect(() => {
     fetchSettings()
       .then((settings) => {
         setServerApiKey(settings.api_key);
+        lastKnownChannelRef.current = settings.update_channel;
         setForm({
           concurrencyLimit: String(settings.concurrency_limit),
           uiAuthEnabled: settings.ui_auth_enabled,
@@ -175,6 +186,19 @@ export function GeneralSection() {
         defaultTracked: updated.default_tracked,
       });
       setSavedAt(Date.now());
+
+      // COL-196: the channel-aware comparison in the Update Check backend
+      // was already correct -- the bug was that its *stored* result went
+      // stale after a channel switch until the next scheduler tick or a
+      // manual "Recheck now". Trigger an immediate out-of-band recheck right
+      // after a successful save that actually changed the channel, so the
+      // Updates indicator reflects the new channel without waiting. Best
+      // effort: a failed recheck here doesn't fail the settings save --
+      // the periodic scheduler (or a manual recheck) will catch up later.
+      if (updated.update_channel !== lastKnownChannelRef.current) {
+        recheckUpdateStatus().catch(() => undefined);
+      }
+      lastKnownChannelRef.current = updated.update_channel;
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
