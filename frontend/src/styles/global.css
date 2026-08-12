@@ -1324,6 +1324,23 @@ a {
   font-size: var(--fs-xs);
 }
 
+/* Nesting depth background shading (COL-189): a Season/Episode row's
+   background gets a bit lighter per depth level (--c-nest-tint-1/2, defined
+   in theme.css), on top of the indentation above -- so an expanded
+   subfolder's rows read as "inside" their parent at a glance, with deeper
+   levels staying visually distinct from shallower ones instead of one flat
+   "nested" style. Set on the whole <tr> (not just the indented title cell)
+   so the shading spans every column in the row. Top-level rows (Series, and
+   Movie's flat rows) get neither class and keep the table's plain
+   --c-surface background. */
+.library-tree-table__row--depth-1 {
+  background-color: var(--c-nest-tint-1);
+}
+
+.library-tree-table__row--depth-2 {
+  background-color: var(--c-nest-tint-2);
+}
+
 .library-tree-table__file-badge {
   display: inline-flex;
   align-items: center;

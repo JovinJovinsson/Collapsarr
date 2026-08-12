@@ -38,6 +38,14 @@
   --c-warning: #fbbf24;
   --c-warning-tint: rgba(251, 191, 36, 0.14);
 
+  /* Library tree nesting overlays (COL-189) — flat white overlays (not fixed
+     hexes) so each deeper Season/Episode row layers a bit more "raised" shade
+     on top of whatever it already sits on, scaling with depth rather than one
+     flat "nested" look, and composing cleanly with --c-surface underneath and
+     with .library-tree-table__row--dimmed's opacity. */
+  --c-nest-tint-1: rgba(255, 255, 255, 0.025);
+  --c-nest-tint-2: rgba(255, 255, 255, 0.05);
+
   /* Type. System stack keeps the wheel self-contained (no bundled webfonts). */
   --font-body: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
     Arial, sans-serif;
