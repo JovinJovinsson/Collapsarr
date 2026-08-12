@@ -413,7 +413,7 @@ export function HistoryPage() {
       )}
 
       {filtered.length > 0 && (
-        <div className="panel activity-panel">
+        <div className="panel">
           <table className="activity-table">
             <thead>
               <tr>
