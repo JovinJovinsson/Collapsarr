@@ -34,6 +34,13 @@ export interface EpisodeNode {
   has_file: boolean;
   tracked: boolean;
   current_default_track: CurrentDefaultTrack | null;
+  /**
+   * The bridged `TrackedMediaFile` id (COL-194) -- the same id
+   * `/wanted/:fileId` matches against, so a `has_file: true` node can link
+   * straight to its file detail page (COL-198). `null` when there is no
+   * bridged tracked-media row yet.
+   */
+  file_id: number | null;
 }
 
 /** A Season node with its Episode children, matching `...routes.SeasonNode`. */
@@ -70,6 +77,8 @@ export interface MovieNode {
   has_file: boolean;
   tracked: boolean;
   current_default_track: CurrentDefaultTrack | null;
+  /** See `EpisodeNode.file_id` (COL-194/COL-198). */
+  file_id: number | null;
 }
 
 /** A Radarr instance's flat Movie list (COL-99), matching `...routes.MovieLibraryTreeResponse`. */

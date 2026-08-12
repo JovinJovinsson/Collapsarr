@@ -191,7 +191,7 @@ def test_tree_episode_current_default_track_reflects_a_probed_default_stream(
     app = client.app
     assert isinstance(app, FastAPI)
     with app.state.session_factory() as session:
-        upsert_tracked_media(
+        tracked_media = upsert_tracked_media(
             session,
             file_path="/media/pilot.mkv",
             streams=[
@@ -211,6 +211,7 @@ def test_tree_episode_current_default_track_reflects_a_probed_default_stream(
             instance_id=instance_id,
             sonarr_episode_id=101,
         )
+        tracked_media_id = tracked_media.id
 
     response = client.get(
         f"/api/library/instances/{instance_id}/tree", headers=_auth_headers(client)
@@ -220,9 +221,15 @@ def test_tree_episode_current_default_track_reflects_a_probed_default_stream(
     episodes = response.json()["series"][0]["seasons"][0]["episodes"]
     probed_episode = next(e for e in episodes if e["episode_number"] == 1)
     assert probed_episode["current_default_track"] == {"language": "dan", "channel_layout": "5.1"}
+    # file_id (COL-194) bridges to the same TrackedMediaFile row that backs
+    # /wanted/:fileId -- present whenever a bridged row exists.
+    assert probed_episode["file_id"] == tracked_media_id
     # The sibling episode was never probed -- unknown, not a stale/copied value.
     unprobed_episode = next(e for e in episodes if e["episode_number"] == 2)
     assert unprobed_episode["current_default_track"] is None
+    # has_file is False and there is no bridged tracked-media row either.
+    assert unprobed_episode["has_file"] is False
+    assert unprobed_episode["file_id"] is None
 
 
 def test_tree_episode_current_default_track_is_null_when_no_stream_reports_default(
@@ -261,7 +268,7 @@ def test_tree_movie_current_default_track_reflects_a_probed_default_stream(
     app = client.app
     assert isinstance(app, FastAPI)
     with app.state.session_factory() as session:
-        upsert_tracked_media(
+        tracked_media = upsert_tracked_media(
             session,
             file_path="/media/arrival.mkv",
             streams=[
@@ -278,6 +285,7 @@ def test_tree_movie_current_default_track_reflects_a_probed_default_stream(
             instance_id=instance_id,
             radarr_movie_id=1,
         )
+        tracked_media_id = tracked_media.id
 
     response = client.get(
         f"/api/library/instances/{instance_id}/tree", headers=_auth_headers(client)
@@ -289,7 +297,13 @@ def test_tree_movie_current_default_track_reflects_a_probed_default_stream(
         "language": "eng",
         "channel_layout": "5.1",
     }
+    # file_id (COL-194) bridges to the same TrackedMediaFile row that backs
+    # /wanted/:fileId -- present whenever a bridged row exists.
+    assert movies["Arrival"]["file_id"] == tracked_media_id
     assert movies["Not Yet Downloaded"]["current_default_track"] is None
+    # has_file is False and there is no bridged tracked-media row either.
+    assert movies["Not Yet Downloaded"]["has_file"] is False
+    assert movies["Not Yet Downloaded"]["file_id"] is None
 
 
 def test_tree_requires_the_api_key(client: TestClient) -> None:
