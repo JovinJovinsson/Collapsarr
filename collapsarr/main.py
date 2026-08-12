@@ -28,7 +28,7 @@ from .arr.webhooks import (
     parse_webhook_payload,
     resolve_webhook_file,
 )
-from .auth import SessionMiddleware, auth_router, enforce_auth_middleware
+from .auth import EnforceAuthMiddleware, SessionMiddleware, auth_router
 from .backup.routes import router as backup_router
 from .backup.scheduler import BackupScheduler
 from .config import Settings, get_settings
@@ -374,7 +374,14 @@ def create_app(
     # middleware is added first (inner) and the session middleware last (outer)
     # so the session is decoded onto the request scope *before* enforcement
     # reads it. Both supersede the old opt-in api_key_middleware (COL-26).
-    app.middleware("http")(enforce_auth_middleware)
+    #
+    # EnforceAuthMiddleware is a raw-ASGI middleware class (COL-199), not the
+    # old app.middleware("http")(...) decorator form -- Starlette wraps the
+    # decorator form in a BaseHTTPMiddleware that re-buffers the response body
+    # through its own anyio streams, a hazard for the large streamed
+    # FileResponse the backup-download route returns. The raw-ASGI class hands
+    # the ASGI send straight through on the happy path (see its docstring).
+    app.add_middleware(EnforceAuthMiddleware)
     app.add_middleware(SessionMiddleware)
 
     # URL base (COL-116): strips a configured COLLAPSARR_URL_BASE prefix from
