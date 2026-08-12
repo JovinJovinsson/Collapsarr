@@ -1,3 +1,4 @@
+import { DatabaseBackup } from "lucide-react";
 import type { ChangeEvent } from "react";
 import { useEffect, useState } from "react";
 
@@ -9,7 +10,6 @@ import {
   restoreBackup,
   restoreFromUpload,
 } from "../api/backups";
-import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
 import { formatBytes } from "../utils/format";
 
@@ -282,7 +282,7 @@ export function BackupsPage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <BackupIcon width={28} height={28} />
+            <DatabaseBackup width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load backups: {state.message}</p>
         </div>
@@ -291,7 +291,7 @@ export function BackupsPage() {
       {state.status === "ready" && !supported && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <BackupIcon width={28} height={28} />
+            <DatabaseBackup width={28} height={28} />
           </span>
           <p className="panel__message">
             Backups are unavailable for this database configuration. Snapshots are only
@@ -303,7 +303,7 @@ export function BackupsPage() {
       {state.status === "ready" && supported && state.backups.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <BackupIcon width={28} height={28} />
+            <DatabaseBackup width={28} height={28} />
           </span>
           <p className="panel__message">
             No backups yet. Use <strong>Backup now</strong> to create the first one.

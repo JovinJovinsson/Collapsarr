@@ -1,8 +1,8 @@
+import { ListOrdered } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { bumpJobToFront, cancelJob, clearQueue, fetchJobQueue } from "../api/activity";
 import { fetchSettings, updateSettings } from "../api/settings";
-import { ActivityIcon } from "../components/icons";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { ClearQueueResult, JobHistoryEntry, JobStatus } from "../types/activity";
 
@@ -480,7 +480,7 @@ export function QueuePage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <ListOrdered width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load queue: {state.message}</p>
         </div>
@@ -489,7 +489,7 @@ export function QueuePage() {
       {state.status === "ready" && state.entries.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <ListOrdered width={28} height={28} />
           </span>
           <p className="panel__message">
             Queue is empty. Running and pending downmix jobs will appear here.
@@ -500,7 +500,7 @@ export function QueuePage() {
       {hasEntries && filtered.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <ListOrdered width={28} height={28} />
           </span>
           <p className="panel__message">No queued jobs match the current filter.</p>
         </div>

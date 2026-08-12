@@ -1,11 +1,13 @@
+import { OctagonAlert, TriangleAlert } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+
 import { useHealth } from "../hooks/useHealth";
 import type { HealthWarning } from "../types/health";
-import { ErrorIcon, WarningIcon } from "./icons";
 
 /** Icon per severity -- error gets the octagon, warning the triangle (COL-76). */
-const SEVERITY_ICON: Record<HealthWarning["severity"], typeof WarningIcon> = {
-  warning: WarningIcon,
-  error: ErrorIcon,
+const SEVERITY_ICON: Record<HealthWarning["severity"], LucideIcon> = {
+  warning: TriangleAlert,
+  error: OctagonAlert,
 };
 
 /**
@@ -55,7 +57,7 @@ export function HealthBanner() {
         const Icon = SEVERITY_ICON[severity];
         return (
           <p key={warning.code} className={`health-banner__message health-banner__message--${severity}`}>
-            <Icon className="health-banner__icon" />
+            <Icon className="health-banner__icon" size={20} />
             {warning.message}
           </p>
         );

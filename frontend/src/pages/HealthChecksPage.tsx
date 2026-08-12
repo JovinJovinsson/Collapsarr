@@ -1,3 +1,5 @@
+import { HeartPulse, OctagonAlert, TriangleAlert } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import {
@@ -6,7 +8,6 @@ import {
   recheckHealthChecks,
   undismissHealthCheck,
 } from "../api/health";
-import { ErrorIcon, HealthIcon, WarningIcon } from "../components/icons";
 import type { HealthCheckState, HealthSeverity, HealthCheckStatus } from "../types/health";
 
 const SEVERITY_LABEL: Record<HealthSeverity, string> = {
@@ -14,9 +15,9 @@ const SEVERITY_LABEL: Record<HealthSeverity, string> = {
   error: "Error",
 };
 
-const SEVERITY_ICON = {
-  warning: WarningIcon,
-  error: ErrorIcon,
+const SEVERITY_ICON: Record<HealthSeverity, LucideIcon> = {
+  warning: TriangleAlert,
+  error: OctagonAlert,
 };
 
 const STATUS_LABEL: Record<HealthCheckStatus, string> = {
@@ -181,7 +182,7 @@ export function HealthChecksPage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <HealthIcon width={28} height={28} />
+            <HeartPulse width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load health checks: {state.message}</p>
         </div>
@@ -190,7 +191,7 @@ export function HealthChecksPage() {
       {state.status === "ready" && state.checks.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <HealthIcon width={28} height={28} />
+            <HeartPulse width={28} height={28} />
           </span>
           <p className="panel__message">No health checks have run yet.</p>
         </div>
@@ -214,7 +215,7 @@ export function HealthChecksPage() {
             </thead>
             <tbody>
               {state.checks.map((check) => {
-                const SeverityIcon = SEVERITY_ICON[check.severity] ?? WarningIcon;
+                const SeverityIcon = SEVERITY_ICON[check.severity] ?? TriangleAlert;
                 const isDismissed = check.dismissed_at !== null;
                 const isPending = pendingId === check.id;
                 return (

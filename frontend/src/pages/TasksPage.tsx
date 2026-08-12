@@ -1,7 +1,7 @@
+import { ListChecks } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { fetchTasks, runBackup, runHealthChecks, runLibraryScan, runUpdateCheck } from "../api/tasks";
-import { TasksIcon } from "../components/icons";
 import type { ScheduledTask } from "../types/tasks";
 
 /** Formats an ISO timestamp in the viewer's local time, or an em dash when absent/unparseable. */
@@ -126,7 +126,7 @@ export function TasksPage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <TasksIcon width={28} height={28} />
+            <ListChecks width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load tasks: {state.message}</p>
         </div>
@@ -135,7 +135,7 @@ export function TasksPage() {
       {state.status === "ready" && state.tasks.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <TasksIcon width={28} height={28} />
+            <ListChecks width={28} height={28} />
           </span>
           <p className="panel__message">No scheduled tasks are registered.</p>
         </div>
