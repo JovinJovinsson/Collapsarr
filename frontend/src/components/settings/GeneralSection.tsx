@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { changePassword, logoutEverywhere } from "../../api/auth";
 import { getStoredApiKey, redirectToLogin, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
+import { useUpdates } from "../../hooks/useUpdates";
 import type { AuthMethod, AuthRequiredMode, UpdateChannel } from "../../types/settings";
 
 type LoadState =
@@ -104,10 +105,27 @@ export function GeneralSection() {
   const [loggingOutEverywhere, setLoggingOutEverywhere] = useState(false);
   const [logoutEverywhereError, setLogoutEverywhereError] = useState<string | null>(null);
 
+  // Last known persisted release channel (COL-196): tracked separately from
+  // `form.updateChannel`, which flips the moment the user touches the select
+  // -- before the save has actually persisted anything. `null` until the
+  // initial GET resolves (there's no real "last known" value yet, so this
+  // doesn't guess one); re-seeded after every successful save. Lets
+  // `handleSave` tell "did this save actually change the channel" from "is
+  // beta merely selected in the form right now".
+  const lastKnownChannelRef = useRef<UpdateChannel | null>(null);
+
+  // COL-196 code review: `refresh` (from `UpdatesProvider`, mounted in
+  // `AppShell`) runs an out-of-band recheck *and* pushes the result into the
+  // Update Check state `UpdateIndicator` reads via the same `useUpdates()`
+  // hook, so the indicator reflects it immediately instead of only the next
+  // time it happens to fetch on its own.
+  const { refresh: refreshUpdateStatus } = useUpdates();
+
   useEffect(() => {
     fetchSettings()
       .then((settings) => {
         setServerApiKey(settings.api_key);
+        lastKnownChannelRef.current = settings.update_channel;
         setForm({
           concurrencyLimit: String(settings.concurrency_limit),
           uiAuthEnabled: settings.ui_auth_enabled,
@@ -175,6 +193,16 @@ export function GeneralSection() {
         defaultTracked: updated.default_tracked,
       });
       setSavedAt(Date.now());
+
+      // COL-196: trigger an immediate out-of-band recheck right after a
+      // successful save that actually changed the channel, so the Updates
+      // indicator reflects the new channel without waiting for the next
+      // scheduler tick. Best-effort: a failed recheck here doesn't fail the
+      // settings save.
+      if (updated.update_channel !== lastKnownChannelRef.current) {
+        refreshUpdateStatus().catch(() => undefined);
+      }
+      lastKnownChannelRef.current = updated.update_channel;
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Unknown error.");
     } finally {

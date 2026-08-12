@@ -6,6 +6,7 @@ import { InstancesProvider } from "./InstancesProvider";
 import { OnboardingPanel } from "./OnboardingPanel";
 import { Sidebar } from "./Sidebar";
 import { UpdateIndicator } from "./UpdateIndicator";
+import { UpdatesProvider } from "./UpdatesProvider";
 
 /**
  * Top-level layout: a fixed sidebar on the left and a scrollable content
@@ -35,20 +36,29 @@ import { UpdateIndicator } from "./UpdateIndicator";
  * reason: it's the shared `GET /health` fetch that `HealthBanner` and
  * `Sidebar`'s version footer both read via `useHealth()`, so the app makes
  * that request once instead of each consumer re-fetching independently.
+ *
+ * `UpdatesProvider` (COL-196 code review) wraps `<Outlet />` too, not just
+ * `UpdateIndicator`: it's the shared Update Check state `UpdateIndicator`
+ * reads via `useUpdates()`, and also exposes `refresh()` so a page rendered
+ * into the outlet (currently `GeneralSection`, after a release-channel
+ * change) can push a freshly rechecked result into that shared state --
+ * `UpdateIndicator` then reflects it immediately, without a page reload.
  */
 export function AppShell() {
   return (
     <HealthProvider>
       <InstancesProvider>
-        <div className="app-shell">
-          <Sidebar />
-          <main className="app-shell__content" id="main-content">
-            <HealthBanner />
-            <UpdateIndicator />
-            <OnboardingPanel />
-            <Outlet />
-          </main>
-        </div>
+        <UpdatesProvider>
+          <div className="app-shell">
+            <Sidebar />
+            <main className="app-shell__content" id="main-content">
+              <HealthBanner />
+              <UpdateIndicator />
+              <OnboardingPanel />
+              <Outlet />
+            </main>
+          </div>
+        </UpdatesProvider>
       </InstancesProvider>
     </HealthProvider>
   );
