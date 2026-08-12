@@ -1,6 +1,7 @@
 import { Library } from "lucide-react";
+import type { ReactNode } from "react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 
 import { bulkTriggerSetDefaultAudio } from "../api/activity";
 import {
@@ -82,6 +83,34 @@ function DefaultAudioTrackCell({ track }: { track: CurrentDefaultTrack | null })
     );
   }
   return <span className="library-tree-table__default-track">{formatCurrentDefaultTrack(track)}</span>;
+}
+
+/**
+ * Wraps a file-bearing leaf row's title content in a link to that file's
+ * detail page (COL-198), shared by `SeriesTree`'s episode rows and
+ * `MovieTable`'s rows -- the same two levels `FileDetailLink`'s siblings
+ * (`FileStatusBadge`/`DefaultAudioTrackCell`) already apply to. Links to
+ * `/wanted/:fileId` (the same route `WantedPage` already links to for the
+ * same file; `FileDetailPage` resolves `fileId` by matching `WantedFile.id`
+ * from `GET /api/wanted`) whenever the row both has a file and carries a
+ * resolved tracked-file id (COL-194's `file_id`) -- a row that's missing
+ * either (no file yet, or `has_file: true` but no bridged tracked-media row,
+ * so `file_id` is still `null`) renders its content unlinked, exactly as
+ * before this ticket.
+ */
+function FileDetailLink({
+  hasFile,
+  fileId,
+  children,
+}: {
+  hasFile: boolean;
+  fileId: number | null;
+  children: ReactNode;
+}) {
+  if (!hasFile || fileId === null) {
+    return <>{children}</>;
+  }
+  return <Link to={`/wanted/${fileId}`}>{children}</Link>;
 }
 
 /**
@@ -503,7 +532,9 @@ function SeriesTree({
                                 />
                               </td>
                               <td className="library-tree-table__cell--indent-2">
-                                E{String(episode.episode_number).padStart(2, "0")} &middot; {episode.title}
+                                <FileDetailLink hasFile={episode.has_file} fileId={episode.file_id}>
+                                  E{String(episode.episode_number).padStart(2, "0")} &middot; {episode.title}
+                                </FileDetailLink>
                               </td>
                               <td>
                                 <FileStatusBadge hasFile={episode.has_file} />
@@ -568,7 +599,11 @@ function MovieTable({
                   selectionDisabled={selectionDisabled}
                 />
               </td>
-              <td>{movie.title}</td>
+              <td>
+                <FileDetailLink hasFile={movie.has_file} fileId={movie.file_id}>
+                  {movie.title}
+                </FileDetailLink>
+              </td>
               <td>
                 <FileStatusBadge hasFile={movie.has_file} />
               </td>
