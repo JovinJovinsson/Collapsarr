@@ -6,21 +6,64 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Four endpoints, each wrapping an existing service without adding new job logic:
+Eleven endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
   ``file`` (exact file path) and/or ``status`` (a :class:`~collapsarr.jobs.queue.
   JobStatus` value). Mirrors Sonarr/Radarr's ``/history`` view.
+- ``GET /api/jobs/queue`` -- lists every currently ``running``/``pending`` Job
+  together (COL-175, :func:`collapsarr.jobs.history.list_queue_jobs`),
+  ordered running-first then pending by ascending ``priority`` -- the shape
+  the Queue page (COL-176) needs and ``GET /api/jobs/history`` deliberately
+  doesn't provide (that endpoint's ``status`` filter is single-valued and its
+  ordering is insertion order, unchanged for the existing History page's
+  ``fetchJobHistory`` contract). Same response shape as ``GET
+  /api/jobs/history`` (:class:`JobHistoryRead`, now including ``priority``).
 - ``POST /api/jobs/scan`` -- triggers an immediate full-library scan
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.scan_now`, COL-23), enqueuing a
-  downmix job for every monitored file that has a qualifying missing target. The
-  Sonarr/Radarr analogue is the ``RescanSeries``/``RefreshMovie`` command.
+  downmix job for enough monitored files with a qualifying missing target to
+  reach the Auto-Queue Limit (COL-171, fixed at 5 total ``PENDING`` jobs) --
+  not every qualifying file, as it did before COL-171. The Sonarr/Radarr
+  analogue is the ``RescanSeries``/``RefreshMovie`` command.
 - ``POST /api/jobs/trigger`` -- manually enqueues a downmix job for one specific
   file (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_file`, COL-23). The
   optional ``extra_languages`` list is the allow-list-bypass option: those
   languages are forced past the scheduler's ``language_allow_list`` for this one
-  call, letting a user downmix a language they normally don't auto-process.
+  call, letting a user downmix a language they normally don't auto-process. As of
+  COL-170 it also always bypasses the Recently-Processed Window (COL-167) --
+  a behavior change from before, when it respected the window like every other
+  trigger: every single, explicit trigger is now treated as a deliberate
+  request that overrides the cooldown, matching ``POST /api/jobs/requeue``
+  below. It still goes through the same qualifying-target detection either
+  way -- a file with nothing to do is still skipped.
+- ``POST /api/jobs/requeue`` -- the per-row "Requeue" action (COL-170):
+  manually enqueues a downmix job for one specific file -- typically a
+  previously-failed one a user is retrying from the Activity/History view --
+  via :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_file`, which
+  always bypasses the Recently-Processed Window. Same response shape as
+  ``POST /api/jobs/trigger``; the only difference is the window is *always*
+  bypassed here (there is no honour-the-window option), and there is no
+  ``extra_languages`` override -- a requeue retries against the standing
+  language allow-list, not a one-off widened one. The window bypass is the
+  only thing it changes: the same qualifying-target detection still applies,
+  so a file with nothing to do (already fully downmixed) is still skipped,
+  and a file with a job already ``PENDING``/``RUNNING`` right now is still
+  reported as not enqueued.
+- ``POST /api/jobs/requeue-failed`` -- the batch "Requeue all failed" action
+  (COL-172): requeues every currently-``FAILED`` ``DOWNMIX`` Job in one call
+  via :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_all_failed` (a
+  ``SET_DEFAULT_AUDIO`` failure is out of scope -- ``POST
+  /api/jobs/trigger-default-audio/bulk`` above is its own bulk retry entry
+  point). Unlike ``POST /api/jobs/requeue`` above, this *respects* the
+  Recently-Processed Window (COL-167) -- a bulk retry of every failed file is
+  closer in spirit to the automatic paths that window protects against than
+  to one explicit single-file action, so a file whose most recent terminal
+  history row falls inside the window is skipped, not requeued. The response
+  reports the full split -- every currently-failed file's path lands in
+  either ``requeued`` (with its newly created job) or ``skipped`` -- so an
+  all-skipped pass (e.g. every failed file failed too recently) is a valid,
+  fully-reported outcome, not an error.
 - ``POST /api/jobs/trigger-default-audio`` -- manually enqueues a
   ``SET_DEFAULT_AUDIO`` job for one specific file
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`,
@@ -41,6 +84,46 @@ Four endpoints, each wrapping an existing service without adding new job logic:
   once per resulting file -- always against the current global Preferred
   Default Audio setting; there is no per-call override, unlike
   ``trigger``'s ``extra_languages``.
+- ``DELETE /api/jobs/{job_id}`` -- cancels one specific still-``PENDING``
+  Job (COL-168) (:meth:`collapsarr.jobs.scheduler.JobScheduler.cancel_job`).
+  "Cancel" is deletion, not a new status: on success the Job's persisted
+  :class:`~collapsarr.jobs.models.JobHistory` row is deleted too -- a
+  cancelled Job leaves no trace, no audit row, no cooldown interaction with
+  the Recently-Processed Window. Because the queue's worker pool keeps
+  running concurrently, the Job may already have been claimed (or already
+  finished) by the time the request lands; that is reported back distinctly
+  (see :class:`CancelJobResult`) rather than erroring or silently pretending
+  success. A ``job_id`` not present in the live queue at all -- unknown,
+  malformed, or already gone -- is a ``404``.
+- ``POST /api/jobs/clear`` -- the batch "Clear queue" cancel action (COL-173):
+  cancels every currently-``PENDING`` Job in one call via
+  :meth:`collapsarr.jobs.scheduler.JobScheduler.clear_queue` (the bulk
+  counterpart of ``DELETE /api/jobs/{job_id}`` above, mirroring ``POST
+  /api/jobs/requeue-failed``'s "one dedicated scheduler method, thin route"
+  shape). Unlike that per-row cancel, the response reports *counts* rather
+  than a single boolean -- ``cancelled`` (how many were actually removed
+  from the live queue) vs. ``already_running`` (how many had already been
+  claimed by a worker, or otherwise progressed past ``PENDING``, by the time
+  their own cancel ran, and so were left alone) -- since the queue's worker
+  pool keeps running concurrently with no push mechanism to freeze it
+  mid-request, only polling. Because cancelling frees a slot exactly like
+  any other cancellation or completion, the Auto-Queue Limit's top-up
+  (COL-171) runs once, immediately after the whole batch -- clearing the
+  queue is not a pause, it simply resets to whatever the scanner refills
+  next (Auto-Queuing Pause, COL-174, is the dedicated lever for that, not
+  implemented here). Clearing an already-empty queue is not an error -- a
+  valid ``cancelled=0``/``already_running=0`` response.
+- ``POST /api/jobs/{job_id}/bump`` -- bumps one still-``PENDING`` Job to the
+  front of the queue (COL-169)
+  (:meth:`collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front`), the only
+  reordering primitive in scope -- there is no general "move to an arbitrary
+  position". Wraps :meth:`~collapsarr.jobs.queue.JobQueue.bump_to_front`,
+  which reassigns the Job's priority below every other pending Job's, so it
+  is the very next Job a free worker claims. Mirrors the ``DELETE``
+  endpoint's result shape: a Job that's no longer ``PENDING`` (already
+  claimed/terminal) reports ``bumped=False`` rather than erroring (see
+  :class:`BumpJobResult`), and a ``job_id`` not present in the live queue at
+  all is a ``404``, same as the ``DELETE`` endpoint.
 
 The scan/trigger endpoints operate on the live
 :class:`~collapsarr.jobs.scheduler.JobScheduler` the app wired onto
@@ -54,6 +137,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -63,7 +147,7 @@ from ..database import get_session
 from ..library.models import LibraryNode, LibraryNodeKind
 from ..library.service import get_node, list_nodes
 from ..media.service import list_tracked_media_by_instance
-from .history import list_job_history
+from .history import list_job_history, list_queue_jobs
 from .models import JobHistory
 from .queue import Job, JobKind, JobStatus
 from .scheduler import JobScheduler
@@ -96,7 +180,14 @@ def get_job_scheduler(request: Request) -> JobScheduler:
 
 
 class JobHistoryRead(BaseModel):
-    """Response shape for one persisted job-history row (COL-21)."""
+    """Response shape for one persisted job-history row (COL-21).
+
+    ``priority`` (COL-163, exposed here as of COL-175) mirrors the
+    originating :class:`~collapsarr.jobs.queue.Job`'s
+    :attr:`~collapsarr.jobs.queue.Job.priority` -- the join-order sequence
+    number a lower value means "earlier"/"next in line". It's what
+    ``GET /api/jobs/queue`` (COL-175) orders pending Jobs by.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -105,6 +196,7 @@ class JobHistoryRead(BaseModel):
     file_path: str
     status: JobStatus
     kind: JobKind
+    priority: int
     started_at: datetime | None
     ended_at: datetime | None
     exit_code: int | None
@@ -162,6 +254,59 @@ class ManualTriggerResult(BaseModel):
 
     enqueued: bool
     job: EnqueuedJob | None
+
+
+class RequeueFileRequest(BaseModel):
+    """Request body for ``POST /api/jobs/requeue`` (COL-170).
+
+    ``file_path`` names the (host-local) file to requeue -- typically one
+    with a ``FAILED`` job-history row a user is retrying from the
+    Activity/History view, though nothing here validates that; it goes
+    through the same probe/qualifying-target sequence as any other trigger.
+    Unlike :class:`ManualTriggerRequest`, there is no ``extra_languages``
+    option -- a requeue retries against the standing language allow-list,
+    not a one-off widened one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str
+
+
+class RequeueFileResult(BaseModel):
+    """Response for ``POST /api/jobs/requeue`` (COL-170).
+
+    ``enqueued`` is ``True`` with the created ``job`` when a downmix job was
+    queued. It is ``False`` with ``job`` ``null`` when the file was skipped --
+    a duplicate (already queued/running -- the Recently-Processed Window is
+    always bypassed here, so it can never be the reason), unprobeable, or
+    with no qualifying target -- mirroring
+    :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_file` returning
+    ``None``.
+    """
+
+    enqueued: bool
+    job: EnqueuedJob | None
+
+
+class BulkRequeueFailedResult(BaseModel):
+    """Response for ``POST /api/jobs/requeue-failed`` (COL-172).
+
+    ``requeued`` lists every newly created job for a currently-``FAILED``
+    file this pass did *not* skip. ``skipped`` lists every currently-``FAILED``
+    file's path this pass did *not* requeue -- most commonly because its most
+    recent terminal history row falls inside the Recently-Processed Window
+    (COL-167), but also any other reason
+    :meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_file` might decline
+    a file (already active, unprobeable, or nothing left to do). Every
+    currently-failed file lands in exactly one of the two lists -- never a
+    silent partial success -- so an all-skipped response (e.g. every failed
+    file failed too recently) is a valid, fully-reported outcome rather than
+    an error.
+    """
+
+    requeued: list[EnqueuedJob]
+    skipped: list[str]
 
 
 class SetDefaultAudioTriggerRequest(BaseModel):
@@ -246,6 +391,64 @@ class BulkSetDefaultAudioTriggerResult(BaseModel):
     """
 
     results: list[FileSetDefaultAudioResult]
+
+
+class CancelJobResult(BaseModel):
+    """Response for ``DELETE /api/jobs/{job_id}`` (COL-168).
+
+    ``cancelled`` is ``True`` when the Job was still ``PENDING`` and has now
+    been removed from the live queue *and* had its
+    :class:`~collapsarr.jobs.models.JobHistory` row deleted -- it leaves no
+    trace at all. It is ``False`` -- not an error -- when the Job still
+    exists but is no longer ``PENDING`` (a worker already claimed it, or it
+    has already reached a terminal status): "too late" to cancel, distinct
+    from both success and a generic failure; the already-claimed/finished
+    Job runs (or has run) to completion normally, history row intact. A
+    ``job_id`` not present in the live queue at all -- unknown, malformed,
+    or already gone -- is reported as ``404``, not this shape (there is
+    nothing to act on either way).
+    """
+
+    cancelled: bool
+
+
+class ClearQueueResult(BaseModel):
+    """Response for ``POST /api/jobs/clear`` (COL-173).
+
+    ``cancelled`` is how many currently-``PENDING`` Jobs, out of every one
+    snapshotted at the start of the pass, this call actually cancelled.
+    ``already_running`` is how many of that same snapshot had already been
+    claimed by a worker (or otherwise progressed past ``PENDING``) by the
+    time their individual cancel ran, and so were left alone -- reported
+    rather than silently ignored, mirroring
+    :meth:`collapsarr.jobs.scheduler.JobScheduler.clear_queue`'s
+    same-named fields (see there for the full ``ClearQueueResult`` contract).
+    Every snapshotted Job lands in exactly one of the two counts. Clearing
+    an already-empty queue is not an error -- a valid
+    ``cancelled=0``/``already_running=0`` response.
+    """
+
+    cancelled: int
+    already_running: int
+
+
+class BumpJobResult(BaseModel):
+    """Response for ``POST /api/jobs/{job_id}/bump`` (COL-169).
+
+    ``bumped`` is ``True`` when the Job was still ``PENDING`` and has now
+    been reassigned a priority ahead of every other currently-pending Job --
+    it is the very next Job a free worker claims. It is ``False`` -- not an
+    error -- when the Job still exists but is no longer ``PENDING`` (a
+    worker already claimed it, or it has already reached a terminal status):
+    "too late" to bump, distinct from both success and a generic failure;
+    the already-claimed/finished Job runs (or has run) to completion
+    normally, unaffected. A ``job_id`` not present in the live queue at all
+    -- unknown, malformed, or already gone -- is reported as ``404``, not
+    this shape (there is nothing to act on either way). Mirrors
+    :class:`CancelJobResult`'s shape exactly.
+    """
+
+    bumped: bool
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -372,6 +575,22 @@ def list_job_history_endpoint(
     return list_job_history(session, file_path=file, status=status, kind=kind)
 
 
+@router.get("/jobs/queue", response_model=list[JobHistoryRead])
+def list_job_queue_endpoint(session: Session = Depends(get_session)) -> list[JobHistory]:
+    """List every currently ``running``/``pending`` Job together, queue-ordered (COL-175).
+
+    Wraps :func:`collapsarr.jobs.history.list_queue_jobs`: only
+    ``RUNNING``/``PENDING`` rows are returned (a terminal row has left the
+    queue), ordered **running first**, then **pending ordered by ascending
+    priority** -- the shape the Queue page (COL-176) needs. This is a
+    separate, additive endpoint rather than a change to ``GET
+    /api/jobs/history``'s existing single-status filter/insertion-order
+    contract, so ``fetchJobHistory`` (the History page's fetch-all-and-filter
+    client-side approach) is unaffected.
+    """
+    return list_queue_jobs(session)
+
+
 @router.post("/jobs/scan", response_model=ScanResult, status_code=202)
 def scan_now_endpoint(scheduler: JobScheduler = Depends(get_job_scheduler)) -> ScanResult:
     """Trigger an immediate full-library scan, returning the jobs it enqueued.
@@ -397,14 +616,76 @@ def manual_trigger_endpoint(
     through as the allow-list-bypass. A ``202`` is returned whether or not a job
     was enqueued; the ``enqueued`` flag distinguishes the two (a skipped file --
     duplicate/unprobeable/nothing to do -- is not an error).
+
+    Always passes ``bypass_dedup_window=True`` (COL-170) -- a behavior change
+    from before COL-170, when this endpoint respected the Recently-Processed
+    Window like every other trigger: every single, explicit trigger is now
+    treated as a deliberate request that overrides the cooldown (matching
+    ``POST /api/jobs/requeue`` below). The window is the only thing bypassed;
+    the qualifying-target gate is unchanged, so a file with nothing to do is
+    still skipped.
     """
     job = scheduler.trigger_file(
         body.file_path,
         extra_languages=body.extra_languages or None,
+        bypass_dedup_window=True,
     )
     if job is None:
         return ManualTriggerResult(enqueued=False, job=None)
     return ManualTriggerResult(enqueued=True, job=EnqueuedJob.from_job(job))
+
+
+@router.post("/jobs/requeue", response_model=RequeueFileResult, status_code=202)
+def requeue_file_endpoint(
+    body: RequeueFileRequest,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+) -> RequeueFileResult:
+    """Requeue one specific file -- the per-row "Requeue" action (COL-170).
+
+    Wraps :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_file`, which
+    always bypasses the Recently-Processed Window (COL-167) regardless of its
+    current value -- the intended use is a user clicking "Requeue" on a
+    specific failed file from the Activity/History view, an explicit request
+    that should never be silently swallowed by the cooldown. It still goes
+    through the same qualifying-target detection as every other trigger, so a
+    file with nothing to do (already fully downmixed) is still skipped, and a
+    file with a job already ``PENDING``/``RUNNING`` right now is still a
+    duplicate. A ``202`` is returned whether or not a job was enqueued; the
+    ``enqueued`` flag distinguishes the two.
+    """
+    job = scheduler.requeue_file(body.file_path)
+    if job is None:
+        return RequeueFileResult(enqueued=False, job=None)
+    return RequeueFileResult(enqueued=True, job=EnqueuedJob.from_job(job))
+
+
+@router.post(
+    "/jobs/requeue-failed",
+    response_model=BulkRequeueFailedResult,
+    status_code=202,
+)
+def requeue_all_failed_endpoint(
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+    session: Session = Depends(get_session),
+) -> BulkRequeueFailedResult:
+    """Requeue every currently-``FAILED`` Job in one call -- "Requeue all failed" (COL-172).
+
+    Wraps :meth:`collapsarr.jobs.scheduler.JobScheduler.requeue_all_failed`,
+    the batch counterpart of ``POST /api/jobs/requeue`` above. Unlike that
+    per-row action (which always bypasses the Recently-Processed Window),
+    this one *respects* it -- a file whose most recent terminal history row
+    falls inside the window is skipped, not requeued, since a bulk retry of
+    every failed file is closer in spirit to the automatic paths the window
+    protects against. A ``202`` is returned whether anything was actually
+    requeued or not; the response's ``requeued``/``skipped`` split reports
+    exactly what happened to every currently-failed file, so an all-skipped
+    pass is a valid outcome, not an error or a silent partial success.
+    """
+    outcome = scheduler.requeue_all_failed(session=session)
+    return BulkRequeueFailedResult(
+        requeued=[EnqueuedJob.from_job(job) for job in outcome.requeued],
+        skipped=outcome.skipped,
+    )
 
 
 @router.post(
@@ -476,3 +757,83 @@ def bulk_set_default_audio_trigger_endpoint(
             )
 
     return BulkSetDefaultAudioTriggerResult(results=results)
+
+
+@router.delete("/jobs/{job_id}", response_model=CancelJobResult)
+def cancel_job_endpoint(
+    job_id: str,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+    session: Session = Depends(get_session),
+) -> CancelJobResult:
+    """Cancel one still-``PENDING`` Job by id (COL-168).
+
+    Wraps :meth:`~collapsarr.jobs.scheduler.JobScheduler.cancel_job` --
+    see there for the get/cancel/delete-history sequence and its
+    ``None``/``False``/``True`` result contract. A ``job_id`` that isn't a
+    valid UUID can't name any job at all, so it's folded into the same
+    ``404`` :meth:`~collapsarr.jobs.scheduler.JobScheduler.cancel_job`
+    reports for an unknown one, without calling it.
+    """
+    try:
+        job_uuid = UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id!r}") from None
+
+    outcome = scheduler.cancel_job(job_uuid, session=session)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
+    return CancelJobResult(cancelled=outcome)
+
+
+# --- POST /api/jobs/clear (COL-173) -------------------------------------------
+
+
+@router.post("/jobs/clear", response_model=ClearQueueResult, status_code=202)
+def clear_queue_endpoint(
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+    session: Session = Depends(get_session),
+) -> ClearQueueResult:
+    """Cancel every currently-``PENDING`` Job in one call -- "Clear queue" (COL-173).
+
+    Wraps :meth:`collapsarr.jobs.scheduler.JobScheduler.clear_queue`, the
+    batch counterpart of ``DELETE /api/jobs/{job_id}`` above. Every Job that
+    is ``PENDING`` at the moment this pass starts is cancelled unless a
+    worker claims it first (the queue keeps running concurrently -- there is
+    no push mechanism to freeze it mid-request, only polling); the
+    response's ``cancelled``/``already_running`` split reports exactly what
+    happened to that snapshot, so a race is surfaced rather than silently
+    swallowed. Because cancelling frees a slot exactly like any other
+    cancellation, the Auto-Queue Limit's top-up (COL-171) runs once,
+    immediately after the whole batch -- clearing the queue is not a pause,
+    it simply resets to whatever the scanner refills next. A ``202`` is
+    returned even when the queue was already empty (``cancelled=0``,
+    ``already_running=0`` is a valid outcome, not an error).
+    """
+    outcome = scheduler.clear_queue(session=session)
+    return ClearQueueResult(cancelled=outcome.cancelled, already_running=outcome.already_running)
+
+
+@router.post("/jobs/{job_id}/bump", response_model=BumpJobResult)
+def bump_job_endpoint(
+    job_id: str,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+) -> BumpJobResult:
+    """Bump one still-``PENDING`` Job to the front of the queue by id (COL-169).
+
+    Wraps :meth:`~collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front` --
+    see there for the ``None``/``True``/``False`` result contract. A
+    ``job_id`` that isn't a valid UUID can't name any job at all, so it's
+    folded into the same ``404``
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front` reports
+    for an unknown one, without calling it -- mirroring
+    :func:`cancel_job_endpoint`.
+    """
+    try:
+        job_uuid = UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id!r}") from None
+
+    outcome = scheduler.bump_job_to_front(job_uuid)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
+    return BumpJobResult(bumped=outcome)

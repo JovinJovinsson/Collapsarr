@@ -62,6 +62,25 @@ matching ``enabled_targets``' own typing) and is stored as its ``.value``.
 rule every other boolean field here follows (``ui_auth_enabled``,
 ``default_tracked``) -- there is no clear-to-default sentinel since it
 always holds a concrete ``True``/``False``.
+
+``recently_processed_window_minutes`` (COL-167) follows the same "only
+change what's passed" rule as the backup/disk-space pairs above, with one
+extra guard: a negative value raises :class:`ValueError` (``0`` is valid --
+it means "no cooldown", not "unset"). :class:`~collapsarr.jobs.scheduler.
+JobScheduler` reads this field live from the row on every "recently
+processed" dedup check (see that module's docstring), so a change here is
+live on the *very next* check, no restart or scheduler reconstruction
+needed -- unlike ``concurrency_limit``, whose worker-pool thread count is
+still fixed at construction.
+
+``auto_queue_paused`` (COL-174, "Auto-Queuing Pause") follows the same
+"only change what's passed" rule as every other boolean field here
+(``ui_auth_enabled``, ``default_tracked``, ``auto_set_default_audio``).
+:class:`~collapsarr.jobs.scheduler.JobScheduler` reads it live from the row
+at the top of every :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up`
+call, so a change here takes effect on the very next auto-fill attempt with
+no restart or scheduler reconstruction -- see that method's docstring for
+exactly what it does and does not gate.
 """
 
 from __future__ import annotations
@@ -194,6 +213,8 @@ def update_global_settings(
     default_audio_language: str | None | _Unset = _UNSET,
     default_audio_channel_tier: DownmixTarget | None | _Unset = _UNSET,
     auto_set_default_audio: bool | None = None,
+    recently_processed_window_minutes: int | None = None,
+    auto_queue_paused: bool | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -317,6 +338,15 @@ def update_global_settings(
         )
     if auto_set_default_audio is not None:
         settings.auto_set_default_audio = auto_set_default_audio
+    if recently_processed_window_minutes is not None:
+        if recently_processed_window_minutes < 0:
+            raise ValueError(
+                "recently_processed_window_minutes must be >= 0 (0 disables the "
+                f"cooldown); got {recently_processed_window_minutes!r}"
+            )
+        settings.recently_processed_window_minutes = recently_processed_window_minutes
+    if auto_queue_paused is not None:
+        settings.auto_queue_paused = auto_queue_paused
 
     session.commit()
     session.refresh(settings)

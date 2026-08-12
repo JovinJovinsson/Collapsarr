@@ -22,6 +22,7 @@ from collapsarr.settings.models import (
     AUTH_METHOD_FORMS,
     AUTH_REQUIRED_ENABLED,
     AUTH_REQUIRED_LOCAL_BYPASS,
+    DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES,
     LOG_LEVEL_DEBUG,
     LOG_LEVEL_INFO,
     UPDATE_CHANNEL_BETA,
@@ -698,6 +699,106 @@ def test_update_global_settings_auto_set_default_audio_is_switchable_back_off(
     updated = update_global_settings(session, auto_set_default_audio=False)
 
     assert updated.auto_set_default_audio is False
+
+
+# ---------------------------------------------------------------------------
+# Recently-Processed Window (COL-167).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_recently_processed_window_default(session: Session) -> None:
+    """COL-167: a fresh row defaults to a 360-minute (6h) dedup cooldown."""
+    settings = get_global_settings(session)
+
+    assert settings.recently_processed_window_minutes == DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES
+
+
+def test_update_global_settings_updates_recently_processed_window(session: Session) -> None:
+    updated = update_global_settings(session, recently_processed_window_minutes=90)
+
+    assert updated.recently_processed_window_minutes == 90
+
+
+def test_update_global_settings_recently_processed_window_accepts_zero(session: Session) -> None:
+    """COL-167: 0 is a valid value meaning 'no cooldown', not 'unset'."""
+    updated = update_global_settings(session, recently_processed_window_minutes=0)
+
+    assert updated.recently_processed_window_minutes == 0
+
+
+def test_update_global_settings_rejects_a_negative_recently_processed_window(
+    session: Session,
+) -> None:
+    with pytest.raises(ValueError, match="recently_processed_window_minutes"):
+        update_global_settings(session, recently_processed_window_minutes=-1)
+
+
+def test_update_global_settings_omitting_recently_processed_window_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, recently_processed_window_minutes=45)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.recently_processed_window_minutes == 45
+
+
+def test_update_global_settings_recently_processed_window_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, recently_processed_window_minutes=15)
+
+    reread = get_global_settings(session)
+
+    assert reread.recently_processed_window_minutes == 15
+
+
+# ---------------------------------------------------------------------------
+# Auto-Queuing Pause (COL-174).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_auto_queue_paused_to_false(session: Session) -> None:
+    """AC: the new toggle defaults to off -- auto-fill runs unless paused explicitly."""
+    settings = get_global_settings(session)
+
+    assert settings.auto_queue_paused is False
+
+
+def test_update_global_settings_updates_auto_queue_paused(session: Session) -> None:
+    updated = update_global_settings(session, auto_queue_paused=True)
+
+    assert updated.auto_queue_paused is True
+
+
+def test_update_global_settings_auto_queue_paused_is_switchable_back_off(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    updated = update_global_settings(session, auto_queue_paused=False)
+
+    assert updated.auto_queue_paused is False
+
+
+def test_update_global_settings_omitting_auto_queue_paused_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.auto_queue_paused is True
+
+
+def test_update_global_settings_auto_queue_paused_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    reread = get_global_settings(session)
+
+    assert reread.auto_queue_paused is True
 
 
 # ---------------------------------------------------------------------------

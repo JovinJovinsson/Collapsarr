@@ -1,11 +1,49 @@
-"""Job queue and bounded-concurrency worker pool (COL-20).
+"""Job queue and persistent priority-pull worker pool (COL-20, COL-164).
 
 Wires the Downmix Engine's end-to-end pipeline
 (:func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`, COL-19) to a job
 queue: :meth:`JobQueue.enqueue` a file plus its target/language context (a
-:class:`~collapsarr.downmix.targets.DownmixSettings`), then
-:meth:`JobQueue.run_pending` drains the queue, running at most
-``max_concurrency`` jobs at once (default 1).
+:class:`~collapsarr.downmix.targets.DownmixSettings`) and it runs, on its own,
+as soon as one of the pool's ``max_concurrency`` worker threads is free.
+
+**Priority-pull worker pool (COL-164, ADR 0007).** ``JobQueue`` runs a fixed
+pool of ``max_concurrency`` worker threads, started once by :meth:`start` and
+living for the process lifetime -- not a fresh
+:class:`~concurrent.futures.ThreadPoolExecutor` per
+drain cycle. Each worker loops forever: it *claims* the lowest-``priority``
+still-``PENDING`` :class:`Job` from the shared, lock-protected ``_jobs`` map
+(atomically flipping it ``PENDING`` -> ``RUNNING`` so no two workers claim the
+same Job), runs it through the pipeline, then loops back for the next one. A
+Job enqueued while every worker is busy is picked up the instant one frees --
+there is no "batch" whose run order is frozen at submit time. This is what
+makes reordering and cancelling not-yet-started work meaningful right up to the
+moment a worker claims a Job:
+
+* :meth:`cancel` removes a still-``PENDING`` Job from ``_jobs`` so it never
+  runs (returning ``False``, not raising, if a worker already claimed it).
+* :meth:`bump_to_front` reassigns a still-``PENDING`` Job's ``priority`` below
+  every other pending Job's, so it is claimed next.
+
+Callers that need to block until the queue has drained (tests, orderly
+shutdown) use :meth:`wait_idle`; :meth:`shutdown` stops the pool, letting any
+in-flight Job finish first. These are internal ``JobQueue``-level Python APIs;
+the HTTP/bulk layer that builds on them is a later slice (COL-161).
+
+**Restart-durable rehydration (COL-166).** The in-memory ``_jobs`` map above
+starts empty on every process restart, but a ``PENDING`` ``JobHistory`` row
+written before the restart survives (it is a durable DB row) with nothing
+left to run it -- a "ghost pending row." :func:`~collapsarr.jobs.rehydrate.
+rehydrate_pending_jobs` (a separate module -- see the note on this module's
+own imports below for why) fixes that at startup: it reads every ``PENDING``
+row, ordered by persisted ``priority``, rebuilds each as a live Job with
+settings/preference re-derived fresh from the *current*
+:class:`~collapsarr.settings.models.GlobalSettings` row (never replayed from
+the row's stored ``target``/``language`` summary, which may now be stale),
+and pushes the result onto a queue via :meth:`JobQueue.rehydrate` --
+preserving each Job's original ``priority`` rather than renumbering it. It
+also seeds :attr:`JobQueue._next_priority` first, via :meth:`JobQueue.
+seed_next_priority` -- see that method's docstring, and the comment on
+``_next_priority``'s own definition below, for why.
 
 Each job's execution invokes the pipeline synchronously in a worker thread
 and captures whatever it returns (or, as a safety net, whatever it raises)
@@ -25,7 +63,15 @@ is configured, that same worker thread calls it -- but only for a job that
 reached ``SUCCEEDED`` -- so the file's just-processed ``(language, target)``
 pairs flip to ``PROCESSED`` in tracked media (COL-95,
 :mod:`collapsarr.jobs.tracked_media`), the Wanted view's data source,
-immediately rather than only after the next scan re-probes the file.
+immediately rather than only after the next scan re-probes the file. Finally,
+when a job-terminal hook is set (:meth:`JobQueue.set_job_terminal_hook`), that
+same worker thread calls it too -- for *every* terminal job, success or
+failure alike, unconditionally. :class:`~collapsarr.jobs.scheduler.
+JobScheduler` wires its own :meth:`~collapsarr.jobs.scheduler.JobScheduler.
+top_up` here (COL-171), so a Job finishing anywhere immediately re-tops-up
+the Auto-Queue Limit's budget if a slot just freed -- see that method's
+docstring for the full algorithm and a re-entrancy/deadlock analysis of
+calling back into this queue from its own worker thread.
 
 This module deliberately does not import :mod:`collapsarr.jobs.history`,
 :mod:`collapsarr.jobs.failure_notify`, or :mod:`collapsarr.jobs.tracked_media`
@@ -55,19 +101,18 @@ always has); :meth:`enqueue_default_audio` (COL-155) creates a
 matches ``job.kind``.
 
 Threads, not asyncio: every stage of the downmix pipeline shells out to
-``ffprobe``/``ffmpeg`` via blocking :mod:`subprocess` calls, so a small
-:class:`~concurrent.futures.ThreadPoolExecutor` sized to ``max_concurrency``
-gives genuine bounded parallelism (the GIL is released for the whole
-``subprocess.run`` call) without pulling the rest of this synchronous
-codebase onto an event loop.
+``ffprobe``/``ffmpeg`` via blocking :mod:`subprocess` calls, so a small pool
+of ``max_concurrency`` worker threads gives genuine bounded parallelism (the
+GIL is released for the whole ``subprocess.run`` call) without pulling the
+rest of this synchronous codebase onto an event loop.
 
-``max_concurrency`` is a plain constructor argument, the same "Settings-
-shaped stand-in" pattern :class:`~collapsarr.downmix.targets.DownmixSettings`
-already uses -- there is no persisted Settings model yet. It defaults to 1,
-and :meth:`JobQueue.from_settings` sources it from
-:class:`~collapsarr.config.Settings`'s ``job_max_concurrency`` (env
-``COLLAPSARR_JOB_MAX_CONCURRENCY``), which is the closest thing this repo has
-to a Settings store today.
+``max_concurrency`` is a plain constructor argument. It defaults to 1, and
+:meth:`JobQueue.from_settings` sources it from the persisted
+:class:`~collapsarr.settings.models.GlobalSettings` row's
+``concurrency_limit`` field (COL-165, editable from the Settings UI) --
+read once, at construction time, so a change made in the UI takes effect
+only after a restart (the pool is a fixed-size thread pool for its whole
+process lifetime; there is no live resizing, see :meth:`JobQueue.from_settings`).
 
 :meth:`JobQueue._run_job` also logs the job lifecycle (COL-129), via a
 module logger -- so it lands in the rotating log file COL-128 wires up: an
@@ -85,22 +130,23 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
-
-from sqlalchemy.orm import Session, sessionmaker
 
 from collapsarr.config import Settings, get_settings
 from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.default_audio_pipeline import run_default_audio_pipeline
 from collapsarr.downmix.pipeline import PipelineResult, run_downmix_pipeline
 from collapsarr.downmix.targets import DownmixSettings
+
+if TYPE_CHECKING:
+    from collapsarr.settings.models import GlobalSettings
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +202,22 @@ class Job:
     empty and are filled in by the queue as the job runs -- never mutate
     them directly.
 
+    ``priority`` (COL-163) likewise starts at a placeholder (``0``) and is
+    immediately overwritten by :meth:`JobQueue._enqueue` -- a plain,
+    lock-guarded counter on the owning :class:`JobQueue` -- with the next
+    value in a monotonically increasing per-queue sequence, so it reads as
+    "join position": the first job ever enqueued on a queue gets ``0``, the
+    next ``1``, and so on, shared across :meth:`JobQueue.enqueue` and
+    :meth:`JobQueue.enqueue_default_audio` (both funnel through
+    :meth:`_enqueue`) so the two kinds interleave into one ordering rather
+    than each keeping its own. The priority-pull worker pool (COL-164) reads
+    ``priority`` back to choose what runs next: a free worker always claims the
+    lowest-``priority`` still-``PENDING`` Job, so lower means "runs sooner."
+    :meth:`JobQueue.bump_to_front` exploits this by dropping a Job's
+    ``priority`` below every other pending Job's (which can push it negative --
+    ``priority`` is an ordering key, not a count), leaving the monotonic
+    ``_next_priority`` counter that hands out join positions untouched.
+
     ``kind`` (COL-155) selects which pipeline the job runs -- ``DOWNMIX``
     (the default, and only kind before COL-155) uses ``settings``;
     ``SET_DEFAULT_AUDIO`` uses ``preference`` instead. ``settings`` stays a
@@ -186,6 +248,7 @@ class Job:
     id: UUID = field(default_factory=uuid4)
     kind: JobKind = JobKind.DOWNMIX
     preference: DefaultAudioPreference | None = None
+    priority: int = 0
     status: JobStatus = JobStatus.PENDING
     result: PipelineResult | None = None
     error: BaseException | None = None
@@ -228,6 +291,19 @@ FailureNotifier = Callable[[Job], None]
 #: appearing in the Wanted view without waiting for the next scan (COL-95).
 TrackedMediaRecorder = Callable[[Job], None]
 
+#: Signature a job-terminal hook must match: called after *every* Job reaches
+#: a terminal status -- ``SUCCEEDED`` or ``FAILED`` alike, unconditionally
+#: (unlike ``failure_notifier``/``tracked_media_recorder``, each gated on one
+#: specific terminal status). :class:`~collapsarr.jobs.scheduler.JobScheduler`
+#: wires its :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up` here
+#: (COL-171), so a Job finishing -- for any reason -- immediately re-tops-up
+#: the Auto-Queue Limit's budget if a slot just freed. Must be safe to call
+#: concurrently (same requirement as the three recorders above) and must
+#: never raise -- see :meth:`JobQueue._call_job_terminal_hook`, which
+#: defensively swallows any exception the hook raises so a hook problem can
+#: never fail the Job it just finished, or the worker thread running it.
+JobTerminalHook = Callable[[Job], None]
+
 
 class JobQueue:
     """Bounded-concurrency queue that runs the downmix pipeline per enqueued file.
@@ -235,18 +311,23 @@ class JobQueue:
     Usage::
 
         queue = JobQueue(max_concurrency=2)
-        queue.enqueue("/media/movie.mkv", DownmixSettings())
-        queue.enqueue("/media/episode.mkv", DownmixSettings())
-        jobs = queue.run_pending()  # blocks until both have run
+        queue.start()  # spin up the worker pool
+        queue.enqueue("/media/movie.mkv", DownmixSettings())     # runs in the pool
+        queue.enqueue("/media/episode.mkv", DownmixSettings())   # runs in the pool
+        queue.wait_idle()  # block until both have finished (e.g. in a test)
+        queue.shutdown()
 
-    :meth:`run_pending` snapshots whatever is pending at the moment it is
-    called and runs exactly that batch, respecting ``max_concurrency``, then
-    returns those jobs (each updated in place with its final ``status`` and
-    ``result``). Jobs enqueued *during* a call are not picked up by it --
-    call :meth:`run_pending` again for a later batch. This keeps behaviour
-    simple and fully deterministic for tests; a long-running background
-    worker loop is left for a future scheduler ticket to build on top of
-    this primitive.
+    Once :meth:`start` has spun up the pool of ``max_concurrency`` worker
+    threads, each :meth:`enqueue`/:meth:`enqueue_default_audio` makes its Job
+    immediately eligible to run -- so there is no batch to "drain": a free
+    worker claims the lowest-``priority`` pending Job and runs it, in place,
+    updating its ``status``/``result``. Before :meth:`start` (or after
+    :meth:`shutdown`), enqueue just records a ``PENDING`` Job that waits for
+    the pool. Because work runs asynchronously, callers that must observe
+    completion (tests, orderly shutdown) call :meth:`wait_idle` to block until
+    nothing is ``PENDING`` or ``RUNNING``; :meth:`shutdown` stops the pool,
+    letting any in-flight Job finish first. :class:`JobQueue` is also a context
+    manager, shutting the pool down on exit.
 
     ``history_recorder``, when set, is called with each :class:`Job` three
     times over its lifecycle: immediately on :meth:`enqueue` (``PENDING``,
@@ -256,10 +337,9 @@ class JobQueue:
     visible in job history the instant it's queued, not only once it
     finishes (COL-108). See :func:`collapsarr.jobs.history.
     make_history_recorder` for the constructor that builds one bound to a
-    real DB session factory. Since :meth:`run_pending` runs jobs across a
-    :class:`~concurrent.futures.ThreadPoolExecutor` (up to ``max_concurrency``
-    at once), ``history_recorder`` must itself be safe to call concurrently
-    from multiple threads; :func:`~collapsarr.jobs.history.
+    real DB session factory. Since the worker pool runs jobs on up to
+    ``max_concurrency`` threads at once, ``history_recorder`` must itself be
+    safe to call concurrently from multiple threads; :func:`~collapsarr.jobs.history.
     make_history_recorder` satisfies this by opening a fresh
     :class:`~sqlalchemy.orm.Session` per call rather than sharing one --
     SQLAlchemy sessions aren't thread-safe, but a ``sessionmaker`` safely
@@ -323,7 +403,56 @@ class JobQueue:
         self._failure_notifier = failure_notifier
         self._tracked_media_recorder = tracked_media_recorder
         self._lock = threading.Lock()
+        #: Guards every access to ``_jobs``/``_next_priority``/``_shutdown``
+        #: and coordinates the worker pool. Workers ``wait`` on it for a
+        #: claimable Job; :meth:`_enqueue`/:meth:`bump_to_front`/:meth:`shutdown`
+        #: ``notify_all`` it. :meth:`wait_idle` waits on it for the queue to
+        #: drain. Wraps ``_lock``, so every ``with self._lock:`` block below is
+        #: equally a critical section of this condition.
+        self._cond = threading.Condition(self._lock)
         self._jobs: dict[UUID, Job] = {}
+        #: Next value :meth:`_enqueue` will hand out as a job's ``priority``
+        #: (COL-163) -- a plain lock-guarded counter, starting at 0 and
+        #: incrementing once per enqueued job (across both ``enqueue`` and
+        #: ``enqueue_default_audio``), so "priority" reads as join order:
+        #: lower means enqueued earlier. Only ever moves forward;
+        #: :meth:`bump_to_front` reorders by lowering a Job's own ``priority``,
+        #: never by rewinding this counter. This is *process-local* only: it
+        #: resets to 0 on construction, so on a fresh restart it would hand out
+        #: values that collide with rows already on disk unless seeded first.
+        #: :meth:`seed_next_priority` (COL-166) is how a caller doing restart
+        #: rehydration fixes that -- called with ``max(persisted priority) + 1``
+        #: across *every* ``JobHistory`` row (not just the ``PENDING`` ones
+        #: being rehydrated, since a completed/failed row may carry a higher
+        #: priority than any pending one) before any post-restart job is
+        #: enqueued, so freshly-submitted work always sorts *after* every
+        #: rehydrated job rather than wrongly jumping the queue.
+        self._next_priority = 0
+        #: Callback invoked after every Job reaches a terminal status, success or
+        #: failure alike (COL-171) -- ``None`` until
+        #: :meth:`set_job_terminal_hook` is called. Late-bound via a setter
+        #: rather than a constructor argument because
+        #: :class:`~collapsarr.jobs.scheduler.JobScheduler` (its only
+        #: caller) takes an already-constructed :class:`JobQueue` as its own
+        #: first constructor argument -- the queue has to exist before the
+        #: scheduler that wires the hook does. See :meth:`set_job_terminal_hook`.
+        self._job_terminal_hook: JobTerminalHook | None = None
+        #: The persistent worker pool (COL-164). Started explicitly by a
+        #: :meth:`start` call (never implicitly on enqueue), then lives until
+        #: :meth:`shutdown` (or process exit -- the threads are daemons).
+        #: :meth:`_enqueue` does *not* start it; it only ``notify_all``s to
+        #: wake any workers already waiting for a claimable Job.
+        self._workers: list[threading.Thread] = []
+        self._started = False
+        #: Set by :meth:`shutdown`; tells every idle worker to exit its loop.
+        self._shutdown = False
+        #: Count of jobs a worker has claimed but not yet *fully* finished --
+        #: including the post-run history/tracked-media/failure side effects,
+        #: not just the pipeline call. :meth:`wait_idle` blocks while this is
+        #: non-zero (or anything is still ``PENDING``), so it doesn't return
+        #: until every side effect of every job has completed -- the guarantee
+        #: the old ``run_pending`` gave by joining its futures.
+        self._active = 0
 
     @classmethod
     def from_settings(
@@ -337,12 +466,19 @@ class JobQueue:
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
     ) -> JobQueue:
-        """Build a :class:`JobQueue` whose concurrency cap comes from Settings.
+        """Build a :class:`JobQueue` whose concurrency cap comes from persisted Settings.
 
         ``settings`` defaults to the process-wide cached
-        :func:`~collapsarr.config.get_settings`. Its ``job_max_concurrency``
-        (default 1, env ``COLLAPSARR_JOB_MAX_CONCURRENCY``) becomes
-        ``max_concurrency``.
+        :func:`~collapsarr.config.get_settings`, used here only to resolve the
+        database to read from. ``max_concurrency`` itself comes from the
+        persisted :class:`~collapsarr.settings.models.GlobalSettings` row's
+        ``concurrency_limit`` (default 1, editable from the Settings UI,
+        COL-165) -- read once here, at construction time, the same as every
+        other field this factory reads off that row. Changing it in the
+        Settings UI does not resize an already-running pool: the new value
+        only takes effect the next time the process (and so this factory)
+        starts, since the worker pool is a fixed-size thread pool for its
+        whole process lifetime (live resizing is out of scope).
 
         Unlike the raw :meth:`__init__` (where ``history_recorder``/
         ``failure_notifier``/``tracked_media_recorder`` default to ``None``
@@ -417,10 +553,18 @@ class JobQueue:
             create_session_factory,
         )
         from collapsarr.migrations import upgrade_to_head
+        from collapsarr.settings.service import get_global_settings
 
         upgrade_to_head(resolved)
         engine = create_engine_from_settings(resolved)
         session_factory = create_session_factory(engine)
+
+        # Read once here, at construction time: concurrency_limit (COL-165)
+        # sizes the pool below, and auto_set_default_audio (COL-152) feeds
+        # _resolve_pipeline_kwargs -- both come off this same singleton row,
+        # so one read serves both rather than opening a second session.
+        with session_factory() as session:
+            global_settings = get_global_settings(session)
 
         resolved_history_recorder = history_recorder
         if resolved_history_recorder is None:
@@ -441,9 +585,9 @@ class JobQueue:
             resolved_tracked_media_recorder = make_tracked_media_recorder(session_factory)
 
         return cls(
-            max_concurrency=resolved.job_max_concurrency,
+            max_concurrency=global_settings.concurrency_limit,
             pipeline_runner=pipeline_runner,
-            pipeline_kwargs=cls._resolve_pipeline_kwargs(pipeline_kwargs, session_factory),
+            pipeline_kwargs=cls._resolve_pipeline_kwargs(pipeline_kwargs, global_settings),
             default_audio_pipeline_runner=default_audio_pipeline_runner,
             history_recorder=resolved_history_recorder,
             failure_notifier=resolved_failure_notifier,
@@ -453,13 +597,15 @@ class JobQueue:
     @staticmethod
     def _resolve_pipeline_kwargs(
         pipeline_kwargs: Mapping[str, Any] | None,
-        session_factory: sessionmaker[Session],
+        global_settings: GlobalSettings,
     ) -> dict[str, Any]:
         """Fold the persisted Default Audio Track preference into ``pipeline_kwargs`` (COL-152).
 
-        Reads the singleton :class:`~collapsarr.settings.models.GlobalSettings`
-        row from ``session_factory`` (the same DB the recorders above bind to)
-        and, **only** when its opt-in ``auto_set_default_audio`` toggle is on,
+        Takes ``global_settings`` -- the same singleton
+        :class:`~collapsarr.settings.models.GlobalSettings` row
+        :meth:`from_settings` already reads once for ``concurrency_limit``
+        (COL-165), reused here rather than opening a second session -- and,
+        **only** when its opt-in ``auto_set_default_audio`` toggle is on,
         threads ``auto_set_default_audio=True`` plus the adapted
         ``default_audio_preference`` (:func:`~collapsarr.settings.service.
         as_default_audio_preference`) into the kwargs every enqueued downmix job
@@ -473,18 +619,13 @@ class JobQueue:
         keys already present are never overwritten -- so a test (or a future
         alternate wiring) can still pin its own values.
 
-        The imports below are deferred, matching the surrounding factory: the
+        The import below is deferred, matching the surrounding factory: the
         settings service pulls in the ORM/adapters, which don't need to load for
         a lightweight :meth:`__init__` construction that never touches Settings.
         """
-        from collapsarr.settings.service import (
-            as_default_audio_preference,
-            get_global_settings,
-        )
+        from collapsarr.settings.service import as_default_audio_preference
 
         resolved = dict(pipeline_kwargs or {})
-        with session_factory() as session:
-            global_settings = get_global_settings(session)
         if global_settings.auto_set_default_audio:
             resolved.setdefault("auto_set_default_audio", True)
             resolved.setdefault(
@@ -498,14 +639,29 @@ class JobQueue:
         """The configured cap on simultaneously running jobs."""
         return self._max_concurrency
 
+    def set_job_terminal_hook(self, hook: JobTerminalHook | None) -> None:
+        """Set (or clear, with ``None``) the job-terminal hook (COL-171).
+
+        Late-bound rather than constructor-injected -- see the attribute's
+        own docstring in :meth:`__init__` for why.
+        :class:`~collapsarr.jobs.scheduler.JobScheduler` calls this on its
+        own ``queue`` constructor argument, wiring :meth:`~collapsarr.jobs.
+        scheduler.JobScheduler.top_up` as the hook -- so production wiring in
+        :mod:`collapsarr.main` (which constructs the queue, then the
+        scheduler around it) needs no changes of its own to get this: simply
+        constructing a ``JobScheduler(job_queue, ...)`` wires it.
+        """
+        self._job_terminal_hook = hook
+
     def enqueue(self, file_path: str | Path, settings: DownmixSettings) -> Job:
         """Add a file + its target/language context to the queue as a ``DOWNMIX`` job.
 
-        Returns the created :class:`Job` (status ``PENDING``) immediately;
-        it is not run until a subsequent :meth:`run_pending` call. Persisted
-        via ``history_recorder`` (if configured) right away, so a job shows up
-        in job history -- and so the Activity view -- the instant it's
-        queued, rather than only once it finishes (COL-108).
+        Returns the created :class:`Job` (status ``PENDING``) immediately; a
+        free worker in the running pool then claims and runs it (or, if
+        :meth:`start` hasn't been called yet, it waits ``PENDING`` until the
+        pool starts). Persisted via ``history_recorder`` (if configured) right
+        away, so a job shows up in job history -- and so the Activity view --
+        the instant it's queued, rather than only once it finishes (COL-108).
         """
         job = Job(file_path=Path(file_path), settings=settings, kind=JobKind.DOWNMIX)
         return self._enqueue(job)
@@ -516,7 +672,7 @@ class JobQueue:
         """Add a file + its Default Audio Track preference as a ``SET_DEFAULT_AUDIO`` job (COL-155).
 
         Mirrors :meth:`enqueue` exactly, for the disposition-only fix: same
-        immediate ``PENDING`` job, same :meth:`run_pending` batch, same
+        immediate ``PENDING`` job, same worker pool runs it, same
         ``history_recorder`` visibility. The job's ``settings`` is a
         placeholder :class:`~collapsarr.downmix.targets.DownmixSettings`
         with an empty ``enabled_targets`` -- unused by :meth:`_run_job` for
@@ -539,11 +695,53 @@ class JobQueue:
         return self._enqueue(job)
 
     def _enqueue(self, job: Job) -> Job:
-        """Shared tail of :meth:`enqueue`/:meth:`enqueue_default_audio`: store + persist."""
-        with self._lock:
+        """Shared tail of :meth:`enqueue`/:meth:`enqueue_default_audio`: assign priority + persist.
+
+        ``job.priority`` (COL-163) is assigned here, under ``self._lock``,
+        atomically with the job's insertion into ``self._jobs`` -- so
+        priority order and ``self._jobs`` insertion order (what
+        :meth:`list_jobs` returns) always agree, and two jobs enqueued
+        concurrently from different threads never race to the same
+        priority value.
+
+        Wakes a worker (via ``notify_all``) so a running pool claims the new
+        Job as soon as one is free. If :meth:`start` hasn't been called yet the
+        notify is harmless (no workers are waiting) and the Job simply sits
+        ``PENDING`` until the pool starts -- so ``enqueue`` deterministically
+        returns a not-yet-run Job, and the pool's lifecycle stays explicit
+        (:meth:`start`/:meth:`shutdown`), owned by whoever built the queue.
+        """
+        with self._cond:
+            job.priority = self._next_priority
+            self._next_priority += 1
             self._jobs[job.id] = job
+            self._cond.notify_all()
         self._record_history(job)
         return job
+
+    def start(self) -> None:
+        """Start the persistent worker pool (COL-164). Idempotent.
+
+        Spawns ``max_concurrency`` daemon worker threads that live until
+        :meth:`shutdown` (or process exit). Safe to call before or after work
+        is enqueued -- workers pick up whatever is already ``PENDING`` on their
+        first pass. A second call, or a call after :meth:`shutdown`, is a
+        no-op (the pool is never resurrected).
+        """
+        with self._cond:
+            if self._started or self._shutdown:
+                return
+            self._workers = [
+                threading.Thread(
+                    target=self._worker_loop,
+                    name=f"collapsarr-jobworker-{index}",
+                    daemon=True,
+                )
+                for index in range(self._max_concurrency)
+            ]
+            self._started = True
+            for worker in self._workers:
+                worker.start()
 
     def get_job(self, job_id: UUID) -> Job | None:
         """Return the job with ``job_id``, or ``None`` if no such job exists."""
@@ -555,48 +753,224 @@ class JobQueue:
         with self._lock:
             return list(self._jobs.values())
 
-    def run_pending(self) -> list[Job]:
-        """Run every currently-``PENDING`` job to completion, then return them.
+    def cancel(self, job_id: UUID) -> bool:
+        """Remove a still-``PENDING`` job so it never runs (COL-164).
 
-        Runs the batch through a :class:`~concurrent.futures.ThreadPoolExecutor`
-        sized to ``max_concurrency``, so at most that many jobs execute the
-        pipeline at once; with ``max_concurrency=1`` the executor has a
-        single worker, so jobs run strictly one at a time, in the order they
-        were enqueued.
+        Returns ``True`` if the job was pending and has now been removed --
+        it will not run, and no longer appears in :meth:`list_jobs`. Returns
+        ``False`` (not an error) if the job is unknown or a worker has already
+        claimed it (its status is no longer ``PENDING``): that's just "too
+        late," and the already-claimed job runs to completion normally.
 
-        Blocks until the whole batch has finished. Returns an empty list if
-        nothing was pending. Each returned :class:`Job` has been updated in
-        place with its final ``status`` and ``result``/``error``, and -- if
-        this queue was built with a ``history_recorder`` -- already
-        persisted via it.
+        Does **not** delete the job's ``JobHistory`` row (its ``PENDING`` row,
+        written at enqueue, stays as-is): row cleanup is a later slice's
+        concern, not this primitive's.
+        """
+        with self._cond:
+            job = self._jobs.get(job_id)
+            if job is None or job.status is not JobStatus.PENDING:
+                return False
+            del self._jobs[job_id]
+            self._cond.notify_all()  # a waiter in wait_idle may now be idle
+            return True
+
+    def bump_to_front(self, job_id: UUID) -> bool:
+        """Make a still-``PENDING`` job the next one a free worker claims (COL-164).
+
+        Reassigns the job's ``priority`` to one below the current minimum
+        pending priority, so it sorts ahead of every other pending job. Returns
+        ``True`` on success, ``False`` (not an error) if the job is unknown or
+        already claimed/terminal -- the same "too late" contract as
+        :meth:`cancel`.
+
+        The new value can be negative; ``priority`` is only ever compared, so
+        that's fine, and the monotonic ``_next_priority`` counter is left
+        alone -- future enqueues keep getting fresh, ever-increasing join
+        positions that never collide with a bumped job's.
+        """
+        with self._cond:
+            job = self._jobs.get(job_id)
+            if job is None or job.status is not JobStatus.PENDING:
+                return False
+            min_pending = min(
+                pending.priority
+                for pending in self._jobs.values()
+                if pending.status is JobStatus.PENDING
+            )
+            job.priority = min_pending - 1
+            self._cond.notify_all()
+            return True
+
+    def seed_next_priority(self, min_value: int) -> None:
+        """Raise :attr:`_next_priority` to at least ``min_value`` (COL-166).
+
+        Called once, at process startup, by restart rehydration
+        (:func:`~collapsarr.jobs.rehydrate.rehydrate_pending_jobs`) with
+        ``max(persisted priority) + 1`` across *every* persisted
+        ``JobHistory`` row -- not only the still-``PENDING`` ones being
+        rehydrated onto this queue, since a completed/failed row can carry a
+        higher ``priority`` than any pending one, and this counter must clear
+        every value already written to disk, not just the ones coming back as
+        live Jobs. Never lowers the counter -- a no-op if ``min_value`` is not
+        greater than the current value, so calling this on an already-used
+        queue (or with a stale/smaller value) can't rewind priorities that
+        were already handed out.
         """
         with self._lock:
-            batch = [job for job in self._jobs.values() if job.status is JobStatus.PENDING]
-        if not batch:
-            return []
+            if min_value > self._next_priority:
+                self._next_priority = min_value
 
-        with ThreadPoolExecutor(max_workers=self._max_concurrency) as executor:
-            futures = [executor.submit(self._run_job, job) for job in batch]
-            for future in futures:
-                future.result()  # re-raise any unexpected executor-level error
+    def rehydrate(self, jobs: Iterable[Job]) -> None:
+        """Insert already-constructed, still-``PENDING`` Jobs directly into the queue (COL-166).
 
-        return batch
+        Unlike :meth:`enqueue`/:meth:`enqueue_default_audio` (which funnel
+        through :meth:`_enqueue` to assign a fresh join-order ``priority``),
+        this trusts each ``job.priority`` as given -- restart rehydration
+        (:func:`~collapsarr.jobs.rehydrate.rehydrate_pending_jobs`) builds
+        ``jobs`` from persisted ``JobHistory`` rows and needs their *original*
+        priority order preserved relative to each other, not renumbered as if
+        they were just enqueued. Callers must seed :attr:`_next_priority`
+        past every persisted priority first (:meth:`seed_next_priority`) so a
+        subsequent fresh :meth:`enqueue` never collides with -- or wrongly
+        sorts ahead of -- a rehydrated Job's priority.
+
+        Does not call ``history_recorder``: every rehydrated Job already has a
+        matching ``PENDING`` ``JobHistory`` row (that's precisely where it was
+        read from), so there is nothing new to persist here -- the row is
+        brought up to date automatically the next time this Job actually runs
+        (:meth:`_run_job` records it again on the ``RUNNING`` transition and
+        again on completion, each time recomputing ``target``/``language``
+        from the Job's live ``settings``/``preference``).
+
+        Wakes any worker already waiting on a claimable Job (harmless, and a
+        no-op, if the pool hasn't been started yet -- the ordinary case, since
+        rehydration runs before :meth:`start` at process startup).
+        """
+        with self._cond:
+            for job in jobs:
+                self._jobs[job.id] = job
+            self._cond.notify_all()
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until no job is ``PENDING`` or ``RUNNING`` (COL-164).
+
+        The replacement for the old ``run_pending`` "blocks until the batch
+        finished" guarantee, decoupled from submission: it simply waits for
+        the whole queue to drain. Returns ``True`` once idle, or ``False`` if
+        ``timeout`` (seconds) elapsed first. With no ``timeout`` it waits
+        indefinitely. Returns immediately when the queue is already idle
+        (including a never-used queue whose pool never started).
+        """
+        with self._cond:
+            if timeout is None:
+                while self._has_active_work_locked():
+                    self._cond.wait()
+                return True
+            deadline = time.monotonic() + timeout
+            while self._has_active_work_locked():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return not self._has_active_work_locked()
+                self._cond.wait(remaining)
+            return True
+
+    def _has_active_work_locked(self) -> bool:
+        """Whether work is still in flight (call with the lock held).
+
+        True while any job a worker has claimed is still being processed
+        (``_active``), or any job is still ``PENDING`` and waiting to be
+        claimed.
+        """
+        if self._active > 0:
+            return True
+        return any(job.status is JobStatus.PENDING for job in self._jobs.values())
+
+    def shutdown(self, *, wait: bool = True, timeout: float | None = None) -> None:
+        """Stop the worker pool; any job a worker already claimed still finishes.
+
+        Idempotent. Signals every worker to exit once it finishes whatever it
+        is currently running (there is no interruption of an in-flight
+        ``ffmpeg`` -- ADR 0007) and, when ``wait`` (the default), joins the
+        worker threads before returning. After shutdown the queue accepts no
+        new work: a later :meth:`enqueue` records the job but never starts a
+        pool to run it.
+        """
+        with self._cond:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            self._cond.notify_all()
+            workers = list(self._workers)
+        if wait:
+            for worker in workers:
+                worker.join(timeout=timeout)
+
+    def __enter__(self) -> JobQueue:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.shutdown()
+
+    def _worker_loop(self) -> None:
+        """One pool worker: claim the next job, run it, repeat until shutdown (COL-164)."""
+        while True:
+            job = self._claim_next()
+            if job is None:  # shutdown signalled while idle
+                return
+            self._run_job(job)
+
+    def _claim_next(self) -> Job | None:
+        """Block until a job is claimable, atomically claim it, and return it.
+
+        Returns the lowest-``priority`` still-``PENDING`` job, flipped to
+        ``RUNNING`` under the lock so no other worker can claim it and a
+        concurrent :meth:`cancel` correctly loses the race (sees it already
+        non-``PENDING``). Returns ``None`` only when :meth:`shutdown` was
+        signalled while this worker was idle -- the worker's cue to exit.
+        """
+        with self._cond:
+            while True:
+                if self._shutdown:
+                    return None
+                job = self._lowest_priority_pending_locked()
+                if job is not None:
+                    job.status = JobStatus.RUNNING
+                    job.started_at = datetime.now(UTC)
+                    self._active += 1  # stays counted until _run_job fully finishes
+                    return job
+                self._cond.wait()
+
+    def _lowest_priority_pending_locked(self) -> Job | None:
+        """The pending job a free worker should claim next (call with the lock held).
+
+        A linear scan for the minimum ``priority`` among ``PENDING`` jobs --
+        the queue holds media-library-scale job counts, so an O(n) pick per
+        claim is simpler and less error-prone than a heap that would also have
+        to support :meth:`cancel`'s arbitrary removal and
+        :meth:`bump_to_front`'s key decrease.
+        """
+        pending = [job for job in self._jobs.values() if job.status is JobStatus.PENDING]
+        if not pending:
+            return None
+        return min(pending, key=lambda job: job.priority)
 
     def _run_job(self, job: Job) -> None:
-        """Execute one job's pipeline run, record its outcome, and persist/notify.
+        """Execute one already-claimed job's pipeline run, record its outcome, and persist/notify.
 
-        Runs entirely on the calling (worker) thread. ``self._history_recorder``
-        (if configured) is called once as ``job`` transitions to ``RUNNING``
-        (COL-108 -- so an in-progress job is already visible in job history,
-        not only once it finishes) and again once it reaches its terminal
-        status (``SUCCEEDED``/``FAILED``), which is also when
+        Runs entirely on the calling (worker) thread. ``job`` arrives already
+        claimed by :meth:`_claim_next` (status ``RUNNING``, ``started_at``
+        stamped, under the lock). ``self._history_recorder`` (if configured)
+        is called once here for that ``RUNNING`` transition (COL-108 -- so an
+        in-progress job is already visible in job history, not only once it
+        finishes) and again once it reaches its terminal status
+        (``SUCCEEDED``/``FAILED``), which is also when
         ``self._record_tracked_media`` (a no-op unless the job actually
         ``SUCCEEDED`` and a ``tracked_media_recorder`` is configured, COL-95)
         and ``self._notify_failure`` (a no-op unless the job actually
         ``FAILED`` and a ``failure_notifier`` is configured) run -- all
         outside ``self._lock``, since by that point only this thread ever
-        touches this particular ``job`` (each job is submitted to the
-        executor exactly once), so there is nothing left to race against.
+        touches this particular ``job`` (each job is claimed by exactly one
+        worker), so there is nothing left to race against.
 
         Dispatches on ``job.kind`` (COL-155) for which runner actually
         executes the pipeline: ``DOWNMIX`` calls ``self._pipeline_runner``
@@ -605,44 +979,55 @@ class JobQueue:
         instead -- everything else below (history/tracked-media/failure
         handling) is identical for both kinds.
         """
-        with self._lock:
-            job.status = JobStatus.RUNNING
-            job.started_at = datetime.now(UTC)
-        self._record_history(job)
-        logger.info(
-            "job %s started: kind=%s file=%s %s",
-            job.id,
-            job.kind.value,
-            job.file_path,
-            _run_context_for_log(job),
-        )
-
         try:
-            if job.kind is JobKind.SET_DEFAULT_AUDIO:
-                assert job.preference is not None  # enqueue_default_audio always sets this
-                result = self._default_audio_pipeline_runner(job.file_path, job.preference)
-            else:
-                result = self._pipeline_runner(job.file_path, job.settings, **self._pipeline_kwargs)
-        except Exception as exc:  # noqa: BLE001 - captured as the job's outcome, not re-raised
+            self._record_history(job)
+            logger.info(
+                "job %s started: kind=%s file=%s %s",
+                job.id,
+                job.kind.value,
+                job.file_path,
+                _run_context_for_log(job),
+            )
+
+            try:
+                if job.kind is JobKind.SET_DEFAULT_AUDIO:
+                    assert job.preference is not None  # enqueue_default_audio always sets this
+                    result = self._default_audio_pipeline_runner(job.file_path, job.preference)
+                else:
+                    result = self._pipeline_runner(
+                        job.file_path, job.settings, **self._pipeline_kwargs
+                    )
+            except Exception as exc:  # noqa: BLE001 - captured as the job's outcome, not re-raised
+                with self._lock:
+                    job.error = exc
+                    job.status = JobStatus.FAILED
+                    job.ended_at = datetime.now(UTC)
+                logger.exception("job %s failed with an unexpected error", job.id)
+                self._record_history(job)
+                self._record_tracked_media(job)
+                self._notify_failure(job)
+                self._call_job_terminal_hook(job)
+                return
+
             with self._lock:
-                job.error = exc
-                job.status = JobStatus.FAILED
+                job.result = result
+                job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
                 job.ended_at = datetime.now(UTC)
-            logger.exception("job %s failed with an unexpected error", job.id)
+            if job.status is JobStatus.SUCCEEDED:
+                logger.info("job %s completed: file=%s -- %s", job.id, job.file_path, result.detail)
             self._record_history(job)
             self._record_tracked_media(job)
             self._notify_failure(job)
-            return
-
-        with self._lock:
-            job.result = result
-            job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
-            job.ended_at = datetime.now(UTC)
-        if job.status is JobStatus.SUCCEEDED:
-            logger.info("job %s completed: file=%s -- %s", job.id, job.file_path, result.detail)
-        self._record_history(job)
-        self._record_tracked_media(job)
-        self._notify_failure(job)
+            self._call_job_terminal_hook(job)
+        finally:
+            # Only now -- after every side effect -- is the job fully done, so
+            # this is where wait_idle is allowed to observe it as no longer
+            # active. The ``finally`` guarantees the count is released (and
+            # waiters woken) even if a recorder/notifier raised unexpectedly,
+            # so a stray side-effect error can never wedge wait_idle/shutdown.
+            with self._cond:
+                self._active -= 1
+                self._cond.notify_all()
 
     def _record_history(self, job: Job) -> None:
         """Persist ``job``'s current state, if configured to.
@@ -685,3 +1070,32 @@ class JobQueue:
             self._failure_notifier(job)
         except Exception:  # noqa: BLE001 - a notifier failure must never fail the job
             pass
+
+    def _call_job_terminal_hook(self, job: Job) -> None:
+        """Invoke the job-terminal hook for ``job``, if one is configured (COL-171).
+
+        Unlike :meth:`_notify_failure`/:meth:`_record_tracked_media` (each
+        gated on one specific terminal status), this fires for *every*
+        terminal ``job`` -- ``SUCCEEDED`` or ``FAILED`` alike -- since
+        :class:`~collapsarr.jobs.scheduler.JobScheduler`'s
+        :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up` (the hook
+        production wiring installs, via :meth:`set_job_terminal_hook`) needs
+        to re-check the Auto-Queue Limit's budget regardless of *why* a slot
+        just freed up.
+
+        Called from the worker thread, outside ``self._lock`` -- same as
+        ``_record_tracked_media``/``_notify_failure`` above, and for the same
+        reason: by this point only this thread still touches ``job``, so a
+        hook that itself enqueues more work (as ``top_up`` does) can safely
+        call back into this very :class:`JobQueue` (``list_jobs``/``enqueue``)
+        without this thread already holding a lock those methods also need --
+        no deadlock, no reentrancy. Wrapped in a defensive ``try``/``except``,
+        same as :meth:`_notify_failure`: a hook problem must never fail the
+        job it just finished, or wedge the worker loop.
+        """
+        if self._job_terminal_hook is None:
+            return
+        try:
+            self._job_terminal_hook(job)
+        except Exception:  # noqa: BLE001 - a hook failure must never fail the worker loop
+            logger.exception("job-terminal hook raised for job %s", job.id)

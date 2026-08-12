@@ -23,6 +23,7 @@ interface GeneralFormValues {
   surroundBitrateKbps: string;
   diskSpaceWarningPercent: string;
   diskSpaceErrorPercent: string;
+  recentlyProcessedWindowMinutes: string;
   defaultTracked: boolean;
 }
 
@@ -49,6 +50,10 @@ function validateGeneralForm(form: GeneralFormValues): string | null {
   const errorPercent = Number(form.diskSpaceErrorPercent);
   if (form.diskSpaceErrorPercent.trim() === "" || !Number.isFinite(errorPercent) || errorPercent <= 0 || errorPercent > 100) {
     return "Disk space critical threshold must be a percentage greater than 0 and at most 100.";
+  }
+  const recentlyProcessedWindow = Number(form.recentlyProcessedWindowMinutes);
+  if (form.recentlyProcessedWindowMinutes.trim() === "" || !Number.isInteger(recentlyProcessedWindow) || recentlyProcessedWindow < 0) {
+    return "Recently-processed window must be a whole number of 0 or more.";
   }
   return null;
 }
@@ -78,6 +83,7 @@ export function GeneralSection() {
     surroundBitrateKbps: "",
     diskSpaceWarningPercent: "5",
     diskSpaceErrorPercent: "2",
+    recentlyProcessedWindowMinutes: "360",
     defaultTracked: true,
   });
 
@@ -115,6 +121,7 @@ export function GeneralSection() {
             settings.surround_bitrate_kbps === null ? "" : String(settings.surround_bitrate_kbps),
           diskSpaceWarningPercent: String(settings.disk_space_warning_percent),
           diskSpaceErrorPercent: String(settings.disk_space_error_percent),
+          recentlyProcessedWindowMinutes: String(settings.recently_processed_window_minutes),
           defaultTracked: settings.default_tracked,
         });
         setState({ status: "ready" });
@@ -147,6 +154,7 @@ export function GeneralSection() {
           form.surroundBitrateKbps.trim() === "" ? null : Number(form.surroundBitrateKbps),
         disk_space_warning_percent: Number(form.diskSpaceWarningPercent),
         disk_space_error_percent: Number(form.diskSpaceErrorPercent),
+        recently_processed_window_minutes: Number(form.recentlyProcessedWindowMinutes),
         default_tracked: form.defaultTracked,
       });
       setServerApiKey(updated.api_key);
@@ -163,6 +171,7 @@ export function GeneralSection() {
           updated.surround_bitrate_kbps === null ? "" : String(updated.surround_bitrate_kbps),
         diskSpaceWarningPercent: String(updated.disk_space_warning_percent),
         diskSpaceErrorPercent: String(updated.disk_space_error_percent),
+        recentlyProcessedWindowMinutes: String(updated.recently_processed_window_minutes),
         defaultTracked: updated.default_tracked,
       });
       setSavedAt(Date.now());
@@ -367,7 +376,23 @@ export function GeneralSection() {
                 value={form.concurrencyLimit}
                 onChange={(event) => setForm({ ...form, concurrencyLimit: event.target.value })}
               />
-              <p className="form-hint">Maximum downmix jobs running at once.</p>
+              <p className="form-hint">
+                Maximum downmix jobs running at once. Restart Collapsarr for a change to take effect.
+              </p>
+            </div>
+
+            <div className="form-field form-field--narrow">
+              <label htmlFor="recently-processed-window">Recently-processed window (minutes)</label>
+              <input
+                id="recently-processed-window"
+                type="number"
+                min={0}
+                value={form.recentlyProcessedWindowMinutes}
+                onChange={(event) => setForm({ ...form, recentlyProcessedWindowMinutes: event.target.value })}
+              />
+              <p className="form-hint">
+                Cooldown period before a file is eligible for retry. Set to 0 to disable the cooldown.
+              </p>
             </div>
           </div>
 

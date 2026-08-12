@@ -68,6 +68,19 @@ class JobHistory(Base):
     created row and, via the migration that added this column, for every
     pre-existing row, so old and new history reads consistently as "this was
     a downmix job" without a manual backfill step.
+
+    ``priority`` (COL-163) mirrors the originating
+    :attr:`~collapsarr.jobs.queue.Job.priority` -- the join-order sequence
+    number :meth:`~collapsarr.jobs.queue.JobQueue._enqueue` assigns; its
+    Python-side ``default=0`` (like ``status``'s above) only matters for a
+    row built without going through :func:`~collapsarr.jobs.history.
+    record_job_history` (e.g. a test seeding a row directly) -- every real
+    job's row gets its actual priority explicitly. Its migration backfills
+    every pre-existing row from its own ``id`` (this table's insertion
+    order), so an upgrade doesn't scramble whatever ordering was already
+    implied by existing history. This is a pure prefactor -- nothing yet
+    reads this column back to change execution order (that is COL-164's
+    priority-pull worker pool).
     """
 
     __tablename__ = "job_history"
@@ -99,6 +112,7 @@ class JobHistory(Base):
         server_default=text("'downmix'"),
         index=True,
     )
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     ended_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)

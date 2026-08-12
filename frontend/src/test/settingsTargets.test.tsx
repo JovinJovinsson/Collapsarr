@@ -29,6 +29,8 @@ const baseSettings: GlobalSettings = {
   default_audio_language: null,
   default_audio_channel_tier: null,
   auto_set_default_audio: false,
+  recently_processed_window_minutes: 360,
+  auto_queue_paused: false,
   api_key: "server-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",

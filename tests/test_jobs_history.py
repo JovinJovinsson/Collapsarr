@@ -9,7 +9,8 @@ DB session -- see ``conftest.py``).
 The "automatic persistence" tests below (bottom section) instead wire
 :func:`~collapsarr.jobs.history.make_history_recorder` into
 :class:`~collapsarr.jobs.queue.JobQueue` itself and prove history shows up
-after :meth:`~collapsarr.jobs.queue.JobQueue.run_pending` *without* the test
+once the worker pool has drained (:meth:`~collapsarr.jobs.queue.JobQueue.start`
+then :meth:`~collapsarr.jobs.queue.JobQueue.wait_idle`) *without* the test
 ever calling ``record_job_history`` -- those build their own engine/session
 factory (via the ``settings`` fixture) rather than the single shared
 ``session`` fixture, since they need a ``sessionmaker`` to hand to
@@ -79,6 +80,7 @@ def test_record_job_history_persists_a_queued_job(session: Session) -> None:
     assert history.file_path == "/media/movie.mkv"
     assert history.status is JobStatus.PENDING
     assert history.kind is JobKind.DOWNMIX
+    assert history.priority == job.priority
     assert history.started_at is None
     assert history.ended_at is None
     assert history.exit_code is None
@@ -92,7 +94,8 @@ def test_record_job_history_persists_a_succeeded_run(session: Session) -> None:
         language_allow_list=frozenset({"eng", "jpn"}),
     )
     job = queue.enqueue("/media/movie.mkv", settings)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     history = record_job_history(session, job)
 
@@ -111,7 +114,8 @@ def test_record_job_history_persists_exit_code_and_error_on_remux_failure(
 ) -> None:
     queue = JobQueue(pipeline_runner=_stub_runner(_REMUX_FAILURE))
     job = queue.enqueue("/media/b.mkv", DownmixSettings())
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     history = record_job_history(session, job)
 
@@ -128,7 +132,8 @@ def test_record_job_history_persists_error_text_for_an_unexpected_exception(
 
     queue = JobQueue(pipeline_runner=raising_runner)
     job = queue.enqueue("/media/c.mkv", DownmixSettings())
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     history = record_job_history(session, job)
 
@@ -157,12 +162,43 @@ def test_record_job_history_upserts_the_same_row_across_lifecycle_calls(
     job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
     queued_history = record_job_history(session, job)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     finished_history = record_job_history(session, job)
 
     assert finished_history.id == queued_history.id
     assert finished_history.status is JobStatus.SUCCEEDED
     assert list_job_history(session) == [finished_history]
+
+
+def test_record_job_history_persists_priority_matching_the_jobs_enqueue_order(
+    session: Session,
+) -> None:
+    """COL-163: priority persists as each job's own join-order sequence number."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    first = queue.enqueue("/media/a.mkv", DownmixSettings())
+    second = queue.enqueue("/media/b.mkv", DownmixSettings())
+
+    first_history = record_job_history(session, first)
+    second_history = record_job_history(session, second)
+
+    assert (first_history.priority, second_history.priority) == (first.priority, second.priority)
+    assert first_history.priority < second_history.priority
+
+
+def test_record_job_history_keeps_priority_stable_across_lifecycle_calls(
+    session: Session,
+) -> None:
+    """Re-recording the same job as it runs never changes its persisted priority."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queued_history = record_job_history(session, job)
+    queue.start()
+    queue.wait_idle()
+    finished_history = record_job_history(session, job)
+
+    assert finished_history.priority == queued_history.priority == job.priority
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +209,8 @@ def test_record_job_history_upserts_the_same_row_across_lifecycle_calls(
 def _record(session: Session, queue: JobQueue, file_path: str, result: PipelineResult) -> Job:
     """Enqueue, run, and persist one job for the given (single-result) queue."""
     job = queue.enqueue(file_path, DownmixSettings())
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     record_job_history(session, job)
     return job
 
@@ -255,7 +292,8 @@ def _stub_default_audio_runner(result: PipelineResult) -> DefaultAudioPipelineRu
 def _record_default_audio(session: Session, queue: JobQueue, file_path: str) -> Job:
     """Enqueue, run, and persist one SET_DEFAULT_AUDIO job for the given queue."""
     job = queue.enqueue_default_audio(file_path, _PREFERENCE)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
     record_job_history(session, job)
     return job
 
@@ -265,7 +303,8 @@ def test_record_job_history_persists_a_set_default_audio_job_kind_and_preference
 ) -> None:
     queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner(_SUCCESS))
     job = queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     history = record_job_history(session, job)
 
@@ -345,10 +384,10 @@ def test_job_history_importable_from_package_root() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_pending_automatically_persists_history_when_a_recorder_is_configured(
+def test_worker_pool_automatically_persists_history_when_a_recorder_is_configured(
     settings: Settings,
 ) -> None:
-    """Every job run is persisted by run_pending() itself -- no manual call."""
+    """Every job run is persisted by the worker pool itself -- no manual call."""
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
@@ -359,7 +398,8 @@ def test_run_pending_automatically_persists_history_when_a_recorder_is_configure
     )
     job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()  # note: no record_job_history(...) call anywhere here
+    queue.start()
+    queue.wait_idle()  # note: no record_job_history(...) call anywhere here
 
     with session_factory() as read_session:
         rows = list_job_history(read_session)
@@ -377,7 +417,7 @@ def test_run_pending_automatically_persists_history_when_a_recorder_is_configure
 
 
 def test_enqueue_immediately_persists_a_pending_job(settings: Settings) -> None:
-    """A job is queryable in history the instant it's enqueued, before run_pending()."""
+    """A job is queryable in history the instant it's enqueued, before the pool runs it."""
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
@@ -399,7 +439,7 @@ def test_enqueue_immediately_persists_a_pending_job(settings: Settings) -> None:
     engine.dispose()
 
 
-def test_run_pending_persists_a_running_row_before_the_job_completes(settings: Settings) -> None:
+def test_worker_pool_persists_a_running_row_before_the_job_completes(settings: Settings) -> None:
     """The recorder observes RUNNING, not just terminal, as the job executes."""
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
@@ -414,13 +454,14 @@ def test_run_pending_persists_a_running_row_before_the_job_completes(settings: S
     queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS), history_recorder=recorder)
     queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     assert seen_statuses == [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCEEDED]
     engine.dispose()
 
 
-def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> None:
+def test_worker_pool_automatically_persists_a_failed_job(settings: Settings) -> None:
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
@@ -431,7 +472,8 @@ def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> 
     )
     queue.enqueue("/media/b.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     with session_factory() as read_session:
         rows = list_job_history(read_session, status=JobStatus.FAILED)
@@ -441,24 +483,25 @@ def test_run_pending_automatically_persists_a_failed_job(settings: Settings) -> 
     assert rows[0].error_text == _REMUX_FAILURE.detail
 
 
-def test_run_pending_with_no_history_recorder_persists_nothing(settings: Settings) -> None:
-    """No history_recorder configured -> run_pending works, nothing persisted."""
+def test_worker_pool_with_no_history_recorder_persists_nothing(settings: Settings) -> None:
+    """No history_recorder configured -> the worker pool works, nothing persisted."""
     engine = create_engine_from_settings(settings)
     upgrade_to_head(settings)
     session_factory = create_session_factory(engine)
 
     queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))  # no history_recorder
-    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    jobs = queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
-    assert jobs[0].status is JobStatus.SUCCEEDED  # the job itself still ran fine
+    assert job.status is JobStatus.SUCCEEDED  # the job itself still ran fine
     with session_factory() as read_session:
         assert list_job_history(read_session) == []
     engine.dispose()
 
 
-def test_run_pending_persists_history_for_every_concurrently_run_job(
+def test_worker_pool_persists_history_for_every_concurrently_run_job(
     settings: Settings,
 ) -> None:
     """A stronger proof that make_history_recorder is safe under real concurrency:
@@ -478,7 +521,8 @@ def test_run_pending_persists_history_for_every_concurrently_run_job(
     )
     jobs = [queue.enqueue(f"/media/{i}.mkv", DownmixSettings()) for i in range(6)]
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     with session_factory() as read_session:
         rows = list_job_history(read_session)
@@ -500,7 +544,8 @@ def test_from_settings_threads_history_recorder_through(settings: Settings) -> N
     )
     queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     with session_factory() as read_session:
         assert len(list_job_history(read_session)) == 1
@@ -521,7 +566,8 @@ def test_from_settings_with_no_history_recorder_arg_still_persists_by_default(
     queue = JobQueue.from_settings(settings, pipeline_runner=_stub_runner(_SUCCESS))
     job = queue.enqueue("/media/movie.mkv", DownmixSettings())
 
-    queue.run_pending()
+    queue.start()
+    queue.wait_idle()
 
     # Read back through an independent engine/session -- proves the data
     # actually landed in settings' database, not just in some in-memory

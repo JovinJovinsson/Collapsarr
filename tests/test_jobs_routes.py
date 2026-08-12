@@ -1,7 +1,9 @@
 """Contract tests for the job history & trigger REST endpoints (COL-29).
 
 Covers request/response shape and the API-key-required behaviour (COL-26) for
-``GET /api/jobs/history``, ``POST /api/jobs/scan``, and ``POST /api/jobs/trigger``.
+``GET /api/jobs/history``, ``POST /api/jobs/scan``, ``POST /api/jobs/trigger``,
+``POST /api/jobs/requeue`` (COL-170), and ``POST /api/jobs/requeue-failed``
+(COL-172).
 
 History rows are seeded through the real :class:`~collapsarr.jobs.models.JobHistory`
 model into the same SQLite file the ``client`` app reads (via the shared
@@ -17,7 +19,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from pathlib import Path
+from uuid import UUID, uuid4
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -29,13 +33,16 @@ from collapsarr.arr.catalog import (
     RadarrCatalog,
     SonarrCatalog,
 )
+from collapsarr.arr.files import MonitoredFile
 from collapsarr.arr.models import ArrInstance, InstanceType
 from collapsarr.config import Settings
 from collapsarr.downmix.probe import AudioStreamInfo
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
+from collapsarr.jobs import scheduler as scheduler_module
 from collapsarr.jobs.models import JobHistory
-from collapsarr.jobs.queue import Job, JobKind, JobStatus
+from collapsarr.jobs.queue import Job, JobKind, JobQueue, JobStatus
 from collapsarr.jobs.routes import get_job_scheduler
+from collapsarr.jobs.scheduler import BulkRequeueResult, ClearQueueResult, JobScheduler
 from collapsarr.library.models import LibraryNodeKind, make_node_key
 from collapsarr.library.service import list_nodes, sync_library
 from collapsarr.main import create_app
@@ -59,8 +66,13 @@ def _seed_history(
     file_path: str,
     status: JobStatus,
     kind: JobKind = JobKind.DOWNMIX,
+    priority: int = 0,
 ) -> None:
-    session.add(JobHistory(job_id=job_id, file_path=file_path, status=status, kind=kind))
+    session.add(
+        JobHistory(
+            job_id=job_id, file_path=file_path, status=status, kind=kind, priority=priority
+        )
+    )
     session.commit()
 
 
@@ -72,18 +84,58 @@ class _FakeScheduler:
         *,
         scan_jobs: list[Job] | None = None,
         trigger_job: Job | None = None,
+        requeue_job: Job | None = None,
+        requeue_all_failed_result: BulkRequeueResult | None = None,
         default_audio_trigger_job: Job | None = None,
         default_audio_trigger_jobs_by_file: dict[str, Job | None] | None = None,
+        cancel_result: bool | None = True,
+        bump_result: bool | None = True,
+        clear_queue_result: ClearQueueResult | None = None,
     ) -> None:
         self._scan_jobs = scan_jobs or []
         self._trigger_job = trigger_job
+        #: COL-170's ``requeue_file`` result -- the per-row Requeue endpoint's
+        #: fixed return value. Defaults to ``None`` (skipped) so a test that
+        #: doesn't care still gets a sane, unenqueued response.
+        self._requeue_job = requeue_job
+        #: COL-172's ``requeue_all_failed`` result -- the bulk "Requeue all
+        #: failed" endpoint's fixed return value. Defaults to an empty
+        #: all-skipped-nothing-to-do split so a test that doesn't care still
+        #: gets a well-formed, empty response.
+        self._requeue_all_failed_result = requeue_all_failed_result or BulkRequeueResult(
+            requeued=[], skipped=[]
+        )
         self._default_audio_trigger_job = default_audio_trigger_job
         #: Per-file override for the bulk endpoint's tests, where a fixed
         #: single job/None (the field above) can't tell different resolved
         #: files apart. Falls back to the fixed value above when unset.
         self._default_audio_trigger_jobs_by_file = default_audio_trigger_jobs_by_file
-        self.trigger_calls: list[tuple[str, frozenset[str]]] = []
+        #: COL-168's ``cancel_job`` result, mirroring the real
+        #: :meth:`~collapsarr.jobs.scheduler.JobScheduler.cancel_job`'s
+        #: three-way contract: ``None`` (404, "no such job"), ``True``
+        #: (cancelled), ``False`` (too late). Defaults to ``True`` so a test
+        #: that doesn't care about cancel behaviour still gets a sane value.
+        self._cancel_result = cancel_result
+        #: COL-169's ``bump_job_to_front`` result, mirroring the real
+        #: :meth:`~collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front`'s
+        #: three-way contract: ``None`` (404, "no such job"), ``True``
+        #: (bumped), ``False`` (too late). Defaults to ``True`` so a test
+        #: that doesn't care about bump behaviour still gets a sane value.
+        self._bump_result = bump_result
+        #: COL-173's ``clear_queue`` result -- the bulk "Clear queue" cancel
+        #: endpoint's fixed return value. Defaults to a zero-cancelled,
+        #: zero-already-running split so a test that doesn't care still gets
+        #: a well-formed, empty-queue-shaped response.
+        self._clear_queue_result = clear_queue_result or ClearQueueResult(
+            cancelled=0, already_running=0
+        )
+        self.trigger_calls: list[tuple[str, frozenset[str], bool]] = []
+        self.requeue_calls: list[str] = []
+        self.requeue_all_failed_calls: int = 0
         self.default_audio_trigger_calls: list[str] = []
+        self.cancel_calls: list[UUID] = []
+        self.bump_calls: list[UUID] = []
+        self.clear_queue_calls: int = 0
 
     def scan_now(self) -> list[Job]:
         return self._scan_jobs
@@ -94,11 +146,24 @@ class _FakeScheduler:
         *,
         extra_languages: Iterable[str] | None = None,
         session: Session | None = None,
+        bypass_dedup_window: bool = False,
     ) -> Job | None:
         self.trigger_calls.append(
-            (file_path, frozenset(extra_languages) if extra_languages is not None else frozenset())
+            (
+                file_path,
+                frozenset(extra_languages) if extra_languages is not None else frozenset(),
+                bypass_dedup_window,
+            )
         )
         return self._trigger_job
+
+    def requeue_file(self, file_path: str, *, session: Session | None = None) -> Job | None:
+        self.requeue_calls.append(file_path)
+        return self._requeue_job
+
+    def requeue_all_failed(self, *, session: Session | None = None) -> BulkRequeueResult:
+        self.requeue_all_failed_calls += 1
+        return self._requeue_all_failed_result
 
     def trigger_set_default_audio(
         self,
@@ -110,6 +175,18 @@ class _FakeScheduler:
         if self._default_audio_trigger_jobs_by_file is not None:
             return self._default_audio_trigger_jobs_by_file.get(file_path)
         return self._default_audio_trigger_job
+
+    def cancel_job(self, job_id: UUID, *, session: Session | None = None) -> bool | None:
+        self.cancel_calls.append(job_id)
+        return self._cancel_result
+
+    def bump_job_to_front(self, job_id: UUID) -> bool | None:
+        self.bump_calls.append(job_id)
+        return self._bump_result
+
+    def clear_queue(self, *, session: Session | None = None) -> ClearQueueResult:
+        self.clear_queue_calls += 1
+        return self._clear_queue_result
 
 
 def _job(file_path: str) -> Job:
@@ -126,7 +203,9 @@ def test_history_is_empty_when_nothing_recorded(client: TestClient) -> None:
 
 
 def test_history_lists_rows_with_full_shape(client: TestClient, session: Session) -> None:
-    _seed_history(session, job_id="job-1", file_path="/media/a.mkv", status=JobStatus.SUCCEEDED)
+    _seed_history(
+        session, job_id="job-1", file_path="/media/a.mkv", status=JobStatus.SUCCEEDED, priority=7
+    )
 
     response = client.get("/api/jobs/history", headers=_auth_headers(client))
 
@@ -138,6 +217,7 @@ def test_history_lists_rows_with_full_shape(client: TestClient, session: Session
     assert row["file_path"] == "/media/a.mkv"
     assert row["status"] == "succeeded"
     assert row["kind"] == "downmix"  # COL-155: a bare JobHistory() row defaults to DOWNMIX
+    assert row["priority"] == 7  # COL-175: priority is exposed in the response shape
     for key in (
         "id",
         "started_at",
@@ -233,6 +313,104 @@ def test_history_rejects_an_unknown_kind_value(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+# --- GET /api/jobs/queue: multi-status filter + priority ordering (COL-175) --
+
+
+def test_queue_is_empty_when_nothing_is_running_or_pending(client: TestClient) -> None:
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+
+
+def test_queue_excludes_terminal_jobs(client: TestClient, session: Session) -> None:
+    _seed_history(session, job_id="j-ok", file_path="/media/a.mkv", status=JobStatus.SUCCEEDED)
+    _seed_history(session, job_id="j-bad", file_path="/media/b.mkv", status=JobStatus.FAILED)
+    _seed_history(session, job_id="j-pending", file_path="/media/c.mkv", status=JobStatus.PENDING)
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-pending"]
+
+
+def test_queue_orders_running_jobs_before_pending_jobs(
+    client: TestClient, session: Session
+) -> None:
+    # Seeded pending-first, with a lower priority than the running job, to
+    # prove ordering isn't just "insertion order" or "priority order" alone.
+    _seed_history(
+        session, job_id="j-pending", file_path="/media/a.mkv", status=JobStatus.PENDING, priority=0
+    )
+    _seed_history(
+        session, job_id="j-running", file_path="/media/b.mkv", status=JobStatus.RUNNING, priority=5
+    )
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-running", "j-pending"]
+
+
+def test_queue_orders_pending_jobs_by_ascending_priority(
+    client: TestClient, session: Session
+) -> None:
+    _seed_history(
+        session, job_id="j-third", file_path="/media/c.mkv", status=JobStatus.PENDING, priority=9
+    )
+    _seed_history(
+        session, job_id="j-first", file_path="/media/a.mkv", status=JobStatus.PENDING, priority=1
+    )
+    _seed_history(
+        session, job_id="j-second", file_path="/media/b.mkv", status=JobStatus.PENDING, priority=4
+    )
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-first", "j-second", "j-third"]
+
+
+def test_queue_orders_same_status_same_priority_ties_by_insertion_id(
+    client: TestClient, session: Session
+) -> None:
+    # Two RUNNING rows with equal priority don't otherwise carry a meaningful
+    # relative order -- proves the `id` (insertion order) tiebreaker documented
+    # on `list_queue_jobs` actually holds, not just that running sorts first.
+    _seed_history(
+        session, job_id="j-first", file_path="/media/a.mkv", status=JobStatus.RUNNING, priority=0
+    )
+    _seed_history(
+        session, job_id="j-second", file_path="/media/b.mkv", status=JobStatus.RUNNING, priority=0
+    )
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [r["job_id"] for r in rows] == ["j-first", "j-second"]
+
+
+def test_queue_rows_include_priority_and_full_shape(
+    client: TestClient, session: Session
+) -> None:
+    _seed_history(
+        session, job_id="j-1", file_path="/media/a.mkv", status=JobStatus.RUNNING, priority=3
+    )
+
+    response = client.get("/api/jobs/queue", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["job_id"] == "j-1"
+    assert row["status"] == "running"
+    assert row["priority"] == 3
+
+
 # --- POST /api/jobs/scan -----------------------------------------------------
 
 
@@ -291,7 +469,7 @@ def test_trigger_enqueues_a_job_and_returns_it(client: TestClient) -> None:
     assert body["enqueued"] is True
     assert body["job"]["file_path"] == "/media/movie.mkv"
     assert body["job"]["status"] == "pending"
-    assert fake.trigger_calls == [("/media/movie.mkv", frozenset())]
+    assert fake.trigger_calls == [("/media/movie.mkv", frozenset(), True)]
 
 
 def test_trigger_threads_extra_languages_as_the_bypass_option(client: TestClient) -> None:
@@ -309,7 +487,26 @@ def test_trigger_threads_extra_languages_as_the_bypass_option(client: TestClient
         app.dependency_overrides.clear()
 
     assert response.status_code == 202, response.text
-    assert fake.trigger_calls == [("/media/movie.mkv", frozenset({"jpn", "kor"}))]
+    assert fake.trigger_calls == [("/media/movie.mkv", frozenset({"jpn", "kor"}), True)]
+
+
+def test_trigger_always_bypasses_the_recently_processed_window(client: TestClient) -> None:
+    """COL-170: every explicit trigger now bypasses the window (a behavior change)."""
+    fake = _FakeScheduler(trigger_job=_job("/media/movie.mkv"))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        client.post(
+            "/api/jobs/trigger",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    [(_, _extra_languages, bypass_dedup_window)] = fake.trigger_calls
+    assert bypass_dedup_window is True
 
 
 def test_trigger_reports_not_enqueued_when_the_file_is_skipped(client: TestClient) -> None:
@@ -347,6 +544,220 @@ def test_trigger_rejects_unknown_body_fields(client: TestClient) -> None:
         app.dependency_overrides.clear()
 
     assert response.status_code == 422, response.text
+
+
+# --- POST /api/jobs/requeue (COL-170) -----------------------------------------
+
+
+def test_requeue_enqueues_a_job_and_returns_it(client: TestClient) -> None:
+    fake = _FakeScheduler(requeue_job=_job("/media/movie.mkv"))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is True
+    assert body["job"]["file_path"] == "/media/movie.mkv"
+    assert body["job"]["status"] == "pending"
+    assert fake.requeue_calls == ["/media/movie.mkv"]
+
+
+def test_requeue_reports_not_enqueued_when_the_file_is_skipped(client: TestClient) -> None:
+    fake = _FakeScheduler(requeue_job=None)  # duplicate / unprobeable / nothing to do
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is False
+    assert body["job"] is None
+
+
+def test_requeue_rejects_unknown_body_fields(client: TestClient) -> None:
+    fake = _FakeScheduler(requeue_job=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/movie.mkv", "bogus": True},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422, response.text
+
+
+def test_requeue_rejects_an_extra_languages_field(client: TestClient) -> None:
+    """Unlike ``/api/jobs/trigger``, requeue has no allow-list-bypass option at all."""
+    fake = _FakeScheduler(requeue_job=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/movie.mkv", "extra_languages": ["jpn"]},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422, response.text
+
+
+def test_requeue_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> requeue fails loudly, not silently."""
+    response = client.post(
+        "/api/jobs/requeue",
+        json={"file_path": "/media/movie.mkv"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 503
+
+
+def test_requeue_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, unprobeable file -> skipped, not an error."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs/requeue",
+            json={"file_path": "/media/does-not-exist.mkv"},
+            headers=_auth_headers(client),
+        )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is False
+    assert body["job"] is None
+
+
+# --- POST /api/jobs/requeue-failed (COL-172) ----------------------------------
+#
+# Contract-only: request/response shape and the pass-through to
+# JobScheduler.requeue_all_failed(), via the same fake-scheduler
+# dependency_overrides pattern as every other endpoint above. The real
+# window-respecting split logic (JobScheduler._requeue_all_failed_in`) is
+# exercised directly, with a real queue/session, in tests/test_jobs_scheduler.py.
+
+
+def test_requeue_all_failed_reports_a_full_success_split(client: TestClient) -> None:
+    """Every currently-failed file was requeued -> an empty ``skipped`` list."""
+    jobs = [_job("/media/a.mkv"), _job("/media/b.mkv")]
+    fake = _FakeScheduler(
+        requeue_all_failed_result=BulkRequeueResult(requeued=jobs, skipped=[])
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert [j["file_path"] for j in body["requeued"]] == ["/media/a.mkv", "/media/b.mkv"]
+    assert all(j["status"] == "pending" for j in body["requeued"])
+    assert body["skipped"] == []
+    assert fake.requeue_all_failed_calls == 1
+
+
+def test_requeue_all_failed_reports_a_partial_skip_split(client: TestClient) -> None:
+    """Some currently-failed files requeued, others skipped -- both surfaced, never silent."""
+    fake = _FakeScheduler(
+        requeue_all_failed_result=BulkRequeueResult(
+            requeued=[_job("/media/a.mkv")], skipped=["/media/b.mkv", "/media/c.mkv"]
+        )
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert [j["file_path"] for j in body["requeued"]] == ["/media/a.mkv"]
+    assert body["skipped"] == ["/media/b.mkv", "/media/c.mkv"]
+
+
+def test_requeue_all_failed_reports_an_all_skipped_split_as_a_valid_response(
+    client: TestClient,
+) -> None:
+    """Every currently-failed file was skipped (e.g. all inside the window) -> not an error."""
+    fake = _FakeScheduler(
+        requeue_all_failed_result=BulkRequeueResult(
+            requeued=[], skipped=["/media/a.mkv", "/media/b.mkv"]
+        )
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["requeued"] == []
+    assert body["skipped"] == ["/media/a.mkv", "/media/b.mkv"]
+
+
+def test_requeue_all_failed_reports_an_empty_split_when_nothing_is_failed(
+    client: TestClient,
+) -> None:
+    """No currently-failed Job at all -> both lists empty, still a 202."""
+    fake = _FakeScheduler()  # default: BulkRequeueResult(requeued=[], skipped=[])
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"requeued": [], "skipped": []}
+
+
+def test_requeue_all_failed_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> the bulk requeue fails loudly, not silently."""
+    response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+    assert response.status_code == 503
+
+
+def test_requeue_all_failed_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, no failed history -> an empty split."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post("/api/jobs/requeue-failed", headers=_auth_headers(client))
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"requeued": [], "skipped": []}
 
 
 # --- POST /api/jobs/trigger-default-audio (COL-155) --------------------------
@@ -920,12 +1331,358 @@ def test_bulk_trigger_default_audio_wires_through_a_real_scheduler(settings: Set
     }
 
 
+# --- DELETE /api/jobs/{job_id} (COL-168) --------------------------------------
+#
+# These are HTTP-contract tests only -- request/response shape, the id ->
+# scheduler.cancel_job(UUID) call, and the None/True/False -> 404/200 mapping
+# -- via the same fake-scheduler dependency_overrides pattern as every other
+# endpoint above. JobScheduler.cancel_job's own behaviour (the real
+# JobQueue.cancel + JobHistory-delete sequence) is exercised directly, with a
+# real queue/session, in tests/test_jobs_scheduler.py.
+
+
+def test_cancel_job_returns_cancelled_true_on_success(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(cancel_result=True)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.delete(f"/api/jobs/{job_id}", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"cancelled": True}
+    assert fake.cancel_calls == [job_id]
+
+
+def test_cancel_job_returns_cancelled_false_when_already_claimed(client: TestClient) -> None:
+    """A no-longer-PENDING Job is "too late", not an error and not a silent success."""
+    job_id = uuid4()
+    fake = _FakeScheduler(cancel_result=False)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.delete(f"/api/jobs/{job_id}", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"cancelled": False}
+    assert fake.cancel_calls == [job_id]
+
+
+def test_cancel_job_returns_404_for_a_job_not_in_the_live_queue(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(cancel_result=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.delete(f"/api/jobs/{job_id}", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.cancel_calls == [job_id]
+
+
+def test_cancel_job_returns_404_for_a_malformed_job_id_without_calling_the_scheduler(
+    client: TestClient,
+) -> None:
+    fake = _FakeScheduler()
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.delete("/api/jobs/not-a-uuid", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.cancel_calls == []  # not a UUID at all -- never reaches the scheduler
+
+
+def test_cancel_job_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> cancel fails loudly, not silently."""
+    response = client.delete(f"/api/jobs/{uuid4()}", headers=_auth_headers(client))
+    assert response.status_code == 503
+
+
+def test_cancel_job_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, unknown id -> 404 (nothing to act on)."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.delete(f"/api/jobs/{uuid4()}", headers=_auth_headers(client))
+
+    assert response.status_code == 404
+
+
+# --- POST /api/jobs/clear (COL-173) -------------------------------------------
+#
+# The empty/full-split shape and the id -> scheduler.clear_queue() call are
+# HTTP-contract tests via the same fake-scheduler dependency_overrides pattern
+# as every other endpoint above. The real batch cancel/history-delete/skip
+# logic (JobScheduler._clear_queue_in`) is exercised directly, with a real
+# queue/session, in tests/test_jobs_scheduler.py. The final test below drives
+# the whole thing end to end through this HTTP endpoint against a real
+# JobScheduler + JobQueue (a stub probe/pipeline_runner standing in for the
+# ffmpeg/ffprobe boundary, same pattern as test_wanted_pipeline_integration.py)
+# to cover the two behaviours this ticket's AC calls out explicitly: a
+# simulated race (a snapshotted PENDING job transitions to RUNNING before its
+# own cancel lands) and the post-clear Auto-Queue Limit top-up.
+
+
+def test_clear_queue_reports_a_full_cancel_split_when_nothing_races(client: TestClient) -> None:
+    fake = _FakeScheduler(clear_queue_result=ClearQueueResult(cancelled=3, already_running=0))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 3, "already_running": 0}
+    assert fake.clear_queue_calls == 1
+
+
+def test_clear_queue_reports_an_already_running_split_when_some_jobs_raced(
+    client: TestClient,
+) -> None:
+    """A too-late-to-cancel Job is surfaced in ``already_running``, not silently dropped."""
+    fake = _FakeScheduler(clear_queue_result=ClearQueueResult(cancelled=2, already_running=1))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 2, "already_running": 1}
+
+
+def test_clear_queue_reports_a_zero_cancelled_split_for_an_empty_queue(
+    client: TestClient,
+) -> None:
+    """AC: clearing an already-empty queue is not an error -- a valid, zero-cancelled result."""
+    fake = _FakeScheduler()  # default: ClearQueueResult(cancelled=0, already_running=0)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 0, "already_running": 0}
+
+
+def test_clear_queue_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> clear fails loudly, not silently."""
+    response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+    assert response.status_code == 503
+
+
+def test_clear_queue_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, empty queue -> a valid zero-cancelled result."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 0, "already_running": 0}
+
+
+def test_clear_queue_reports_a_mid_request_race_and_tops_up_after(
+    client: TestClient, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end through the real HTTP endpoint, against a real JobScheduler + JobQueue.
+
+    Three PENDING Jobs are seeded; one (``b``) is made to race PENDING ->
+    RUNNING in between the request snapshotting it and its own individual
+    cancel attempt landing (there is no push mechanism to freeze the live
+    queue mid-request, only polling -- the queue's worker pool keeps running
+    concurrently the whole time). The response must report that split rather
+    than silently ignoring it, and -- since cancelling frees a slot exactly
+    like any other cancellation -- the Auto-Queue Limit's top-up (COL-171)
+    must have run immediately after, pulling a Wanted file back in.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+
+    with session_factory() as session:
+        instance = ArrInstance(
+            name="inst", type=InstanceType.SONARR, base_url="http://arr.local", api_key="k"
+        )
+        session.add(instance)
+        session.commit()
+        session.refresh(instance)
+        instance_id = instance.id
+
+    def fake_fetch(instance: ArrInstance, **_: object) -> list[MonitoredFile]:
+        return [
+            MonitoredFile(instance_id=instance_id, media_title="Show", file_path="/tv/extra.mkv")
+        ]
+
+    monkeypatch.setattr(scheduler_module, "fetch_monitored_files", fake_fetch)
+
+    surround_stream = [
+        AudioStreamInfo(
+            index=0, codec="ac3", channels=6, channel_layout="5.1(side)", language="eng"
+        )
+    ]
+
+    def stub_probe(path: Path) -> list[AudioStreamInfo]:
+        return surround_stream
+
+    queue = JobQueue()  # pipeline never actually runs -- every seeded Job stays PENDING/RUNNING
+    scheduler = JobScheduler(queue, session_factory, settings, probe=stub_probe)
+    app.state.job_scheduler = scheduler
+
+    job_a = scheduler.trigger_file("/media/a.mkv")
+    job_b = scheduler.trigger_file("/media/b.mkv")
+    job_c = scheduler.trigger_file("/media/c.mkv")
+    assert job_a is not None
+    assert job_b is not None
+    assert job_c is not None
+
+    original_cancel = queue.cancel
+
+    def racy_cancel(job_id: UUID) -> bool:
+        if job_id == job_b.id:
+            job_b.status = JobStatus.RUNNING  # simulate a worker claiming it, mid-request
+        return original_cancel(job_id)
+
+    monkeypatch.setattr(queue, "cancel", racy_cancel)
+
+    response = client.post("/api/jobs/clear", headers=_auth_headers(client))
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"cancelled": 2, "already_running": 1}
+
+    # a/c: genuinely cancelled -- gone from the live queue.
+    assert queue.get_job(job_a.id) is None
+    assert queue.get_job(job_c.id) is None
+    # b: raced to RUNNING -- left exactly as it was, not cancelled.
+    still_there = queue.get_job(job_b.id)
+    assert still_there is not None
+    assert still_there.status is JobStatus.RUNNING
+
+    # Post-clear top-up (COL-171): the freed slots pulled a Wanted file back in.
+    assert any(job.file_path == Path("/tv/extra.mkv") for job in queue.list_jobs())
+
+
+# --- POST /api/jobs/{job_id}/bump (COL-169) -----------------------------------
+#
+# These are HTTP-contract tests only -- request/response shape, the id ->
+# scheduler.bump_job_to_front(UUID) call, and the None/True/False -> 404/200
+# mapping -- via the same fake-scheduler dependency_overrides pattern as
+# every other endpoint above, mirroring the DELETE section. The real
+# priority-reassignment + "next claimed by a free worker" behaviour is
+# exercised end-to-end against a real JobQueue and worker pool in
+# tests/test_jobs_queue.py::test_bumped_job_is_claimed_before_earlier_enqueued_pending_jobs,
+# and JobScheduler.bump_job_to_front's own None/True/False mapping is
+# exercised directly, with a real queue, in tests/test_jobs_scheduler.py.
+
+
+def test_bump_job_returns_bumped_true_on_success(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(bump_result=True)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(f"/api/jobs/{job_id}/bump", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"bumped": True}
+    assert fake.bump_calls == [job_id]
+
+
+def test_bump_job_returns_bumped_false_when_already_claimed(client: TestClient) -> None:
+    """A no-longer-PENDING Job is "too late", not an error and not a silent success."""
+    job_id = uuid4()
+    fake = _FakeScheduler(bump_result=False)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(f"/api/jobs/{job_id}/bump", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"bumped": False}
+    assert fake.bump_calls == [job_id]
+
+
+def test_bump_job_returns_404_for_a_job_not_in_the_live_queue(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(bump_result=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(f"/api/jobs/{job_id}/bump", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.bump_calls == [job_id]
+
+
+def test_bump_job_returns_404_for_a_malformed_job_id_without_calling_the_scheduler(
+    client: TestClient,
+) -> None:
+    fake = _FakeScheduler()
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post("/api/jobs/not-a-uuid/bump", headers=_auth_headers(client))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.bump_calls == []  # not a UUID at all -- never reaches the scheduler
+
+
+def test_bump_job_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> bump fails loudly, not silently."""
+    response = client.post(f"/api/jobs/{uuid4()}/bump", headers=_auth_headers(client))
+    assert response.status_code == 503
+
+
+def test_bump_job_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, unknown id -> 404 (nothing to act on)."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post(f"/api/jobs/{uuid4()}/bump", headers=_auth_headers(client))
+
+    assert response.status_code == 404
+
+
 # --- auth-required behaviour --------------------------------------------------
 
 
 def test_history_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     assert client.get("/api/jobs/history").status_code == 401
+
+
+def test_queue_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    assert client.get("/api/jobs/queue").status_code == 401
 
 
 def test_scan_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
@@ -936,6 +1693,20 @@ def test_scan_endpoint_requires_the_api_key(client: TestClient, session: Session
 def test_trigger_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     response = client.post("/api/jobs/trigger", json={"file_path": "/media/movie.mkv"})
+    assert response.status_code == 401
+
+
+def test_requeue_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post("/api/jobs/requeue", json={"file_path": "/media/movie.mkv"})
+    assert response.status_code == 401
+
+
+def test_requeue_all_failed_endpoint_requires_the_api_key(
+    client: TestClient, session: Session
+) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post("/api/jobs/requeue-failed")
     assert response.status_code == 401
 
 
@@ -957,4 +1728,22 @@ def test_bulk_trigger_default_audio_endpoint_requires_the_api_key(
         "/api/jobs/trigger-default-audio/bulk",
         json={"references": [{"node_type": "episode", "node_id": 1}]},
     )
+    assert response.status_code == 401
+
+
+def test_cancel_job_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.delete(f"/api/jobs/{uuid4()}")
+    assert response.status_code == 401
+
+
+def test_bump_job_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post(f"/api/jobs/{uuid4()}/bump")
+    assert response.status_code == 401
+
+
+def test_clear_queue_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post("/api/jobs/clear")
     assert response.status_code == 401

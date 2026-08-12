@@ -31,6 +31,14 @@ export interface JobHistoryEntry {
   file_path: string;
   status: JobStatus;
   kind: JobKind;
+  /**
+   * Join-order sequence number -- a lower value means "earlier"/"next in
+   * line" (COL-163, exposed in the response as of COL-175). `GET
+   * /api/jobs/queue` (COL-175, `fetchJobQueue`) orders its pending rows by
+   * this field ascending; `QueuePage` (COL-178) relies on the server's
+   * ordering rather than re-sorting client-side.
+   */
+  priority: number;
   started_at: string | null;
   ended_at: string | null;
   exit_code: number | null;
@@ -132,4 +140,96 @@ export interface FileSetDefaultAudioResult {
  */
 export interface BulkSetDefaultAudioTriggerResult {
   results: FileSetDefaultAudioResult[];
+}
+
+/**
+ * Request body for `POST /api/jobs/requeue` (COL-170, `RequeueFileRequest`)
+ * -- `HistoryPage`'s (COL-176) per-row "Requeue" action on a `failed` row.
+ *
+ * Unlike {@link ManualTriggerRequest} there is no `extra_languages` option --
+ * a requeue retries against the standing language allow-list, not a one-off
+ * widened one.
+ */
+export interface RequeueFileRequest {
+  file_path: string;
+}
+
+/**
+ * Response for `POST /api/jobs/requeue` (COL-170, `RequeueFileResult`). Same
+ * shape as {@link ManualTriggerResult}: `enqueued` is `true` with the created
+ * `job` when a downmix job was queued, `false` with `job` `null` when the
+ * file was skipped -- a duplicate (already `PENDING`/`RUNNING`), unprobeable,
+ * or with no qualifying target. The Recently-Processed Window is always
+ * bypassed for a requeue, so it is never the skip reason.
+ */
+export type RequeueFileResult = ManualTriggerResult;
+
+/**
+ * Response for `POST /api/jobs/requeue-failed` (COL-172, `BulkRequeueFailedResult`)
+ * -- `HistoryPage`'s (COL-179) page-level "Requeue all failed" action, the
+ * batch counterpart of {@link RequeueFileResult}'s per-row scope.
+ *
+ * `requeued` lists every newly created job for a currently-`failed` file this
+ * pass did not skip. `skipped` lists every currently-`failed` file's path
+ * this pass did not requeue -- most commonly because its most recent
+ * terminal history row falls inside the Recently-Processed Window (COL-167),
+ * but also any other reason a trigger might decline a file (already active,
+ * unprobeable, or nothing left to do). Every currently-failed file lands in
+ * exactly one of the two lists -- never a silent partial success, so an
+ * all-skipped response is a valid, fully-reported outcome, not an error.
+ */
+export interface BulkRequeueFailedResult {
+  requeued: EnqueuedJob[];
+  skipped: string[];
+}
+
+/**
+ * Response for `DELETE /api/jobs/{job_id}` (COL-168, `CancelJobResult`) --
+ * `QueuePage`'s (COL-180) per-row "Cancel" action.
+ *
+ * `cancelled` is `true` when the Job was still `pending` and has now been
+ * removed from the live queue (its `JobHistory` row deleted too -- a
+ * cancelled Job leaves no trace). It is `false` -- not an error -- when a
+ * worker already claimed the Job, or it already reached a terminal status,
+ * before the request landed: "too late" to cancel, distinct from a generic
+ * failure; the Job runs (or has run) to completion unaffected. A `job_id`
+ * not present in the live queue at all is a `404` instead, surfaced by
+ * `api/activity.ts`'s `cancelJob` as a thrown error, not this shape.
+ */
+export interface CancelJobResult {
+  cancelled: boolean;
+}
+
+/**
+ * Response for `POST /api/jobs/{job_id}/bump` (COL-169, `BumpJobResult`) --
+ * `QueuePage`'s (COL-180) per-row "Process next" action.
+ *
+ * `bumped` is `true` when the Job was still `pending` and has now been
+ * reassigned a priority ahead of every other currently-pending Job -- it is
+ * the very next Job a free worker claims. It is `false` -- not an error --
+ * when a worker already claimed the Job, or it already reached a terminal
+ * status, before the request landed: "too late" to bump, unaffected.
+ * Mirrors {@link CancelJobResult}'s shape exactly. A `job_id` not present
+ * in the live queue at all is a `404` instead, surfaced as a thrown error.
+ */
+export interface BumpJobResult {
+  bumped: boolean;
+}
+
+/**
+ * Response for `POST /api/jobs/clear` (COL-173, `ClearQueueResult`) --
+ * `QueuePage`'s (COL-181) page-level "Clear queue" action.
+ *
+ * `cancelled` is how many currently-`pending` Jobs, out of every one
+ * snapshotted when the pass started, were actually cancelled. `already_running`
+ * is how many of that same snapshot had already been claimed by a worker (or
+ * otherwise progressed past `pending`) by the time their own cancel ran, and
+ * so were left alone -- reported rather than silently dropped, so the UI can
+ * show the split instead of a single generic success count. Every snapshotted
+ * Job lands in exactly one of the two counts; clearing an already-empty queue
+ * is a valid `cancelled: 0`/`already_running: 0` response, not an error.
+ */
+export interface ClearQueueResult {
+  cancelled: number;
+  already_running: number;
 }
