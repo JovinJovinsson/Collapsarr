@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
+import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import Mount
@@ -23,6 +27,7 @@ from collapsarr.backup.service import BACKUP_MANUAL, backups_root
 from collapsarr.config import Settings
 from collapsarr.main import create_app
 from collapsarr.settings.service import get_global_settings
+from tests.conftest import _ample_free_space, _offline_update_check_transport
 
 
 def _auth_headers(client: TestClient) -> dict[str, str]:
@@ -264,6 +269,102 @@ def test_large_backup_download_completes_through_the_full_middleware_stack(
     assert int(response.headers["content-length"]) == _LARGE_DOWNLOAD_PAYLOAD_SIZE
     assert len(response.content) == _LARGE_DOWNLOAD_PAYLOAD_SIZE
     assert response.content == payload
+
+
+_LIVE_SERVER_STARTUP_TIMEOUT = 15.0
+"""Bound on how long the background ``uvicorn`` server may take to bind + boot."""
+
+_SLOW_READER_CHUNK = 16 * 1024
+"""Read the download body in small chunks so the reader lags the writer and the
+kernel send buffer fills -- the real socket-level backpressure the in-process
+``TestClient`` transport cannot produce."""
+
+_SLOW_READER_CHUNK_DELAY = 0.002
+"""Per-chunk pause on the reader side, to keep it slower than the writer for the
+whole transfer so backpressure is sustained rather than momentary."""
+
+
+@contextmanager
+def _live_server(app: FastAPI) -> Iterator[str]:
+    """Serve ``app`` on a real loopback socket via ``uvicorn`` in a daemon thread.
+
+    Yields the base URL (``http://127.0.0.1:<port>``). Unlike ``TestClient``'s
+    in-process :class:`~starlette.testclient.ASGITransport`, this is a genuine
+    HTTP server bound to an ephemeral port, so a slow-reading client produces
+    real TCP backpressure -- the condition COL-197 flagged as the one its
+    in-process reproduction could not exercise, and the one the classic
+    ``BaseHTTPMiddleware`` streaming-hang needs to manifest. ``uvicorn`` runs
+    the app's lifespan (schema/session-factory setup) itself on startup.
+    """
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + _LIVE_SERVER_STARTUP_TIMEOUT
+        while time.monotonic() < deadline and not (server.started and server.servers):
+            time.sleep(0.02)
+        assert server.started and server.servers, "uvicorn did not start in time"
+        port = server.servers[0].sockets[0].getsockname()[1]
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=_LIVE_SERVER_STARTUP_TIMEOUT)
+
+
+def test_large_backup_download_completes_through_a_real_asgi_server(
+    settings: Settings,
+) -> None:
+    """Stronger COL-199 reproduction: a real socket + a deliberately slow reader.
+
+    The sibling ``..._through_the_full_middleware_stack`` test drives the whole
+    middleware stack but over ``TestClient``'s in-process transport, which has
+    no socket-level backpressure -- the exact mechanism the ``BaseHTTPMiddleware``
+    streaming-hang bug needs (see that test's docstring, caveat 1). This test
+    closes that gap: it runs the app under a real ``uvicorn`` server bound to a
+    loopback socket and reads the multi-megabyte body in small chunks with a
+    per-chunk pause, so the writer outruns the reader and the kernel send buffer
+    fills -- producing the sustained backpressure the in-process transport
+    cannot. With ``EnforceAuthMiddleware`` now a raw-ASGI middleware (COL-199)
+    that hands ``send`` straight through, the streamed ``FileResponse`` completes
+    byte-for-byte; it is a regression guard against reintroducing a body-buffering
+    middleware layer in front of the download route.
+
+    The server binds to loopback, so the default ``local_bypass`` auth mode lets
+    the request through without a credential (COL-51) -- the download still
+    traverses the full ``UrlBaseMiddleware`` -> ``SessionMiddleware`` ->
+    ``EnforceAuthMiddleware`` -> route stack, exercising exactly the raw-ASGI
+    happy path this ticket changed.
+    """
+    app = create_app(
+        settings=settings,
+        disk_usage=_ample_free_space,
+        update_check_transport=_offline_update_check_transport(),
+    )
+    with _live_server(app) as base_url:
+        created = httpx.post(f"{base_url}/api/system/backup", timeout=30.0).json()
+
+        # Swap the tiny real archive for a large synthetic payload, same trick as
+        # the in-process test: the route only streams whatever bytes are at the
+        # resolved path, so it need not still be a valid zip.
+        archive_path = backups_root(settings) / BACKUP_MANUAL / created["name"]
+        payload = os.urandom(_LARGE_DOWNLOAD_PAYLOAD_SIZE)
+        archive_path.write_bytes(payload)
+
+        received = bytearray()
+        with httpx.Client(timeout=_LARGE_DOWNLOAD_JOIN_TIMEOUT) as http_client:
+            with http_client.stream(
+                "GET", f"{base_url}/api/system/backup/{created['id']}/download"
+            ) as response:
+                assert response.status_code == 200
+                assert response.headers["content-type"] == "application/zip"
+                assert int(response.headers["content-length"]) == _LARGE_DOWNLOAD_PAYLOAD_SIZE
+                for chunk in response.iter_bytes(chunk_size=_SLOW_READER_CHUNK):
+                    received.extend(chunk)
+                    time.sleep(_SLOW_READER_CHUNK_DELAY)
+
+    assert len(received) == _LARGE_DOWNLOAD_PAYLOAD_SIZE
+    assert bytes(received) == payload
 
 
 # --------------------------------------------------------------------------- #
