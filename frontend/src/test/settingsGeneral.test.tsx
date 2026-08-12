@@ -81,6 +81,28 @@ describe("GeneralSection", () => {
     expect(screen.getByText(/restart collapsarr for a change to take effect/i)).toBeInTheDocument();
   });
 
+  it("lays out the Authentication & concurrency and Update channel fields with the shared full-width grid (COL-188)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    const authRequiredSelect = await screen.findByLabelText(/login requirement/i);
+    const authMethodSelect = screen.getByLabelText(/sign-in method/i);
+    const concurrencyInput = screen.getByLabelText(/concurrency limit/i);
+    const windowInput = screen.getByLabelText(/recently-processed window/i);
+    const channelSelect = screen.getByLabelText(/release channel/i);
+
+    // Same grid pattern as the "Disk space alerts" / "Advanced" panels: each
+    // field lives in a `.form-grid` > `.form-field` wrapper, not the old
+    // fixed-width `.form-field--narrow`, so fields flow across the full
+    // panel width instead of being capped at a narrow column.
+    for (const field of [authRequiredSelect, authMethodSelect, concurrencyInput, windowInput, channelSelect]) {
+      const wrapper = field.closest(".form-field");
+      expect(wrapper).not.toBeNull();
+      expect(wrapper).not.toHaveClass("form-field--narrow");
+      expect(wrapper?.parentElement).toHaveClass("form-grid");
+    }
+  });
+
   it("saves the disk-space thresholds via PUT with the edited values", async () => {
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
       if ((init?.method ?? "GET") === "PUT") {
