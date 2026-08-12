@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -55,6 +55,26 @@ function mockFetchRejected(error: Error) {
   vi.stubGlobal("fetch", vi.fn().mockRejectedValue(error));
 }
 
+/**
+ * Routes `GET /api/wanted` to `wantedResponse` (the initial list load) and
+ * everything else -- the "Queue now" action's `POST /api/jobs/trigger` --
+ * through `triggerHandler`, which inspects the request itself. Mirrors
+ * `queuePage.test.tsx`'s `mockFetchWithAction` shape.
+ */
+function mockFetchWithTrigger(
+  triggerHandler: (url: string, init?: RequestInit) => { ok: boolean; status?: number; body: unknown },
+) {
+  const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    if (typeof url === "string" && url.includes("/api/wanted")) {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(wantedResponse) });
+    }
+    const { ok, status = 200, body } = triggerHandler(url, init);
+    return Promise.resolve({ ok, status, json: () => Promise.resolve(body) });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
 describe("WantedPage", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -99,5 +119,96 @@ describe("WantedPage", () => {
     renderWantedPage();
 
     expect(await screen.findByText(/failed to load wanted list \(500\)/i)).toBeInTheDocument();
+  });
+
+  describe('"Queue now" action (COL-195)', () => {
+    it("shows a \"Queue now\" action on every row", async () => {
+      mockFetchResolved(wantedResponse);
+      renderWantedPage();
+
+      const firstRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      expect(within(firstRow).getByRole("button", { name: /queue now/i })).toBeInTheDocument();
+
+      const secondRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
+      expect(within(secondRow).getByRole("button", { name: /queue now/i })).toBeInTheDocument();
+    });
+
+    it("calls the trigger endpoint with the row's file path and shows a success notice on enqueue", async () => {
+      const fetchMock = mockFetchWithTrigger((url, init) => {
+        expect(url).toContain("/api/jobs/trigger");
+        expect(url).not.toContain("trigger-default-audio");
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(init?.body as string)).toEqual({
+          file_path: wantedResponse[0].file_path,
+        });
+        return {
+          ok: true,
+          body: {
+            enqueued: true,
+            job: { id: "job-1", file_path: wantedResponse[0].file_path, status: "pending" },
+          },
+        };
+      });
+
+      renderWantedPage();
+
+      const row = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(row).getByRole("button", { name: /queue now/i }));
+
+      expect(await screen.findByText(/"Interstellar" queued — job job-1 \(Pending\)\./i)).toBeInTheDocument();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      // The row survives -- queuing doesn't remove it from the Wanted list --
+      // and its button is back to normal, not stuck mid-action.
+      expect(within(row).getByRole("button", { name: /queue now/i })).not.toBeDisabled();
+    });
+
+    it("shows a hint notice, not an error, when the file was skipped (enqueued: false)", async () => {
+      mockFetchWithTrigger(() => ({ ok: true, body: { enqueued: false, job: null } }));
+      renderWantedPage();
+
+      const row = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(row).getByRole("button", { name: /queue now/i }));
+
+      expect(
+        await screen.findByText(/"Show\.S01E01" wasn't queued — the file was skipped/i),
+      ).toBeInTheDocument();
+    });
+
+    it("shows an error notice when the trigger request fails", async () => {
+      mockFetchWithTrigger(() => ({ ok: false, status: 500, body: { detail: "boom" } }));
+      renderWantedPage();
+
+      const row = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(row).getByRole("button", { name: /queue now/i }));
+
+      expect(await screen.findByText(/boom/i)).toBeInTheDocument();
+      expect(within(row).getByRole("button", { name: /queue now/i })).not.toBeDisabled();
+    });
+
+    it("disables only the clicked row's button while its request is in flight", async () => {
+      let resolveTrigger: (value: { ok: boolean; status?: number; body: unknown }) => void = () => {};
+      const pending = new Promise<{ ok: boolean; status?: number; body: unknown }>((resolve) => {
+        resolveTrigger = resolve;
+      });
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (typeof url === "string" && url.includes("/api/wanted")) {
+          return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(wantedResponse) });
+        }
+        return pending.then(({ ok, status = 200, body }) => ({ ok, status, json: () => Promise.resolve(body) }));
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      renderWantedPage();
+
+      const firstRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      const secondRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
+      fireEvent.click(within(firstRow).getByRole("button", { name: /queue now/i }));
+
+      expect(await within(firstRow).findByRole("button", { name: /queuing/i })).toBeDisabled();
+      expect(within(secondRow).getByRole("button", { name: /queue now/i })).not.toBeDisabled();
+
+      resolveTrigger({ ok: true, body: { enqueued: true, job: { id: "job-2", file_path: "x", status: "pending" } } });
+      await waitFor(() => expect(within(firstRow).getByRole("button", { name: /queue now/i })).not.toBeDisabled());
+    });
   });
 });
