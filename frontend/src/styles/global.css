@@ -440,9 +440,14 @@ a {
 
 /* COL-187: scale with the viewport instead of a fixed 1100px cap, so wide
    tables (Queue, History) get more room on larger windows instead of being
-   squeezed into a width that no longer reflects the available viewport. */
+   squeezed into a width that no longer reflects the available viewport.
+   `margin: 0 auto` centers the view once the 90vw cap actually binds (only
+   past very wide/ultrawide viewports -- see the cascade math in the COL-187
+   Jira comment); below that threshold .view already fills its column, so
+   the auto margins resolve to 0 and this is a no-op. */
 .view {
   max-width: 90vw;
+  margin: 0 auto;
 }
 
 .view__header {
