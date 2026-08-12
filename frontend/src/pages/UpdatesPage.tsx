@@ -1,3 +1,4 @@
+import { Download } from "lucide-react";
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
@@ -7,7 +8,6 @@ import {
   recheckUpdateStatus,
   undismissUpdateStatus,
 } from "../api/updates";
-import { UpdateIcon } from "../components/icons";
 import type { UpdateCheckState } from "../types/updates";
 
 /** The Docker Hub repository the release pipeline publishes to (`.github/workflows/release.yml`'s `IMAGE_NAME`). */
@@ -176,7 +176,7 @@ export function UpdatesPage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <UpdateIcon width={28} height={28} />
+            <Download width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load update status: {state.message}</p>
         </div>
@@ -205,7 +205,7 @@ export function UpdatesPage() {
                 state.state.update_available ? " update-panel__status--available" : ""
               }`}
             >
-              <UpdateIcon width={16} height={16} className="update-panel__status-icon" />
+              <Download width={16} height={16} className="update-panel__status-icon" />
               {state.state.update_available
                 ? `An update is available${state.state.latest_version ? ` (${state.state.latest_version})` : ""}.`
                 : "You're up to date."}

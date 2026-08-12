@@ -1,7 +1,7 @@
+import { FileText } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { clearLogs, downloadLogFile, fetchLogFiles, fetchLogs } from "../api/logs";
-import { LogsIcon } from "../components/icons";
 import type { LogFile, LogLevelFilter, LogsResponse } from "../types/logs";
 import { formatBytes } from "../utils/format";
 
@@ -244,7 +244,7 @@ export function LogsPage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <LogsIcon width={28} height={28} />
+            <FileText width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load logs: {state.message}</p>
         </div>
@@ -253,7 +253,7 @@ export function LogsPage() {
       {state.status === "ready" && state.entries.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <LogsIcon width={28} height={28} />
+            <FileText width={28} height={28} />
           </span>
           <p className="panel__message">
             {level ? `No ${level}+ log lines found.` : "The log file is empty."}
@@ -363,7 +363,7 @@ export function LogsPage() {
       {fileListState.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <LogsIcon width={28} height={28} />
+            <FileText width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load log files: {fileListState.message}</p>
         </div>
@@ -372,7 +372,7 @@ export function LogsPage() {
       {fileListState.status === "ready" && fileListState.files.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <LogsIcon width={28} height={28} />
+            <FileText width={28} height={28} />
           </span>
           <p className="panel__message">No log files yet.</p>
         </div>

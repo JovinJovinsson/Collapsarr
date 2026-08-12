@@ -1,17 +1,18 @@
 import type { ReactNode } from "react";
 
 import {
-  ActivityIcon,
-  BackupIcon,
-  HealthIcon,
-  LibraryIcon,
-  LogsIcon,
-  SettingsIcon,
-  StatusIcon,
-  TasksIcon,
-  UpdateIcon,
-  WantedIcon,
-} from "../components/icons";
+  CakeSlice,
+  DatabaseBackup,
+  Download,
+  FileText,
+  FolderClock,
+  HeartPulse,
+  Info,
+  Library,
+  ListChecks,
+  ListOrdered,
+  Settings,
+} from "lucide-react";
 import { BackupsPage } from "../pages/BackupsPage";
 import { HealthChecksPage } from "../pages/HealthChecksPage";
 import { HistoryPage } from "../pages/HistoryPage";
@@ -101,16 +102,18 @@ export interface NavItem {
  * rather than through this array.
  */
 export const navItems: NavItem[] = [
-  { to: "/wanted", label: "Wanted", icon: <WantedIcon />, element: <WantedPage /> },
-  { to: LIBRARIES_PATH, label: "Libraries", icon: <LibraryIcon />, element: <LibrariesIndexPage /> },
+  { to: "/wanted", label: "Wanted", icon: <CakeSlice size={20} />, element: <WantedPage /> },
+  { to: LIBRARIES_PATH, label: "Libraries", icon: <Library size={20} />, element: <LibrariesIndexPage /> },
   // Was "Activity" (the combined live-queue + history table). COL-178
   // repurposed this route into the live-only Queue view; COL-176 gives
   // terminal (succeeded/failed) job history its own dedicated page/nav entry.
-  { to: "/queue", label: "Queue", icon: <ActivityIcon />, element: <QueuePage /> },
+  { to: "/queue", label: "Queue", icon: <ListOrdered size={20} />, element: <QueuePage /> },
   // Terminal (succeeded/failed) job history (COL-176) -- the other half of
   // the old combined Activity table, split out into its own nav entry
-  // distinct from "Queue" above (live pending/running rows only).
-  { to: "/history", label: "History", icon: <ActivityIcon />, element: <HistoryPage /> },
+  // distinct from "Queue" above (live pending/running rows only). COL-191:
+  // renders a visually distinct icon from Queue (FolderClock vs ListOrdered)
+  // -- previously both shared the same ActivityIcon.
+  { to: "/history", label: "History", icon: <FolderClock size={20} />, element: <HistoryPage /> },
 ];
 
 /**
@@ -128,12 +131,12 @@ export const navItems: NavItem[] = [
  * above.
  */
 export const systemNavItems: NavItem[] = [
-  { to: `${SYSTEM_PATH}/tasks`, label: "Tasks", icon: <TasksIcon />, element: <TasksPage /> },
-  { to: `${SYSTEM_PATH}/backups`, label: "Backups", icon: <BackupIcon />, element: <BackupsPage /> },
-  { to: `${SYSTEM_PATH}/health`, label: "Health", icon: <HealthIcon />, element: <HealthChecksPage /> },
-  { to: `${SYSTEM_PATH}/status`, label: "Status", icon: <StatusIcon />, element: <StatusPage /> },
-  { to: `${SYSTEM_PATH}/updates`, label: "Updates", icon: <UpdateIcon />, element: <UpdatesPage /> },
-  { to: `${SYSTEM_PATH}/logs`, label: "Logs", icon: <LogsIcon />, element: <LogsPage /> },
+  { to: `${SYSTEM_PATH}/tasks`, label: "Tasks", icon: <ListChecks size={20} />, element: <TasksPage /> },
+  { to: `${SYSTEM_PATH}/backups`, label: "Backups", icon: <DatabaseBackup size={20} />, element: <BackupsPage /> },
+  { to: `${SYSTEM_PATH}/health`, label: "Health", icon: <HeartPulse size={20} />, element: <HealthChecksPage /> },
+  { to: `${SYSTEM_PATH}/status`, label: "Status", icon: <Info size={20} />, element: <StatusPage /> },
+  { to: `${SYSTEM_PATH}/updates`, label: "Updates", icon: <Download size={20} />, element: <UpdatesPage /> },
+  { to: `${SYSTEM_PATH}/logs`, label: "Logs", icon: <FileText size={20} />, element: <LogsPage /> },
 ];
 
 /**
@@ -154,11 +157,11 @@ export const systemNavItems: NavItem[] = [
  * instead (wired in `router.tsx`, mirroring the bare `/system` redirect).
  */
 export const settingsNavItems: NavItem[] = [
-  { to: SETTINGS_GENERAL_PATH, label: "General", icon: <SettingsIcon />, element: <SettingsGeneralPage /> },
-  { to: SETTINGS_SONARR_PATH, label: "Sonarr", icon: <SettingsIcon />, element: <SettingsSonarrPage /> },
-  { to: SETTINGS_RADARR_PATH, label: "Radarr", icon: <SettingsIcon />, element: <SettingsRadarrPage /> },
-  { to: SETTINGS_TARGETS_PATH, label: "Targets", icon: <SettingsIcon />, element: <SettingsTargetsPage /> },
-  { to: SETTINGS_CONNECT_PATH, label: "Connect", icon: <SettingsIcon />, element: <SettingsConnectPage /> },
-  { to: SETTINGS_SCHEDULER_PATH, label: "Scheduler", icon: <SettingsIcon />, element: <SettingsSchedulerPage /> },
-  { to: SETTINGS_LOGGING_PATH, label: "Logging", icon: <SettingsIcon />, element: <SettingsLoggingPage /> },
+  { to: SETTINGS_GENERAL_PATH, label: "General", icon: <Settings size={20} />, element: <SettingsGeneralPage /> },
+  { to: SETTINGS_SONARR_PATH, label: "Sonarr", icon: <Settings size={20} />, element: <SettingsSonarrPage /> },
+  { to: SETTINGS_RADARR_PATH, label: "Radarr", icon: <Settings size={20} />, element: <SettingsRadarrPage /> },
+  { to: SETTINGS_TARGETS_PATH, label: "Targets", icon: <Settings size={20} />, element: <SettingsTargetsPage /> },
+  { to: SETTINGS_CONNECT_PATH, label: "Connect", icon: <Settings size={20} />, element: <SettingsConnectPage /> },
+  { to: SETTINGS_SCHEDULER_PATH, label: "Scheduler", icon: <Settings size={20} />, element: <SettingsSchedulerPage /> },
+  { to: SETTINGS_LOGGING_PATH, label: "Logging", icon: <Settings size={20} />, element: <SettingsLoggingPage /> },
 ];

@@ -438,8 +438,16 @@ a {
 
 /* ---- Views ----------------------------------------------------------- */
 
+/* COL-187: scale with the viewport instead of a fixed 1100px cap, so wide
+   tables (Queue, History) get more room on larger windows instead of being
+   squeezed into a width that no longer reflects the available viewport.
+   `margin: 0 auto` centers the view once the 90vw cap actually binds (only
+   past very wide/ultrawide viewports -- see the cascade math in the COL-187
+   Jira comment); below that threshold .view already fills its column, so
+   the auto margins resolve to 0 and this is a no-op. */
 .view {
-  max-width: 1100px;
+  max-width: 90vw;
+  margin: 0 auto;
 }
 
 .view__header {
@@ -466,6 +474,12 @@ a {
   background: var(--c-surface);
   border: 1px solid var(--c-border);
   border-radius: var(--radius-lg);
+  /* COL-187: contain wide tables (Queue, History, Health Checks, Backups,
+     Logs, Tasks, etc.) so they scroll horizontally within the panel itself
+     once the viewport shrinks below the table's content width, instead of
+     overflowing into .app-shell__content and forcing the whole page to
+     scroll sideways. */
+  overflow-x: auto;
 }
 
 .panel--empty {
@@ -591,10 +605,6 @@ a {
 .activity-filters__select:focus {
   outline: none;
   border-color: var(--c-accent);
-}
-
-.activity-panel {
-  overflow-x: auto;
 }
 
 .activity-table {
@@ -980,10 +990,6 @@ a {
 
 /* ---- Settings page ------------------------------------------------------- */
 
-.view--settings {
-  max-width: 1100px;
-}
-
 .settings-sections {
   display: flex;
   flex-direction: column;
@@ -1322,6 +1328,23 @@ a {
   padding-left: calc(var(--sp-4) + var(--sp-5) * 2);
   color: var(--c-text-muted);
   font-size: var(--fs-xs);
+}
+
+/* Nesting depth background shading (COL-189): a Season/Episode row's
+   background gets a bit lighter per depth level (--c-nest-tint-1/2, defined
+   in theme.css), on top of the indentation above -- so an expanded
+   subfolder's rows read as "inside" their parent at a glance, with deeper
+   levels staying visually distinct from shallower ones instead of one flat
+   "nested" style. Set on the whole <tr> (not just the indented title cell)
+   so the shading spans every column in the row. Top-level rows (Series, and
+   Movie's flat rows) get neither class and keep the table's plain
+   --c-surface background. */
+.library-tree-table__row--depth-1 {
+  background-color: var(--c-nest-tint-1);
+}
+
+.library-tree-table__row--depth-2 {
+  background-color: var(--c-nest-tint-2);
 }
 
 .library-tree-table__file-badge {

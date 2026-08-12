@@ -5,6 +5,9 @@ import { describe, expect, it, vi } from "vitest";
 import { routes } from "../routes/router";
 import { systemNavItems } from "../routes/nav";
 
+/** The lucide `MonitorCog` icon's rendered class name (COL-191): `Sidebar` passes it directly to `NavSection`'s `icon` prop for the System group header, replacing the previous icon-less gap. */
+const MONITOR_COG_ICON_CLASS = "lucide-monitor-cog";
+
 // Mock fetch for pages that fetch on mount
 vi.stubGlobal(
   "fetch",
@@ -105,5 +108,15 @@ describe("System navigation (COL-126, COL-131)", () => {
     for (const item of systemNavItems) {
       expect(await within(nav).findByRole("link", { name: item.label })).toBeInTheDocument();
     }
+  });
+
+  // COL-191: System previously rendered with no icon at all next to Settings
+  // -- now renders MonitorCog, like every other migrated nav icon.
+  it("renders the MonitorCog icon on the System group header", async () => {
+    renderWithSystemNav("/wanted");
+
+    const nav = await screen.findByRole("navigation", { name: /primary/i });
+    const systemLink = within(nav).getByRole("link", { name: "System" });
+    expect(systemLink.querySelector(`svg.${MONITOR_COG_ICON_CLASS}`)).toBeInTheDocument();
   });
 });

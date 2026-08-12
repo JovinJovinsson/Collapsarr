@@ -1,8 +1,8 @@
+import { CakeSlice } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { fetchWantedList } from "../api/wanted";
-import { WantedIcon } from "../components/icons";
 import type { WantedFile } from "../types/wanted";
 
 const TARGET_LABEL: Record<string, string> = {
@@ -69,7 +69,7 @@ export function WantedPage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <WantedIcon width={28} height={28} />
+            <CakeSlice width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load the wanted list: {state.message}</p>
         </div>
@@ -78,7 +78,7 @@ export function WantedPage() {
       {state.status === "ready" && state.files.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <WantedIcon width={28} height={28} />
+            <CakeSlice width={28} height={28} />
           </span>
           <p className="panel__message">
             Nothing wanted right now. Every tracked file already has all enabled downmix targets.
