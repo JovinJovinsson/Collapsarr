@@ -28,6 +28,7 @@ from collapsarr.arr.models import ArrInstance, InstanceType, RemotePathMapping
 from collapsarr.arr.webhooks import ResolvedWebhookFile
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.downmix.cancellation import CancellationHandle
 from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError
@@ -1050,14 +1051,44 @@ def test_cancel_job_removes_a_pending_job_and_deletes_its_history(
         assert get_job_history(session, job.id) is None
 
 
-def test_cancel_job_reports_too_late_for_a_job_no_longer_pending(
+def test_cancel_job_hard_kills_a_running_job(
     settings: Settings, session_factory: sessionmaker[Session]
 ) -> None:
+    """COL-192 AC: cancelling a RUNNING Job signals its hard-kill handle and succeeds.
+
+    The killed Job's history row is left intact (unlike the PENDING case's
+    delete) -- the worker finishing the killed run re-records it as FAILED
+    through the ordinary terminal path.
+    """
     scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
     job = scheduler.trigger_file("/media/movie.mkv")
     assert job is not None
-    # Simulate a worker having already claimed the job before the cancel request lands.
+    # Simulate a worker having claimed the job and armed its hard-kill handle,
+    # exactly as JobQueue._claim_next does the instant it flips it to RUNNING.
     job.status = JobStatus.RUNNING
+    job.cancellation = CancellationHandle()
+    with session_factory() as session:
+        record_job_history(session, job)
+
+    with session_factory() as session:
+        outcome = scheduler.cancel_job(job.id, session=session)
+
+    assert outcome is True
+    assert job.cancellation.cancelled is True  # the subprocess kill was fired
+    # History row is NOT deleted for a running cancel (the worker finalizes it).
+    with session_factory() as session:
+        assert get_job_history(session, job.id) is not None
+
+
+def test_cancel_job_reports_too_late_for_a_terminal_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A Job that finished naturally between the request and the cancel is a no-op (False)."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    # Simulate the job reaching a terminal status before the cancel request lands.
+    job.status = JobStatus.FAILED
     with session_factory() as session:
         record_job_history(session, job)
 
