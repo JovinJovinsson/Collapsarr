@@ -201,8 +201,29 @@ def test_large_backup_download_completes_through_the_full_middleware_stack(
 
     If this test fails (times out, or the bytes/content-length don't match),
     that confirms the middleware hypothesis and this becomes the regression
-    test for the fix (COL-199). If it passes, the hypothesis needs revisiting
-    before COL-199 proceeds.
+    test for the fix (COL-199).
+
+    Outcome as of this writing: the test PASSES against current code -- the
+    download completes with correct status/content-length/byte-for-byte
+    content well within the bound, so the full middleware stack does not
+    reproduce the reported stall here. This does NOT rule out the hypothesis
+    outright, for two reasons COL-199 should factor in before trusting the
+    pass:
+
+    1. ``TestClient`` drives requests through an in-process
+       :class:`~starlette.testclient.ASGITransport` with no real socket-level
+       backpressure. The classic ``BaseHTTPMiddleware`` streaming-hang bug
+       needs that backpressure (a slow/stalled real client connection) to
+       manifest -- an in-memory transport that always reads eagerly may
+       simply never trigger it.
+    2. The installed Starlette version (1.3.1) postdates the versions the
+       ``BaseHTTPMiddleware`` streaming-hang bug was originally reported
+       against, so it may already be fixed upstream.
+
+    If COL-199 wants stronger confirmation before committing to the
+    middleware-conversion fix, consider reproducing against a real ASGI
+    server bound to a real socket (e.g. ``uvicorn`` + a client that reads
+    slowly) rather than relying solely on this in-process pass.
     """
     headers = _auth_headers(client)
     created = client.post("/api/system/backup", headers=headers).json()
