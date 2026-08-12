@@ -17,6 +17,7 @@ injected via ``dependency_overrides`` drives their response shapes deterministic
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -36,6 +37,8 @@ from collapsarr.arr.catalog import (
 from collapsarr.arr.files import MonitoredFile
 from collapsarr.arr.models import ArrInstance, InstanceType
 from collapsarr.config import Settings
+from collapsarr.downmix.cancellation import CancellationHandle
+from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.probe import AudioStreamInfo
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs import scheduler as scheduler_module
@@ -1357,8 +1360,13 @@ def test_cancel_job_returns_cancelled_true_on_success(client: TestClient) -> Non
     assert fake.cancel_calls == [job_id]
 
 
-def test_cancel_job_returns_cancelled_false_when_already_claimed(client: TestClient) -> None:
-    """A no-longer-PENDING Job is "too late", not an error and not a silent success."""
+def test_cancel_job_returns_cancelled_false_when_too_late(client: TestClient) -> None:
+    """A Job that finished naturally in the request/cancel race is "too late" (False), not an error.
+
+    Since COL-192 a ``RUNNING`` Job is hard-killed (``cancelled=True``, see the
+    end-to-end test below), so ``False`` now means only "already terminal by the
+    time the cancel ran" -- the scheduler's ``cancel_job`` returning ``False``.
+    """
     job_id = uuid4()
     fake = _FakeScheduler(cancel_result=False)
     app = client.app
@@ -1418,6 +1426,78 @@ def test_cancel_job_wires_through_a_real_scheduler(settings: Settings) -> None:
         response = client.delete(f"/api/jobs/{uuid4()}", headers=_auth_headers(client))
 
     assert response.status_code == 404
+
+
+def test_cancel_job_hard_kills_a_running_job_end_to_end(
+    client: TestClient, settings: Settings
+) -> None:
+    """COL-192 end-to-end: DELETE against a RUNNING Job hard-kills it -> 200 cancelled:true, FAILED.
+
+    Wires a real :class:`JobScheduler` over a real running :class:`JobQueue`
+    whose pipeline runner registers a fake subprocess with the job's hard-kill
+    handle and blocks until it is killed -- so the ``DELETE`` request drives the
+    full route -> ``cancel_job`` -> ``cancel_running`` -> handle path, then the
+    worker fails the killed job out and frees its slot.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+
+    started = threading.Event()
+    killed = threading.Event()
+
+    class _FakeProcess:
+        pid = 2_000_000_000  # no such process -> os.getpgid raises, forcing kill()
+
+        def poll(self) -> int | None:
+            return None
+
+        def kill(self) -> None:
+            killed.set()
+
+    def hard_kill_runner(
+        file_path: Path,
+        _settings: DownmixSettings,
+        *,
+        cancel_handle: CancellationHandle | None = None,
+        **_: object,
+    ) -> PipelineResult:
+        assert cancel_handle is not None
+        cancel_handle.attach(_FakeProcess())
+        started.set()
+        assert killed.wait(timeout=5), "subprocess was never killed"
+        return PipelineResult(
+            outcome=PipelineOutcome.REMUX_FAILED, success=False, detail="killed"
+        )
+
+    surround = [
+        AudioStreamInfo(
+            index=0, codec="ac3", channels=6, channel_layout="5.1(side)", language="eng"
+        )
+    ]
+
+    queue = JobQueue(max_concurrency=1, pipeline_runner=hard_kill_runner)
+    queue.start()
+    try:
+        scheduler = JobScheduler(queue, session_factory, settings, probe=lambda path: surround)
+        app.state.job_scheduler = scheduler
+
+        job = scheduler.trigger_file("/media/movie.mkv")
+        assert job is not None
+        assert started.wait(timeout=5)  # a worker claimed + is "running" it
+
+        response = client.delete(f"/api/jobs/{job.id}", headers=_auth_headers(client))
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"cancelled": True}
+
+        assert queue.wait_idle(timeout=5) is True
+        assert killed.is_set()  # the subprocess was terminated
+        finished = queue.get_job(job.id)
+        assert finished is not None
+        assert finished.status is JobStatus.FAILED
+    finally:
+        queue.shutdown()
 
 
 # --- POST /api/jobs/clear (COL-173) -------------------------------------------
