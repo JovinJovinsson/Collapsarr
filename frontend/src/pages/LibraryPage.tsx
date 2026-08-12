@@ -451,7 +451,7 @@ function SeriesTree({
                     const seasonOpen = expandAll || expandedSeasons.has(seasonNode.id);
                     return (
                       <Fragment key={seasonNode.id}>
-                        <tr className="library-tree-table__row library-tree-table__row--season">
+                        <tr className="library-tree-table__row library-tree-table__row--season library-tree-table__row--depth-1">
                           <td>
                             <SelectionCheckbox
                               nodeType="season"
@@ -491,6 +491,7 @@ function SeriesTree({
                                 episode.has_file,
                                 "library-tree-table__row",
                                 "library-tree-table__row--episode",
+                                "library-tree-table__row--depth-2",
                               )}
                             >
                               <td>
