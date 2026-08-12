@@ -128,7 +128,8 @@ queued at once": before COL-171, both the periodic scan and ``POST
 enforce this, rather than five separate ad-hoc implementations: (1) a Job
 completing, success or failure alike, via the job-terminal hook wired onto
 ``queue`` in :meth:`__init__` (:meth:`~collapsarr.jobs.queue.JobQueue.
-set_job_terminal_hook`); (2) a Job being cancelled (COL-168, :meth:`cancel_job`);
+set_job_terminal_hook`); (2) a Job being cancelled -- a ``PENDING`` one
+removed, or (COL-192) a ``RUNNING`` one hard-killed (COL-168, :meth:`cancel_job`);
 (3) the periodic background scan (:meth:`scan_once`); (4) ``POST
 /api/jobs/scan`` (:meth:`scan_now`, an alias for :meth:`scan_once`); and (5) the
 bulk "Clear queue" cancel (COL-173, :meth:`clear_queue`) -- which calls
@@ -923,7 +924,7 @@ class JobScheduler:
     # -- Cancel (COL-168) -----------------------------------------------------
 
     def cancel_job(self, job_id: UUID, *, session: Session | None = None) -> bool | None:
-        """Cancel one still-``PENDING`` Job by id -- deletion, not a new status (COL-168).
+        """Cancel one Job by id -- pending *or* running (COL-168, hard-kill COL-192).
 
         The entry point ``DELETE /api/jobs/{job_id}`` (:mod:`collapsarr.jobs.
         routes`) calls, mirroring :meth:`trigger_file`/
@@ -939,47 +940,75 @@ class JobScheduler:
           restarted past (only ``PENDING`` rows survive a restart, see
           :class:`~collapsarr.jobs.queue.JobQueue`'s module docstring). The
           route reports this as ``404`` -- there is nothing to act on.
-        * ``True`` -- the Job was still ``PENDING`` and
-          :meth:`~collapsarr.jobs.queue.JobQueue.cancel` removed it from the
-          live queue; its persisted ``JobHistory`` row is then deleted too
-          (:func:`~collapsarr.jobs.history.delete_job_history`), so a
-          cancelled Job leaves no trace at all -- no audit row, no cooldown
-          interaction with the Recently-Processed Window (see the module
-          docstring above).
-        * ``False`` -- the Job exists but is no longer ``PENDING`` (a worker
-          already claimed it, or it already reached a terminal status) by
-          the time :meth:`~collapsarr.jobs.queue.JobQueue.cancel` ran:
-          "too late," left exactly as it was, history row intact.
+        * ``True`` -- the Job was cancelled. Two shapes fold into this one
+          success:
 
-        A successful cancel (``True``) frees a slot in the Auto-Queue Limit's
-        budget, so it also runs :meth:`top_up` immediately afterward (COL-171)
-        -- the second of the five top-up hook points (see :meth:`top_up`'s
-        docstring). A ``False``/``None`` outcome leaves the live ``PENDING``
-        count unchanged, so no top-up runs for either.
+          - **Was ``PENDING``:** :meth:`~collapsarr.jobs.queue.JobQueue.cancel`
+            removed it from the live queue and its persisted ``JobHistory`` row
+            is deleted too (:func:`~collapsarr.jobs.history.delete_job_history`),
+            so a never-started Job leaves no trace at all -- no audit row, no
+            cooldown interaction with the Recently-Processed Window.
+          - **Was ``RUNNING`` (COL-192):**
+            :meth:`~collapsarr.jobs.queue.JobQueue.cancel_running` hard-kills
+            its in-flight ffmpeg/ffprobe subprocess (and children). The
+            history row is deliberately **not** deleted here -- the worker
+            finishing the killed job re-records it as ``FAILED`` through the
+            ordinary terminal path (a hard-cancel is recorded as a failure, no
+            distinct ``CANCELLED`` status -- see
+            :meth:`~collapsarr.jobs.queue.JobQueue.cancel_running` and
+            ``docs/adr/0007``), so deleting it here would just race that write.
+        * ``False`` -- the Job exists but is no longer cancellable: it already
+          reached a terminal status between the request landing and the cancel
+          running (the "finished naturally" race). "Too late," left exactly as
+          it was, history row intact -- the same too-late shape the pending
+          case has always reported for an already-claimed Job.
 
-        Delegates the actual cancel to :meth:`_cancel_one` -- the same
+        A successful cancel (``True``, pending removal or running kill alike)
+        frees a slot in the Auto-Queue Limit's budget, so it runs :meth:`top_up`
+        immediately afterward (COL-171) -- the second of the top-up hook points
+        (see :meth:`top_up`'s docstring). A ``False``/``None`` outcome leaves
+        the live count unchanged, so no top-up runs for either.
+
+        The pending path delegates to :meth:`_cancel_one` -- the same
         get/cancel/delete-history primitive :meth:`clear_queue` (COL-173)
-        reuses for its own bulk pass -- and runs :meth:`top_up` right after a
-        success, same as always. :meth:`clear_queue` deliberately does *not*
-        call this method directly for that reason: it needs the cancel
-        primitive without a top-up after every individual cancellation (see
-        its own docstring for why), so it calls :meth:`_cancel_one` itself
-        and runs :meth:`top_up` once, after its whole batch, instead.
+        reuses for its own bulk pass. :meth:`clear_queue` deliberately calls
+        that primitive (not this method) so it can cancel *only* pending Jobs
+        and top up once for the whole batch; a running Job it snapshots is left
+        alone as ``already_running`` rather than hard-killed -- "Clear queue"
+        clears the pending backlog, it is not a "kill everything in flight"
+        button, which stays this single, explicit per-Job action.
 
         Mirrors :meth:`_is_duplicate`'s session handling: reuses ``session``
         when the caller has one open (the route always does), else opens a
         short-lived one for the ``JobHistory`` delete and the top-up.
         """
         if session is not None:
-            outcome = self._cancel_one(job_id, session)
-            if outcome:
-                self.top_up(session=session)
-            return outcome
+            return self._cancel_job_in(job_id, session)
         with self._session_factory() as owned_session:
-            outcome = self._cancel_one(job_id, owned_session)
-            if outcome:
-                self.top_up(session=owned_session)
-            return outcome
+            return self._cancel_job_in(job_id, owned_session)
+
+    def _cancel_job_in(self, job_id: UUID, session: Session) -> bool | None:
+        """The body of :meth:`cancel_job`, run against an already-open ``session``.
+
+        Tries the pending-cancel primitive first (:meth:`_cancel_one`); a
+        ``False`` from it means the Job is not ``PENDING``, so it is either
+        ``RUNNING`` -- hard-killed via
+        :meth:`~collapsarr.jobs.queue.JobQueue.cancel_running` (COL-192) -- or
+        already terminal, the genuinely-too-late case left untouched.
+        """
+        outcome = self._cancel_one(job_id, session)
+        if outcome is None:
+            return None  # unknown id -- nothing to act on
+        if outcome is False:
+            # Not PENDING: hard-kill it if a worker is running it right now
+            # (COL-192). cancel_running returns False for a Job that already
+            # reached a terminal status between the request and now -- the
+            # "finished naturally" race, genuinely too late.
+            if not self._queue.cancel_running(job_id):
+                return False
+        # A freed slot (pending removal or running kill) tops the budget back up.
+        self.top_up(session=session)
+        return True
 
     def _cancel_one(self, job_id: UUID, session: Session) -> bool | None:
         """Cancel one still-``PENDING`` Job by id, without running :meth:`top_up` (COL-168/COL-173).
@@ -1253,8 +1282,10 @@ class JobScheduler:
            (:meth:`~collapsarr.jobs.queue.JobQueue.set_job_terminal_hook`), so
            this runs on the worker thread the instant any Job finishes, via
            :meth:`_top_up_on_job_terminal`.
-        2. **Cancellation** (COL-168) -- :meth:`cancel_job` calls this
-           directly right after a successful cancel frees a slot.
+        2. **Cancellation** (COL-168; COL-192 for a running Job) --
+           :meth:`cancel_job` calls this directly right after a successful
+           cancel frees a slot, whether it removed a ``PENDING`` Job or
+           hard-killed a ``RUNNING`` one.
         3. **Periodic background scan** -- :meth:`scan_once` calls this for
            its enqueue pass (the library-mirror sync is unaffected/uncapped).
         4. **``POST /api/jobs/scan``** ("Scan now") -- an alias for
