@@ -73,6 +73,12 @@ class EpisodeNode(BaseModel):
     #: its ffprobe metadata carries no Default Audio Track disposition flag
     #: on any stream -- both render as "unknown" on the Library page.
     current_default_track: CurrentDefaultTrack | None = None
+    #: The bridged ``TrackedMediaFile`` id (COL-194) -- the same id
+    #: ``/wanted/:fileId`` matches against, so a ``has_file: true`` node can
+    #: link straight to its file detail page. ``None`` when there is no
+    #: bridged row yet; see
+    #: :attr:`~collapsarr.library.service.TreeEpisode.file_id`.
+    file_id: int | None = None
 
 
 class SeasonNode(BaseModel):
@@ -114,6 +120,8 @@ class MovieNode(BaseModel):
     tracked: bool
     #: See :attr:`EpisodeNode.current_default_track` (COL-154).
     current_default_track: CurrentDefaultTrack | None = None
+    #: See :attr:`EpisodeNode.file_id` (COL-194).
+    file_id: int | None = None
 
 
 class MovieLibraryTreeResponse(BaseModel):
@@ -218,6 +226,7 @@ def get_library_tree_endpoint(
                     has_file=movie.has_file,
                     tracked=movie.tracked,
                     current_default_track=_to_current_default_track(movie.current_default_track),
+                    file_id=movie.file_id,
                 )
                 for movie in movie_tree.movies
             ],
@@ -249,6 +258,7 @@ def get_library_tree_endpoint(
                                 current_default_track=_to_current_default_track(
                                     episode.current_default_track
                                 ),
+                                file_id=episode.file_id,
                             )
                             for episode in season.episodes
                         ],

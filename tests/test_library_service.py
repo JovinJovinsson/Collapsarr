@@ -20,6 +20,8 @@ from collapsarr.arr.catalog import (
     SonarrCatalog,
 )
 from collapsarr.arr.models import ArrInstance, InstanceType
+from collapsarr.downmix.probe import AudioStreamInfo
+from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.library.models import LibraryNode, LibraryNodeKind, make_node_key
 from collapsarr.library.service import (
     build_movie_tree,
@@ -32,6 +34,7 @@ from collapsarr.library.service import (
     upsert_movie_node,
     upsert_series_episode_node,
 )
+from collapsarr.media.service import upsert_tracked_media
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
 
@@ -299,6 +302,32 @@ def test_build_tree_raises_when_season_number_is_null(session: Session) -> None:
         build_tree(session, instance.id)
 
 
+def test_build_tree_episode_file_id_bridges_the_tracked_media_row(session: Session) -> None:
+    instance = _seed_instance(session)
+    sync_library(session, instance_id=instance.id, catalog=_catalog(instance.id))
+
+    tracked_media = upsert_tracked_media(
+        session,
+        file_path="/media/pilot.mkv",
+        streams=[
+            AudioStreamInfo(
+                index=0, codec="ac3", channels=2, channel_layout="stereo", language="eng"
+            )
+        ],
+        settings=DownmixSettings(enabled_targets=frozenset({DownmixTarget.STEREO})),
+        instance_id=instance.id,
+        sonarr_episode_id=101,
+    )
+
+    tree = build_tree(session, instance.id)
+    episodes = tree.series[0].seasons[0].episodes
+    bridged = next(e for e in episodes if e.episode_number == 1)
+    assert bridged.file_id == tracked_media.id
+    # No tracked-media row was ever created for episode 102 -- no bridge.
+    unbridged = next(e for e in episodes if e.episode_number == 2)
+    assert unbridged.file_id is None
+
+
 def test_default_tracked_is_true_on_fresh_settings(session: Session) -> None:
     assert get_global_settings(session).default_tracked is True
 
@@ -395,6 +424,28 @@ def test_build_movie_tree_shape_and_resolved_values(session: Session) -> None:
     assert all(m.tracked is True for m in tree.movies)
     arrival = next(m for m in tree.movies if m.radarr_movie_id == 1)
     assert arrival.has_file is True
+
+
+def test_build_movie_tree_file_id_bridges_the_tracked_media_row(session: Session) -> None:
+    instance = _seed_instance(session, type_=InstanceType.RADARR)
+    sync_library(session, instance_id=instance.id, catalog=_radarr_catalog(instance.id))
+
+    tracked_media = upsert_tracked_media(
+        session,
+        file_path="/media/arrival.mkv",
+        streams=[
+            AudioStreamInfo(index=0, codec="dts", channels=6, channel_layout="5.1", language="eng")
+        ],
+        settings=DownmixSettings(enabled_targets=frozenset({DownmixTarget.STEREO})),
+        instance_id=instance.id,
+        radarr_movie_id=1,
+    )
+
+    tree = build_movie_tree(session, instance.id)
+    movies = {m.radarr_movie_id: m for m in tree.movies}
+    assert movies[1].file_id == tracked_media.id
+    # Movie 2 ("Not Yet Downloaded") never had a tracked-media row -- no bridge.
+    assert movies[2].file_id is None
 
 
 def test_build_movie_tree_excludes_hidden_movies(session: Session) -> None:
