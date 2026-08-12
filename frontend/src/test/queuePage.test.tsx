@@ -252,16 +252,25 @@ describe("QueuePage", () => {
   });
 
   describe("per-row actions (COL-180)", () => {
-    it("shows \"Process next\" and \"Cancel\" only on pending rows, not running rows", async () => {
+    it("shows \"Process next\" only on pending rows, not running rows (COL-193: Bump stays pending-only)", async () => {
       mockFetchQueue([queueResponse]);
       render(<QueuePage />);
 
       const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
       expect(within(runningRow).queryByRole("button", { name: /process next/i })).not.toBeInTheDocument();
-      expect(within(runningRow).queryByRole("button", { name: /^cancel$/i })).not.toBeInTheDocument();
 
       const pendingRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
       expect(within(pendingRow).getByRole("button", { name: /process next/i })).toBeInTheDocument();
+    });
+
+    it("shows \"Cancel\" on both pending and running rows (COL-193)", async () => {
+      mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      expect(within(runningRow).getByRole("button", { name: /^cancel$/i })).toBeInTheDocument();
+
+      const pendingRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
       expect(within(pendingRow).getByRole("button", { name: /^cancel$/i })).toBeInTheDocument();
     });
 
@@ -334,6 +343,46 @@ describe("QueuePage", () => {
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
       // Still there, not stuck -- the row survives (it never left `pending` server-side).
       expect(screen.getByText("Show.S01E01")).toBeInTheDocument();
+    });
+
+    it("\"Cancel\" on a running row calls the DELETE endpoint for that job, and the row updates once the hard-kill lands (COL-193)", async () => {
+      // The hard-killed Job transitions to `failed` (COL-192) and drops out
+      // of the live queue (`GET /api/jobs/queue` only ever returns
+      // pending/running rows) -- so, like the pending-row case, success is
+      // observed as the row disappearing on refresh.
+      const afterCancel = [pendingJobLowerPriority, pendingJobHigherPriority];
+      const fetchMock = mockFetchWithAction([queueResponse, afterCancel], (url, init) => {
+        expect(url).toContain(`/api/jobs/${runningJob.job_id}`);
+        expect(url).not.toContain("bump");
+        expect(init?.method).toBe("DELETE");
+        return { ok: true, body: { cancelled: true } };
+      });
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(runningRow).getByRole("button", { name: /^cancel$/i }));
+
+      // Mount: queue poll + settings load; then the DELETE + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+      await waitFor(() => expect(screen.queryByText("Interstellar")).not.toBeInTheDocument());
+    });
+
+    it("\"Cancel\" on a running row shows a graceful notice, not an error, when the job finished first (too-late race, COL-193)", async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: true,
+        body: { cancelled: false },
+      }));
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(runningRow).getByRole("button", { name: /^cancel$/i }));
+
+      expect(await screen.findByText(/already finished/i)).toBeInTheDocument();
+      // Mount: queue poll + settings load; then the DELETE + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+      // Still there, not stuck -- the row survives (it never left `running` server-side).
+      expect(screen.getByText("Interstellar")).toBeInTheDocument();
+      expect(within(runningRow).getByRole("button", { name: /^cancel$/i })).not.toBeDisabled();
     });
 
     it("surfaces a clear message, not a stuck row, when the cancel target is already gone (404)", async () => {
