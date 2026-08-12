@@ -1,7 +1,7 @@
+import { Library } from "lucide-react";
 import { Navigate } from "react-router-dom";
 
 import { readLastVisitedLibraryInstanceId } from "../api/library";
-import { LibraryIcon } from "../components/icons";
 import { useInstances } from "../hooks/useInstances";
 
 /**
@@ -39,7 +39,7 @@ export function LibrariesIndexPage() {
         </header>
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <LibraryIcon width={28} height={28} />
+            <Library width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load configured instances: {state.message}</p>
         </div>
@@ -55,7 +55,7 @@ export function LibrariesIndexPage() {
         </header>
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <LibraryIcon width={28} height={28} />
+            <Library width={28} height={28} />
           </span>
           <p className="panel__message">
             No Sonarr or Radarr instances configured yet. Add one under Settings to browse its

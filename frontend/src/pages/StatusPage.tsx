@@ -1,18 +1,19 @@
+import { HeartPulse, Info, OctagonAlert, TriangleAlert } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 
 import { fetchHealthChecks } from "../api/health";
 import { fetchSystemInfo } from "../api/system";
-import { ErrorIcon, HealthIcon, StatusIcon, WarningIcon } from "../components/icons";
 import { prefixPath } from "../runtime/urlBase";
 import type { HealthCheckState, HealthSeverity } from "../types/health";
 import type { SystemInfo } from "../types/system";
 import { formatBytes } from "../utils/format";
 
 /** Icon per severity, matching `HealthBanner`/`HealthChecksPage`'s convention. */
-const SEVERITY_ICON: Record<HealthSeverity, typeof WarningIcon> = {
-  warning: WarningIcon,
-  error: ErrorIcon,
+const SEVERITY_ICON: Record<HealthSeverity, LucideIcon> = {
+  warning: TriangleAlert,
+  error: OctagonAlert,
 };
 
 /** The static "More Info" external links (COL-125) -- no backend source, so fixed here. */
@@ -156,7 +157,7 @@ export function StatusPage() {
         {state.status === "error" && (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <StatusIcon width={28} height={28} />
+              <Info width={28} height={28} />
             </span>
             <p className="panel__message">Couldn&apos;t load system info: {state.message}</p>
           </div>
@@ -195,7 +196,7 @@ export function StatusPage() {
 
           {healthState.status === "ready" && healthState.failing.length === 0 && (
             <p className="status-health-clear">
-              <HealthIcon width={18} height={18} aria-hidden />
+              <HeartPulse width={18} height={18} aria-hidden />
               All health checks are passing.
             </p>
           )}
@@ -203,7 +204,7 @@ export function StatusPage() {
           {healthState.status === "ready" && healthState.failing.length > 0 && (
             <ul className="status-health-list">
               {healthState.failing.map((check) => {
-                const SeverityIcon = SEVERITY_ICON[check.severity] ?? WarningIcon;
+                const SeverityIcon = SEVERITY_ICON[check.severity] ?? TriangleAlert;
                 return (
                   <li key={check.id} className="status-health-row">
                     <SeverityIcon

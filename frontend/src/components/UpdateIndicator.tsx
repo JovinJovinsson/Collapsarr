@@ -1,9 +1,9 @@
+import { Download } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { fetchUpdateStatus } from "../api/updates";
 import type { UpdateCheckState } from "../types/updates";
-import { UpdateIcon } from "./icons";
 
 /**
  * App-wide "update available" indicator (COL-87). Fetches `GET /api/system/
@@ -53,7 +53,7 @@ export function UpdateIndicator() {
 
   return (
     <Link to="/system/updates" className="update-indicator" role="status">
-      <UpdateIcon className="update-indicator__icon" width={16} height={16} />
+      <Download className="update-indicator__icon" width={16} height={16} />
       <span className="update-indicator__message">
         Update available{update.latest_version ? ` — ${update.latest_version}` : ""}
       </span>

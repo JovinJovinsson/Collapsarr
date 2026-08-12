@@ -1,3 +1,4 @@
+import { Library } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
@@ -8,7 +9,6 @@ import {
   rememberVisitedLibraryInstance,
   updateTracked,
 } from "../api/library";
-import { LibraryIcon } from "../components/icons";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import { useInstances } from "../hooks/useInstances";
 import type { BulkSetDefaultAudioTriggerResult } from "../types/activity";
@@ -1018,7 +1018,7 @@ export function LibraryPage() {
       {treeState.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <LibraryIcon width={28} height={28} />
+            <Library width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load this library: {treeState.message}</p>
         </div>
@@ -1029,14 +1029,14 @@ export function LibraryPage() {
         (treeState.tree.series.length === 0 ? (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <LibraryIcon width={28} height={28} />
+              <Library width={28} height={28} />
             </span>
             <p className="panel__message">No series found in this library yet.</p>
           </div>
         ) : filteredSeries.length === 0 ? (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <LibraryIcon width={28} height={28} />
+              <Library width={28} height={28} />
             </span>
             <p className="panel__message">No series match your search or filter.</p>
           </div>
@@ -1058,14 +1058,14 @@ export function LibraryPage() {
         (treeState.tree.movies.length === 0 ? (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <LibraryIcon width={28} height={28} />
+              <Library width={28} height={28} />
             </span>
             <p className="panel__message">No movies found in this library yet.</p>
           </div>
         ) : filteredMovies.length === 0 ? (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <LibraryIcon width={28} height={28} />
+              <Library width={28} height={28} />
             </span>
             <p className="panel__message">No movies match your search or filter.</p>
           </div>

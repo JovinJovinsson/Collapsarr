@@ -1,3 +1,4 @@
+import { MonitorCog, Settings } from "lucide-react";
 import { useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 
@@ -7,7 +8,6 @@ import { logout } from "../api/auth";
 import { useHealth } from "../hooks/useHealth";
 import { LIBRARIES_PATH, navItems, SETTINGS_PATH, settingsNavItems, SYSTEM_PATH, systemNavItems } from "../routes/nav";
 import type { NavItem } from "../routes/nav";
-import { SettingsIcon } from "./icons";
 import { LibraryNavSection } from "./LibraryNavSection";
 import { NavSection } from "./NavSection";
 
@@ -82,14 +82,17 @@ export function Sidebar() {
             bare redirect (router.tsx) rather than a distinct page, so `to`
             can be the group's own base path -- same as System below -- and
             isn't part of `navItems` for the same reason System isn't. */}
-        <NavSection to={SETTINGS_PATH} label="Settings" icon={<SettingsIcon />} items={settingsNavItems} />
+        <NavSection to={SETTINGS_PATH} label="Settings" icon={<Settings size={20} />} items={settingsNavItems} />
 
         {/* System (COL-63): expands only while a /system/* route is active
             (COL-141), rather than always-visible like the primary items
-            above -- System's own pages/routes/order are unchanged. */}
+            above -- System's own pages/routes/order are unchanged. COL-191:
+            now renders MonitorCog, closing the icon-less gap this group
+            previously had next to Settings above. */}
         <NavSection
           to={SYSTEM_PATH}
           label="System"
+          icon={<MonitorCog size={20} />}
           items={systemNavItems}
           className="sidebar__nav-group--system"
         />

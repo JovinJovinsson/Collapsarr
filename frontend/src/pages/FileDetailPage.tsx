@@ -1,3 +1,4 @@
+import { CakeSlice } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
@@ -5,7 +6,6 @@ import { fetchJobHistory, triggerDownmix, triggerSetDefaultAudio } from "../api/
 import { updateTracked } from "../api/library";
 import { fetchSettings } from "../api/settings";
 import { fetchWantedList } from "../api/wanted";
-import { WantedIcon } from "../components/icons";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { JobHistoryEntry, JobKind, JobStatus, ManualTriggerResult } from "../types/activity";
@@ -339,7 +339,7 @@ export function FileDetailPage() {
       {fileState.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <WantedIcon width={28} height={28} />
+            <CakeSlice width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load this file: {fileState.message}</p>
         </div>
@@ -348,7 +348,7 @@ export function FileDetailPage() {
       {fileState.status === "not-found" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <WantedIcon width={28} height={28} />
+            <CakeSlice width={28} height={28} />
           </span>
           <p className="panel__message">
             No tracked file with this id is currently in the wanted list. It may already have every

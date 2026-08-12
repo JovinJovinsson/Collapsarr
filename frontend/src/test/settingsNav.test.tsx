@@ -5,6 +5,9 @@ import { describe, expect, it, vi } from "vitest";
 import { settingsNavItems } from "../routes/nav";
 import { routes } from "../routes/router";
 
+/** The lucide `Settings` icon's rendered class name (COL-191): `Sidebar` passes it directly to `NavSection`'s `icon` prop for the Settings group header. */
+const SETTINGS_ICON_CLASS = "lucide-settings";
+
 // Mock fetch for pages that fetch on mount (Settings' General page among them).
 vi.stubGlobal(
   "fetch",
@@ -63,6 +66,16 @@ describe("Settings navigation (COL-142, COL-143, COL-144, COL-146, COL-147)", ()
     const nav = await screen.findByRole("navigation", { name: /primary/i });
     const settingsLink = within(nav).getByRole("link", { name: "Settings" });
     expect(settingsLink).toHaveAttribute("href", "/settings");
+  });
+
+  // COL-191: the Settings group header renders the lucide `Settings` icon
+  // (unchanged in spirit from the old hand-drawn SettingsIcon it replaced).
+  it("renders the Settings icon on the Settings group header", async () => {
+    renderWithSettingsNav("/wanted");
+
+    const nav = await screen.findByRole("navigation", { name: /primary/i });
+    const settingsLink = within(nav).getByRole("link", { name: "Settings" });
+    expect(settingsLink.querySelector(`svg.${SETTINGS_ICON_CLASS}`)).toBeInTheDocument();
   });
 
   it("renders settings nav items in the correct order in the sidebar", async () => {

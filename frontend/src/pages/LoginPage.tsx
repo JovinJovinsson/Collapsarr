@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { fetchAuthStatus, login } from "../api/auth";
-import { BrandMark } from "../components/icons";
+import { BrandMark } from "../components/BrandMark";
 
 /**
  * Forms login (COL-50): authenticates the single operator credential and opens
