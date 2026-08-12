@@ -208,12 +208,25 @@ enqueued Job (auto or manual) always joins at the back of the order.
 
 ## Cancel (job)
 
-Removing a `pending` Job from the queue — never a status a Job reaches.
-Deletes both the live in-memory Job and its `JobHistory` row outright, so
-a cancelled Job leaves no trace and carries no cooldown. Only `pending`
-Jobs can be cancelled; a `running` Job cannot be interrupted (see
-`docs/adr/0007-job-queue-priority-pull-rearchitecture.md`'s Consequences
-for why that's deferred, not solved here).
+Ending a Job on request — never a status a Job reaches; there is no
+distinct `cancelled` state. Both `pending` and `running` Jobs can be
+cancelled (COL-192), but the two cases resolve differently:
+
+- **`pending`** — a clean removal from the queue. Deletes both the live
+  in-memory Job and its `JobHistory` row outright, so a never-started Job
+  leaves no trace and carries no cooldown.
+- **`running`** — a hard kill. `SIGKILL` is sent to the process group of
+  the in-flight `ffmpeg`/`ffprobe` subprocess (each runs in its own process
+  group, so children die with it), which makes the pipeline call return a
+  failure. The worker then transitions the Job to `failed` through the
+  ordinary terminal path — a hard-cancelled run is recorded as `failed`
+  like any other pipeline failure, not a new status, so its `JobHistory`
+  row is kept and it interacts with the Recently-Processed Window's cooldown
+  exactly as a natural failure would.
+
+This supersedes ADR 0007's original stance that a `running` Job could not
+be interrupted (see
+`docs/adr/0007-job-queue-priority-pull-rearchitecture.md`).
 
 ## Auto-Queue Limit
 
