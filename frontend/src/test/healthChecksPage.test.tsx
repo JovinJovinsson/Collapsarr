@@ -103,6 +103,22 @@ describe("HealthChecksPage", () => {
     expect(errorSeverity.className).not.toBe(warningSeverity.className);
   });
 
+  it("hides severity badges for passing checks, showing only status", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse([errorCheck, passingCheck])));
+    render(<HealthChecksPage />);
+
+    const failingRow = (await screen.findByText("ERR-CONN-001")).closest("tr") as HTMLElement;
+    const passingRow = screen.getByText("ffmpeg_missing").closest("tr") as HTMLElement;
+
+    // Failing check shows severity badge
+    expect(within(failingRow).getByText("Error")).toBeInTheDocument();
+    expect(within(failingRow).getByText("Error")).toHaveClass("health-table__severity--error");
+
+    // Passing check does not show severity badge (even though it has severity="error")
+    expect(within(passingRow).queryByText("Error")).not.toBeInTheDocument();
+    expect(within(passingRow).getByText("Passing")).toBeInTheDocument();
+  });
+
   it("shows the per-instance id and both passing/failing statuses", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse([errorCheck, passingCheck])));
     render(<HealthChecksPage />);

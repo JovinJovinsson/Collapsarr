@@ -227,12 +227,14 @@ export function HealthChecksPage() {
                     </td>
                     <td>{check.category}</td>
                     <td>
-                      <span
-                        className={`health-table__severity health-table__severity--${check.severity}`}
-                      >
-                        <SeverityIcon className="health-table__severity-icon" width={14} height={14} />
-                        {SEVERITY_LABEL[check.severity] ?? check.severity}
-                      </span>
+                      {check.status === "failing" && (
+                        <span
+                          className={`health-table__severity health-table__severity--${check.severity}`}
+                        >
+                          <SeverityIcon className="health-table__severity-icon" width={14} height={14} />
+                          {SEVERITY_LABEL[check.severity] ?? check.severity}
+                        </span>
+                      )}
                     </td>
                     <td>
                       <span className={`health-table__status health-table__status--${check.status}`}>
