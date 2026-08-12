@@ -9,9 +9,12 @@ non-file-based database.
 
 from __future__ import annotations
 
+import os
+import threading
 import zipfile
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import Mount
@@ -155,6 +158,112 @@ def test_download_path_traversal_id_returns_404(client: TestClient) -> None:
         headers=headers,
     )
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Large download through the full middleware stack (COL-197)
+# --------------------------------------------------------------------------- #
+_LARGE_DOWNLOAD_PAYLOAD_SIZE = 12 * 1024 * 1024
+"""~190 of FileResponse's 64 KiB send chunks -- large enough to actually
+exercise chunked streaming rather than complete in a single ``send()``."""
+
+_LARGE_DOWNLOAD_JOIN_TIMEOUT = 30.0
+"""Bound on how long the background-thread download is allowed to run.
+
+If the middleware stack really does stall (rather than merely mis-count
+bytes), the request never returns and the thread never finishes -- joining
+with a timeout turns that into a clear, bounded test failure instead of
+hanging the suite forever."""
+
+
+def test_large_backup_download_completes_through_the_full_middleware_stack(
+    client: TestClient, settings: Settings
+) -> None:
+    """Reproduction test for the reported "stalls at 100%" download bug (COL-197).
+
+    Backup downloads reportedly hang in Safari/Chrome after appearing to reach
+    100%. The leading hypothesis is ``enforce_auth_middleware``: it is wired
+    onto the app via ``app.middleware("http")``, which Starlette turns into a
+    :class:`~starlette.middleware.base.BaseHTTPMiddleware` that re-buffers the
+    wrapped response body through its own ``anyio`` task-group/memory-stream
+    machinery instead of handing the ASGI ``send`` callable straight through
+    to :class:`~fastapi.responses.FileResponse` -- and that this mishandles a
+    large streamed body.
+
+    Unlike ``test_download_streams_the_correct_archive`` above (a handful of
+    real bytes), this drives the request through the *whole* registered
+    middleware stack -- ``enforce_auth_middleware``, ``SessionMiddleware``,
+    and ``UrlBaseMiddleware`` -- against a multi-megabyte synthetic payload,
+    not just the route handler in isolation. The download runs on a
+    background thread with a bounded ``join`` (see
+    ``_LARGE_DOWNLOAD_JOIN_TIMEOUT``) so a genuine stall fails the test
+    explicitly instead of hanging the suite.
+
+    If this test fails (times out, or the bytes/content-length don't match),
+    that confirms the middleware hypothesis and this becomes the regression
+    test for the fix (COL-199).
+
+    Outcome as of this writing: the test PASSES against current code -- the
+    download completes with correct status/content-length/byte-for-byte
+    content well within the bound, so the full middleware stack does not
+    reproduce the reported stall here. This does NOT rule out the hypothesis
+    outright, for two reasons COL-199 should factor in before trusting the
+    pass:
+
+    1. ``TestClient`` drives requests through an in-process
+       :class:`~starlette.testclient.ASGITransport` with no real socket-level
+       backpressure. The classic ``BaseHTTPMiddleware`` streaming-hang bug
+       needs that backpressure (a slow/stalled real client connection) to
+       manifest -- an in-memory transport that always reads eagerly may
+       simply never trigger it.
+    2. The installed Starlette version (1.3.1) postdates the versions the
+       ``BaseHTTPMiddleware`` streaming-hang bug was originally reported
+       against, so it may already be fixed upstream.
+
+    If COL-199 wants stronger confirmation before committing to the
+    middleware-conversion fix, consider reproducing against a real ASGI
+    server bound to a real socket (e.g. ``uvicorn`` + a client that reads
+    slowly) rather than relying solely on this in-process pass.
+    """
+    headers = _auth_headers(client)
+    created = client.post("/api/system/backup", headers=headers).json()
+
+    # Overwrite the tiny real archive with a large synthetic payload. The
+    # download route only cares about what bytes are on disk at the resolved
+    # path -- it doesn't need to still be a valid zip -- so this is a cheap
+    # way to get a multi-MB body without minutes of real database growth.
+    archive_path = backups_root(settings) / BACKUP_MANUAL / created["name"]
+    payload = os.urandom(_LARGE_DOWNLOAD_PAYLOAD_SIZE)
+    archive_path.write_bytes(payload)
+
+    outcome: dict[str, object] = {}
+
+    def _download() -> None:
+        try:
+            outcome["response"] = client.get(
+                f"/api/system/backup/{created['id']}/download", headers=headers
+            )
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_download, daemon=True)
+    thread.start()
+    thread.join(timeout=_LARGE_DOWNLOAD_JOIN_TIMEOUT)
+    assert not thread.is_alive(), (
+        f"backup download did not complete within {_LARGE_DOWNLOAD_JOIN_TIMEOUT:.0f}s "
+        "through the full middleware stack -- reproduces the reported "
+        "stalled-download bug (COL-197)"
+    )
+
+    if "error" in outcome:
+        raise outcome["error"]  # type: ignore[misc]
+
+    response = outcome["response"]
+    assert isinstance(response, httpx.Response)
+    assert response.status_code == 200
+    assert int(response.headers["content-length"]) == _LARGE_DOWNLOAD_PAYLOAD_SIZE
+    assert len(response.content) == _LARGE_DOWNLOAD_PAYLOAD_SIZE
+    assert response.content == payload
 
 
 # --------------------------------------------------------------------------- #
