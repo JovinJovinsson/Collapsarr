@@ -3,21 +3,41 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getStoredApiKey } from "../api/client";
-import { recheckUpdateStatus } from "../api/updates";
+import { fetchUpdateStatus, recheckUpdateStatus } from "../api/updates";
 import { GeneralSection } from "../components/settings/GeneralSection";
+import { UpdateIndicator } from "../components/UpdateIndicator";
+import { UpdatesProvider } from "../components/UpdatesProvider";
 import type { GlobalSettings } from "../types/settings";
+import type { UpdateCheckState } from "../types/updates";
 
-// COL-196: `recheckUpdateStatus` is mocked at the module level rather than
-// via the raw `fetch` mock used elsewhere in this file, so the assertion
-// below is "was the recheck triggered", not "which URL got hit" -- keeps the
-// test decoupled from the recheck endpoint's own request shape.
+// COL-196: `fetchUpdateStatus`/`recheckUpdateStatus` are mocked at the
+// module level rather than via the raw `fetch` mock used elsewhere in this
+// file, so the assertions below are "was the recheck triggered"/"what state
+// did it push", not "which URL got hit" -- keeps the tests decoupled from
+// those endpoints' own request shapes. `fetchUpdateStatus` is mocked too
+// (COL-196 code review) because `GeneralSection` now reads the shared Update
+// Check state via `useUpdates()`, which requires wrapping it in
+// `UpdatesProvider` -- whose own initial-mount fetch needs a resolved value
+// here, same as `UpdateIndicator`'s in `updateIndicator.test.tsx`.
 vi.mock("../api/updates", () => ({
+  fetchUpdateStatus: vi.fn(),
   recheckUpdateStatus: vi.fn(),
 }));
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
 }
+
+const baseUpdateCheckState: UpdateCheckState = {
+  running_version: "1.2.3",
+  latest_version: "v1.2.3",
+  latest_version_label: "v1.2.3",
+  changelog: null,
+  checked_at: "2026-08-02T10:00:00Z",
+  update_available: false,
+  dismissed_at: null,
+  is_docker: false,
+};
 
 const baseSettings: GlobalSettings = {
   enabled_targets: ["stereo"],
@@ -47,12 +67,19 @@ const baseSettings: GlobalSettings = {
   updated_at: "2026-07-01T00:00:00Z",
 };
 
-/** GeneralSection renders a `Link` to the Updates page (COL-88), so every
- * render needs a Router context -- mirrors `updateIndicator.test.tsx`. */
+/**
+ * GeneralSection renders a `Link` to the Updates page (COL-88), so every
+ * render needs a Router context -- mirrors `updateIndicator.test.tsx`. It
+ * also reads the shared Update Check state via `useUpdates()` (COL-196 code
+ * review), so it needs `UpdatesProvider` too, mirroring
+ * `healthBanner.test.tsx`'s `HealthProvider` wrapping.
+ */
 function renderGeneralSection() {
   return render(
     <MemoryRouter>
-      <GeneralSection />
+      <UpdatesProvider>
+        <GeneralSection />
+      </UpdatesProvider>
     </MemoryRouter>
   );
 }
@@ -60,16 +87,8 @@ function renderGeneralSection() {
 describe("GeneralSection", () => {
   beforeEach(() => {
     localStorage.clear();
-    vi.mocked(recheckUpdateStatus).mockReset().mockResolvedValue({
-      running_version: "1.2.3",
-      latest_version: "v1.2.3",
-      latest_version_label: "v1.2.3",
-      changelog: null,
-      checked_at: "2026-08-02T10:00:00Z",
-      update_available: false,
-      dismissed_at: null,
-      is_docker: false,
-    });
+    vi.mocked(fetchUpdateStatus).mockReset().mockResolvedValue(baseUpdateCheckState);
+    vi.mocked(recheckUpdateStatus).mockReset().mockResolvedValue(baseUpdateCheckState);
   });
 
   afterEach(() => {
@@ -282,6 +301,52 @@ describe("GeneralSection", () => {
     expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
     expect(recheckUpdateStatus).not.toHaveBeenCalled();
   });
+
+  it(
+    "reflects a channel-changing save's recheck result in a concurrently mounted UpdateIndicator, " +
+      "with no page reload (COL-196 code review)",
+    async () => {
+      const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+        if ((init?.method ?? "GET") === "PUT") {
+          const body = JSON.parse(String(init?.body));
+          return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+        }
+        return Promise.resolve(jsonResponse(baseSettings));
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const refreshedState: UpdateCheckState = {
+        ...baseUpdateCheckState,
+        latest_version: "v1.3.0-beta.1",
+        update_available: true,
+      };
+      vi.mocked(recheckUpdateStatus).mockReset().mockResolvedValue(refreshedState);
+
+      // UpdateIndicator mounted as a sibling under the same UpdatesProvider,
+      // mirroring how AppShell mounts it once (outside the <Outlet />) for
+      // the whole SPA session, alongside whatever page (here, GeneralSection)
+      // is currently routed into that outlet.
+      render(
+        <MemoryRouter>
+          <UpdatesProvider>
+            <UpdateIndicator />
+            <GeneralSection />
+          </UpdatesProvider>
+        </MemoryRouter>
+      );
+
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+      const channelSelect = await screen.findByLabelText(/release channel/i);
+      fireEvent.change(channelSelect, { target: { value: "beta" } });
+      fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+      expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+      const notice = await screen.findByRole("status");
+      expect(notice).toHaveTextContent(/update available/i);
+      expect(notice).toHaveTextContent("v1.3.0-beta.1");
+    }
+  );
 
   it("saves the browser-stored API key to localStorage", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));

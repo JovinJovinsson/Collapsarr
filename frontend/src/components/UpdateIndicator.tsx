@@ -1,18 +1,24 @@
 import { Download } from "lucide-react";
-import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { fetchUpdateStatus } from "../api/updates";
-import type { UpdateCheckState } from "../types/updates";
+import { useUpdates } from "../hooks/useUpdates";
 
 /**
- * App-wide "update available" indicator (COL-87). Fetches `GET /api/system/
- * updates` once on mount and, when an update is available, renders a small
- * persistent strip above every view -- rendered in `AppShell` alongside
- * `HealthBanner`/`OnboardingPanel` so it's visible regardless of which page
- * the user is on. Renders nothing while up to date, while the fetch hasn't
- * resolved yet, or if the fetch itself fails (a transient network hiccup
- * shouldn't itself read as a notice).
+ * App-wide "update available" indicator (COL-87). Reads the shared Update
+ * Check state from `UpdatesProvider` (mounted in `AppShell`, above this
+ * component) via `useUpdates()` and, when an update is available, renders a
+ * small persistent strip above every view -- alongside `HealthBanner`/
+ * `OnboardingPanel` so it's visible regardless of which page the user is on.
+ * Renders nothing while up to date, while the initial fetch hasn't resolved
+ * yet, or if it failed (a transient network hiccup shouldn't itself read as
+ * a notice).
+ *
+ * COL-196 code review: previously fetched `GET /api/system/updates` itself,
+ * once on mount, with no way to pick up a fresher result for the rest of the
+ * SPA session. Reading from `UpdatesProvider` instead means any consumer
+ * that pushes a refreshed result into the shared state (e.g. `GeneralSection`
+ * after a release-channel-changing save, via `useUpdates().refresh()`) is
+ * reflected here immediately, without a page reload.
  *
  * Deliberately **not** styled like `HealthBanner`: nothing is broken here --
  * an available update is informational (`CONTEXT.md`'s Update Check entry has
@@ -29,23 +35,7 @@ import type { UpdateCheckState } from "../types/updates";
  * release is published, so this indicator reappears on its own then.
  */
 export function UpdateIndicator() {
-  const [update, setUpdate] = useState<UpdateCheckState | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetchUpdateStatus()
-      .then((result) => {
-        if (!cancelled) {
-          setUpdate(result);
-        }
-      })
-      .catch(() => {
-        // Best-effort: see the docstring above.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const { update } = useUpdates();
 
   if (!update || !update.update_available || update.dismissed_at) {
     return null;

@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import { changePassword, logoutEverywhere } from "../../api/auth";
 import { getStoredApiKey, redirectToLogin, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
-import { recheckUpdateStatus } from "../../api/updates";
+import { useUpdates } from "../../hooks/useUpdates";
 import type { AuthMethod, AuthRequiredMode, UpdateChannel } from "../../types/settings";
 
 type LoadState =
@@ -114,6 +114,13 @@ export function GeneralSection() {
   // beta merely selected in the form right now".
   const lastKnownChannelRef = useRef<UpdateChannel | null>(null);
 
+  // COL-196 code review: `refresh` (from `UpdatesProvider`, mounted in
+  // `AppShell`) runs an out-of-band recheck *and* pushes the result into the
+  // Update Check state `UpdateIndicator` reads via the same `useUpdates()`
+  // hook, so the indicator reflects it immediately instead of only the next
+  // time it happens to fetch on its own.
+  const { refresh: refreshUpdateStatus } = useUpdates();
+
   useEffect(() => {
     fetchSettings()
       .then((settings) => {
@@ -187,16 +194,13 @@ export function GeneralSection() {
       });
       setSavedAt(Date.now());
 
-      // COL-196: the channel-aware comparison in the Update Check backend
-      // was already correct -- the bug was that its *stored* result went
-      // stale after a channel switch until the next scheduler tick or a
-      // manual "Recheck now". Trigger an immediate out-of-band recheck right
-      // after a successful save that actually changed the channel, so the
-      // Updates indicator reflects the new channel without waiting. Best
-      // effort: a failed recheck here doesn't fail the settings save --
-      // the periodic scheduler (or a manual recheck) will catch up later.
+      // COL-196: trigger an immediate out-of-band recheck right after a
+      // successful save that actually changed the channel, so the Updates
+      // indicator reflects the new channel without waiting for the next
+      // scheduler tick. Best-effort: a failed recheck here doesn't fail the
+      // settings save.
       if (updated.update_channel !== lastKnownChannelRef.current) {
-        recheckUpdateStatus().catch(() => undefined);
+        refreshUpdateStatus().catch(() => undefined);
       }
       lastKnownChannelRef.current = updated.update_channel;
     } catch (err: unknown) {
