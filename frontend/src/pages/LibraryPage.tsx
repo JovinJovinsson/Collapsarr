@@ -1,5 +1,7 @@
+import { Library } from "lucide-react";
+import type { ReactNode } from "react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 
 import { bulkTriggerSetDefaultAudio } from "../api/activity";
 import {
@@ -8,7 +10,6 @@ import {
   rememberVisitedLibraryInstance,
   updateTracked,
 } from "../api/library";
-import { LibraryIcon } from "../components/icons";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import { useInstances } from "../hooks/useInstances";
 import type { BulkSetDefaultAudioTriggerResult } from "../types/activity";
@@ -82,6 +83,34 @@ function DefaultAudioTrackCell({ track }: { track: CurrentDefaultTrack | null })
     );
   }
   return <span className="library-tree-table__default-track">{formatCurrentDefaultTrack(track)}</span>;
+}
+
+/**
+ * Wraps a file-bearing leaf row's title content in a link to that file's
+ * detail page (COL-198), shared by `SeriesTree`'s episode rows and
+ * `MovieTable`'s rows -- the same two levels `FileDetailLink`'s siblings
+ * (`FileStatusBadge`/`DefaultAudioTrackCell`) already apply to. Links to
+ * `/wanted/:fileId` (the same route `WantedPage` already links to for the
+ * same file; `FileDetailPage` resolves `fileId` by matching `WantedFile.id`
+ * from `GET /api/wanted`) whenever the row both has a file and carries a
+ * resolved tracked-file id (COL-194's `file_id`) -- a row that's missing
+ * either (no file yet, or `has_file: true` but no bridged tracked-media row,
+ * so `file_id` is still `null`) renders its content unlinked, exactly as
+ * before this ticket.
+ */
+function FileDetailLink({
+  hasFile,
+  fileId,
+  children,
+}: {
+  hasFile: boolean;
+  fileId: number | null;
+  children: ReactNode;
+}) {
+  if (!hasFile || fileId === null) {
+    return <>{children}</>;
+  }
+  return <Link to={`/wanted/${fileId}`}>{children}</Link>;
 }
 
 /**
@@ -451,7 +480,7 @@ function SeriesTree({
                     const seasonOpen = expandAll || expandedSeasons.has(seasonNode.id);
                     return (
                       <Fragment key={seasonNode.id}>
-                        <tr className="library-tree-table__row library-tree-table__row--season">
+                        <tr className="library-tree-table__row library-tree-table__row--season library-tree-table__row--depth-1">
                           <td>
                             <SelectionCheckbox
                               nodeType="season"
@@ -491,6 +520,7 @@ function SeriesTree({
                                 episode.has_file,
                                 "library-tree-table__row",
                                 "library-tree-table__row--episode",
+                                "library-tree-table__row--depth-2",
                               )}
                             >
                               <td>
@@ -502,7 +532,9 @@ function SeriesTree({
                                 />
                               </td>
                               <td className="library-tree-table__cell--indent-2">
-                                E{String(episode.episode_number).padStart(2, "0")} &middot; {episode.title}
+                                <FileDetailLink hasFile={episode.has_file} fileId={episode.file_id}>
+                                  E{String(episode.episode_number).padStart(2, "0")} &middot; {episode.title}
+                                </FileDetailLink>
                               </td>
                               <td>
                                 <FileStatusBadge hasFile={episode.has_file} />
@@ -567,7 +599,11 @@ function MovieTable({
                   selectionDisabled={selectionDisabled}
                 />
               </td>
-              <td>{movie.title}</td>
+              <td>
+                <FileDetailLink hasFile={movie.has_file} fileId={movie.file_id}>
+                  {movie.title}
+                </FileDetailLink>
+              </td>
               <td>
                 <FileStatusBadge hasFile={movie.has_file} />
               </td>
@@ -1018,7 +1054,7 @@ export function LibraryPage() {
       {treeState.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <LibraryIcon width={28} height={28} />
+            <Library width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load this library: {treeState.message}</p>
         </div>
@@ -1029,14 +1065,14 @@ export function LibraryPage() {
         (treeState.tree.series.length === 0 ? (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <LibraryIcon width={28} height={28} />
+              <Library width={28} height={28} />
             </span>
             <p className="panel__message">No series found in this library yet.</p>
           </div>
         ) : filteredSeries.length === 0 ? (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <LibraryIcon width={28} height={28} />
+              <Library width={28} height={28} />
             </span>
             <p className="panel__message">No series match your search or filter.</p>
           </div>
@@ -1058,14 +1094,14 @@ export function LibraryPage() {
         (treeState.tree.movies.length === 0 ? (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <LibraryIcon width={28} height={28} />
+              <Library width={28} height={28} />
             </span>
             <p className="panel__message">No movies found in this library yet.</p>
           </div>
         ) : filteredMovies.length === 0 ? (
           <div className="panel panel--empty">
             <span className="panel__icon" aria-hidden>
-              <LibraryIcon width={28} height={28} />
+              <Library width={28} height={28} />
             </span>
             <p className="panel__message">No movies match your search or filter.</p>
           </div>

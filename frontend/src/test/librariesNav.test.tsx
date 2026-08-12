@@ -80,6 +80,16 @@ describe("Libraries sidebar nav (COL-100)", () => {
     expect(await screen.findByRole("link", { name: /libraries/i })).toBeInTheDocument();
   });
 
+  // COL-191: renders the lucide `Library` icon (previously a custom
+  // hand-drawn open-book SVG from components/icons.tsx).
+  it("renders the Library icon on the Libraries nav entry", async () => {
+    mockInstancesApi([sonarr, radarr]);
+    renderSidebar("/wanted");
+
+    const link = await screen.findByRole("link", { name: /libraries/i });
+    expect(link.querySelector("svg.lucide-library")).toBeInTheDocument();
+  });
+
   it("is collapsed (no per-instance sub-items) while a different section is active", async () => {
     mockInstancesApi([sonarr, radarr]);
     renderSidebar("/wanted");

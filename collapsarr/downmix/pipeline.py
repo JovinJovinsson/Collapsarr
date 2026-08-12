@@ -68,6 +68,7 @@ from collapsarr.downmix.apply import (
     ApplyResult,
     apply_remux_result,
 )
+from collapsarr.downmix.cancellation import CancellationHandle, make_cancellable_runner
 from collapsarr.downmix.default_audio import (
     DefaultAudioPreference,
     resolve_default_audio_output_index,
@@ -168,6 +169,7 @@ def run_downmix_pipeline(
     default_audio_preference: DefaultAudioPreference | None = None,
     auto_set_default_audio: bool = False,
     runner: _Runner | None = None,
+    cancel_handle: CancellationHandle | None = None,
 ) -> PipelineResult:
     """Run the full downmix pipeline for a single file, end to end.
 
@@ -221,8 +223,24 @@ def run_downmix_pipeline(
     default), or when the resolver reports nothing needs changing, no
     disposition flags are emitted and the remux command is byte-for-byte what it
     would be without this feature.
+
+    ``cancel_handle`` (COL-192) makes a ``RUNNING`` job hard-killable: when it
+    is supplied and no explicit ``runner`` is given, every subprocess this
+    pipeline spawns is run through :func:`~collapsarr.downmix.cancellation.
+    make_cancellable_runner`, registering each with the handle so a concurrent
+    :meth:`~collapsarr.downmix.cancellation.CancellationHandle.cancel` (driven
+    by :meth:`~collapsarr.jobs.queue.JobQueue.cancel_running`) terminates
+    ffmpeg/ffprobe and its children immediately -- the interrupted subprocess
+    returns a signal exit code, surfacing here as an ordinary
+    :attr:`PipelineOutcome.PROBE_FAILED`/:attr:`PipelineOutcome.REMUX_FAILED`.
+    An explicit ``runner`` always wins (a test injecting its own subprocess
+    stub keeps full control), and with neither supplied the behaviour is
+    byte-for-byte unchanged.
     """
     path = Path(file_path)
+
+    if runner is None and cancel_handle is not None:
+        runner = make_cancellable_runner(cancel_handle)
 
     try:
         streams = probe_audio_streams(

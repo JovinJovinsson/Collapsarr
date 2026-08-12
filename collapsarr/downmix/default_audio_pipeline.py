@@ -72,6 +72,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from collapsarr.downmix.apply import DEFAULT_DURATION_TOLERANCE_SECONDS, apply_remux_result
+from collapsarr.downmix.cancellation import CancellationHandle, make_cancellable_runner
 from collapsarr.downmix.default_audio import DefaultAudioPreference, resolve_default_audio_stream
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
 from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_streams
@@ -125,6 +126,7 @@ def run_default_audio_pipeline(
     remux_timeout: float = _DEFAULT_REMUX_TIMEOUT,
     duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS,
     runner: _Runner | None = None,
+    cancel_handle: CancellationHandle | None = None,
 ) -> PipelineResult:
     """Fix a single file's Default Audio Track disposition, on demand, no downmixing.
 
@@ -166,8 +168,18 @@ def run_default_audio_pipeline(
     identical to it except for which stream(s) carry the Default Audio Track
     disposition flag — every stream stream-copied, none re-encoded,
     ``tracks_added`` always empty (this pipeline never adds a track).
+
+    ``cancel_handle`` (COL-192) behaves exactly as in
+    :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`: when supplied
+    (and no explicit ``runner`` is given) every subprocess runs through
+    :func:`~collapsarr.downmix.cancellation.make_cancellable_runner`, so a
+    ``RUNNING`` ``SET_DEFAULT_AUDIO`` job is hard-killable the same way a
+    ``DOWNMIX`` one is.
     """
     path = Path(file_path)
+
+    if runner is None and cancel_handle is not None:
+        runner = make_cancellable_runner(cancel_handle)
 
     try:
         streams = probe_audio_streams(

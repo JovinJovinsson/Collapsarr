@@ -187,3 +187,83 @@ within the matched language; (3) if the preferred language isn't present
 on the file at all (a foreign-only-audio file), the best-available tier
 in whatever language the file has. Case (3) is expected fallback
 behavior, not a gap — a foreign-only file is never "wrong."
+
+## Job
+
+One enqueued unit of work: a file plus its downmix target/language
+context, run by `JobQueue`'s worker pool and mirrored into the persisted
+`JobHistory` table at each lifecycle stage (`pending` → `running` →
+`succeeded`/`failed`). A `pending` Job survives a process restart by
+rehydrating from its `JobHistory` row — settings are re-derived fresh from
+current global settings at rehydration time, never replayed from an old
+snapshot (`docs/adr/0007-job-queue-priority-pull-rearchitecture.md`).
+
+## Job Priority
+
+The persisted ordering value on a `pending` Job that determines which one
+the worker pool picks up next — lower runs sooner. Only ever moved by
+"Process next" (bump to the front of the queue, ahead of every other
+currently-pending Job); there is no general manual reordering. A newly
+enqueued Job (auto or manual) always joins at the back of the order.
+
+## Cancel (job)
+
+Ending a Job on request — never a status a Job reaches; there is no
+distinct `cancelled` state. Both `pending` and `running` Jobs can be
+cancelled (COL-192), but the two cases resolve differently:
+
+- **`pending`** — a clean removal from the queue. Deletes both the live
+  in-memory Job and its `JobHistory` row outright, so a never-started Job
+  leaves no trace and carries no cooldown.
+- **`running`** — a hard kill. `SIGKILL` is sent to the process group of
+  the in-flight `ffmpeg`/`ffprobe` subprocess (each runs in its own process
+  group, so children die with it), which makes the pipeline call return a
+  failure. The worker then transitions the Job to `failed` through the
+  ordinary terminal path — a hard-cancelled run is recorded as `failed`
+  like any other pipeline failure, not a new status, so its `JobHistory`
+  row is kept and it interacts with the Recently-Processed Window's cooldown
+  exactly as a natural failure would.
+
+This supersedes ADR 0007's original stance that a `running` Job could not
+be interrupted (see
+`docs/adr/0007-job-queue-priority-pull-rearchitecture.md`).
+
+## Auto-Queue Limit
+
+The cap (default 5) on how many **Wanted** entries the scanner will
+auto-enqueue at once. Whenever the total pending count (auto **and**
+manually queued combined — origin is never tracked) drops below the
+limit, whether from a Job finishing or being cancelled, the scanner tops
+up with the next not-yet-queued Wanted entry. Manually triggering a Job
+(single or bulk) is never blocked by the limit — it only throttles the
+scanner's own auto-fill, including a manual "Scan now."
+
+## Auto-Queuing Pause
+
+A persisted global toggle that halts only the scanner's Wanted-driven
+auto-fill (both the periodic/manual scan's initial enqueue and the
+**Auto-Queue Limit**'s top-up). Already-`pending`/`running` Jobs keep
+processing, and manual triggers keep working, while paused. Persists
+across restarts, same as **Tracked** — an intentional pause is never
+silently undone by an unrelated restart.
+
+## Recently-Processed Window
+
+The configurable cooldown (minutes; default 360; `0` disables it) that
+stops an *automatic* trigger (scan/webhook) from re-enqueuing a file
+whose most recent terminal `JobHistory` row (`succeeded`/`failed`) falls
+inside the window. Live-reloaded from settings on every check — unlike
+**Concurrency Limit**, it has no restart-forcing structural constraint.
+Deliberately decoupled from the scan cadence (`scan_interval_hours`),
+which it used to silently reuse. Every *explicit single-action* trigger
+(the file-detail "Trigger downmix" button, a per-row "Requeue") bypasses
+it outright; only a *batch* requeue action respects it, reporting how
+many of the batch were skipped for falling inside the window.
+
+## Concurrency Limit
+
+The persisted setting (default 1) capping how many Jobs `JobQueue`'s
+worker pool runs simultaneously. Takes effect only after a restart — the
+worker pool is sized once at startup — unlike the **Recently-Processed
+Window**, which live-reloads. The Settings UI surfaces this restart
+requirement as a static hint, not a dynamic post-save notice.

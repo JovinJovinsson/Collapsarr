@@ -1,8 +1,8 @@
+import { ListOrdered } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { bumpJobToFront, cancelJob, clearQueue, fetchJobQueue } from "../api/activity";
 import { fetchSettings, updateSettings } from "../api/settings";
-import { ActivityIcon } from "../components/icons";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { ClearQueueResult, JobHistoryEntry, JobStatus } from "../types/activity";
 
@@ -127,19 +127,24 @@ function describeClearQueueResult(result: ClearQueueResult): string {
  *
  * COL-180 adds per-row "Process next" (`bumpJobToFront`, `POST
  * /api/jobs/{job_id}/bump`, COL-169) and "Cancel" (`cancelJob`, `DELETE
- * /api/jobs/{job_id}`, COL-168) actions to every `pending` row -- `running`
- * rows get neither, there's nothing to reorder or cancel once a worker has
- * claimed a Job. Both endpoints report a would-be "too late" race (the Job
- * started running, or finished, between render and click) as a normal
- * `bumped`/`cancelled: false` result rather than an error, so a click that
- * loses that race surfaces a muted inline notice instead of leaving the row
- * looking broken or stuck; a genuine error (e.g. the Job vanished
- * entirely -- `404`) surfaces as a page-level error notice instead. Either
- * way the queue is re-fetched immediately after the action settles, rather
- * than waiting on the next scheduled poll, so the row's fate (moved to
- * front / removed / unaffected) is reflected right away. No confirm dialog
- * -- these are single-item, easily-reversible actions per the plan (only
- * page-level bulk actions, COL-181, get a confirm dialog).
+ * /api/jobs/{job_id}`, COL-168) actions to every `pending` row. "Process
+ * next" stays `pending`-only forever -- there's nothing to reorder once a
+ * worker has claimed a Job -- but COL-193 extends "Cancel" to `running` rows
+ * too, now that `DELETE /api/jobs/{job_id}` hard-kills an in-flight Job
+ * (COL-192) instead of only being able to remove a still-queued one. Both
+ * endpoints report a would-be "too late" race (the pending Job started
+ * running, or the Job -- pending or running -- finished, between render and
+ * click) as a normal `bumped`/`cancelled: false` result rather than an
+ * error, so a click that loses that race surfaces a muted inline notice
+ * instead of leaving the row looking broken or stuck; a genuine error (e.g.
+ * the Job vanished entirely -- `404`) surfaces as a page-level error notice
+ * instead. Either way the queue is re-fetched immediately after the action
+ * settles, rather than waiting on the next scheduled poll, so the row's
+ * fate (moved to front / removed / updated to `failed` / unaffected) is
+ * reflected right away. No confirm dialog -- these are single-item,
+ * easily-reversible (pending) or immediately-visible (running, via the
+ * refreshed row) actions per the plan (only page-level bulk actions,
+ * COL-181, get a confirm dialog).
  *
  * COL-181 adds two page-level controls, both in the header next to the
  * title:
@@ -296,12 +301,27 @@ export function QueuePage() {
     );
   }
 
+  /**
+   * The "too late" race differs by the row's status at click time (COL-193):
+   * a `pending` row can only lose the race by the worker claiming it (it
+   * started running) before the cancel landed, while a `running` row -- the
+   * worker already holds it -- can only lose the race by finishing (success
+   * or a natural failure) first. Picking the message off `entry.status`
+   * (captured at click time, not re-checked after) keeps each case's wording
+   * accurate instead of reusing "started running" for a row that already
+   * was.
+   */
   async function handleCancel(entry: JobHistoryEntry): Promise<void> {
+    const title = titleFromPath(entry.file_path);
+    const tooLateText =
+      entry.status === "running"
+        ? `"${title}" already finished before it could be cancelled.`
+        : `"${title}" already started running before it could be cancelled.`;
     await runRowAction(
       entry,
       "cancel",
       async () => (await cancelJob(entry.job_id)).cancelled,
-      `"${titleFromPath(entry.file_path)}" already started running before it could be cancelled.`,
+      tooLateText,
       "Failed to cancel job.",
     );
   }
@@ -480,7 +500,7 @@ export function QueuePage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <ListOrdered width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load queue: {state.message}</p>
         </div>
@@ -489,7 +509,7 @@ export function QueuePage() {
       {state.status === "ready" && state.entries.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <ListOrdered width={28} height={28} />
           </span>
           <p className="panel__message">
             Queue is empty. Running and pending downmix jobs will appear here.
@@ -500,14 +520,14 @@ export function QueuePage() {
       {hasEntries && filtered.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <ListOrdered width={28} height={28} />
           </span>
           <p className="panel__message">No queued jobs match the current filter.</p>
         </div>
       )}
 
       {filtered.length > 0 && (
-        <div className="panel activity-panel">
+        <div className="panel">
           <table className="activity-table">
             <thead>
               <tr>
@@ -523,6 +543,10 @@ export function QueuePage() {
             <tbody>
               {filtered.map((entry) => {
                 const isPendingRow = entry.status === "pending";
+                // Cancel is available on pending rows (deletes the queued
+                // Job) and running rows (hard-kills the in-flight one,
+                // COL-192/COL-193) -- Bump stays pending-only, above.
+                const canCancel = isPendingRow || entry.status === "running";
                 const rowAction = pendingActions[entry.job_id] ?? null;
                 return (
                   <tr key={entry.id}>
@@ -547,24 +571,24 @@ export function QueuePage() {
                     <td>{entry.language ?? "—"}</td>
                     <td className="data-table__actions">
                       {isPendingRow && (
-                        <>
-                          <button
-                            type="button"
-                            className="btn btn--secondary btn--sm"
-                            onClick={() => void handleProcessNext(entry)}
-                            disabled={rowAction !== null}
-                          >
-                            {rowAction === "bump" ? "Processing…" : "Process next"}
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn--danger btn--sm"
-                            onClick={() => void handleCancel(entry)}
-                            disabled={rowAction !== null}
-                          >
-                            {rowAction === "cancel" ? "Cancelling…" : "Cancel"}
-                          </button>
-                        </>
+                        <button
+                          type="button"
+                          className="btn btn--secondary btn--sm"
+                          onClick={() => void handleProcessNext(entry)}
+                          disabled={rowAction !== null}
+                        >
+                          {rowAction === "bump" ? "Processing…" : "Process next"}
+                        </button>
+                      )}
+                      {canCancel && (
+                        <button
+                          type="button"
+                          className="btn btn--danger btn--sm"
+                          onClick={() => void handleCancel(entry)}
+                          disabled={rowAction !== null}
+                        >
+                          {rowAction === "cancel" ? "Cancelling…" : "Cancel"}
+                        </button>
                       )}
                     </td>
                   </tr>

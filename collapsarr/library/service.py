@@ -33,9 +33,10 @@ Four responsibilities:
   Episode tree, or the visible flat Movie list, each node carrying its
   *resolved* Tracked value. Hidden nodes are omitted from both. Each
   Episode/Movie leaf also carries its current-default-track snapshot
-  (COL-154), bridged from :mod:`collapsarr.media.service`'s tracked-media
-  rows the same way Tracked resolution bridges the other direction: one
-  bulk fetch of every tracked-media row for the instance
+  (COL-154) and its bridged tracked-media file id (COL-194), both bridged
+  from :mod:`collapsarr.media.service`'s tracked-media rows the same way
+  Tracked resolution bridges the other direction: one bulk fetch of every
+  tracked-media row for the instance
   (:func:`~collapsarr.media.service.list_tracked_media_by_instance`), keyed
   by the same ``sonarr_episode_id``/``radarr_movie_id`` the tree already
   carries, rather than a per-node query.
@@ -103,6 +104,15 @@ class TreeEpisode:
     #: its ffprobe metadata carries no Default Audio Track disposition flag
     #: on any stream -- both render as "unknown" on the Library page.
     current_default_track: TreeDefaultTrack | None
+    #: The bridged :class:`~collapsarr.media.models.TrackedMediaFile` row's
+    #: id (COL-194) -- the same id the Wanted page's file detail route
+    #: (``/wanted/:fileId``) matches against. ``None`` whenever there is no
+    #: bridged row yet (mirrors :func:`_adapt_default_track`'s ``None``
+    #: case), which in practice only happens when ``has_file`` is ``False``
+    #: or the file hasn't been scanned/imported since COL-154 shipped --
+    #: never populated from ``has_file`` alone, since that flag comes from
+    #: the Arr catalog, not this bridge.
+    file_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +155,8 @@ class TreeMovie:
     tracked: bool
     #: See :attr:`TreeEpisode.current_default_track` (COL-154).
     current_default_track: TreeDefaultTrack | None
+    #: See :attr:`TreeEpisode.file_id` (COL-194).
+    file_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,6 +685,7 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
                     f"library node {episode.id} has kind EPISODE but episode_number is NULL "
                     "-- this is a data-integrity violation, not a legitimate missing id"
                 )
+                episode_media = media_by_episode_id.get(episode.sonarr_episode_id)
                 episodes_out.append(
                     TreeEpisode(
                         id=episode.id,
@@ -682,9 +695,8 @@ def build_tree(session: Session, instance_id: int) -> LibraryTree:
                         title=episode.title,
                         has_file=episode.has_file,
                         tracked=resolve_tracked(episode, nodes_by_id, default_tracked),
-                        current_default_track=_adapt_default_track(
-                            media_by_episode_id.get(episode.sonarr_episode_id)
-                        ),
+                        current_default_track=_adapt_default_track(episode_media),
+                        file_id=episode_media.id if episode_media is not None else None,
                     )
                 )
             assert season.season_number is not None, (
@@ -745,6 +757,7 @@ def build_movie_tree(session: Session, instance_id: int) -> MovieLibraryTree:
             f"library node {movie.id} has kind MOVIE but radarr_movie_id is NULL "
             "-- this is a data-integrity violation, not a legitimate missing id"
         )
+        movie_media = media_by_movie_id.get(movie.radarr_movie_id)
         movies_out.append(
             TreeMovie(
                 id=movie.id,
@@ -752,9 +765,8 @@ def build_movie_tree(session: Session, instance_id: int) -> MovieLibraryTree:
                 title=movie.title,
                 has_file=movie.has_file,
                 tracked=resolve_tracked(movie, nodes_by_id, default_tracked),
-                current_default_track=_adapt_default_track(
-                    media_by_movie_id.get(movie.radarr_movie_id)
-                ),
+                current_default_track=_adapt_default_track(movie_media),
+                file_id=movie_media.id if movie_media is not None else None,
             )
         )
 

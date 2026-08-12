@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { setupCredential } from "../api/auth";
-import { BrandMark } from "../components/icons";
+import { BrandMark } from "../components/BrandMark";
 
 /**
  * First-run setup (COL-50): the one-time screen that creates the single

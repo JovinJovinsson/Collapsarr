@@ -1,7 +1,7 @@
+import { FolderClock } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { fetchJobHistory, requeueAllFailed, requeueFile } from "../api/activity";
-import { ActivityIcon } from "../components/icons";
 import { Modal } from "../components/Modal";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { BulkRequeueFailedResult, JobHistoryEntry, JobStatus } from "../types/activity";
@@ -386,7 +386,7 @@ export function HistoryPage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <FolderClock width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load job history: {state.message}</p>
         </div>
@@ -395,7 +395,7 @@ export function HistoryPage() {
       {state.status === "ready" && !hasEntries && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <FolderClock width={28} height={28} />
           </span>
           <p className="panel__message">
             No history yet. Completed downmix jobs will be listed here once they succeed or fail.
@@ -406,14 +406,14 @@ export function HistoryPage() {
       {hasEntries && filtered.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <ActivityIcon width={28} height={28} />
+            <FolderClock width={28} height={28} />
           </span>
           <p className="panel__message">No job history matches the current filters.</p>
         </div>
       )}
 
       {filtered.length > 0 && (
-        <div className="panel activity-panel">
+        <div className="panel">
           <table className="activity-table">
             <thead>
               <tr>

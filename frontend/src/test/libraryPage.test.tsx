@@ -71,6 +71,7 @@ const seriesTree: LibraryTreeResponse = {
               has_file: true,
               tracked: true,
               current_default_track: null,
+              file_id: null,
             },
             {
               id: 31,
@@ -82,6 +83,7 @@ const seriesTree: LibraryTreeResponse = {
               has_file: false,
               tracked: true,
               current_default_track: null,
+              file_id: null,
             },
           ],
         },
@@ -123,6 +125,7 @@ const twoSeriesTree: LibraryTreeResponse = {
               has_file: true,
               tracked: true,
               current_default_track: null,
+              file_id: null,
             },
           ],
         },
@@ -169,6 +172,7 @@ const mixedTrackedTree: LibraryTreeResponse = {
               has_file: true,
               tracked: false,
               current_default_track: null,
+              file_id: null,
             },
           ],
         },
@@ -219,6 +223,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               has_file: true,
               tracked: true,
               current_default_track: null,
+              file_id: null,
             },
             {
               id: 34,
@@ -230,6 +235,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               has_file: true,
               tracked: false,
               current_default_track: null,
+              file_id: null,
             },
           ],
         },
@@ -249,6 +255,7 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
               has_file: true,
               tracked: true,
               current_default_track: null,
+              file_id: null,
             },
           ],
         },
@@ -260,7 +267,16 @@ const withinBranchMixedTrackedTree: LibraryTreeResponse = {
 const movieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
-    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true, current_default_track: null },
+    {
+      id: 40,
+      kind: "movie",
+      radarr_movie_id: 400,
+      title: "Interstellar",
+      has_file: true,
+      tracked: true,
+      current_default_track: null,
+      file_id: null,
+    },
     {
       id: 41,
       kind: "movie",
@@ -269,6 +285,7 @@ const movieTree: MovieLibraryTreeResponse = {
       has_file: false,
       tracked: true,
       current_default_track: null,
+      file_id: null,
     },
   ],
 };
@@ -277,7 +294,16 @@ const movieTree: MovieLibraryTreeResponse = {
 const mixedTrackedMovieTree: MovieLibraryTreeResponse = {
   instance_id: 2,
   movies: [
-    { id: 40, kind: "movie", radarr_movie_id: 400, title: "Interstellar", has_file: true, tracked: true, current_default_track: null },
+    {
+      id: 40,
+      kind: "movie",
+      radarr_movie_id: 400,
+      title: "Interstellar",
+      has_file: true,
+      tracked: true,
+      current_default_track: null,
+      file_id: null,
+    },
     {
       id: 41,
       kind: "movie",
@@ -286,6 +312,7 @@ const mixedTrackedMovieTree: MovieLibraryTreeResponse = {
       has_file: false,
       tracked: false,
       current_default_track: null,
+      file_id: null,
     },
   ],
 };
@@ -436,6 +463,55 @@ describe("LibraryPage (COL-100)", () => {
     expect(missingRow.className).toContain("library-tree-table__row--dimmed");
   });
 
+  it("links an Episode row with a resolved tracked-file id to its file detail page (COL-198)", async () => {
+    const treeWithFileId: LibraryTreeResponse = {
+      ...seriesTree,
+      series: [
+        {
+          ...seriesTree.series[0],
+          seasons: [
+            {
+              ...seriesTree.series[0].seasons[0],
+              episodes: [
+                { ...seriesTree.series[0].seasons[0].episodes[0], file_id: 900 },
+                seriesTree.series[0].seasons[0].episodes[1], // has_file: false, file_id: null
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: treeWithFileId }));
+    renderLibraryPage(1);
+
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+
+    // "Pilot" has a resolved file_id (900) -- same route WantedPage links to
+    // for the same file (`/wanted/:fileId`, matched against `WantedFile.id`).
+    const pilotLink = await screen.findByRole("link", { name: /pilot/i });
+    expect(pilotLink).toHaveAttribute("href", "/wanted/900");
+
+    // "Cat's in the Bag..." has no file at all (has_file: false, file_id:
+    // null) -- unaffected, no link.
+    const missingRow = screen.getByText(/cat's in the bag/i).closest("tr") as HTMLElement;
+    expect(within(missingRow).queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it("does not link an Episode row that has a file but no resolved tracked-file id yet (COL-198)", async () => {
+    // has_file: true but file_id: null -- e.g. no bridged tracked-media row
+    // yet. Matches `seriesTree`'s "Pilot" fixture, which is exactly this
+    // state (has_file: true, file_id: null).
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [sonarrInstance], tree: seriesTree }));
+    renderLibraryPage(1);
+
+    fireEvent.click(await screen.findByRole("button", { name: /breaking bad/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
+
+    const pilotRow = (await screen.findByText(/pilot/i)).closest("tr") as HTMLElement;
+    expect(within(pilotRow).queryByRole("link")).not.toBeInTheDocument();
+  });
+
   it("renders the current Default Audio Track column, with a clear unknown state (COL-154)", async () => {
     const treeWithDefaultTrack: LibraryTreeResponse = {
       ...seriesTree,
@@ -503,6 +579,27 @@ describe("LibraryPage (COL-100)", () => {
     expect(presentRow.className).not.toContain("library-tree-table__row--dimmed");
     expect(within(missingRow).getByText("Missing")).toBeInTheDocument();
     expect(missingRow.className).toContain("library-tree-table__row--dimmed");
+  });
+
+  it("links a Movie row with a resolved tracked-file id to its file detail page, leaving a fileless row unaffected (COL-198)", async () => {
+    const movieTreeWithFileId: MovieLibraryTreeResponse = {
+      ...movieTree,
+      movies: [
+        { ...movieTree.movies[0], file_id: 901 },
+        movieTree.movies[1], // has_file: false, file_id: null
+      ],
+    };
+    vi.stubGlobal("fetch", mockLibraryApi({ instances: [radarrInstance], tree: movieTreeWithFileId }));
+    renderLibraryPage(2);
+
+    // "Interstellar" has a resolved file_id (901) -- same route WantedPage
+    // links to for the same file.
+    const interstellarLink = await screen.findByRole("link", { name: "Interstellar" });
+    expect(interstellarLink).toHaveAttribute("href", "/wanted/901");
+
+    // "Dune: Part Two" has no file at all -- unaffected, no link.
+    const duneRow = screen.getByText("Dune: Part Two").closest("tr") as HTMLElement;
+    expect(within(duneRow).queryByRole("link")).not.toBeInTheDocument();
   });
 
   it("renders an error state when the tree request fails", async () => {

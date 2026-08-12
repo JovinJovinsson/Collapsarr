@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { changePassword, logoutEverywhere } from "../../api/auth";
 import { getStoredApiKey, redirectToLogin, setStoredApiKey } from "../../api/client";
 import { fetchSettings, updateSettings } from "../../api/settings";
+import { useUpdates } from "../../hooks/useUpdates";
 import type { AuthMethod, AuthRequiredMode, UpdateChannel } from "../../types/settings";
 
 type LoadState =
@@ -104,10 +105,27 @@ export function GeneralSection() {
   const [loggingOutEverywhere, setLoggingOutEverywhere] = useState(false);
   const [logoutEverywhereError, setLogoutEverywhereError] = useState<string | null>(null);
 
+  // Last known persisted release channel (COL-196): tracked separately from
+  // `form.updateChannel`, which flips the moment the user touches the select
+  // -- before the save has actually persisted anything. `null` until the
+  // initial GET resolves (there's no real "last known" value yet, so this
+  // doesn't guess one); re-seeded after every successful save. Lets
+  // `handleSave` tell "did this save actually change the channel" from "is
+  // beta merely selected in the form right now".
+  const lastKnownChannelRef = useRef<UpdateChannel | null>(null);
+
+  // COL-196 code review: `refresh` (from `UpdatesProvider`, mounted in
+  // `AppShell`) runs an out-of-band recheck *and* pushes the result into the
+  // Update Check state `UpdateIndicator` reads via the same `useUpdates()`
+  // hook, so the indicator reflects it immediately instead of only the next
+  // time it happens to fetch on its own.
+  const { refresh: refreshUpdateStatus } = useUpdates();
+
   useEffect(() => {
     fetchSettings()
       .then((settings) => {
         setServerApiKey(settings.api_key);
+        lastKnownChannelRef.current = settings.update_channel;
         setForm({
           concurrencyLimit: String(settings.concurrency_limit),
           uiAuthEnabled: settings.ui_auth_enabled,
@@ -175,6 +193,16 @@ export function GeneralSection() {
         defaultTracked: updated.default_tracked,
       });
       setSavedAt(Date.now());
+
+      // COL-196: trigger an immediate out-of-band recheck right after a
+      // successful save that actually changed the channel, so the Updates
+      // indicator reflects the new channel without waiting for the next
+      // scheduler tick. Best-effort: a failed recheck here doesn't fail the
+      // settings save.
+      if (updated.update_channel !== lastKnownChannelRef.current) {
+        refreshUpdateStatus().catch(() => undefined);
+      }
+      lastKnownChannelRef.current = updated.update_channel;
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
@@ -306,47 +334,49 @@ export function GeneralSection() {
           <div className="panel settings-form">
             <h3 className="settings-form__subtitle">Authentication &amp; concurrency</h3>
 
-            <div className="form-field form-field--narrow">
-              <label htmlFor="auth-required">Login requirement</label>
-              <select
-                id="auth-required"
-                value={form.authRequired}
-                onChange={(event) =>
-                  setForm({ ...form, authRequired: event.target.value as typeof form.authRequired })
-                }
-              >
-                <option value="local_bypass">Disabled for local addresses</option>
-                <option value="enabled">Always required</option>
-              </select>
-              <p className="form-hint">
-                <strong>Disabled for local addresses</strong> (default): a browser connecting from
-                localhost or your LAN reaches the app without logging in; anyone connecting from
-                outside your network still has to sign in. This is based on the direct connection
-                address only, never an <code>X-Forwarded-For</code> header — if Collapsarr sits
-                behind a reverse proxy, every client looks like the proxy&apos;s own address, so
-                pick <strong>Always required</strong> instead until trusted-proxy support ships.
-              </p>
-            </div>
+            <div className="form-grid">
+              <div className="form-field">
+                <label htmlFor="auth-required">Login requirement</label>
+                <select
+                  id="auth-required"
+                  value={form.authRequired}
+                  onChange={(event) =>
+                    setForm({ ...form, authRequired: event.target.value as typeof form.authRequired })
+                  }
+                >
+                  <option value="local_bypass">Disabled for local addresses</option>
+                  <option value="enabled">Always required</option>
+                </select>
+                <p className="form-hint">
+                  <strong>Disabled for local addresses</strong> (default): a browser connecting from
+                  localhost or your LAN reaches the app without logging in; anyone connecting from
+                  outside your network still has to sign in. This is based on the direct connection
+                  address only, never an <code>X-Forwarded-For</code> header — if Collapsarr sits
+                  behind a reverse proxy, every client looks like the proxy&apos;s own address, so
+                  pick <strong>Always required</strong> instead until trusted-proxy support ships.
+                </p>
+              </div>
 
-            <div className="form-field form-field--narrow">
-              <label htmlFor="auth-method">Sign-in method</label>
-              <select
-                id="auth-method"
-                value={form.authMethod}
-                onChange={(event) =>
-                  setForm({ ...form, authMethod: event.target.value as typeof form.authMethod })
-                }
-              >
-                <option value="forms">Sign-in page</option>
-                <option value="basic">HTTP Basic (browser prompt)</option>
-              </select>
-              <p className="form-hint">
-                <strong>Sign-in page</strong> (default) shows Collapsarr&apos;s own login form,
-                with an optional &quot;remember me&quot;. <strong>HTTP Basic</strong> uses your
-                browser&apos;s native credential prompt instead -- no remember-me option, since
-                Basic re-sends credentials with every request. Both verify the same username and
-                password.
-              </p>
+              <div className="form-field">
+                <label htmlFor="auth-method">Sign-in method</label>
+                <select
+                  id="auth-method"
+                  value={form.authMethod}
+                  onChange={(event) =>
+                    setForm({ ...form, authMethod: event.target.value as typeof form.authMethod })
+                  }
+                >
+                  <option value="forms">Sign-in page</option>
+                  <option value="basic">HTTP Basic (browser prompt)</option>
+                </select>
+                <p className="form-hint">
+                  <strong>Sign-in page</strong> (default) shows Collapsarr&apos;s own login form,
+                  with an optional &quot;remember me&quot;. <strong>HTTP Basic</strong> uses your
+                  browser&apos;s native credential prompt instead -- no remember-me option, since
+                  Basic re-sends credentials with every request. Both verify the same username and
+                  password.
+                </p>
+              </div>
             </div>
 
             <label className="checkbox-row">
@@ -367,55 +397,59 @@ export function GeneralSection() {
               Default Tracked for new library items
             </label>
 
-            <div className="form-field form-field--narrow">
-              <label htmlFor="concurrency-limit">Concurrency limit</label>
-              <input
-                id="concurrency-limit"
-                type="number"
-                min={1}
-                value={form.concurrencyLimit}
-                onChange={(event) => setForm({ ...form, concurrencyLimit: event.target.value })}
-              />
-              <p className="form-hint">
-                Maximum downmix jobs running at once. Restart Collapsarr for a change to take effect.
-              </p>
-            </div>
+            <div className="form-grid">
+              <div className="form-field">
+                <label htmlFor="concurrency-limit">Concurrency limit</label>
+                <input
+                  id="concurrency-limit"
+                  type="number"
+                  min={1}
+                  value={form.concurrencyLimit}
+                  onChange={(event) => setForm({ ...form, concurrencyLimit: event.target.value })}
+                />
+                <p className="form-hint">
+                  Maximum downmix jobs running at once. Restart Collapsarr for a change to take effect.
+                </p>
+              </div>
 
-            <div className="form-field form-field--narrow">
-              <label htmlFor="recently-processed-window">Recently-processed window (minutes)</label>
-              <input
-                id="recently-processed-window"
-                type="number"
-                min={0}
-                value={form.recentlyProcessedWindowMinutes}
-                onChange={(event) => setForm({ ...form, recentlyProcessedWindowMinutes: event.target.value })}
-              />
-              <p className="form-hint">
-                Cooldown period before a file is eligible for retry. Set to 0 to disable the cooldown.
-              </p>
+              <div className="form-field">
+                <label htmlFor="recently-processed-window">Recently-processed window (minutes)</label>
+                <input
+                  id="recently-processed-window"
+                  type="number"
+                  min={0}
+                  value={form.recentlyProcessedWindowMinutes}
+                  onChange={(event) => setForm({ ...form, recentlyProcessedWindowMinutes: event.target.value })}
+                />
+                <p className="form-hint">
+                  Cooldown period before a file is eligible for retry. Set to 0 to disable the cooldown.
+                </p>
+              </div>
             </div>
           </div>
 
           <div className="panel settings-form">
             <h3 className="settings-form__subtitle">Update channel</h3>
-            <div className="form-field form-field--narrow">
-              <label htmlFor="update-channel">Release channel</label>
-              <select
-                id="update-channel"
-                value={form.updateChannel}
-                onChange={(event) =>
-                  setForm({ ...form, updateChannel: event.target.value as typeof form.updateChannel })
-                }
-              >
-                <option value="stable">Stable</option>
-                <option value="beta">Beta</option>
-              </select>
-              <p className="form-hint">
-                <strong>Stable</strong> (default) checks for the latest tagged GitHub release.{" "}
-                <strong>Beta</strong> checks for the latest pre-release build instead -- may be
-                less stable, intended for early testing. See the{" "}
-                <Link to="/system/updates">Updates page</Link> for the current comparison result.
-              </p>
+            <div className="form-grid">
+              <div className="form-field">
+                <label htmlFor="update-channel">Release channel</label>
+                <select
+                  id="update-channel"
+                  value={form.updateChannel}
+                  onChange={(event) =>
+                    setForm({ ...form, updateChannel: event.target.value as typeof form.updateChannel })
+                  }
+                >
+                  <option value="stable">Stable</option>
+                  <option value="beta">Beta</option>
+                </select>
+                <p className="form-hint">
+                  <strong>Stable</strong> (default) checks for the latest tagged GitHub release.{" "}
+                  <strong>Beta</strong> checks for the latest pre-release build instead -- may be
+                  less stable, intended for early testing. See the{" "}
+                  <Link to="/system/updates">Updates page</Link> for the current comparison result.
+                </p>
+              </div>
             </div>
           </div>
 

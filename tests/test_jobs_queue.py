@@ -19,6 +19,7 @@ import pytest
 
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.downmix.cancellation import CancellationHandle
 from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.default_audio_pipeline import run_default_audio_pipeline
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
@@ -439,6 +440,125 @@ def test_cancel_returns_false_for_an_unknown_job() -> None:
     assert queue.cancel(uuid4()) is False
 
 
+# ---------------------------------------------------------------------------
+# Hard-kill a RUNNING job (COL-192): cancel_running terminates the in-flight
+# subprocess, the job fails out, and its worker slot frees for the next job.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProcess:
+    """A stand-in for the job's live subprocess, killable by the cancel handle.
+
+    Shaped for :func:`~collapsarr.downmix.cancellation._terminate_process_tree`:
+    ``poll`` reports "still running", ``pid`` is a non-existent one so the
+    process-group lookup falls through to ``kill`` (there is no real group), and
+    ``kill`` records the termination and unblocks the runner -- exactly what a
+    real ffmpeg does when its ``subprocess`` call returns after being signalled.
+    """
+
+    def __init__(self) -> None:
+        self.pid = 2_000_000_000  # no such process -> os.getpgid raises, forcing kill()
+        self.killed = threading.Event()
+
+    def poll(self) -> int | None:
+        return None
+
+    def kill(self) -> None:
+        self.killed.set()
+
+
+class _HardKillRunner:
+    """A pipeline_runner whose ``victim`` job registers a fake subprocess and blocks.
+
+    The COL-192 counterpart of :class:`_GatedRunner`: the ``victim`` job
+    attaches a :class:`_FakeProcess` to the ``cancel_handle`` the queue threads
+    in, then blocks until that process is killed (mimicking ffmpeg's
+    ``subprocess`` call returning on a signal), returning a FAILED result. Any
+    other job runs straight to success, so a job enqueued behind the victim
+    proves the worker slot freed.
+    """
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.process = _FakeProcess()
+
+    def __call__(
+        self,
+        file_path: Path,
+        settings: DownmixSettings,
+        *,
+        cancel_handle: CancellationHandle | None = None,
+        **_: object,
+    ) -> PipelineResult:
+        if file_path.stem == "victim":
+            assert cancel_handle is not None, "queue must thread a cancel handle into a RUNNING job"
+            cancel_handle.attach(self.process)
+            self.started.set()
+            assert self.process.killed.wait(timeout=5), "victim subprocess was never killed"
+            cancel_handle.detach(self.process)
+            return _FAILED
+        return _SUCCESS
+
+
+def test_cancel_running_hard_kills_the_subprocess_fails_the_job_and_frees_the_slot() -> None:
+    """COL-192 AC: cancelling a RUNNING job kills its subprocess, fails it, frees the slot."""
+    runner = _HardKillRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    victim = queue.enqueue("/media/victim.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)  # worker claimed victim; its subprocess is attached
+
+    # A second job waits behind the single busy worker -- it can only run once
+    # the victim's slot frees.
+    nxt = queue.enqueue("/media/next.mkv", DownmixSettings())
+    assert nxt in queue.list_jobs()  # queued behind the busy worker
+
+    assert queue.cancel_running(victim.id) is True
+
+    assert queue.wait_idle(timeout=5) is True
+
+    # Subprocess termination: the registered process was killed.
+    assert runner.process.killed.is_set()
+    # Status transition: the hard-killed job is FAILED (no distinct CANCELLED status).
+    assert victim.status is JobStatus.FAILED
+    # Worker-slot release: the next pending job then ran to completion.
+    assert nxt.status is JobStatus.SUCCEEDED
+
+
+def test_cancel_running_returns_false_for_a_still_pending_job() -> None:
+    """cancel_running is RUNNING-only: a not-yet-claimed job is left for cancel() to remove."""
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    queue.enqueue("/media/gate.mkv", DownmixSettings())  # worker claims + blocks here
+    assert runner.started.wait(timeout=5)
+    pending = queue.enqueue("/media/pending.mkv", DownmixSettings())
+
+    assert queue.cancel_running(pending.id) is False  # still PENDING -- not its job
+    assert pending.status is JobStatus.PENDING
+
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True
+
+
+def test_cancel_running_returns_false_for_an_unknown_job() -> None:
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    assert queue.cancel_running(uuid4()) is False
+
+
+def test_cancel_running_returns_false_for_a_terminal_job() -> None:
+    """A job that already finished is "too late" -- cancel_running is a no-op (False)."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    queue.start()
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    assert queue.wait_idle(timeout=5) is True
+    assert job.status is JobStatus.SUCCEEDED
+
+    assert queue.cancel_running(job.id) is False
+
+
 def test_shutdown_lets_an_in_flight_job_finish_then_stops_the_pool() -> None:
     runner = _GatedRunner()
     queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
@@ -698,7 +818,7 @@ def test_from_settings_threads_default_audio_preference_when_toggle_on(tmp_path:
 
 
 def test_from_settings_passes_no_default_audio_kwargs_when_toggle_off(tmp_path: Path) -> None:
-    """Toggle off (the default): the pipeline call is byte-for-byte pre-COL-152 -- no fix kwargs."""
+    """Toggle off (the default): no Default Audio fix kwargs -- only COL-192's cancel_handle."""
     settings = Settings(
         _env_file=None,
         database_path=str(tmp_path / "collapsarr.db"),
@@ -722,7 +842,10 @@ def test_from_settings_passes_no_default_audio_kwargs_when_toggle_off(tmp_path: 
     kwargs = runner.kwargs_calls[0]
     assert "auto_set_default_audio" not in kwargs
     assert "default_audio_preference" not in kwargs
-    assert kwargs == {}
+    # The only per-call kwarg the queue now threads is COL-192's hard-kill
+    # handle (created per RUNNING job); the Default Audio fix stays gated out.
+    assert set(kwargs) == {"cancel_handle"}
+    assert isinstance(kwargs["cancel_handle"], CancellationHandle)
 
 
 # ---------------------------------------------------------------------------

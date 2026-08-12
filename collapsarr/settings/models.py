@@ -201,7 +201,7 @@ class GlobalSettings(Base):
 
     ``api_key`` is auto-generated (via :func:`generate_api_key`) the first time
     the row is created and accepted on every ``/api`` request by
-    :func:`collapsarr.auth.enforcement.enforce_auth_middleware`.
+    :class:`collapsarr.auth.enforcement.EnforceAuthMiddleware`.
 
     The auth-credential columns (COL-49) hold the single UI operator credential
     -- Radarr-style, no multi-user. ``auth_username``/``auth_password_hash`` are
@@ -217,7 +217,7 @@ class GlobalSettings(Base):
     ``auth_required`` defaults to ``local_bypass`` (COL-51), not ``enabled``: a
     fresh install stays frictionless for a caller connecting from a
     loopback/private-network address (see
-    :func:`collapsarr.auth.enforcement.enforce_auth_middleware`), while any
+    :class:`collapsarr.auth.enforcement.EnforceAuthMiddleware`), while any
     routable address must still authenticate -- closing the "wide open on
     0.0.0.0" gap without any pre-launch configuration. An install sitting
     behind a reverse proxy should switch this to ``enabled``, since

@@ -84,17 +84,22 @@ Eleven endpoints, each wrapping an existing service without adding new job logic
   once per resulting file -- always against the current global Preferred
   Default Audio setting; there is no per-call override, unlike
   ``trigger``'s ``extra_languages``.
-- ``DELETE /api/jobs/{job_id}`` -- cancels one specific still-``PENDING``
-  Job (COL-168) (:meth:`collapsarr.jobs.scheduler.JobScheduler.cancel_job`).
-  "Cancel" is deletion, not a new status: on success the Job's persisted
+- ``DELETE /api/jobs/{job_id}`` -- cancels one specific Job, ``PENDING`` or
+  ``RUNNING`` (COL-168; hard-kill COL-192)
+  (:meth:`collapsarr.jobs.scheduler.JobScheduler.cancel_job`). Cancelling a
+  still-``PENDING`` Job is deletion, not a new status: the Job's persisted
   :class:`~collapsarr.jobs.models.JobHistory` row is deleted too -- a
-  cancelled Job leaves no trace, no audit row, no cooldown interaction with
-  the Recently-Processed Window. Because the queue's worker pool keeps
-  running concurrently, the Job may already have been claimed (or already
-  finished) by the time the request lands; that is reported back distinctly
-  (see :class:`CancelJobResult`) rather than erroring or silently pretending
-  success. A ``job_id`` not present in the live queue at all -- unknown,
-  malformed, or already gone -- is a ``404``.
+  never-started Job leaves no trace, no audit row, no cooldown interaction
+  with the Recently-Processed Window. Cancelling a Job a worker is already
+  *running* (COL-192) hard-kills its in-flight ffmpeg/ffprobe subprocess (and
+  children) immediately, freeing the worker slot for the next queued Job; the
+  killed run transitions to ``FAILED`` and keeps its history row (a
+  hard-cancel is recorded as a failure -- there is no distinct ``CANCELLED``
+  status). Both report ``cancelled=True``. Only a Job that finished naturally
+  in the race between the request landing and the cancel running is reported
+  ``cancelled=False`` ("too late"); see :class:`CancelJobResult`. A ``job_id``
+  not present in the live queue at all -- unknown, malformed, or already gone
+  -- is a ``404``.
 - ``POST /api/jobs/clear`` -- the batch "Clear queue" cancel action (COL-173):
   cancels every currently-``PENDING`` Job in one call via
   :meth:`collapsarr.jobs.scheduler.JobScheduler.clear_queue` (the bulk
@@ -394,19 +399,21 @@ class BulkSetDefaultAudioTriggerResult(BaseModel):
 
 
 class CancelJobResult(BaseModel):
-    """Response for ``DELETE /api/jobs/{job_id}`` (COL-168).
+    """Response for ``DELETE /api/jobs/{job_id}`` (COL-168; hard-kill COL-192).
 
-    ``cancelled`` is ``True`` when the Job was still ``PENDING`` and has now
-    been removed from the live queue *and* had its
-    :class:`~collapsarr.jobs.models.JobHistory` row deleted -- it leaves no
-    trace at all. It is ``False`` -- not an error -- when the Job still
-    exists but is no longer ``PENDING`` (a worker already claimed it, or it
-    has already reached a terminal status): "too late" to cancel, distinct
-    from both success and a generic failure; the already-claimed/finished
-    Job runs (or has run) to completion normally, history row intact. A
-    ``job_id`` not present in the live queue at all -- unknown, malformed,
-    or already gone -- is reported as ``404``, not this shape (there is
-    nothing to act on either way).
+    ``cancelled`` is ``True`` in both success shapes: a still-``PENDING`` Job
+    removed from the live queue with its
+    :class:`~collapsarr.jobs.models.JobHistory` row deleted (leaving no trace
+    at all), **or** a ``RUNNING`` Job whose in-flight subprocess was hard-killed
+    (COL-192), freeing its worker slot -- that run transitions to ``FAILED``
+    and keeps its history row (a hard-cancel is recorded as a failure, not a
+    distinct ``CANCELLED`` status). It is ``False`` -- not an error -- only
+    when the Job finished naturally in the race between the request landing and
+    the cancel running: "too late" to cancel, distinct from both success and a
+    generic failure; the finished Job's history row is left intact. A ``job_id``
+    not present in the live queue at all -- unknown, malformed, or already gone
+    -- is reported as ``404``, not this shape (there is nothing to act on
+    either way).
     """
 
     cancelled: bool

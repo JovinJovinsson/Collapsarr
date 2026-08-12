@@ -78,6 +78,21 @@ describe("app shell", () => {
     );
   });
 
+  // COL-191: Wanted and Queue each render their mapped lucide icon
+  // (previously custom hand-drawn SVGs from components/icons.tsx) --
+  // Queue's ListOrdered is also asserted distinct from History's FolderClock
+  // in navIcons.test.tsx, since History isn't wired into this hand-rolled
+  // shell fixture.
+  it("renders CakeSlice for Wanted and ListOrdered for Queue", async () => {
+    renderAt("/wanted");
+    const nav = await screen.findByRole("navigation", { name: /primary/i });
+    const wantedLink = within(nav).getByRole("link", { name: /wanted/i });
+    expect(wantedLink.querySelector("svg.lucide-cake-slice")).toBeInTheDocument();
+
+    const queueLink = within(nav).getByRole("link", { name: /queue/i });
+    expect(queueLink.querySelector("svg.lucide-list-ordered")).toBeInTheDocument();
+  });
+
   it("marks the current route active", async () => {
     renderAt("/queue");
     const nav = await screen.findByRole("navigation", { name: /primary/i });

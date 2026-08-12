@@ -21,6 +21,11 @@ moment a worker claims a Job:
 
 * :meth:`cancel` removes a still-``PENDING`` Job from ``_jobs`` so it never
   runs (returning ``False``, not raising, if a worker already claimed it).
+  A Job a worker has *already* claimed is instead hard-killed by
+  :meth:`cancel_running` (COL-192), which terminates its in-flight
+  ffmpeg/ffprobe subprocess so the Job fails out and frees its slot at once --
+  the manual mid-flight cancellation that supersedes ADR 0007's original
+  "no interruption of an in-flight ffmpeg."
 * :meth:`bump_to_front` reassigns a still-``PENDING`` Job's ``priority`` below
   every other pending Job's, so it is claimed next.
 
@@ -140,6 +145,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from collapsarr.config import Settings, get_settings
+from collapsarr.downmix.cancellation import CancellationHandle
 from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.default_audio_pipeline import run_default_audio_pipeline
 from collapsarr.downmix.pipeline import PipelineResult, run_downmix_pipeline
@@ -241,6 +247,14 @@ class Job:
     when the job transitions to ``RUNNING`` and when it reaches a terminal
     status, respectively -- the start/end timestamps COL-21's job history
     persists. Both stay ``None`` for a job that has never run.
+
+    ``cancellation`` (COL-192) is the job's hard-kill handle. It stays ``None``
+    while the job is ``PENDING`` and is set by :meth:`JobQueue._claim_next` the
+    instant a worker flips the job to ``RUNNING`` -- so
+    :meth:`JobQueue.cancel_running` can reach the live ffmpeg/ffprobe
+    subprocess and terminate it on an explicit user cancel. Not mutated
+    directly by anyone else; ``None`` again reads simply as "never ran / not
+    running."
     """
 
     file_path: Path
@@ -254,6 +268,7 @@ class Job:
     error: BaseException | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None
+    cancellation: CancellationHandle | None = None
 
 
 def _run_context_for_log(job: Job) -> str:
@@ -760,7 +775,11 @@ class JobQueue:
         it will not run, and no longer appears in :meth:`list_jobs`. Returns
         ``False`` (not an error) if the job is unknown or a worker has already
         claimed it (its status is no longer ``PENDING``): that's just "too
-        late," and the already-claimed job runs to completion normally.
+        late." To hard-kill a job that a worker has *already* claimed (status
+        ``RUNNING``), use :meth:`cancel_running` (COL-192) -- this primitive is
+        deliberately pending-only, so the bulk "Clear queue" pass
+        (:meth:`~collapsarr.jobs.scheduler.JobScheduler.clear_queue`) that
+        loops over it keeps its "cancel pending, leave running alone" contract.
 
         Does **not** delete the job's ``JobHistory`` row (its ``PENDING`` row,
         written at enqueue, stays as-is): row cleanup is a later slice's
@@ -773,6 +792,44 @@ class JobQueue:
             del self._jobs[job_id]
             self._cond.notify_all()  # a waiter in wait_idle may now be idle
             return True
+
+    def cancel_running(self, job_id: UUID) -> bool:
+        """Hard-kill a job a worker is currently running (COL-192).
+
+        The ``RUNNING``-state counterpart of :meth:`cancel`: signals the job's
+        :class:`~collapsarr.downmix.cancellation.CancellationHandle` (attached
+        in :meth:`_claim_next` when the job was claimed), terminating its live
+        ffmpeg/ffprobe subprocess -- and any children, since
+        :func:`~collapsarr.downmix.cancellation.make_cancellable_runner` runs
+        each in its own process group -- immediately. Returns ``True`` if the
+        job was ``RUNNING`` and has now been signalled, ``False`` (not an
+        error) if it is unknown or no longer ``RUNNING`` (still ``PENDING``, or
+        already terminal): the "finished naturally between the request and the
+        kill" race, the same too-late shape :meth:`cancel` reports for the
+        pending case.
+
+        The killed subprocess makes the in-flight pipeline call return a
+        failure, so the worker transitions the job to
+        :attr:`JobStatus.FAILED` and frees its slot through the ordinary
+        terminal path (:meth:`_run_job`) -- this method does **not** itself
+        touch the job's status, ``_active`` count, or ``JobHistory`` row; it
+        only fires the kill and lets the existing machinery run its course. No
+        distinct ``CANCELLED`` status is introduced (see the module docstring
+        and ``docs/adr/0007``): a hard-cancelled run is recorded as a failure,
+        which the ticket permits.
+
+        The handle is signalled outside ``self._lock`` -- killing a subprocess
+        can block briefly, and a worker thread needs the lock to make progress
+        toward the very terminal transition this cancel is waiting on.
+        """
+        with self._cond:
+            job = self._jobs.get(job_id)
+            if job is None or job.status is not JobStatus.RUNNING:
+                return False
+            handle = job.cancellation
+        if handle is not None:
+            handle.cancel()
+        return True
 
     def bump_to_front(self, job_id: UUID) -> bool:
         """Make a still-``PENDING`` job the next one a free worker claims (COL-164).
@@ -889,11 +946,13 @@ class JobQueue:
         """Stop the worker pool; any job a worker already claimed still finishes.
 
         Idempotent. Signals every worker to exit once it finishes whatever it
-        is currently running (there is no interruption of an in-flight
-        ``ffmpeg`` -- ADR 0007) and, when ``wait`` (the default), joins the
-        worker threads before returning. After shutdown the queue accepts no
-        new work: a later :meth:`enqueue` records the job but never starts a
-        pool to run it.
+        is currently running -- an orderly *shutdown* still does not interrupt
+        an in-flight ``ffmpeg`` (it drains gracefully); the manual, per-job
+        hard kill COL-192 added (:meth:`cancel_running`, superseding ADR 0007's
+        original blanket "no interruption") is a separate, explicit action, not
+        part of shutdown. When ``wait`` (the default), joins the worker threads
+        before returning. After shutdown the queue accepts no new work: a later
+        :meth:`enqueue` records the job but never starts a pool to run it.
         """
         with self._cond:
             if self._shutdown:
@@ -936,6 +995,12 @@ class JobQueue:
                 if job is not None:
                     job.status = JobStatus.RUNNING
                     job.started_at = datetime.now(UTC)
+                    # COL-192: attach a hard-kill handle under the same lock
+                    # that flips the job to RUNNING, so a concurrent
+                    # cancel_running() either sees it here (and kills the
+                    # subprocess once _run_job attaches one) or loses the race
+                    # cleanly against a job that already finished.
+                    job.cancellation = CancellationHandle()
                     self._active += 1  # stays counted until _run_job fully finishes
                     return job
                 self._cond.wait()
@@ -990,12 +1055,22 @@ class JobQueue:
             )
 
             try:
+                # COL-192: thread the job's hard-kill handle into whichever
+                # pipeline runs, so its ffmpeg/ffprobe subprocesses register
+                # with it and a concurrent cancel_running() can terminate them.
+                # The real pipeline runners accept `cancel_handle`; injected
+                # test stubs swallow it via **kwargs.
                 if job.kind is JobKind.SET_DEFAULT_AUDIO:
                     assert job.preference is not None  # enqueue_default_audio always sets this
-                    result = self._default_audio_pipeline_runner(job.file_path, job.preference)
+                    result = self._default_audio_pipeline_runner(
+                        job.file_path, job.preference, cancel_handle=job.cancellation
+                    )
                 else:
                     result = self._pipeline_runner(
-                        job.file_path, job.settings, **self._pipeline_kwargs
+                        job.file_path,
+                        job.settings,
+                        cancel_handle=job.cancellation,
+                        **self._pipeline_kwargs,
                     )
             except Exception as exc:  # noqa: BLE001 - captured as the job's outcome, not re-raised
                 with self._lock:
