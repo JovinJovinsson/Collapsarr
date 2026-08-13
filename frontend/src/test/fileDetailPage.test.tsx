@@ -4,23 +4,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FileDetailPage } from "../pages/FileDetailPage";
 import type { JobHistoryEntry } from "../types/activity";
+import type { AudioStreamsResponse } from "../types/audioStreams";
 import type { GlobalSettings } from "../types/settings";
 import type { WantedFile } from "../types/wanted";
 
 const FILE_PATH = "/media/movies/Interstellar (2014)/Interstellar.mkv";
 
-const wantedResponse: WantedFile[] = [
-  {
-    id: 1,
-    file_path: FILE_PATH,
-    missing_targets: [{ language: "en", target: "5.1" }],
-    created_at: "2026-07-01T00:00:00Z",
-    updated_at: "2026-07-02T00:00:00Z",
-    library_node_id: 42,
-    node_type: "movie",
-    tracked: true,
-  },
-];
+const fileResponse: WantedFile = {
+  id: 1,
+  file_path: FILE_PATH,
+  missing_targets: [{ language: "en", target: "5.1" }],
+  created_at: "2026-07-01T00:00:00Z",
+  updated_at: "2026-07-02T00:00:00Z",
+  library_node_id: 42,
+  node_type: "movie",
+  tracked: true,
+};
 
 const historyResponse: JobHistoryEntry[] = [
   {
@@ -40,6 +39,15 @@ const historyResponse: JobHistoryEntry[] = [
     updated_at: "2026-07-10T10:05:00Z",
   },
 ];
+
+const audioStreamsResponse: AudioStreamsResponse = {
+  probeable: true,
+  error: null,
+  streams: [
+    { index: 0, codec: "eac3", channels: 6, channel_layout: "5.1", language: "eng", is_default: true },
+    { index: 1, codec: "aac", channels: 2, channel_layout: "stereo", language: "jpn", is_default: false },
+  ],
+};
 
 const settingsResponse: GlobalSettings = {
   enabled_targets: ["stereo", "5.1"],
@@ -96,15 +104,33 @@ function mockFetchRouter(handler: Handler): { calls: FetchCall[] } {
 
 function defaultHandler(
   overrides: Partial<{
-    wanted: unknown;
+    file: unknown;
+    fileNotFound: boolean;
     history: unknown;
     settings: unknown;
+    audioStreams: unknown;
+    audioStreamsNotFound: boolean;
     trigger: { ok: boolean; status?: number; body: unknown };
     defaultAudioTrigger: { ok: boolean; status?: number; body: unknown };
     tracked: { ok: boolean; status?: number; body: unknown };
+    poster: { ok: boolean; status?: number; body: unknown };
   }> = {},
 ): Handler {
   return (url, init) => {
+    if (url.endsWith("/audio-streams")) {
+      if (overrides.audioStreamsNotFound) {
+        return { ok: false, status: 404, body: { detail: "No tracked file with this id." } };
+      }
+      return { ok: true, body: overrides.audioStreams ?? audioStreamsResponse };
+    }
+    if (url.endsWith("/poster")) {
+      return (
+        overrides.poster ?? {
+          ok: true,
+          body: { file_id: 1, status: "placeholder", poster_url: null },
+        }
+      );
+    }
     if (url === "/api/jobs/trigger-default-audio") {
       return (
         overrides.defaultAudioTrigger ?? {
@@ -139,8 +165,11 @@ function defaultHandler(
         },
       };
     }
-    if (url.startsWith("/api/wanted")) {
-      return { ok: true, body: overrides.wanted ?? wantedResponse };
+    if (url.startsWith("/api/files/")) {
+      if (overrides.fileNotFound) {
+        return { ok: false, status: 404, body: { detail: "No tracked file with this id." } };
+      }
+      return { ok: true, body: overrides.file ?? fileResponse };
     }
     throw new Error(`Unexpected fetch: ${String(init?.method ?? "GET")} ${url}`);
   };
@@ -148,9 +177,9 @@ function defaultHandler(
 
 function renderFileDetailPage(fileId = "1") {
   return render(
-    <MemoryRouter initialEntries={[`/wanted/${fileId}`]}>
+    <MemoryRouter initialEntries={[`/files/${fileId}`]}>
       <Routes>
-        <Route path="/wanted/:fileId" element={<FileDetailPage />} />
+        <Route path="/files/:fileId" element={<FileDetailPage />} />
       </Routes>
     </MemoryRouter>,
   );
@@ -179,13 +208,11 @@ describe("FileDetailPage", () => {
     expect(screen.getByText("en, fr")).toBeInTheDocument();
   });
 
-  it("renders a not-found state when no wanted file matches the id", async () => {
-    mockFetchRouter(defaultHandler({ wanted: [] }));
+  it("renders a not-found state when the endpoint returns a 404", async () => {
+    mockFetchRouter(defaultHandler({ fileNotFound: true }));
     renderFileDetailPage("999");
 
-    expect(
-      await screen.findByText(/no tracked file with this id is currently in the wanted list/i),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/no tracked file exists with this id/i)).toBeInTheDocument();
   });
 
   it("renders an error state when the file fails to load", async () => {
@@ -318,6 +345,29 @@ describe("FileDetailPage", () => {
 
     expect(await screen.findByText(/no job enqueued/i)).toBeInTheDocument();
   });
+
+  it.each([
+    ["no_preference", /no preferred default audio setting is configured yet/i],
+    ["already_correct", /this file's default audio track is already set correctly/i],
+    ["unprobeable", /could not be probed/i],
+    ["duplicate", /already queued, running, or was processed too recently/i],
+  ] as const)(
+    'shows a specific message for the "%s" skip reason (COL-207)',
+    async (skip_reason, expectedText) => {
+      mockFetchRouter(
+        defaultHandler({
+          defaultAudioTrigger: { ok: true, body: { enqueued: false, job: null, skip_reason } },
+        }),
+      );
+      renderFileDetailPage("1");
+
+      await screen.findByText("Interstellar");
+      fireEvent.click(screen.getByRole("button", { name: /^set default audio track$/i }));
+
+      expect(await screen.findByText(/no job enqueued/i)).toBeInTheDocument();
+      expect(await screen.findByText(expectedText)).toBeInTheDocument();
+    },
+  );
 
   it('shows an error message when the "Set Default Audio Track" request fails', async () => {
     mockFetchRouter(
@@ -472,14 +522,12 @@ describe("FileDetailPage", () => {
   it("shows a status-unavailable message when the file has no resolved Library node bridge", async () => {
     mockFetchRouter(
       defaultHandler({
-        wanted: [
-          {
-            ...wantedResponse[0],
-            library_node_id: null,
-            node_type: null,
-            tracked: null,
-          },
-        ],
+        file: {
+          ...fileResponse,
+          library_node_id: null,
+          node_type: null,
+          tracked: null,
+        },
       }),
     );
     renderFileDetailPage("1");
@@ -501,5 +549,118 @@ describe("FileDetailPage", () => {
 
     expect(await screen.findByText(/couldn't update tracked: boom/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^tracked$/i })).not.toBeDisabled();
+  });
+
+  // --- Current audio streams (COL-204) ----------------------------------------
+
+  it("shows every current audio stream's language and channel count, with the current Default Audio Track indicated", async () => {
+    mockFetchRouter(defaultHandler());
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    const defaultRow = (await screen.findByText("eng")).closest("tr") as HTMLElement;
+    expect(within(defaultRow).getByText(/5\.1 \(6ch\)/)).toBeInTheDocument();
+    expect(within(defaultRow).getByText("eac3")).toBeInTheDocument();
+    expect(within(defaultRow).getByText("Default")).toBeInTheDocument();
+
+    const nonDefaultRow = (await screen.findByText("jpn")).closest("tr") as HTMLElement;
+    expect(within(nonDefaultRow).getByText(/stereo \(2ch\)/)).toBeInTheDocument();
+    expect(within(nonDefaultRow).queryByText("Default")).not.toBeInTheDocument();
+  });
+
+  it("degrades gracefully instead of crashing when the file can't currently be probed (e.g. missing on disk)", async () => {
+    mockFetchRouter(
+      defaultHandler({
+        audioStreams: { probeable: false, error: "no such file: '/media/gone.mkv'", streams: [] },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(
+      await screen.findByText(/couldn't be probed right now.*no such file/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an error message rather than crashing when the audio-streams request itself fails", async () => {
+    mockFetchRouter(
+      defaultHandler({ audioStreamsNotFound: true }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(
+      await screen.findByText(/couldn't probe audio streams/i),
+    ).toBeInTheDocument();
+  });
+
+  // --- Poster slot (COL-205) --------------------------------------------------
+
+  it("shows the placeholder graphic when the poster endpoint returns no poster_url", async () => {
+    mockFetchRouter(defaultHandler());
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(screen.getByRole("img", { name: /no poster available/i })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /^poster for/i })).not.toBeInTheDocument();
+  });
+
+  it("renders the returned image when the poster endpoint resolves a poster_url", async () => {
+    mockFetchRouter(
+      defaultHandler({
+        poster: {
+          ok: true,
+          body: { file_id: 1, status: "available", poster_url: "https://example.com/poster.jpg" },
+        },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    const image = (await screen.findByRole("img", {
+      name: /^poster for interstellar$/i,
+    })) as HTMLImageElement;
+    expect(image.src).toBe("https://example.com/poster.jpg");
+  });
+
+  it("falls back to the placeholder graphic, never an error, when the poster request fails", async () => {
+    mockFetchRouter(
+      defaultHandler({ poster: { ok: false, status: 500, body: { detail: "boom" } } }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(await screen.findByRole("img", { name: /no poster available/i })).toBeInTheDocument();
+    expect(screen.queryByText(/boom/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/couldn't load poster/i)).not.toBeInTheDocument();
+  });
+
+  it("falls back to the placeholder graphic if the resolved poster image itself fails to load", async () => {
+    // Guards the Phase 2 (COL-212) handoff: once a real poster_url is
+    // returned, a broken/expired/hotlink-blocked image must still degrade to
+    // the placeholder graphic rather than a broken-image glyph.
+    mockFetchRouter(
+      defaultHandler({
+        poster: {
+          ok: true,
+          body: { file_id: 1, status: "available", poster_url: "https://example.com/poster.jpg" },
+        },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    const image = await screen.findByRole("img", { name: /^poster for interstellar$/i });
+
+    fireEvent.error(image);
+
+    expect(await screen.findByRole("img", { name: /no poster available/i })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /^poster for/i })).not.toBeInTheDocument();
   });
 });
