@@ -12,7 +12,11 @@ import {
 } from "../api/library";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import { useInstances } from "../hooks/useInstances";
-import type { BulkSetDefaultAudioTriggerResult } from "../types/activity";
+import {
+  DEFAULT_AUDIO_SKIP_REASONS,
+  DEFAULT_AUDIO_SKIP_REASON_SHORT_LABEL,
+} from "../types/activity";
+import type { BulkSetDefaultAudioTriggerResult, DefaultAudioSkipReason } from "../types/activity";
 import type { ArrInstance } from "../types/instances";
 import type {
   CurrentDefaultTrack,
@@ -751,6 +755,70 @@ function BulkActionToolbar({
  * selected-but-now-filtered-out row's selection persists (it reappears
  * checked once the filter that hid it is cleared).
  */
+
+/**
+ * Renders a bulk Set Default Audio Track trigger's response as plain text
+ * (COL-158): the only thing genuinely known synchronously right after
+ * `POST /api/jobs/trigger-default-audio/bulk` returns is, per resolved
+ * file, whether a `SET_DEFAULT_AUDIO` job was enqueued or the file was
+ * skipped -- mirrors `FileDetailPage`'s single-file enqueued/skipped
+ * result text (COL-157) rather than implying the Default Audio column
+ * already reflects it.
+ *
+ * The skipped count is broken down per {@link DefaultAudioSkipReason}
+ * (COL-208) using {@link DEFAULT_AUDIO_SKIP_REASON_SHORT_LABEL} -- e.g.
+ * "2 skipped (duplicate), 1 skipped (already correct)" -- rather than one
+ * opaque "already correct or skipped" bucket, so a bulk run that skipped a
+ * batch of files for a *fixable* reason (no Preferred Default Audio
+ * setting configured, or files that couldn't be probed) reads differently
+ * from one that skipped files because they were already correct. A result
+ * missing `skip_reason` (defensive -- COL-207's contract always sets it on
+ * a skip) still counts toward the total via a reason-less "skipped"
+ * bucket instead of silently vanishing from the summary.
+ *
+ * Module-level and pure (only reads its `result` argument), matching
+ * `HistoryPage`'s `describeBulkRequeueResult` / `QueuePage`'s
+ * `describeClearQueueResult` -- the sibling bulk-result-summary functions
+ * this one mirrors.
+ */
+function summarizeDefaultAudioResult(result: BulkSetDefaultAudioTriggerResult): string {
+  const total = result.results.length;
+  if (total === 0) {
+    return "No files resolved from the selection — nothing was triggered.";
+  }
+  const enqueuedCount = result.results.filter((entry) => entry.enqueued).length;
+  const skipped = result.results.filter((entry) => !entry.enqueued);
+
+  const skipCountByReason = new Map<DefaultAudioSkipReason, number>();
+  let reasonlessSkipCount = 0;
+  for (const entry of skipped) {
+    if (entry.skip_reason) {
+      skipCountByReason.set(entry.skip_reason, (skipCountByReason.get(entry.skip_reason) ?? 0) + 1);
+    } else {
+      reasonlessSkipCount += 1;
+    }
+  }
+
+  const parts: string[] = [];
+  if (enqueuedCount > 0) {
+    parts.push(`${enqueuedCount} job${enqueuedCount === 1 ? "" : "s"} enqueued`);
+  }
+  for (const reason of DEFAULT_AUDIO_SKIP_REASONS) {
+    const count = skipCountByReason.get(reason) ?? 0;
+    if (count > 0) {
+      parts.push(`${count} skipped (${DEFAULT_AUDIO_SKIP_REASON_SHORT_LABEL[reason]})`);
+    }
+  }
+  if (reasonlessSkipCount > 0) {
+    parts.push(`${reasonlessSkipCount} skipped`);
+  }
+
+  const summary = parts.join(", ");
+  return enqueuedCount > 0
+    ? `${summary}. Enqueued jobs haven't run yet — their Default Audio column value will update once each job completes.`
+    : `${summary}.`;
+}
+
 export function LibraryPage() {
   const { instanceId: instanceIdParam } = useParams<{ instanceId: string }>();
   const instanceId = Number(instanceIdParam);
@@ -933,35 +1001,6 @@ export function LibraryPage() {
     } finally {
       setBulkPending(false);
     }
-  }
-
-  /**
-   * Renders a bulk Set Default Audio Track trigger's response as plain text
-   * (COL-158): the only thing genuinely known synchronously right after
-   * `POST /api/jobs/trigger-default-audio/bulk` returns is, per resolved
-   * file, whether a `SET_DEFAULT_AUDIO` job was enqueued or the file was
-   * already correct (skipped) -- mirrors `FileDetailPage`'s single-file
-   * enqueued/skipped result text (COL-157) rather than implying the Default
-   * Audio column already reflects it.
-   */
-  function summarizeDefaultAudioResult(result: BulkSetDefaultAudioTriggerResult): string {
-    const total = result.results.length;
-    if (total === 0) {
-      return "No files resolved from the selection — nothing was triggered.";
-    }
-    const enqueuedCount = result.results.filter((entry) => entry.enqueued).length;
-    const alreadyCorrectCount = total - enqueuedCount;
-    const parts: string[] = [];
-    if (enqueuedCount > 0) {
-      parts.push(`${enqueuedCount} job${enqueuedCount === 1 ? "" : "s"} enqueued`);
-    }
-    if (alreadyCorrectCount > 0) {
-      parts.push(`${alreadyCorrectCount} already correct or skipped`);
-    }
-    const summary = parts.join(", ");
-    return enqueuedCount > 0
-      ? `${summary}. Enqueued jobs haven't run yet — their Default Audio column value will update once each job completes.`
-      : `${summary}.`;
   }
 
   const instance =

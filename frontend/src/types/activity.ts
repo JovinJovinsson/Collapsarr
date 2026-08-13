@@ -115,6 +115,35 @@ export const DEFAULT_AUDIO_SKIP_REASON_MESSAGE: Record<DefaultAudioSkipReason, s
 };
 
 /**
+ * Short, lowercase label for each {@link DefaultAudioSkipReason} (COL-208) --
+ * fits inline in a bulk-result count like "2 skipped (duplicate)", unlike
+ * {@link DEFAULT_AUDIO_SKIP_REASON_MESSAGE}'s full sentences, which are
+ * written for a single-file result paragraph instead. The Library page's
+ * bulk "Set Default Audio Track" summary uses this to break its skipped
+ * count down per reason.
+ */
+export const DEFAULT_AUDIO_SKIP_REASON_SHORT_LABEL: Record<DefaultAudioSkipReason, string> = {
+  no_preference: "no preference configured",
+  already_correct: "already correct",
+  unprobeable: "unprobeable",
+  duplicate: "duplicate",
+};
+
+/**
+ * Stable enumeration order for {@link DefaultAudioSkipReason} (COL-208) --
+ * drives the order per-reason counts appear in the Library page's bulk
+ * "Set Default Audio Track" summary, so repeat runs render deterministically
+ * rather than depending on `Map`/object key insertion order of whichever
+ * reasons happened to appear in a given response.
+ */
+export const DEFAULT_AUDIO_SKIP_REASONS: readonly DefaultAudioSkipReason[] = [
+  "no_preference",
+  "already_correct",
+  "unprobeable",
+  "duplicate",
+];
+
+/**
  * Response for `POST /api/jobs/trigger-default-audio` (COL-155,
  * `SetDefaultAudioTriggerResult`; `skip_reason` COL-207). `enqueued` is
  * `true` with the created `job` when a `SET_DEFAULT_AUDIO` job was queued
