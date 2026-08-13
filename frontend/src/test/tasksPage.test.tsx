@@ -40,7 +40,15 @@ const updateCheck: ScheduledTask = {
   scheduler_enabled: true,
 };
 
-const allTasks: ScheduledTask[] = [libraryScan, healthChecks, backups, updateCheck];
+const plexSync: ScheduledTask = {
+  name: "Plex Sync",
+  interval_label: "Every 1 week",
+  next_run_at: "2026-08-16T09:00:00Z",
+  last_run_at: "2026-08-09T09:00:00Z",
+  scheduler_enabled: true,
+};
+
+const allTasks: ScheduledTask[] = [libraryScan, healthChecks, backups, updateCheck, plexSync];
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -57,7 +65,9 @@ describe("TasksPage", () => {
     expect(screen.getByText("Health checks")).toBeInTheDocument();
     expect(screen.getByText("Backups")).toBeInTheDocument();
     expect(screen.getByText("Update check")).toBeInTheDocument();
+    expect(screen.getByText("Plex Sync")).toBeInTheDocument();
     expect(screen.getByText("Every 6 hours")).toBeInTheDocument();
+    expect(screen.getByText("Every 1 week")).toBeInTheDocument();
 
     // A null next_run_at (scheduler disabled / never run) renders as an em dash.
     const backupsRow = screen.getByText("Backups").closest("tr") as HTMLElement;
@@ -100,6 +110,31 @@ describe("TasksPage", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       "/api/jobs/scan",
+      expect.objectContaining({ method: "POST" })
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/system/tasks", expect.anything());
+  });
+
+  it("runs the Plex Sync task via POST /api/plex/sync and refetches the list", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(allTasks)) // initial GET on mount
+      .mockResolvedValueOnce(jsonResponse({ items: 12 }, 202)) // POST /api/plex/sync
+      .mockResolvedValueOnce(jsonResponse(allTasks)); // refetch GET
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<TasksPage />);
+
+    await waitFor(() => expect(screen.getByText("Plex Sync")).toBeInTheDocument());
+    const row = screen.getByText("Plex Sync").closest("tr") as HTMLElement;
+
+    fireEvent.click(within(row).getByRole("button", { name: "Run now" }));
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/plex/sync",
       expect.objectContaining({ method: "POST" })
     );
 

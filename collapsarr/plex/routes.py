@@ -22,21 +22,46 @@ present in the request body are changed. Omitting ``token`` leaves the
 currently-stored token untouched -- since a ``GET`` never echoes it back,
 the frontend has no way to "round-trip" it, so the edit form simply leaves
 the token field blank and only sends it when the operator types a new one.
+Saving also **kicks off a background Plex Sync** (COL-210) via the scheduler's
+non-blocking :meth:`~collapsarr.plex.scheduler.PlexSyncScheduler.request_sync`,
+so a freshly-saved/reconnected server's library is mapped without waiting for
+the weekly cadence -- and without blocking this save's HTTP response.
+
+``POST /api/plex/sync`` (COL-210) is the manual "Run now" trigger for the Plex
+Sync Scheduled Task (surfaced on ``/system/tasks``): it rebuilds the Plex
+Library Item mapping table synchronously and returns a ``202`` with the row
+count, mirroring ``POST /api/jobs/scan``'s "Scan now" shape.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from ..database import get_session
 from .models import ConnectivityStatus, PlexConnection
+from .scheduler import PlexSyncScheduler
 from .service import get_plex_connection, update_plex_connection
 
 router = APIRouter(prefix="/api", tags=["plex"])
+
+
+def _plex_sync_scheduler(request: Request) -> PlexSyncScheduler:
+    """Return the live Plex Sync scheduler, or ``503`` if the app was built without it.
+
+    ``create_app`` wires ``plex_sync_scheduler`` onto ``app.state``
+    unconditionally, so in a normally-built app this always resolves; the guard
+    only trips for a deliberately-stripped-down app (mirroring
+    :func:`collapsarr.jobs.routes.get_job_scheduler`'s own 503 for the job
+    scheduler).
+    """
+    scheduler: PlexSyncScheduler | None = getattr(request.app.state, "plex_sync_scheduler", None)
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="Plex Sync scheduler is not enabled")
+    return scheduler
 
 
 # --- schemas -----------------------------------------------------------------
@@ -53,6 +78,12 @@ class PlexConnectionRead(BaseModel):
     version: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class PlexSyncRunResult(BaseModel):
+    """Response for ``POST /api/plex/sync``: the mapping table's row count after the rebuild."""
+
+    items: int
 
 
 class PlexConnectionUpdate(BaseModel):
@@ -99,9 +130,9 @@ def get_plex_connection_endpoint(session: Session = Depends(get_session)) -> Ple
 
 @router.put("/plex/connection", response_model=PlexConnectionRead)
 def update_plex_connection_endpoint(
-    body: PlexConnectionUpdate, session: Session = Depends(get_session)
+    body: PlexConnectionUpdate, request: Request, session: Session = Depends(get_session)
 ) -> PlexConnectionRead:
-    """Update the provided fields and re-validate connectivity.
+    """Update the provided fields, re-validate connectivity, and kick off a Plex Sync.
 
     A ``None`` field (whether omitted or explicitly sent as ``null``) is left
     unchanged by :func:`~collapsarr.plex.service.update_plex_connection` --
@@ -111,5 +142,32 @@ def update_plex_connection_endpoint(
     :func:`collapsarr.arr.routes.update_instance_endpoint` uses. Saving always
     re-runs the connectivity check and persists the outcome, the same way
     ``PUT /api/instances/{id}`` does for Sonarr/Radarr.
+
+    On save/reconnect it also asks the Plex Sync scheduler to take an off-cycle
+    sync (COL-210), via the non-blocking
+    :meth:`~collapsarr.plex.scheduler.PlexSyncScheduler.request_sync` -- so a
+    just-configured server's library is mapped promptly rather than at the next
+    weekly tick, without this response waiting on the walk. The trigger fires
+    regardless of the connectivity outcome: an operator correcting a URL/token
+    wants the retry to remap, and a still-broken connection simply makes the
+    background sync a no-op.
     """
-    return _to_read(update_plex_connection(session, base_url=body.base_url, token=body.token))
+    connection = _to_read(
+        update_plex_connection(session, base_url=body.base_url, token=body.token)
+    )
+    _plex_sync_scheduler(request).request_sync()
+    return connection
+
+
+@router.post("/plex/sync", status_code=202, response_model=PlexSyncRunResult)
+def run_plex_sync_endpoint(request: Request) -> PlexSyncRunResult:
+    """Rebuild the Plex Library Item mapping table now -- the "Run now" trigger (COL-210).
+
+    Drives :meth:`~collapsarr.plex.scheduler.PlexSyncScheduler.run_once`
+    synchronously (the same method the weekly loop and the on-save trigger run)
+    and returns ``202`` with the rebuilt table's row count. The Scheduled Task
+    row on ``/system/tasks`` reads its refreshed ``last_run_at`` afterward, the
+    same "Run now then refetch" shape ``POST /api/jobs/scan`` uses for the
+    library scan.
+    """
+    return PlexSyncRunResult(items=_plex_sync_scheduler(request).run_once())

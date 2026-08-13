@@ -261,10 +261,10 @@ POST_BASELINE_INDEXES: tuple[str, ...] = (
 
 #: Whole tables a *post-baseline* migration adds (COL-75's
 #: ``health_check_state``, COL-80's ``health_write_probe``, COL-98's
-#: ``library_nodes``, COL-209's ``plex_connection``). ``create_all``
-#: below builds them from the live ``Base.metadata``, so they are dropped
-#: afterwards to de-evolve the stand-in back to a real
-#: pre-COL-75/pre-COL-80/pre-COL-98/pre-COL-209
+#: ``library_nodes``, COL-209's ``plex_connection``, COL-210's
+#: ``plex_library_items``). ``create_all`` below builds them from the live
+#: ``Base.metadata``, so they are dropped afterwards to de-evolve the stand-in
+#: back to a real pre-COL-75/pre-COL-80/pre-COL-98/pre-COL-209/pre-COL-210
 #: create_all-era release -- exactly as :data:`POST_BASELINE_COLUMNS` does for
 #: later-added columns -- so the adoption delta (not create_all) is what
 #: creates them.
@@ -274,6 +274,7 @@ POST_BASELINE_TABLES: tuple[str, ...] = (
     "update_check_state",
     "library_nodes",
     "plex_connection",
+    "plex_library_items",
 )
 
 

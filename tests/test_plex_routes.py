@@ -127,6 +127,62 @@ def test_token_never_appears_in_openapi_schema_response_shape(client: TestClient
     assert "token" not in plex_read_schema.get("properties", {})
 
 
+# --- Plex Sync manual trigger + on-save hook (COL-210) --------------------------
+
+
+class _SpyScheduler:
+    """Stands in for the wired ``PlexSyncScheduler`` to observe the route's calls."""
+
+    def __init__(self) -> None:
+        self.request_sync_calls = 0
+        self.run_once_calls = 0
+
+    def request_sync(self) -> None:
+        self.request_sync_calls += 1
+
+    def run_once(self) -> int:
+        self.run_once_calls += 1
+        return 7
+
+
+def _install_spy_scheduler(client: TestClient) -> _SpyScheduler:
+    """Swap the wired Plex Sync scheduler for a spy, to observe the route's calls."""
+    app = client.app
+    assert isinstance(app, FastAPI)
+    spy = _SpyScheduler()
+    app.state.plex_sync_scheduler = spy
+    return spy
+
+
+def test_saving_the_connection_triggers_a_background_sync(client: TestClient) -> None:
+    spy = _install_spy_scheduler(client)
+
+    _put_connection(client, base_url=UNREACHABLE_URL, token="plex-secret-token")
+
+    # The save asked for an off-cycle sync (non-blocking request_sync), and did
+    # not itself run one synchronously on the request thread.
+    assert spy.request_sync_calls == 1
+    assert spy.run_once_calls == 0
+
+
+def test_run_now_endpoint_runs_a_sync_and_reports_the_row_count(client: TestClient) -> None:
+    spy = _install_spy_scheduler(client)
+
+    response = client.post("/api/plex/sync", headers=_auth_headers(client))
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"items": 7}
+    assert spy.run_once_calls == 1
+
+
+def test_run_now_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+
+    response = client.post("/api/plex/sync", json={})
+
+    assert response.status_code == 401
+
+
 # --- auth-required behaviour ---------------------------------------------------
 
 

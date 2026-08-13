@@ -1,11 +1,12 @@
 """HTTP REST endpoint aggregating Collapsarr's background schedulers (COL-122).
 
-A thin, read-only aggregation layer over the four independent scheduler
+A thin, read-only aggregation layer over the five independent scheduler
 classes -- :class:`~collapsarr.jobs.scheduler.JobScheduler` (library scan),
 :class:`~collapsarr.health.scheduler.HealthCheckScheduler` (health checks),
-:class:`~collapsarr.backup.scheduler.BackupScheduler` (backups), and
+:class:`~collapsarr.backup.scheduler.BackupScheduler` (backups),
 :class:`~collapsarr.update_check.scheduler.UpdateCheckScheduler` (update
-check) -- exposed as a FastAPI :class:`~fastapi.APIRouter` mounted under
+check), and :class:`~collapsarr.plex.scheduler.PlexSyncScheduler` (Plex sync,
+COL-210) -- exposed as a FastAPI :class:`~fastapi.APIRouter` mounted under
 ``/api/system`` by :func:`collapsarr.main.create_app`, inheriting the same
 auth gate every other ``/api`` route does.
 
@@ -20,17 +21,19 @@ Endpoint:
 
 * ``GET /api/system/tasks`` -- one :class:`ScheduledTaskRead` row per
   Scheduled Task (``CONTEXT.md``'s "Scheduled Task"), in a fixed order:
-  Library scan, Health checks, Backups, Update check. ``scheduler_enabled``
-  reflects whether *that task's* background loop is actually running right
-  now; when it is ``False``, or the task has not completed a run yet this
-  process (``last_run_at`` is ``None``), ``next_run_at`` is reported
-  ``None`` rather than a computed time that will never fire.
+  Library scan, Health checks, Backups, Update check, Plex Sync.
+  ``scheduler_enabled`` reflects whether *that task's* background loop is
+  actually running right now; when it is ``False``, or the task has not
+  completed a run yet this process (``last_run_at`` is ``None``),
+  ``next_run_at`` is reported ``None`` rather than a computed time that will
+  never fire.
 
 Each row's manual "Run now" action is **not** a new endpoint here -- the
 frontend calls that task's existing manual-trigger endpoint unchanged
 (``POST /api/jobs/scan``, ``POST /api/system/health-checks/recheck``,
-``POST /api/system/backup``, ``POST /api/system/updates/recheck``) and
-refetches this list, per the ticket's acceptance criteria.
+``POST /api/system/backup``, ``POST /api/system/updates/recheck``,
+``POST /api/plex/sync``) and refetches this list, per the ticket's acceptance
+criteria.
 """
 
 from __future__ import annotations
@@ -48,9 +51,15 @@ from ..database import get_session
 from ..health.scheduler import INTERVAL_SECONDS as HEALTH_CHECK_INTERVAL_SECONDS
 from ..health.service import list_health_check_states
 from ..jobs.scheduler import JobScheduler
+from ..plex.scheduler import INTERVAL_SECONDS as PLEX_SYNC_INTERVAL_SECONDS
+from ..plex.scheduler import PlexSyncScheduler
 from ..settings.service import get_global_settings
 from ..update_check.scheduler import INTERVAL_SECONDS as UPDATE_CHECK_INTERVAL_SECONDS
 from ..update_check.service import get_update_check_state
+
+#: Seconds in one week -- the unit :data:`PLEX_SYNC_INTERVAL_SECONDS` (a fixed
+#: weekly cadence) is rendered in for the Plex Sync row's ``interval_label``.
+_SECONDS_PER_WEEK = 7 * 24 * 60 * 60.0
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -216,6 +225,33 @@ def _update_check_task(request: Request, session: Session) -> ScheduledTaskRead:
     )
 
 
+def _plex_sync_task(request: Request) -> ScheduledTaskRead:
+    """Build the Plex Sync row from :class:`~collapsarr.plex.scheduler.PlexSyncScheduler` (COL-210).
+
+    Wired on ``app.state.plex_sync_scheduler`` unconditionally (so the manual
+    ``POST /api/plex/sync`` "Run now" always has a target), so its presence
+    can't tell us whether the periodic background loop is running -- like Health
+    Checks/Update Check, ``scheduler_enabled`` reads the app-wide
+    ``enable_scheduler`` flag directly, the condition the lifespan gates
+    ``plex_sync_scheduler.start()`` on. ``last_run_at`` is the scheduler's
+    in-memory ``last_sync_at`` (``None`` until the first sync runs this
+    process); ``next_run_at`` only becomes meaningful once both are set.
+    """
+    scheduler: PlexSyncScheduler | None = getattr(request.app.state, "plex_sync_scheduler", None)
+    scheduler_enabled = bool(getattr(request.app.state, "enable_scheduler", False))
+    last_run_at = scheduler.last_sync_at if scheduler is not None else None
+    interval = timedelta(seconds=PLEX_SYNC_INTERVAL_SECONDS)
+    return ScheduledTaskRead(
+        name="Plex Sync",
+        interval_label=_format_interval(PLEX_SYNC_INTERVAL_SECONDS / _SECONDS_PER_WEEK, "week"),
+        next_run_at=_next_run_at(
+            scheduler_enabled=scheduler_enabled, last_run_at=last_run_at, interval=interval
+        ),
+        last_run_at=last_run_at,
+        scheduler_enabled=scheduler_enabled,
+    )
+
+
 # --- endpoints ---------------------------------------------------------------
 
 
@@ -225,8 +261,8 @@ def list_tasks_endpoint(
 ) -> list[ScheduledTaskRead]:
     """List every Scheduled Task with its cadence, next/last run, and enabled state.
 
-    Fixed order: Library scan, Health checks, Backups, Update check -- matches
-    the order the ticket/ADR describe the four schedulers in, giving the
+    Fixed order: Library scan, Health checks, Backups, Update check, Plex Sync
+    -- matches the order the ticket/ADR describe the schedulers in, giving the
     frontend table a stable row order across requests.
     """
     return [
@@ -234,6 +270,7 @@ def list_tasks_endpoint(
         _health_checks_task(request, session),
         _backups_task(request, session),
         _update_check_task(request, session),
+        _plex_sync_task(request),
     ]
 
 

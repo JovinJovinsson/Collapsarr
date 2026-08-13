@@ -4,7 +4,7 @@ import { apiErrorMessage, apiFetch } from "./client";
 /**
  * Fetches the Scheduled Task registry (`GET /api/system/tasks`, COL-122) --
  * one row per background scheduler (library scan, health checks, backups,
- * update check), driving the System > Tasks page.
+ * update check, Plex sync), driving the System > Tasks page.
  */
 export async function fetchTasks(): Promise<ScheduledTask[]> {
   const response = await apiFetch("/api/system/tasks");
@@ -71,6 +71,22 @@ export async function runUpdateCheck(): Promise<void> {
   if (!response.ok) {
     throw new Error(
       await apiErrorMessage(response, `Failed to run the update check (${response.status})`)
+    );
+  }
+}
+
+/**
+ * Triggers the Plex Sync task's manual endpoint
+ * (`POST /api/plex/sync`, `collapsarr/plex/routes.py::run_plex_sync_endpoint`,
+ * COL-210) -- the "Run now" action for the Plex Sync Scheduled Task. Rebuilds
+ * the Plex Library Item mapping table; the response is a row-count summary, not
+ * a task row, so callers follow up with `fetchTasks()` to see the refreshed row.
+ */
+export async function runPlexSync(): Promise<void> {
+  const response = await apiFetch("/api/plex/sync", { method: "POST" });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to run the Plex sync (${response.status})`)
     );
   }
 }
