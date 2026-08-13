@@ -87,11 +87,32 @@ def make_ffmpeg_check_run(
     """Build the framework ``run`` callable wrapping the FFmpeg presence probe.
 
     ``checker`` defaults to the real :func:`check_ffmpeg`; the app/tests inject a
-    fake to simulate a present/missing binary. The returned callable ignores its
-    context (FFmpeg presence is process-global, not per-instance or DB-backed).
+    fake to simulate a present/missing binary -- an injected fake's returned
+    callable still ignores its context entirely (FFmpeg presence is
+    process-global, not per-instance or DB-backed), matching the pre-COL-218
+    behaviour exactly, so existing tests need no changes.
+
+    With the real, un-overridden ``checker`` (identity-checked against
+    :func:`check_ffmpeg`, the only way ``default_health_checks`` -- see
+    :mod:`collapsarr.health.registry` -- ever resolves an un-overridden
+    probe), the returned callable additionally reads ``context.session`` for
+    the persisted :class:`~collapsarr.settings.models.GlobalSettings` row
+    (COL-218) fresh on every tick, and -- only when its ``ffmpeg_path``
+    override is set -- probes *that* path instead of the bare ``"ffmpeg"``
+    default, so pointing Settings at a runtime-free native FFmpeg build
+    (Epic COL-214) flips this check to "available" on the very next tick,
+    no restart required. Unset (every fresh install's state, and every
+    existing install's row after the additive migration) keeps probing the
+    bare ``"ffmpeg"`` default -- byte-for-byte the pre-COL-218 behaviour.
     """
 
-    def run(_context: HealthCheckContext) -> Sequence[HealthCheckResult]:
+    def run(context: HealthCheckContext) -> Sequence[HealthCheckResult]:
+        if checker is check_ffmpeg:
+            from collapsarr.settings.service import get_global_settings
+
+            configured_path = get_global_settings(context.session).ffmpeg_path
+            if configured_path:
+                return [_to_result(check_ffmpeg(configured_path))]
         return [_to_result(checker())]
 
     return run

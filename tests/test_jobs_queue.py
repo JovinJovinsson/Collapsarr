@@ -921,6 +921,74 @@ def test_from_settings_passes_no_default_audio_kwargs_when_toggle_off(tmp_path: 
 
 
 # ---------------------------------------------------------------------------
+# ffmpeg_path override wiring (COL-218): a configured FFmpeg path must reach
+# run_downmix_pipeline's ``ffmpeg_path`` kwarg for a real job dispatched
+# through a JobQueue built via from_settings; unset must add nothing.
+# ---------------------------------------------------------------------------
+
+
+def _write_ffmpeg_path(settings: Settings, ffmpeg_path: str | None) -> None:
+    """Persist ``ffmpeg_path`` directly on the singleton row.
+
+    Not routed through :func:`update_global_settings` -- ``ffmpeg_path`` has
+    no public setter there yet (COL-218 only wires the read path; a write
+    path -- e.g. an opt-in UI -- is COL-222's concern, which COL-218
+    deliberately blocks until this schema/wiring lands).
+    """
+    from collapsarr.settings.service import get_global_settings
+
+    upgrade_to_head(settings)
+    engine = create_engine_from_settings(settings)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        row = get_global_settings(session)
+        row.ffmpeg_path = ffmpeg_path
+        session.commit()
+    engine.dispose()
+
+
+def test_from_settings_threads_ffmpeg_path_when_set(tmp_path: Path) -> None:
+    """A configured ffmpeg_path reaches the pipeline runner's kwargs."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_ffmpeg_path(settings, "/opt/collapsarr/ffmpeg/ffmpeg")
+
+    runner = _KwargsCapturingRunner(_SUCCESS)
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+    queue.wait_idle()
+
+    assert len(runner.kwargs_calls) == 1
+    assert runner.kwargs_calls[0]["ffmpeg_path"] == "/opt/collapsarr/ffmpeg/ffmpeg"
+
+
+def test_from_settings_passes_no_ffmpeg_path_kwarg_when_unset(tmp_path: Path) -> None:
+    """Unset (the default, every fresh/existing install's row): no ffmpeg_path kwarg added --
+    a job's pipeline call is byte-for-byte what it was before COL-218."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    upgrade_to_head(settings)
+
+    runner = _KwargsCapturingRunner(_SUCCESS)
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+    queue.wait_idle()
+
+    assert len(runner.kwargs_calls) == 1
+    kwargs = runner.kwargs_calls[0]
+    assert "ffmpeg_path" not in kwargs
+    assert set(kwargs) == {"cancel_handle"}
+
+
+# ---------------------------------------------------------------------------
 # Job kinds (COL-155): SET_DEFAULT_AUDIO jobs run through their own injected
 # runner, sharing this queue's concurrency limit; DOWNMIX jobs are unaffected.
 # ---------------------------------------------------------------------------
@@ -994,6 +1062,109 @@ def test_worker_pool_dispatches_set_default_audio_jobs_to_their_own_runner() -> 
     assert job.result is _SUCCESS
     assert default_audio_runner.calls == [(Path("/media/movie.mkv"), _PREFERENCE)]
     assert downmix_runner.calls == []  # the DOWNMIX runner is never touched
+
+
+class _KwargsCapturingDefaultAudioRunner:
+    """A default_audio_pipeline_runner stub that records the **kwargs each call passes it."""
+
+    def __init__(self, result: PipelineResult) -> None:
+        self._result = result
+        self.kwargs_calls: list[dict[str, object]] = []
+
+    def __call__(
+        self, file_path: Path, preference: DefaultAudioPreference, **kwargs: object
+    ) -> PipelineResult:
+        self.kwargs_calls.append(kwargs)
+        return self._result
+
+
+def test_from_settings_threads_ffmpeg_path_to_set_default_audio_jobs_too(tmp_path: Path) -> None:
+    """A configured ffmpeg_path must also reach a SET_DEFAULT_AUDIO job's runner
+    (COL-218) -- not just a DOWNMIX job's, since run_default_audio_pipeline
+    accepts the same ffmpeg_path kwarg as run_downmix_pipeline."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_ffmpeg_path(settings, "/opt/collapsarr/ffmpeg/ffmpeg")
+
+    default_audio_runner = _KwargsCapturingDefaultAudioRunner(_SUCCESS)
+    queue = JobQueue.from_settings(
+        settings,
+        pipeline_runner=_stub_runner(_SUCCESS),
+        default_audio_pipeline_runner=default_audio_runner,
+    )
+    queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
+    queue.start()
+    queue.wait_idle()
+
+    assert len(default_audio_runner.kwargs_calls) == 1
+    assert (
+        default_audio_runner.kwargs_calls[0]["ffmpeg_path"] == "/opt/collapsarr/ffmpeg/ffmpeg"
+    )
+
+
+class _StrictDefaultAudioRunner:
+    """A default_audio_pipeline_runner stub matching run_default_audio_pipeline's
+    exact kwarg surface -- ``ffmpeg_path`` only, no catch-all ``**kwargs`` -- so a
+    call with any other keyword (e.g. ``auto_set_default_audio``) raises
+    ``TypeError`` just like the real function would. Guards against a regression
+    where :meth:`JobQueue._run_job` forwards an unsupported ``pipeline_kwargs``
+    key to it (COL-218)."""
+
+    def __init__(self, result: PipelineResult) -> None:
+        self._result = result
+        self.calls: list[tuple[Path, DefaultAudioPreference, str | None]] = []
+
+    def __call__(
+        self,
+        file_path: Path,
+        preference: DefaultAudioPreference,
+        *,
+        cancel_handle: object = None,
+        ffmpeg_path: str | None = None,
+    ) -> PipelineResult:
+        self.calls.append((file_path, preference, ffmpeg_path))
+        return self._result
+
+
+def test_from_settings_does_not_forward_downmix_only_kwargs_to_set_default_audio_jobs(
+    tmp_path: Path,
+) -> None:
+    """``auto_set_default_audio``/``default_audio_preference`` are
+    run_downmix_pipeline-*only* kwargs (COL-152); run_default_audio_pipeline has
+    no matching parameters or catch-all **kwargs for them, so forwarding the
+    whole pipeline_kwargs dict unfiltered would raise TypeError on a real
+    SET_DEFAULT_AUDIO job the moment both features are configured together.
+    ffmpeg_path, the one key both pipelines share, must still get through."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_default_audio_settings(
+        settings,
+        auto_set_default_audio=True,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+    )
+    _write_ffmpeg_path(settings, "/opt/collapsarr/ffmpeg/ffmpeg")
+
+    default_audio_runner = _StrictDefaultAudioRunner(_SUCCESS)
+    queue = JobQueue.from_settings(
+        settings,
+        pipeline_runner=_stub_runner(_SUCCESS),
+        default_audio_pipeline_runner=default_audio_runner,
+    )
+    job = queue.enqueue_default_audio("/media/movie.mkv", _PREFERENCE)
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED  # no TypeError from an unsupported kwarg
+    assert default_audio_runner.calls == [
+        (Path("/media/movie.mkv"), _PREFERENCE, "/opt/collapsarr/ffmpeg/ffmpeg")
+    ]
 
 
 def test_worker_pool_dispatches_downmix_jobs_to_the_downmix_runner_only() -> None:

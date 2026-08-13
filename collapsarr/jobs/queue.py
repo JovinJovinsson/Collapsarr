@@ -176,6 +176,20 @@ PipelineRunner = Callable[..., PipelineResult]
 #: default_audio_pipeline.run_default_audio_pipeline` (COL-155).
 DefaultAudioPipelineRunner = Callable[..., PipelineResult]
 
+#: The subset of ``_pipeline_kwargs`` keys (COL-218) that
+#: :func:`~collapsarr.downmix.default_audio_pipeline.run_default_audio_pipeline`
+#: also accepts, so :meth:`JobQueue._run_job` can forward them to a
+#: ``SET_DEFAULT_AUDIO`` job's runner too. **Not** every key: ``pipeline_kwargs``
+#: can also carry ``auto_set_default_audio``/``default_audio_preference``
+#: (COL-152), which are :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`
+#: -only parameters -- :func:`run_default_audio_pipeline` has no matching
+#: parameters (nor a catch-all ``**kwargs``) for those, so passing the whole
+#: dict through unfiltered would raise ``TypeError`` on a real
+#: ``SET_DEFAULT_AUDIO`` job the moment the Default Audio Track auto-fix
+#: toggle is also on. ``ffmpeg_path`` is the only key both pipelines share
+#: today.
+_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS = frozenset({"ffmpeg_path"})
+
 
 def _enabled_targets_for_log(settings: DownmixSettings) -> str:
     """Render ``settings.enabled_targets`` for a log line, in a stable order."""
@@ -659,25 +673,37 @@ class JobQueue:
         pipeline_kwargs: Mapping[str, Any] | None,
         global_settings: GlobalSettings,
     ) -> dict[str, Any]:
-        """Fold the persisted Default Audio Track preference into ``pipeline_kwargs`` (COL-152).
+        """Fold persisted Settings-driven overrides into ``pipeline_kwargs``.
 
         Takes ``global_settings`` -- the same singleton
         :class:`~collapsarr.settings.models.GlobalSettings` row
         :meth:`from_settings` already reads once for ``concurrency_limit``
-        (COL-165), reused here rather than opening a second session -- and,
-        **only** when its opt-in ``auto_set_default_audio`` toggle is on,
-        threads ``auto_set_default_audio=True`` plus the adapted
+        (COL-165), reused here rather than opening a second session.
+
+        **Only** when its opt-in ``auto_set_default_audio`` toggle is on
+        (COL-152), threads ``auto_set_default_audio=True`` plus the adapted
         ``default_audio_preference`` (:func:`~collapsarr.settings.service.
         as_default_audio_preference`) into the kwargs every enqueued downmix job
         passes to :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`. This
         is the production wiring that makes the automatic in-band fix reachable:
         a real downmix job dispatched through this queue now actually applies it.
 
-        With the toggle off (the default, every fresh install's state) nothing is
-        added, so a job's pipeline call is byte-for-byte what it was before this
-        feature. An explicit ``pipeline_kwargs`` from the caller always wins --
-        keys already present are never overwritten -- so a test (or a future
-        alternate wiring) can still pin its own values.
+        **Only** when ``ffmpeg_path`` is set (COL-218 -- e.g. an operator has
+        pointed Collapsarr at a runtime-free native FFmpeg build, Epic COL-214),
+        threads it into the kwargs both
+        :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline` and
+        :func:`~collapsarr.downmix.default_audio_pipeline.
+        run_default_audio_pipeline` already accept (``ffmpeg_path: str =
+        _DEFAULT_FFMPEG_PATH``), so a real job dispatched through this queue
+        invokes that FFmpeg binary instead of the bare ``"ffmpeg"`` resolved off
+        ``PATH``.
+
+        With both toggles at their default (unset/off -- every fresh install's
+        state, and every existing install's row after the additive migrations)
+        nothing is added, so a job's pipeline call is byte-for-byte what it was
+        before either feature. An explicit ``pipeline_kwargs`` from the caller
+        always wins -- keys already present are never overwritten -- so a test
+        (or a future alternate wiring) can still pin its own values.
 
         The import below is deferred, matching the surrounding factory: the
         settings service pulls in the ORM/adapters, which don't need to load for
@@ -692,6 +718,8 @@ class JobQueue:
                 "default_audio_preference",
                 as_default_audio_preference(global_settings),
             )
+        if global_settings.ffmpeg_path:
+            resolved.setdefault("ffmpeg_path", global_settings.ffmpeg_path)
         return resolved
 
     @property
@@ -1086,10 +1114,14 @@ class JobQueue:
 
         Dispatches on ``job.kind`` (COL-155) for which runner actually
         executes the pipeline: ``DOWNMIX`` calls ``self._pipeline_runner``
-        with ``job.settings``, ``SET_DEFAULT_AUDIO`` calls
-        ``self._default_audio_pipeline_runner`` with ``job.preference``
-        instead -- everything else below (history/tracked-media/failure
-        handling) is identical for both kinds.
+        with ``job.settings`` and the full ``self._pipeline_kwargs``,
+        ``SET_DEFAULT_AUDIO`` calls ``self._default_audio_pipeline_runner``
+        with ``job.preference`` and only the
+        :data:`_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS` subset of
+        ``self._pipeline_kwargs`` (COL-218 -- today, just ``ffmpeg_path``; see
+        that constant's docstring for why the *whole* dict can't be forwarded)
+        -- everything else below (history/tracked-media/failure handling) is
+        identical for both kinds.
         """
         try:
             self._record_history(job)
@@ -1109,8 +1141,16 @@ class JobQueue:
                 # test stubs swallow it via **kwargs.
                 if job.kind is JobKind.SET_DEFAULT_AUDIO:
                     assert job.preference is not None  # enqueue_default_audio always sets this
+                    shared_kwargs = {
+                        key: value
+                        for key, value in self._pipeline_kwargs.items()
+                        if key in _SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS
+                    }
                     result = self._default_audio_pipeline_runner(
-                        job.file_path, job.preference, cancel_handle=job.cancellation
+                        job.file_path,
+                        job.preference,
+                        cancel_handle=job.cancellation,
+                        **shared_kwargs,
                     )
                 else:
                     result = self._pipeline_runner(
