@@ -100,6 +100,21 @@ class PlexConnection(Base):
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)
 
+    @property
+    def is_configured(self) -> bool:
+        """Whether both ``base_url`` and ``token`` are set (COL-212).
+
+        The single name for "Plex isn't configured" that a caller outside
+        this module needs -- e.g. :mod:`collapsarr.media.routes`'s poster
+        endpoints, which must not attempt a ratingKey resolution or an image
+        fetch against a still-blank singleton row. Requires *both* fields,
+        unlike the base-URL-only emptiness check :func:`collapsarr.plex.
+        client.check_connectivity` and friends make (those only need
+        ``base_url`` to attempt a request at all; a poster fetch also needs a
+        non-blank ``token`` to authenticate it).
+        """
+        return bool(self.base_url) and bool(self.token)
+
     def __repr__(self) -> str:
         return (
             f"PlexConnection(id={self.id!r}, base_url={self.base_url!r}, "

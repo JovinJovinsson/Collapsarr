@@ -19,10 +19,12 @@ from collapsarr.plex.client import (
     ConnectivityResult,
     LibrarySection,
     PlexMediaItem,
+    PosterImageResult,
     SectionItemsResult,
     SectionsResult,
     analyze_item,
     check_connectivity,
+    fetch_poster_image,
     list_library_sections,
     list_section_items,
     search_items,
@@ -214,6 +216,106 @@ def test_analyze_item_connection_error_is_reported_as_failure() -> None:
 
     assert result.ok is False
     assert result.error is not None
+
+
+# ---------------------------------------------------------------------------
+# fetch_poster_image
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_poster_image_success_returns_bytes_and_content_type() -> None:
+    image_bytes = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=image_bytes, headers={"Content-Type": "image/jpeg"})
+
+    transport = httpx.MockTransport(handler)
+
+    result = fetch_poster_image(
+        "http://plex.local:32400", "plex-token", "12345", transport=transport
+    )
+
+    assert result == PosterImageResult(
+        ok=True, content=image_bytes, content_type="image/jpeg", error=None
+    )
+
+
+def test_fetch_poster_image_request_carries_token_header_and_rating_key_path() -> None:
+    seen: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = request
+        return httpx.Response(200, content=b"bytes", headers={"Content-Type": "image/png"})
+
+    transport = httpx.MockTransport(handler)
+
+    fetch_poster_image("http://plex.local:32400", "plex-token", "999", transport=transport)
+
+    request = seen["request"]
+    assert request.method == "GET"
+    assert request.url.path == "/library/metadata/999/thumb"
+    assert request.headers["X-Plex-Token"] == "plex-token"
+    # Unlike the JSON-returning calls, no explicit `Accept: application/json`
+    # is sent -- the response body here is binary image data. (httpx's own
+    # default `Accept: */*` still rides along, since nothing overrides it.)
+    assert request.headers["Accept"] == "*/*"
+
+
+def test_fetch_poster_image_missing_content_type_falls_back_to_jpeg() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"bytes")
+
+    transport = httpx.MockTransport(handler)
+
+    result = fetch_poster_image("http://plex.local:32400", "plex-token", "1", transport=transport)
+
+    assert result.ok is True
+    assert result.content_type == "image/jpeg"
+
+
+def test_fetch_poster_image_unauthorized_is_reported_as_failure() -> None:
+    payload = _load_fixture("unauthorized.json")
+    transport = _transport_returning(401, payload)
+
+    result = fetch_poster_image("http://plex.local:32400", "wrong-token", "1", transport=transport)
+
+    assert result.ok is False
+    assert result.content is None
+    assert result.error is not None
+    assert "401" in result.error
+
+
+def test_fetch_poster_image_not_found_is_reported_as_failure() -> None:
+    transport = _transport_returning(404, {"errors": [{"code": 404, "message": "Not Found"}]})
+
+    result = fetch_poster_image(
+        "http://plex.local:32400", "plex-token", "does-not-exist", transport=transport
+    )
+
+    assert result.ok is False
+    assert result.content is None
+
+
+def test_fetch_poster_image_connection_error_is_reported_as_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    result = fetch_poster_image(
+        "http://unreachable.local:32400", "plex-token", "1", transport=transport
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_fetch_poster_image_empty_base_url_is_reported_as_failure_not_raised() -> None:
+    result = fetch_poster_image("", "plex-token", "1")
+
+    assert result == PosterImageResult(
+        ok=False, content=None, content_type=None, error="No base URL configured"
+    )
 
 
 # ---------------------------------------------------------------------------

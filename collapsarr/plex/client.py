@@ -33,6 +33,14 @@ COL-210 adds two more, both feeding the Plex Sync mapping table
   season/episode and takes the match's ``ratingKey`` (see
   :func:`collapsarr.plex.library_sync.resolve_rating_key`).
 
+COL-212 adds one more:
+
+* :func:`fetch_poster_image` -- fetches a single item's poster (``thumb``)
+  image bytes, given its already-resolved ``ratingKey``. Consumed by
+  :mod:`collapsarr.media.routes`'s poster-image endpoint, which streams the
+  bytes back to the browser server-side so the ``X-Plex-Token`` never reaches
+  the client.
+
 Every call authenticates with the ``X-Plex-Token`` header -- the token is
 supplied by the caller (:mod:`collapsarr.plex.service`, reading it from the
 server-side-only :class:`~collapsarr.plex.models.PlexConnection` row) and
@@ -51,8 +59,10 @@ _SECTIONS_PATH = "/library/sections"
 _SECTION_ITEMS_PATH_TEMPLATE = "/library/sections/{section_key}/all"
 _SEARCH_PATH = "/search"
 _ANALYZE_PATH_TEMPLATE = "/library/metadata/{rating_key}/analyze"
+_POSTER_PATH_TEMPLATE = "/library/metadata/{rating_key}/thumb"
 _DEFAULT_TIMEOUT = 10.0
 _ERROR_BODY_LIMIT = 500
+_DEFAULT_POSTER_CONTENT_TYPE = "image/jpeg"
 
 #: Plex's numeric ``type`` for an episode item -- passed as the ``type`` query
 #: param to :func:`list_section_items` for a *show* section so ``/all`` returns
@@ -91,6 +101,22 @@ class AnalyzeResult:
     """Outcome of triggering Plex's per-item Analyze scan."""
 
     ok: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PosterImageResult:
+    """Outcome of fetching a Plex item's poster (``thumb``) image bytes (COL-212).
+
+    ``content``/``content_type`` are only set on success. ``content_type``
+    falls back to :data:`_DEFAULT_POSTER_CONTENT_TYPE` when Plex's response
+    omits a ``Content-Type`` header, so a caller can always set a
+    ``media_type`` on the proxied response.
+    """
+
+    ok: bool
+    content: bytes | None = None
+    content_type: str | None = None
     error: str | None = None
 
 
@@ -235,6 +261,46 @@ def analyze_item(
         return AnalyzeResult(ok=False, error=str(exc))
 
     return AnalyzeResult(ok=True)
+
+
+def fetch_poster_image(
+    base_url: str,
+    token: str,
+    rating_key: str,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+    transport: httpx.BaseTransport | None = None,
+) -> PosterImageResult:
+    """Fetch a single item's poster (``thumb``) image bytes, given its ``ratingKey``.
+
+    Server-side only: the caller (:mod:`collapsarr.media.routes`'s poster-image
+    endpoint) streams ``content`` straight back to the browser with the
+    resolved ``content_type``, so the ``X-Plex-Token`` this call authenticates
+    with never reaches the client. Never raises -- see
+    :func:`check_connectivity`'s docstring for the full "never raises"
+    contract, which this mirrors. No ``Accept: application/json`` header is
+    sent (unlike the metadata calls above), since the response body here is
+    binary image data, not JSON.
+    """
+    if not base_url:
+        return PosterImageResult(ok=False, error="No base URL configured")
+
+    path = _POSTER_PATH_TEMPLATE.format(rating_key=rating_key)
+    url = f"{base_url.rstrip('/')}{path}"
+    client = _make_client(timeout, transport)
+
+    try:
+        with client:
+            response = client.get(url, headers=_auth_headers(token))
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = f"HTTP {exc.response.status_code}: {exc.response.text}"[:_ERROR_BODY_LIMIT]
+        return PosterImageResult(ok=False, error=detail)
+    except (httpx.HTTPError, ValueError) as exc:
+        return PosterImageResult(ok=False, error=str(exc))
+
+    content_type = response.headers.get("content-type") or _DEFAULT_POSTER_CONTENT_TYPE
+    return PosterImageResult(ok=True, content=response.content, content_type=content_type)
 
 
 def list_library_sections(
