@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "code": 401,
+      "message": "Unauthorized",
+      "status": 401
+    }
+  ]
+}

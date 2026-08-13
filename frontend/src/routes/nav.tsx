@@ -22,6 +22,7 @@ import { QueuePage } from "../pages/QueuePage";
 import { SettingsConnectPage } from "../pages/SettingsConnectPage";
 import { SettingsGeneralPage } from "../pages/SettingsGeneralPage";
 import { SettingsLoggingPage } from "../pages/SettingsLoggingPage";
+import { SettingsPlexPage } from "../pages/SettingsPlexPage";
 import { SettingsRadarrPage } from "../pages/SettingsRadarrPage";
 import { SettingsSchedulerPage } from "../pages/SettingsSchedulerPage";
 import { SettingsSonarrPage } from "../pages/SettingsSonarrPage";
@@ -69,6 +70,9 @@ export const SETTINGS_SONARR_PATH = `${SETTINGS_PATH}/sonarr`;
 
 /** Path of the Settings sub-nav's Radarr entry (COL-144). */
 export const SETTINGS_RADARR_PATH = `${SETTINGS_PATH}/radarr`;
+
+/** Path of the Settings sub-nav's Plex entry (COL-209). */
+export const SETTINGS_PLEX_PATH = `${SETTINGS_PATH}/plex`;
 
 /** Path of the Settings sub-nav's Targets entry (COL-143). */
 export const SETTINGS_TARGETS_PATH = `${SETTINGS_PATH}/targets`;
@@ -140,26 +144,32 @@ export const systemNavItems: NavItem[] = [
 ];
 
 /**
- * The **Settings** sub-nav (COL-139/COL-142/COL-143/COL-144/COL-146/COL-147):
- * mirrors `systemNavItems`' shape, splitting the old composed `SettingsPage`
- * into Bazarr-style dedicated pages one at a time. General (COL-142) was the
- * first migrated page; Targets and Connect (COL-143) were the second and
- * third; Sonarr and Radarr (COL-144) split the old combined Sonarr/Radarr
- * instances table into two type-scoped pages (`SettingsSonarrPage`/
- * `SettingsRadarrPage`, both rendering `InstancesSection` fixed to one
- * `type`). Scheduler (COL-146, Phase 2) moves the editable "Backup schedule"
- * panel off `BackupsPage` and adds a read-only cadence readout for the other
- * three periodic tasks. Logging (COL-147) is the seventh and last: it moves
- * the `log_level` runtime-override control off `GeneralSection` onto its own
- * page. This is the final order: General, Sonarr, Radarr, Targets, Connect,
- * Scheduler, Logging -- the old composed `SettingsPage` and its `/settings`
- * route are gone; a bare `/settings` redirects to `SETTINGS_GENERAL_PATH`
- * instead (wired in `router.tsx`, mirroring the bare `/system` redirect).
+ * The **Settings** sub-nav (COL-139/COL-142/COL-143/COL-144/COL-146/COL-147/
+ * COL-209): mirrors `systemNavItems`' shape, splitting the old composed
+ * `SettingsPage` into Bazarr-style dedicated pages one at a time. General
+ * (COL-142) was the first migrated page; Targets and Connect (COL-143) were
+ * the second and third; Sonarr and Radarr (COL-144) split the old combined
+ * Sonarr/Radarr instances table into two type-scoped pages
+ * (`SettingsSonarrPage`/`SettingsRadarrPage`, both rendering
+ * `InstancesSection` fixed to one `type`). Scheduler (COL-146, Phase 2)
+ * moves the editable "Backup schedule" panel off `BackupsPage` and adds a
+ * read-only cadence readout for the other three periodic tasks. Logging
+ * (COL-147) moves the `log_level` runtime-override control off
+ * `GeneralSection` onto its own page. Plex (COL-209, Phase 2) adds the
+ * singleton Plex Connection page (`SettingsPlexPage`, wrapping `PlexSection`)
+ * -- unlike Sonarr/Radarr, backing one config row rather than a CRUD
+ * instance list; placed alongside the other connection pages (Sonarr,
+ * Radarr) rather than at the end. This is the current order: General,
+ * Sonarr, Radarr, Plex, Targets, Connect, Scheduler, Logging -- the old
+ * composed `SettingsPage` and its `/settings` route are gone; a bare
+ * `/settings` redirects to `SETTINGS_GENERAL_PATH` instead (wired in
+ * `router.tsx`, mirroring the bare `/system` redirect).
  */
 export const settingsNavItems: NavItem[] = [
   { to: SETTINGS_GENERAL_PATH, label: "General", icon: <Settings size={20} />, element: <SettingsGeneralPage /> },
   { to: SETTINGS_SONARR_PATH, label: "Sonarr", icon: <Settings size={20} />, element: <SettingsSonarrPage /> },
   { to: SETTINGS_RADARR_PATH, label: "Radarr", icon: <Settings size={20} />, element: <SettingsRadarrPage /> },
+  { to: SETTINGS_PLEX_PATH, label: "Plex", icon: <Settings size={20} />, element: <SettingsPlexPage /> },
   { to: SETTINGS_TARGETS_PATH, label: "Targets", icon: <Settings size={20} />, element: <SettingsTargetsPage /> },
   { to: SETTINGS_CONNECT_PATH, label: "Connect", icon: <Settings size={20} />, element: <SettingsConnectPage /> },
   { to: SETTINGS_SCHEDULER_PATH, label: "Scheduler", icon: <Settings size={20} />, element: <SettingsSchedulerPage /> },

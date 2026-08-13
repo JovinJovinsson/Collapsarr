@@ -1,0 +1,20 @@
+{
+  "MediaContainer": {
+    "size": 2,
+    "allowSync": true,
+    "Directory": [
+      {
+        "key": "1",
+        "title": "Movies",
+        "type": "movie",
+        "agent": "tv.plex.agents.movie"
+      },
+      {
+        "key": "2",
+        "title": "TV Shows",
+        "type": "show",
+        "agent": "tv.plex.agents.series"
+      }
+    ]
+  }
+}

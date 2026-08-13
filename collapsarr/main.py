@@ -56,6 +56,7 @@ from .logging_setup import apply_log_level, configure_logging
 from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
+from .plex.routes import router as plex_router
 from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
@@ -414,6 +415,10 @@ def create_app(
 
     # Notifier config GET/PUT (COL-36), under /api.
     app.include_router(notifiers_router)
+
+    # Plex connection GET/PUT (COL-209), under /api. The Plex token never
+    # leaves this router's PUT request body -- every response omits it.
+    app.include_router(plex_router)
 
     # Database backup list/create (COL-63), under /api/system.
     app.include_router(backup_router)
