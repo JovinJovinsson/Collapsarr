@@ -89,13 +89,7 @@ export function Sidebar() {
             above -- System's own pages/routes/order are unchanged. COL-191:
             now renders MonitorCog, closing the icon-less gap this group
             previously had next to Settings above. */}
-        <NavSection
-          to={SYSTEM_PATH}
-          label="System"
-          icon={<MonitorCog size={20} />}
-          items={systemNavItems}
-          className="sidebar__nav-group--system"
-        />
+        <NavSection to={SYSTEM_PATH} label="System" icon={<MonitorCog size={20} />} items={systemNavItems} />
       </ul>
 
       <div className="sidebar__footer">

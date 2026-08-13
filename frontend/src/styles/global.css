@@ -1585,15 +1585,6 @@ a {
   }
 }
 
-/* ---- System nav section + Backups page (COL-63) ------------------------ */
-
-/* System (COL-141) renders through `NavSection` now, styled like every other
-   `sidebar__nav-group`; this modifier just keeps the visual gap the old
-   always-visible `.sidebar__section` label gave it above the primary items. */
-.sidebar__nav-group--system {
-  margin-top: var(--sp-4);
-}
-
 /* Header variant that seats page-level actions beside the title block. */
 .view__header--row {
   display: flex;
