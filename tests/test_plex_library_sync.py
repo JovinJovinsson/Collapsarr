@@ -9,7 +9,9 @@ client (which has its own coverage in ``test_plex_client.py``).
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from typing import Any
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -200,6 +202,59 @@ def test_rebuild_skips_a_failing_section_but_keeps_the_others(session: Session) 
     assert _rows(session) == {"/movies/a.mkv": ("101", "1")}
 
 
+def test_rebuild_every_section_failing_preserves_existing_rows(session: Session) -> None:
+    """Sections list successfully, but every one's item-fetch fails: not a
+    truthful empty rebuild -- must not silently wipe a previously-good map
+    (code-review must-fix)."""
+    session.add(PlexLibraryItem(file_path="/keep.mkv", rating_key="5", section_key="1"))
+    session.commit()
+
+    sections = _sections(
+        LibrarySection(key="1", title="Movies", type="movie"),
+        LibrarySection(key="2", title="TV", type="show"),
+    )
+    items = _items({}, failing=frozenset({"1", "2"}))
+
+    count = rebuild_library_items(
+        session, base_url=BASE_URL, token=TOKEN, list_sections=sections, list_items=items
+    )
+
+    assert count == 0
+    assert _rows(session) == {"/keep.mkv": ("5", "1")}
+
+
+def test_rebuild_no_sections_configured_is_a_truthful_empty_commit(session: Session) -> None:
+    """Zero sections configured (nothing failed) is legitimately empty -- unlike
+    every-section-failing, this *does* commit an empty table."""
+    session.add(PlexLibraryItem(file_path="/stale.mkv", rating_key="5", section_key="1"))
+    session.commit()
+
+    count = rebuild_library_items(
+        session, base_url=BASE_URL, token=TOKEN, list_sections=_sections(), list_items=_items({})
+    )
+
+    assert count == 0
+    assert _rows(session) == {}
+
+
+def test_rebuild_all_sections_reporting_zero_items_is_a_truthful_empty_commit(
+    session: Session,
+) -> None:
+    """Every section succeeds but genuinely has no items -- also a truthful
+    empty rebuild, distinct from an every-section-failure."""
+    session.add(PlexLibraryItem(file_path="/stale.mkv", rating_key="5", section_key="1"))
+    session.commit()
+
+    sections = _sections(LibrarySection(key="1", title="Movies", type="movie"))
+
+    count = rebuild_library_items(
+        session, base_url=BASE_URL, token=TOKEN, list_sections=sections, list_items=_items({})
+    )
+
+    assert count == 0
+    assert _rows(session) == {}
+
+
 # --------------------------------------------------------------------------- #
 # resolve_rating_key
 # --------------------------------------------------------------------------- #
@@ -387,3 +442,30 @@ def test_resolve_swallows_an_unexpected_error_and_gives_up(session: Session) -> 
     )
 
     assert rating_key is None  # a raising query must never propagate
+
+
+def test_resolve_swallows_an_error_from_the_mapping_table_lookup_itself(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DB error on the *cheap indexed lookup* (step 1, before any live query
+    is even considered) must also give up silently, not propagate -- the whole
+    path is soft-fail by design, not just the live-query fallback (code-review
+    follow-up)."""
+    _add_movie(session, file_path="/movies/dune.mkv", title="Dune")
+    record: list[str] = []
+
+    def raising_scalars(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(session, "scalars", raising_scalars)
+
+    rating_key = resolve_rating_key(
+        session,
+        "/movies/dune.mkv",
+        base_url=BASE_URL,
+        token=TOKEN,
+        search=_search(SectionItemsResult(ok=True), record=record),
+    )
+
+    assert rating_key is None
+    assert record == []  # never even reached the live-query fallback

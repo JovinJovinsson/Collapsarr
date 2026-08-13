@@ -81,15 +81,26 @@ def rebuild_library_items(
     """Walk every Plex section and rebuild the mapping table by file path (COL-210).
 
     Returns the number of ``(file_path -> ratingKey)`` rows the rebuilt table
-    now holds. A blank ``base_url`` (Plex not configured) or a failed
-    section *listing* is a no-op that leaves the existing table untouched --
-    the rebuild only replaces the table once it has actually gathered items, so
-    a transient outage never wipes a good map (mirroring
-    :meth:`collapsarr.jobs.scheduler.JobScheduler._sync_instance_library`, which
-    never soft-hides on a failed catalog fetch). A *per-section* item-fetch
-    failure is logged and skipped -- one unreachable/erroring section doesn't
-    abort the walk over the others; that section's items simply won't appear in
-    the new map until the next successful sync.
+    now holds. Three cases leave the **existing table untouched** (a no-op,
+    returning ``0``) rather than replacing it -- the rebuild only ever commits
+    once it has genuine confidence in what it gathered, so a transient outage
+    never wipes a good map (mirroring :meth:`collapsarr.jobs.scheduler.
+    JobScheduler._sync_instance_library`, which never soft-hides on a failed
+    catalog fetch):
+
+    1. a blank ``base_url`` (Plex not configured);
+    2. a failed section *listing* call; or
+    3. **every** configured section's item-fetch failing (distinct from a
+       library that is genuinely configured with zero sections, or whose
+       sections legitimately report zero items -- both of those *do* commit an
+       empty table, since that's a truthful rebuild, not a fetch failure).
+
+    A *partial* failure -- some sections list successfully, others don't --
+    still commits: the successful sections' items replace the table, and each
+    failed section is logged and skipped, so that section's items simply won't
+    appear in the new map until the next successful sync (one unreachable/
+    erroring section doesn't block the others' otherwise-good data from
+    landing).
 
     For each section, ``item_type`` is the episode filter for a ``show``
     section (so ``/all`` returns file-bearing episodes, not show/season
@@ -110,6 +121,7 @@ def rebuild_library_items(
         return 0
 
     mapping: dict[str, tuple[str, str]] = {}  # file_path -> (rating_key, section_key)
+    sections_succeeded = 0
     for section in sections_result.sections:
         item_type = PLEX_EPISODE_TYPE if section.type == _SHOW_SECTION_TYPE else None
         items_result = list_items(
@@ -122,9 +134,24 @@ def rebuild_library_items(
                 items_result.error,
             )
             continue
+        sections_succeeded += 1
         for item in items_result.items:
             for file_path in item.file_paths:
                 mapping[file_path] = (item.rating_key, item.section_key or section.key)
+
+    # Every configured section failed its item-fetch: an empty `mapping` here
+    # would be a fetch-failure artefact, not a truthful "the library is empty"
+    # rebuild -- committing it would silently destroy a previously-good map on
+    # what may be a purely transient outage. A library with zero sections
+    # configured at all (`sections_result.sections` itself empty) is not this
+    # case -- there was nothing to fail, so an empty rebuild there is truthful
+    # and proceeds below.
+    if sections_result.sections and sections_succeeded == 0:
+        logger.warning(
+            "Plex sync: every configured library section failed to list its "
+            "items; leaving the mapping table unchanged"
+        )
+        return 0
 
     session.execute(delete(PlexLibraryItem))
     session.add_all(
@@ -166,21 +193,25 @@ def resolve_rating_key(
        first movie candidate). A match returns its ``ratingKey``.
     3. **Give up silently** otherwise: a blank ``base_url``, an un-bridgeable
        file, a failed/empty query, or no matching candidate all return ``None``
-       with no error surfaced. Any unexpected exception is swallowed too (logged
-       at debug only) -- this whole path is soft-fail by design.
+       with no error surfaced. Any unexpected exception -- including one raised
+       by the mapping-table lookup itself (step 1), not just the live-query
+       fallback -- is swallowed too (logged at debug only): the whole path,
+       start to finish, is soft-fail by design, so a DB hiccup on the cheap
+       indexed lookup gives up exactly like a failed live query would, rather
+       than propagating.
     """
     path_str = str(file_path)
 
-    existing = session.scalars(
-        select(PlexLibraryItem).where(PlexLibraryItem.file_path == path_str)
-    ).one_or_none()
-    if existing is not None:
-        return existing.rating_key
-
-    if not base_url:
-        return None
-
     try:
+        existing = session.scalars(
+            select(PlexLibraryItem).where(PlexLibraryItem.file_path == path_str)
+        ).one_or_none()
+        if existing is not None:
+            return existing.rating_key
+
+        if not base_url:
+            return None
+
         scope = _resolve_scope(session, path_str)
         if scope is None:
             return None
