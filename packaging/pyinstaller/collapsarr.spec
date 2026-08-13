@@ -35,14 +35,26 @@ from __future__ import annotations
 from importlib import metadata
 from pathlib import Path
 
+# PyInstaller conventionally relies on `Analysis`/`PYZ`/`EXE`/`COLLECT` being
+# injected into a spec file's globals when PyInstaller execs it, rather than
+# importing them explicitly -- which leaves the file un-lintable (every use
+# reads as an undefined name to ruff/mypy). Importing them here instead makes
+# this file ordinary, statically-analyzable Python (see
+# packaging/pyinstaller/README notes in pyproject.toml's mypy override for
+# why `PyInstaller.*` itself is exempted from import resolution rather than
+# added as a real runtime/dev dependency) while behaving identically: these
+# are the exact same classes PyInstaller would have injected.
+from PyInstaller.building.api import COLLECT
+from PyInstaller.building.build_main import EXE, PYZ, Analysis
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-# `SPECPATH` is injected into this file's globals by PyInstaller when it
-# execs the spec (see PyInstaller's Analysis docs) -- it is the directory
-# this .spec file lives in, regardless of the caller's cwd.
-SPEC_DIR = Path(SPECPATH)  # noqa: F821
+# `SPECPATH` has no importable equivalent -- PyInstaller injects it into the
+# spec's exec globals as the directory this .spec file lives in (regardless
+# of the caller's cwd), computed only at build time from the spec file's own
+# path. Unlike Analysis/PYZ/EXE/COLLECT above, there is nothing to import.
+SPEC_DIR = Path(SPECPATH)  # type: ignore[name-defined]  # noqa: F821
 ENTRYPOINT = SPEC_DIR / "entrypoint.py"
 
 
