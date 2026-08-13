@@ -68,8 +68,14 @@ is configured, that same worker thread calls it -- but only for a job that
 reached ``SUCCEEDED`` -- so the file's just-processed ``(language, target)``
 pairs flip to ``PROCESSED`` in tracked media (COL-95,
 :mod:`collapsarr.jobs.tracked_media`), the Wanted view's data source,
-immediately rather than only after the next scan re-probes the file. Finally,
-when a job-terminal hook is set (:meth:`JobQueue.set_job_terminal_hook`), that
+immediately rather than only after the next scan re-probes the file. When a
+``plex_analyzer`` is configured, that same worker thread calls it too -- but
+only for a job that reached ``SUCCEEDED`` -- so Plex is told to re-analyze
+the file's stream-level metadata right after a successful downmix or
+Default Audio Track fix rewrites it (COL-211,
+:mod:`collapsarr.jobs.plex_analyze`), without waiting for Plex's own library
+scan to notice. Finally, when a job-terminal hook is set
+(:meth:`JobQueue.set_job_terminal_hook`), that
 same worker thread calls it too -- for *every* terminal job, success or
 failure alike, unconditionally. :class:`~collapsarr.jobs.scheduler.
 JobScheduler` wires its own :meth:`~collapsarr.jobs.scheduler.JobScheduler.
@@ -79,15 +85,17 @@ docstring for the full algorithm and a re-entrancy/deadlock analysis of
 calling back into this queue from its own worker thread.
 
 This module deliberately does not import :mod:`collapsarr.jobs.history`,
-:mod:`collapsarr.jobs.failure_notify`, or :mod:`collapsarr.jobs.tracked_media`
-itself (those modules import *this* one, for :class:`Job`/:class:`JobStatus`
--- importing them back here would be circular). Instead
-``history_recorder``/``failure_notifier``/``tracked_media_recorder`` are
-plain injected callables, the same seam ``pipeline_runner`` already uses;
+:mod:`collapsarr.jobs.failure_notify`, :mod:`collapsarr.jobs.tracked_media`,
+or :mod:`collapsarr.jobs.plex_analyze` itself (those modules import *this*
+one, for :class:`Job`/:class:`JobStatus` -- importing them back here would be
+circular). Instead ``history_recorder``/``failure_notifier``/
+``tracked_media_recorder``/``plex_analyzer`` are plain injected callables,
+the same seam ``pipeline_runner`` already uses;
 :func:`collapsarr.jobs.history.make_history_recorder`,
-:func:`collapsarr.jobs.failure_notify.make_failure_notifier`, and
-:func:`collapsarr.jobs.tracked_media.make_tracked_media_recorder` build ones
-bound to a session factory.
+:func:`collapsarr.jobs.failure_notify.make_failure_notifier`,
+:func:`collapsarr.jobs.tracked_media.make_tracked_media_recorder`, and
+:func:`collapsarr.jobs.plex_analyze.make_plex_analyzer` build ones bound to a
+session factory.
 
 **Job kinds (COL-155):** a :class:`Job` is either a ``DOWNMIX`` job (the
 original kind -- runs :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`
@@ -306,10 +314,19 @@ FailureNotifier = Callable[[Job], None]
 #: appearing in the Wanted view without waiting for the next scan (COL-95).
 TrackedMediaRecorder = Callable[[Job], None]
 
+#: Signature a ``plex_analyzer`` must match: takes the just-terminated
+#: ``Job`` (only ever called for one with ``status is JobStatus.SUCCEEDED``)
+#: and triggers a Plex Analyze call for its file, when Plex is configured and
+#: the file resolves to a ratingKey (see :func:`collapsarr.jobs.plex_analyze.
+#: make_plex_analyzer`, COL-211). Must never raise -- see
+#: :meth:`JobQueue._trigger_plex_analyze`.
+PlexAnalyzer = Callable[[Job], None]
+
 #: Signature a job-terminal hook must match: called after *every* Job reaches
 #: a terminal status -- ``SUCCEEDED`` or ``FAILED`` alike, unconditionally
-#: (unlike ``failure_notifier``/``tracked_media_recorder``, each gated on one
-#: specific terminal status). :class:`~collapsarr.jobs.scheduler.JobScheduler`
+#: (unlike ``failure_notifier``/``tracked_media_recorder``/``plex_analyzer``,
+#: each gated on one specific terminal status).
+#: :class:`~collapsarr.jobs.scheduler.JobScheduler`
 #: wires its :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up` here
 #: (COL-171), so a Job finishing -- for any reason -- immediately re-tops-up
 #: the Auto-Queue Limit's budget if a slot just freed. Must be safe to call
@@ -382,19 +399,33 @@ class JobQueue:
     file; it must be safe to call concurrently for the same reason
     ``history_recorder``/``failure_notifier`` must.
 
+    ``plex_analyzer``, when set, is called the same way -- same worker
+    thread, right after the job reaches its terminal status -- but only for
+    a job whose terminal status is ``SUCCEEDED`` (COL-211). See
+    :func:`collapsarr.jobs.plex_analyze.make_plex_analyzer` for the
+    constructor that resolves the file's Plex ratingKey and issues a Plex
+    Analyze call for it, when Plex is configured and the file resolves; it
+    must be safe to call concurrently for the same reason the other three
+    hooks must, and -- like ``failure_notifier`` -- any exception it raises
+    is swallowed by :meth:`_trigger_plex_analyze` so a Plex-side problem can
+    never fail the job it is reporting on.
+
     ``default_audio_pipeline_runner`` (COL-155) is the second
     constructor-injected runner: it runs a ``SET_DEFAULT_AUDIO`` job's
     disposition-only fix (:func:`~collapsarr.downmix.default_audio_pipeline.
     run_default_audio_pipeline`) the same way ``pipeline_runner`` runs a
     ``DOWNMIX`` job's pipeline. Both kinds share every other seam on this
     class -- ``max_concurrency``, ``history_recorder``, ``failure_notifier``,
-    ``tracked_media_recorder`` -- so a ``SET_DEFAULT_AUDIO`` job is visible
-    in job history, dispatches a failure notification, and is bounded by the
-    same concurrency cap exactly like a ``DOWNMIX`` job. It is not, however,
-    a source of *new* tracked-media targets (it never adds a track), so
-    :meth:`_record_tracked_media` is a no-op for it in practice (its
-    :attr:`~collapsarr.downmix.pipeline.PipelineResult.tracks_added` is
-    always empty).
+    ``tracked_media_recorder``, ``plex_analyzer`` -- so a
+    ``SET_DEFAULT_AUDIO`` job is visible in job history, dispatches a failure
+    notification, and is bounded by the same concurrency cap exactly like a
+    ``DOWNMIX`` job. It is not, however, a source of *new* tracked-media
+    targets (it never adds a track), so :meth:`_record_tracked_media` is a
+    no-op for it in practice (its :attr:`~collapsarr.downmix.pipeline.
+    PipelineResult.tracks_added` is always empty); ``plex_analyzer`` fires
+    for it exactly as it does for a ``DOWNMIX`` job, though, since a Default
+    Audio Track fix also rewrites the file's stream-level metadata Plex has
+    cached.
     """
 
     def __init__(
@@ -407,6 +438,7 @@ class JobQueue:
         history_recorder: HistoryRecorder | None = None,
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
+        plex_analyzer: PlexAnalyzer | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
@@ -417,6 +449,7 @@ class JobQueue:
         self._history_recorder = history_recorder
         self._failure_notifier = failure_notifier
         self._tracked_media_recorder = tracked_media_recorder
+        self._plex_analyzer = plex_analyzer
         self._lock = threading.Lock()
         #: Guards every access to ``_jobs``/``_next_priority``/``_shutdown``
         #: and coordinates the worker pool. Workers ``wait`` on it for a
@@ -480,6 +513,7 @@ class JobQueue:
         history_recorder: HistoryRecorder | None = None,
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
+        plex_analyzer: PlexAnalyzer | None = None,
     ) -> JobQueue:
         """Build a :class:`JobQueue` whose concurrency cap comes from persisted Settings.
 
@@ -496,26 +530,28 @@ class JobQueue:
         whole process lifetime (live resizing is out of scope).
 
         Unlike the raw :meth:`__init__` (where ``history_recorder``/
-        ``failure_notifier``/``tracked_media_recorder`` default to ``None``
-        -- the right default for lightweight unit construction that doesn't
-        want DB writes, e.g. COL-20's concurrency tests), this factory is
-        the production path: when any isn't passed explicitly, it defaults
-        to a *real* one -- ``history_recorder`` via :func:`collapsarr.jobs.
-        history.make_history_recorder`, ``failure_notifier`` via
-        :func:`collapsarr.jobs.failure_notify.make_failure_notifier`, and
-        ``tracked_media_recorder`` via :func:`collapsarr.jobs.tracked_media.
-        make_tracked_media_recorder` -- all three bound to the same session
-        factory for ``resolved``'s database (schema brought up to head via
+        ``failure_notifier``/``tracked_media_recorder``/``plex_analyzer``
+        default to ``None`` -- the right default for lightweight unit
+        construction that doesn't want DB writes, e.g. COL-20's concurrency
+        tests), this factory is the production path: when any isn't passed
+        explicitly, it defaults to a *real* one -- ``history_recorder`` via
+        :func:`collapsarr.jobs.history.make_history_recorder``,
+        ``failure_notifier`` via :func:`collapsarr.jobs.failure_notify.
+        make_failure_notifier`, ``tracked_media_recorder`` via
+        :func:`collapsarr.jobs.tracked_media.make_tracked_media_recorder`,
+        and ``plex_analyzer`` via :func:`collapsarr.jobs.plex_analyze.
+        make_plex_analyzer` -- all four bound to the same session factory for
+        ``resolved``'s database (schema brought up to head via
         :func:`~collapsarr.migrations.upgrade_to_head` if not already
         current) -- rather than staying ``None``. This mirrors how
         ``pipeline_runner`` already defaults to the real
         :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline` in the raw
         ``__init__``: a bare ``JobQueue.from_settings()`` call, with no extra
-        plumbing, persists history, dispatches failure notifications, and
-        keeps tracked media (the Wanted view's data source, COL-95) up to
-        date for real. Pass any of the three explicitly (or ``None`` isn't
-        obtainable here -- construct via :meth:`__init__` directly instead)
-        to opt out.
+        plumbing, persists history, dispatches failure notifications, keeps
+        tracked media (the Wanted view's data source, COL-95) up to date, and
+        triggers a Plex Analyze call on success (COL-211) for real. Pass any
+        of the four explicitly (or ``None`` isn't obtainable here -- construct
+        via :meth:`__init__` directly instead) to opt out.
 
         This factory is also where the persisted **Preferred Default Audio**
         settings reach a real downmix job (COL-152): it reads
@@ -544,22 +580,24 @@ class JobQueue:
         The database engine backing all of the above is created at most once,
         here, for this :class:`JobQueue` instance -- shared between
         ``history_recorder``, ``failure_notifier``,
-        ``tracked_media_recorder``, and the Default-Audio settings read, but
-        not shared with the FastAPI app's own request-scoped engine (see
-        :mod:`collapsarr.main`). For SQLite (this project's only supported
-        backend today) that's safe -- both point at the same on-disk file --
-        but it does mean calling this factory repeatedly opens a new engine
-        each time, so production code should call it once and hold onto the
-        resulting :class:`JobQueue` (e.g. on ``app.state``), the same way it
-        already holds onto one session factory.
+        ``tracked_media_recorder``, ``plex_analyzer``, and the Default-Audio
+        settings read, but not shared with the FastAPI app's own
+        request-scoped engine (see :mod:`collapsarr.main`). For SQLite (this
+        project's only supported backend today) that's safe -- both point at
+        the same on-disk file -- but it does mean calling this factory
+        repeatedly opens a new engine each time, so production code should
+        call it once and hold onto the resulting :class:`JobQueue` (e.g. on
+        ``app.state``), the same way it already holds onto one session
+        factory.
 
         The imports of :mod:`collapsarr.jobs.history`,
-        :mod:`collapsarr.jobs.failure_notify`, and :mod:`collapsarr.jobs.
-        tracked_media` below are deferred (inside this method, not at module
-        scope) because those modules import *this* one (for
-        :class:`Job`/:class:`JobStatus`) -- a deferred import to break the
-        module cycle, the same reason the schema/engine helpers above are
-        imported inside this method rather than at module scope.
+        :mod:`collapsarr.jobs.failure_notify`, :mod:`collapsarr.jobs.
+        tracked_media`, and :mod:`collapsarr.jobs.plex_analyze` below are
+        deferred (inside this method, not at module scope) because those
+        modules import *this* one (for :class:`Job`/:class:`JobStatus`) -- a
+        deferred import to break the module cycle, the same reason the
+        schema/engine helpers above are imported inside this method rather
+        than at module scope.
         """
         resolved = settings or get_settings()
 
@@ -599,6 +637,12 @@ class JobQueue:
 
             resolved_tracked_media_recorder = make_tracked_media_recorder(session_factory)
 
+        resolved_plex_analyzer = plex_analyzer
+        if resolved_plex_analyzer is None:
+            from collapsarr.jobs.plex_analyze import make_plex_analyzer
+
+            resolved_plex_analyzer = make_plex_analyzer(session_factory)
+
         return cls(
             max_concurrency=global_settings.concurrency_limit,
             pipeline_runner=pipeline_runner,
@@ -607,6 +651,7 @@ class JobQueue:
             history_recorder=resolved_history_recorder,
             failure_notifier=resolved_failure_notifier,
             tracked_media_recorder=resolved_tracked_media_recorder,
+            plex_analyzer=resolved_plex_analyzer,
         )
 
     @staticmethod
@@ -1031,9 +1076,11 @@ class JobQueue:
         (``SUCCEEDED``/``FAILED``), which is also when
         ``self._record_tracked_media`` (a no-op unless the job actually
         ``SUCCEEDED`` and a ``tracked_media_recorder`` is configured, COL-95)
-        and ``self._notify_failure`` (a no-op unless the job actually
-        ``FAILED`` and a ``failure_notifier`` is configured) run -- all
-        outside ``self._lock``, since by that point only this thread ever
+        ``self._notify_failure`` (a no-op unless the job actually
+        ``FAILED`` and a ``failure_notifier`` is configured), and
+        ``self._trigger_plex_analyze`` (a no-op unless the job actually
+        ``SUCCEEDED`` and a ``plex_analyzer`` is configured, COL-211) run --
+        all outside ``self._lock``, since by that point only this thread ever
         touches this particular ``job`` (each job is claimed by exactly one
         worker), so there is nothing left to race against.
 
@@ -1081,6 +1128,7 @@ class JobQueue:
                 self._record_history(job)
                 self._record_tracked_media(job)
                 self._notify_failure(job)
+                self._trigger_plex_analyze(job)
                 self._call_job_terminal_hook(job)
                 return
 
@@ -1093,6 +1141,7 @@ class JobQueue:
             self._record_history(job)
             self._record_tracked_media(job)
             self._notify_failure(job)
+            self._trigger_plex_analyze(job)
             self._call_job_terminal_hook(job)
         finally:
             # Only now -- after every side effect -- is the job fully done, so
@@ -1144,6 +1193,26 @@ class JobQueue:
         try:
             self._failure_notifier(job)
         except Exception:  # noqa: BLE001 - a notifier failure must never fail the job
+            pass
+
+    def _trigger_plex_analyze(self, job: Job) -> None:
+        """Trigger a Plex Analyze call for ``job``'s file, if configured and it succeeded (COL-211).
+
+        A no-op for a job that didn't reach ``SUCCEEDED``, or when no
+        ``plex_analyzer`` was configured. ``self._plex_analyzer`` is expected
+        to never raise on its own (COL-211's :func:`~collapsarr.jobs.
+        plex_analyze.trigger_plex_analyze` guarantees this -- it is itself a
+        no-op, with no error surfaced, when Plex isn't configured or the file
+        doesn't resolve to a ratingKey), but it is called inside a defensive
+        ``try``/``except`` anyway, mirroring :meth:`_notify_failure` exactly
+        -- a Plex-side problem must never be able to fail the job it is
+        reporting on, or the worker thread running it.
+        """
+        if self._plex_analyzer is None or job.status is not JobStatus.SUCCEEDED:
+            return
+        try:
+            self._plex_analyzer(job)
+        except Exception:  # noqa: BLE001 - a Plex problem must never fail the job
             pass
 
     def _call_job_terminal_hook(self, job: Job) -> None:
