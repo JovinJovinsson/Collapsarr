@@ -94,14 +94,40 @@ export interface SetDefaultAudioTriggerRequest {
   file_path: string;
 }
 
+/** Matches `collapsarr.jobs.scheduler.DefaultAudioSkipReason`'s enum values (COL-207). */
+export type DefaultAudioSkipReason =
+  | "no_preference"
+  | "already_correct"
+  | "unprobeable"
+  | "duplicate";
+
+/**
+ * Human-readable explanation for each {@link DefaultAudioSkipReason} (COL-207)
+ * -- shared by File Detail's single-file result message and, once COL-208
+ * lands, the Library page's bulk-result-summary breakdown, so the wording
+ * stays consistent between the two "Set Default Audio Track" entry points.
+ */
+export const DEFAULT_AUDIO_SKIP_REASON_MESSAGE: Record<DefaultAudioSkipReason, string> = {
+  no_preference: "No Preferred Default Audio setting is configured yet.",
+  already_correct: "This file's Default Audio Track is already set correctly.",
+  unprobeable: "The file's audio streams could not be probed.",
+  duplicate: "A job for this file is already queued, running, or was processed too recently.",
+};
+
 /**
  * Response for `POST /api/jobs/trigger-default-audio` (COL-155,
- * `SetDefaultAudioTriggerResult`). Same shape as {@link ManualTriggerResult}:
- * `enqueued` is `true` with the created `job` when a `SET_DEFAULT_AUDIO` job
- * was queued, `false` with `job` `null` when the file was skipped -- no
- * preference configured, a duplicate, unprobeable, or already correct.
+ * `SetDefaultAudioTriggerResult`; `skip_reason` COL-207). `enqueued` is
+ * `true` with the created `job` when a `SET_DEFAULT_AUDIO` job was queued
+ * (`skip_reason` is `null`). It is `false` with `job` `null` when the file
+ * was skipped, and `skip_reason` names which {@link DefaultAudioSkipReason}
+ * explains why -- no preference configured, a duplicate, unprobeable, or
+ * already correct.
  */
-export type SetDefaultAudioTriggerResult = ManualTriggerResult;
+export interface SetDefaultAudioTriggerResult {
+  enqueued: boolean;
+  job: EnqueuedJob | null;
+  skip_reason: DefaultAudioSkipReason | null;
+}
 
 /**
  * Request body for `POST /api/jobs/trigger-default-audio/bulk` (COL-156,
@@ -121,15 +147,16 @@ export interface BulkSetDefaultAudioTriggerRequest {
 
 /**
  * One resolved file's outcome within a bulk trigger response (COL-156,
- * `FileSetDefaultAudioResult`). Mirrors {@link SetDefaultAudioTriggerResult}'s
- * `enqueued`/`job` pair, per file, plus the `file_path` identifying which
- * resolved file this result belongs to -- a bulk selection can cascade to
- * several files, so there's no other way to attribute an outcome back to one.
+ * `FileSetDefaultAudioResult`; `skip_reason` COL-207). Extends
+ * {@link SetDefaultAudioTriggerResult} with the `file_path` identifying
+ * which resolved file this result belongs to -- a bulk selection can
+ * cascade to several files, so there's no other way to attribute an
+ * outcome back to one -- so the two response shapes share one definition
+ * of the `enqueued`/`job`/`skip_reason` triple rather than two copies that
+ * could drift.
  */
-export interface FileSetDefaultAudioResult {
+export interface FileSetDefaultAudioResult extends SetDefaultAudioTriggerResult {
   file_path: string;
-  enqueued: boolean;
-  job: EnqueuedJob | null;
 }
 
 /**

@@ -169,6 +169,7 @@ import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from uuid import UUID
 
@@ -289,6 +290,57 @@ class ClearQueueResult:
 
     cancelled: int
     already_running: int
+
+
+class DefaultAudioSkipReason(Enum):
+    """Why :meth:`JobScheduler.trigger_set_default_audio` did not enqueue a job (COL-207).
+
+    Distinguishes the four "nothing to do" branches of :meth:`~JobScheduler.
+    trigger_set_default_audio` that previously all collapsed to a bare
+    ``None``, so a caller (the single-file and bulk "Set Default Audio Track"
+    REST endpoints, :mod:`collapsarr.jobs.routes`) can report *why*, not just
+    *that*, a file was skipped:
+
+    - ``NO_PREFERENCE`` -- no Preferred Default Audio setting is configured
+      at all (:func:`~collapsarr.settings.service.as_default_audio_preference`
+      returned ``None``).
+    - ``ALREADY_CORRECT`` -- the file already carries the resolved
+      disposition winner (or there are fewer than two streams to compare, so
+      there is nothing to resolve in the first place).
+    - ``UNPROBEABLE`` -- probing the file's audio streams failed
+      (:class:`~collapsarr.downmix.probe.FfprobeError`).
+    - ``DUPLICATE`` -- :meth:`~JobScheduler._is_duplicate` says the file is
+      already active (a ``PENDING``/``RUNNING`` job for the same path,
+      regardless of kind), or -- only when ``bypass_dedup_window`` is
+      ``False`` -- its most recent terminal history row falls inside the
+      Recently-Processed Window (COL-167). Since COL-206 the single-file
+      trigger always passes ``bypass_dedup_window=True``, so this reason is
+      only reachable there via the still-unbypassable active-job check; the
+      window half is reachable only via the bulk endpoint, which never
+      bypasses it.
+    """
+
+    NO_PREFERENCE = "no_preference"
+    ALREADY_CORRECT = "already_correct"
+    UNPROBEABLE = "unprobeable"
+    DUPLICATE = "duplicate"
+
+
+@dataclass(slots=True, frozen=True)
+class SetDefaultAudioOutcome:
+    """The result of one :meth:`JobScheduler.trigger_set_default_audio` call (COL-207).
+
+    Exactly one field is set: ``job`` holds the newly created
+    :class:`~collapsarr.jobs.queue.Job` when a ``SET_DEFAULT_AUDIO`` job was
+    enqueued (``skip_reason`` is ``None``); otherwise ``job`` is ``None`` and
+    ``skip_reason`` names which :class:`DefaultAudioSkipReason` explains why
+    nothing was enqueued. Replaces the bare ``Job | None`` this method used
+    to return -- that shape could report *that* a file was skipped but never
+    *why*.
+    """
+
+    job: Job | None
+    skip_reason: DefaultAudioSkipReason | None
 
 
 class JobScheduler:
@@ -725,7 +777,7 @@ class JobScheduler:
         *,
         session: Session | None = None,
         bypass_dedup_window: bool = False,
-    ) -> Job | None:
+    ) -> SetDefaultAudioOutcome:
         """Manually trigger a Default Audio Track fix job for one file on demand (COL-155).
 
         The entry point the single-file "set default audio track" REST
@@ -782,9 +834,11 @@ class JobScheduler:
         the window, the same way ``requeue_all_failed`` respects it for bulk
         requeue.
 
-        Returns the created :class:`~collapsarr.jobs.queue.Job`, or ``None``
-        for any of the "nothing to do" reasons above (no preference
-        configured, duplicate, unprobeable, or the file already correct).
+        Returns a :class:`SetDefaultAudioOutcome` (COL-207): its ``job`` holds
+        the created :class:`~collapsarr.jobs.queue.Job` on success, or its
+        ``skip_reason`` names which :class:`DefaultAudioSkipReason` explains
+        one of the "nothing to do" cases above (no preference configured,
+        duplicate, unprobeable, or the file already correct).
         """
         path = Path(file_path)
 
@@ -793,25 +847,34 @@ class JobScheduler:
             logger.info(
                 "skipping %s: no Default Audio Track preference configured", path
             )
-            return None
+            return SetDefaultAudioOutcome(
+                job=None, skip_reason=DefaultAudioSkipReason.NO_PREFERENCE
+            )
 
         if self._is_duplicate(path, session, bypass_dedup_window=bypass_dedup_window):
-            return None
+            return SetDefaultAudioOutcome(job=None, skip_reason=DefaultAudioSkipReason.DUPLICATE)
 
         try:
             streams = self._probe(path)
         except FfprobeError as exc:
             logger.warning("skipping %s: could not probe audio streams: %s", path, exc)
-            return None
+            return SetDefaultAudioOutcome(
+                job=None, skip_reason=DefaultAudioSkipReason.UNPROBEABLE
+            )
 
         winner = resolve_default_audio_stream(streams, preference)
         if winner is None or self._default_audio_already_correct(streams, winner):
-            return None
+            return SetDefaultAudioOutcome(
+                job=None, skip_reason=DefaultAudioSkipReason.ALREADY_CORRECT
+            )
 
         with self._enqueue_lock:
             if self._is_duplicate(path, session, bypass_dedup_window=bypass_dedup_window):
-                return None
-            return self._queue.enqueue_default_audio(path, preference)
+                return SetDefaultAudioOutcome(
+                    job=None, skip_reason=DefaultAudioSkipReason.DUPLICATE
+                )
+            job = self._queue.enqueue_default_audio(path, preference)
+            return SetDefaultAudioOutcome(job=job, skip_reason=None)
 
     def _resolve_default_audio_preference(
         self, session: Session | None

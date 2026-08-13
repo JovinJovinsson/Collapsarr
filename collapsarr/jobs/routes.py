@@ -166,7 +166,7 @@ from ..media.service import list_tracked_media_by_instance
 from .history import list_job_history, list_queue_jobs
 from .models import JobHistory
 from .queue import Job, JobKind, JobStatus
-from .scheduler import JobScheduler
+from .scheduler import DefaultAudioSkipReason, JobScheduler
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 
@@ -340,19 +340,25 @@ class SetDefaultAudioTriggerRequest(BaseModel):
 
 
 class SetDefaultAudioTriggerResult(BaseModel):
-    """Response for ``POST /api/jobs/trigger-default-audio`` (COL-155).
+    """Response for ``POST /api/jobs/trigger-default-audio`` (COL-155; ``skip_reason`` COL-207).
 
     ``enqueued`` is ``True`` with the created ``job`` when a
-    ``SET_DEFAULT_AUDIO`` job was queued. It is ``False`` with ``job`` ``null``
-    when the file was skipped -- no Default Audio Track preference is
-    configured, a duplicate (already queued / recently processed), unprobeable,
-    or the file already carries the correct disposition -- mirroring
-    :meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`
-    returning ``None``.
+    ``SET_DEFAULT_AUDIO`` job was queued, and ``skip_reason`` is ``null``. It
+    is ``False`` with ``job`` ``null`` when the file was skipped, and
+    ``skip_reason`` names which :class:`~collapsarr.jobs.scheduler.
+    DefaultAudioSkipReason` explains why -- no Default Audio Track preference
+    is configured, a duplicate (already queued / recently processed --
+    reachable here only via the still-unbypassable active-job check, since
+    this endpoint always bypasses the Recently-Processed Window, COL-206),
+    unprobeable, or the file already carries the correct disposition --
+    mirroring :meth:`collapsarr.jobs.scheduler.JobScheduler.
+    trigger_set_default_audio` returning a :class:`~collapsarr.jobs.
+    scheduler.SetDefaultAudioOutcome`.
     """
 
     enqueued: bool
     job: EnqueuedJob | None
+    skip_reason: DefaultAudioSkipReason | None = None
 
 
 class DefaultAudioNodeReference(BaseModel):
@@ -383,18 +389,21 @@ class BulkSetDefaultAudioTriggerRequest(BaseModel):
     references: list[DefaultAudioNodeReference] = Field(min_length=1)
 
 
-class FileSetDefaultAudioResult(BaseModel):
-    """One resolved file's outcome within a bulk trigger response (COL-156).
+class FileSetDefaultAudioResult(SetDefaultAudioTriggerResult):
+    """One resolved file's outcome within a bulk trigger response (COL-156; COL-207 skip_reason).
 
-    Mirrors :class:`SetDefaultAudioTriggerResult`'s ``enqueued``/``job``
-    pair, per file, plus the ``file_path`` identifying which resolved file
-    this result belongs to (the bulk response has no other way to attribute
-    an outcome back to a specific file).
+    Extends :class:`SetDefaultAudioTriggerResult` with the ``file_path``
+    identifying which resolved file this result belongs to (the bulk
+    response has no other way to attribute an outcome back to a specific
+    file) -- so the two response shapes share one definition of the
+    ``enqueued``/``job``/``skip_reason`` triple rather than two copies that
+    could drift. Unlike the single-file endpoint, this one never bypasses
+    the Recently-Processed Window, so ``skip_reason=DUPLICATE`` here can
+    mean either the active-job check or the window -- see
+    :class:`~collapsarr.jobs.scheduler.DefaultAudioSkipReason`.
     """
 
     file_path: str
-    enqueued: bool
-    job: EnqueuedJob | None
 
 
 class BulkSetDefaultAudioTriggerResult(BaseModel):
@@ -734,10 +743,12 @@ def manual_set_default_audio_trigger_endpoint(
     gate is unchanged, so a file that's already correct is still skipped.
     The bulk endpoint below is unaffected -- it still respects the window.
     """
-    job = scheduler.trigger_set_default_audio(body.file_path, bypass_dedup_window=True)
-    if job is None:
-        return SetDefaultAudioTriggerResult(enqueued=False, job=None)
-    return SetDefaultAudioTriggerResult(enqueued=True, job=EnqueuedJob.from_job(job))
+    outcome = scheduler.trigger_set_default_audio(body.file_path, bypass_dedup_window=True)
+    if outcome.job is None:
+        return SetDefaultAudioTriggerResult(
+            enqueued=False, job=None, skip_reason=outcome.skip_reason
+        )
+    return SetDefaultAudioTriggerResult(enqueued=True, job=EnqueuedJob.from_job(outcome.job))
 
 
 @router.post(
@@ -773,13 +784,20 @@ def bulk_set_default_audio_trigger_endpoint(
 
     results: list[FileSetDefaultAudioResult] = []
     for file_path in file_paths:
-        job = scheduler.trigger_set_default_audio(file_path, session=session)
-        if job is None:
-            results.append(FileSetDefaultAudioResult(file_path=file_path, enqueued=False, job=None))
+        outcome = scheduler.trigger_set_default_audio(file_path, session=session)
+        if outcome.job is None:
+            results.append(
+                FileSetDefaultAudioResult(
+                    file_path=file_path,
+                    enqueued=False,
+                    job=None,
+                    skip_reason=outcome.skip_reason,
+                )
+            )
         else:
             results.append(
                 FileSetDefaultAudioResult(
-                    file_path=file_path, enqueued=True, job=EnqueuedJob.from_job(job)
+                    file_path=file_path, enqueued=True, job=EnqueuedJob.from_job(outcome.job)
                 )
             )
 

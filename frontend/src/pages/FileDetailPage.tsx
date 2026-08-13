@@ -7,8 +7,14 @@ import { FileNotFoundError, fetchFileById } from "../api/files";
 import { updateTracked } from "../api/library";
 import { fetchSettings } from "../api/settings";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
-import { JOB_KIND_LABEL } from "../types/activity";
-import type { JobHistoryEntry, JobKind, JobStatus, ManualTriggerResult } from "../types/activity";
+import { DEFAULT_AUDIO_SKIP_REASON_MESSAGE, JOB_KIND_LABEL } from "../types/activity";
+import type {
+  JobHistoryEntry,
+  JobKind,
+  JobStatus,
+  ManualTriggerResult,
+  SetDefaultAudioTriggerResult,
+} from "../types/activity";
 import type { GlobalSettings } from "../types/settings";
 import type { DownmixTarget, WantedFile } from "../types/wanted";
 
@@ -48,11 +54,11 @@ type SettingsLoadState =
   | { status: "error"; message: string }
   | { status: "ready"; settings: GlobalSettings };
 
-type TriggerState =
+type TriggerState<TResult> =
   | { status: "idle" }
   | { status: "submitting" }
   | { status: "error"; message: string }
-  | { status: "result"; result: ManualTriggerResult };
+  | { status: "result"; result: TResult };
 
 interface StatusRow {
   key: string;
@@ -156,8 +162,12 @@ export function FileDetailPage() {
   const [fileState, setFileState] = useState<FileLoadState>({ status: "loading" });
   const [historyState, setHistoryState] = useState<HistoryLoadState>({ status: "loading" });
   const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
-  const [triggerState, setTriggerState] = useState<TriggerState>({ status: "idle" });
-  const [defaultAudioTriggerState, setDefaultAudioTriggerState] = useState<TriggerState>({
+  const [triggerState, setTriggerState] = useState<TriggerState<ManualTriggerResult>>({
+    status: "idle",
+  });
+  const [defaultAudioTriggerState, setDefaultAudioTriggerState] = useState<
+    TriggerState<SetDefaultAudioTriggerResult>
+  >({
     status: "idle",
   });
   const [extraLanguages, setExtraLanguages] = useState("");
@@ -535,7 +545,12 @@ export function FileDetailPage() {
                     </span>
                   </>
                 ) : (
-                  "No job enqueued — the file was skipped (already correct, no preference configured, already queued, or unprobeable)."
+                  <>
+                    No job enqueued —{" "}
+                    {defaultAudioTriggerState.result.skip_reason
+                      ? DEFAULT_AUDIO_SKIP_REASON_MESSAGE[defaultAudioTriggerState.result.skip_reason]
+                      : "the file was skipped."}
+                  </>
                 )}
               </p>
             )}

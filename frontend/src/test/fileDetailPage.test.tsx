@@ -319,6 +319,29 @@ describe("FileDetailPage", () => {
     expect(await screen.findByText(/no job enqueued/i)).toBeInTheDocument();
   });
 
+  it.each([
+    ["no_preference", /no preferred default audio setting is configured yet/i],
+    ["already_correct", /this file's default audio track is already set correctly/i],
+    ["unprobeable", /could not be probed/i],
+    ["duplicate", /already queued, running, or was processed too recently/i],
+  ] as const)(
+    'shows a specific message for the "%s" skip reason (COL-207)',
+    async (skip_reason, expectedText) => {
+      mockFetchRouter(
+        defaultHandler({
+          defaultAudioTrigger: { ok: true, body: { enqueued: false, job: null, skip_reason } },
+        }),
+      );
+      renderFileDetailPage("1");
+
+      await screen.findByText("Interstellar");
+      fireEvent.click(screen.getByRole("button", { name: /^set default audio track$/i }));
+
+      expect(await screen.findByText(/no job enqueued/i)).toBeInTheDocument();
+      expect(await screen.findByText(expectedText)).toBeInTheDocument();
+    },
+  );
+
   it('shows an error message when the "Set Default Audio Track" request fails', async () => {
     mockFetchRouter(
       defaultHandler({

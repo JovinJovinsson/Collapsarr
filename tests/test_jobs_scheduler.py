@@ -43,7 +43,7 @@ from collapsarr.jobs.queue import (
     JobStatus,
     PipelineRunner,
 )
-from collapsarr.jobs.scheduler import AUTO_QUEUE_LIMIT, JobScheduler
+from collapsarr.jobs.scheduler import AUTO_QUEUE_LIMIT, DefaultAudioSkipReason, JobScheduler
 from collapsarr.library.service import set_tracked, upsert_series_episode_node
 from collapsarr.media.service import get_tracked_media
 from collapsarr.migrations import upgrade_to_head
@@ -1791,8 +1791,10 @@ def test_trigger_set_default_audio_enqueues_a_set_default_audio_job_when_a_fix_i
         settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX), queue=queue
     )
 
-    job = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv")
 
+    assert outcome.skip_reason is None
+    job = outcome.job
     assert job is not None
     assert job.file_path == Path("/media/movie.mkv")
     assert job.kind is JobKind.SET_DEFAULT_AUDIO
@@ -1813,7 +1815,9 @@ def test_trigger_set_default_audio_skips_when_already_correct(
         queue=queue,
     )
 
-    assert scheduler.trigger_set_default_audio("/media/movie.mkv") is None
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    assert outcome.job is None
+    assert outcome.skip_reason is DefaultAudioSkipReason.ALREADY_CORRECT
     assert scheduler._queue.list_jobs() == []
 
 
@@ -1823,7 +1827,9 @@ def test_trigger_set_default_audio_skips_a_file_with_fewer_than_two_streams(
     _configure_preference(session_factory)
     scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SINGLE_STREAM))
 
-    assert scheduler.trigger_set_default_audio("/media/movie.mkv") is None
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    assert outcome.job is None
+    assert outcome.skip_reason is DefaultAudioSkipReason.ALREADY_CORRECT
     assert scheduler._queue.list_jobs() == []
 
 
@@ -1835,7 +1841,9 @@ def test_trigger_set_default_audio_skips_when_no_preference_is_configured(
         settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX)
     )
 
-    assert scheduler.trigger_set_default_audio("/media/movie.mkv") is None
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    assert outcome.job is None
+    assert outcome.skip_reason is DefaultAudioSkipReason.NO_PREFERENCE
     assert scheduler._queue.list_jobs() == []
 
 
@@ -1845,7 +1853,9 @@ def test_trigger_set_default_audio_skips_a_file_that_cannot_be_probed(
     _configure_preference(session_factory)
     scheduler = _make_scheduler(settings, session_factory, probe=_probe_raising())
 
-    assert scheduler.trigger_set_default_audio("/media/movie.mkv") is None
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    assert outcome.job is None
+    assert outcome.skip_reason is DefaultAudioSkipReason.UNPROBEABLE
     assert scheduler._queue.list_jobs() == []
 
 
@@ -1861,9 +1871,9 @@ def test_trigger_set_default_audio_bypasses_the_tracked_gate(
         settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX), queue=queue
     )
 
-    job = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv")
 
-    assert job is not None
+    assert outcome.job is not None
 
 
 # --- De-duplication spans both job kinds (COL-155's headline risk) ---------
@@ -1889,7 +1899,8 @@ def test_trigger_set_default_audio_is_blocked_by_an_in_flight_downmix_job(
 
     result = scheduler.trigger_set_default_audio("/media/movie.mkv")
 
-    assert result is None
+    assert result.job is None
+    assert result.skip_reason is DefaultAudioSkipReason.DUPLICATE
     assert len(scheduler._queue.list_jobs()) == 1  # only the DOWNMIX job
 
 
@@ -1907,9 +1918,9 @@ def test_trigger_file_is_blocked_by_an_in_flight_set_default_audio_job(
         probe=_probe_returning(_SURROUND_TWO_LANGUAGES_NEEDS_DEFAULT_AUDIO_FIX),
         queue=queue,
     )
-    default_audio_job = scheduler.trigger_set_default_audio("/media/movie.mkv")
-    assert default_audio_job is not None
-    assert default_audio_job.kind is JobKind.SET_DEFAULT_AUDIO
+    default_audio_outcome = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    assert default_audio_outcome.job is not None
+    assert default_audio_outcome.job.kind is JobKind.SET_DEFAULT_AUDIO
 
     result = scheduler.trigger_file("/media/movie.mkv")
 
@@ -1937,7 +1948,8 @@ def test_trigger_set_default_audio_re_enqueues_after_a_terminal_downmix_job(
 
     result = scheduler.trigger_set_default_audio("/media/movie.mkv")
 
-    assert result is not None
+    assert result.job is not None
+    assert result.skip_reason is None
     assert len(scheduler._queue.list_jobs()) == 2
 
 
@@ -1960,10 +1972,11 @@ def test_trigger_set_default_audio_bypass_dedup_window_ignores_a_recently_proces
     with session_factory() as session:
         # Without the bypass this would be skipped (see
         # test_trigger_set_default_audio_defaults_to_respecting_a_recently_processed_history_row).
-        job = scheduler.trigger_set_default_audio(
+        outcome = scheduler.trigger_set_default_audio(
             "/media/movie.mkv", session=session, bypass_dedup_window=True
         )
-    assert job is not None
+    assert outcome.job is not None
+    assert outcome.skip_reason is None
 
 
 def test_trigger_set_default_audio_bypass_dedup_window_still_treats_an_active_job_as_a_duplicate(
@@ -1978,12 +1991,13 @@ def test_trigger_set_default_audio_bypass_dedup_window_still_treats_an_active_jo
         settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX), queue=queue
     )
 
-    job = scheduler.trigger_set_default_audio("/media/movie.mkv")
-    assert job is not None  # still PENDING -> active
+    first = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    assert first.job is not None  # still PENDING -> active
 
     second = scheduler.trigger_set_default_audio("/media/movie.mkv", bypass_dedup_window=True)
 
-    assert second is None
+    assert second.job is None
+    assert second.skip_reason is DefaultAudioSkipReason.DUPLICATE
     assert len(scheduler._queue.list_jobs()) == 1
 
 
@@ -2001,7 +2015,9 @@ def test_trigger_set_default_audio_defaults_to_respecting_a_recently_processed_h
     )
 
     with session_factory() as session:
-        assert scheduler.trigger_set_default_audio("/media/movie.mkv", session=session) is None
+        outcome = scheduler.trigger_set_default_audio("/media/movie.mkv", session=session)
+    assert outcome.job is None
+    assert outcome.skip_reason is DefaultAudioSkipReason.DUPLICATE
 
 
 # ---------------------------------------------------------------------------

@@ -45,7 +45,13 @@ from collapsarr.jobs import scheduler as scheduler_module
 from collapsarr.jobs.models import JobHistory
 from collapsarr.jobs.queue import Job, JobKind, JobQueue, JobStatus
 from collapsarr.jobs.routes import get_job_scheduler
-from collapsarr.jobs.scheduler import BulkRequeueResult, ClearQueueResult, JobScheduler
+from collapsarr.jobs.scheduler import (
+    BulkRequeueResult,
+    ClearQueueResult,
+    DefaultAudioSkipReason,
+    JobScheduler,
+    SetDefaultAudioOutcome,
+)
 from collapsarr.library.models import LibraryNodeKind, make_node_key
 from collapsarr.library.service import list_nodes, sync_library
 from collapsarr.main import create_app
@@ -90,7 +96,10 @@ class _FakeScheduler:
         requeue_job: Job | None = None,
         requeue_all_failed_result: BulkRequeueResult | None = None,
         default_audio_trigger_job: Job | None = None,
+        default_audio_skip_reason: DefaultAudioSkipReason | None = None,
         default_audio_trigger_jobs_by_file: dict[str, Job | None] | None = None,
+        default_audio_skip_reasons_by_file: dict[str, DefaultAudioSkipReason | None]
+        | None = None,
         cancel_result: bool | None = True,
         bump_result: bool | None = True,
         clear_queue_result: ClearQueueResult | None = None,
@@ -109,10 +118,18 @@ class _FakeScheduler:
             requeued=[], skipped=[]
         )
         self._default_audio_trigger_job = default_audio_trigger_job
+        #: COL-207's skip reason, returned whenever the fixed/per-file job
+        #: above resolves to ``None``. Defaults to ``None`` so an existing
+        #: test that only cares about ``enqueued``/``job`` still gets a
+        #: well-formed (if reason-less) outcome.
+        self._default_audio_skip_reason = default_audio_skip_reason
         #: Per-file override for the bulk endpoint's tests, where a fixed
         #: single job/None (the field above) can't tell different resolved
         #: files apart. Falls back to the fixed value above when unset.
         self._default_audio_trigger_jobs_by_file = default_audio_trigger_jobs_by_file
+        #: Per-file skip-reason override, mirroring
+        #: ``default_audio_trigger_jobs_by_file`` above.
+        self._default_audio_skip_reasons_by_file = default_audio_skip_reasons_by_file
         #: COL-168's ``cancel_job`` result, mirroring the real
         #: :meth:`~collapsarr.jobs.scheduler.JobScheduler.cancel_job`'s
         #: three-way contract: ``None`` (404, "no such job"), ``True``
@@ -181,12 +198,20 @@ class _FakeScheduler:
         *,
         session: Session | None = None,
         bypass_dedup_window: bool = False,
-    ) -> Job | None:
+    ) -> SetDefaultAudioOutcome:
         self.default_audio_trigger_calls.append(file_path)
         self.default_audio_trigger_bypass_calls.append(bypass_dedup_window)
         if self._default_audio_trigger_jobs_by_file is not None:
-            return self._default_audio_trigger_jobs_by_file.get(file_path)
-        return self._default_audio_trigger_job
+            job = self._default_audio_trigger_jobs_by_file.get(file_path)
+        else:
+            job = self._default_audio_trigger_job
+        if job is not None:
+            return SetDefaultAudioOutcome(job=job, skip_reason=None)
+        if self._default_audio_skip_reasons_by_file is not None:
+            skip_reason = self._default_audio_skip_reasons_by_file.get(file_path)
+        else:
+            skip_reason = self._default_audio_skip_reason
+        return SetDefaultAudioOutcome(job=None, skip_reason=skip_reason)
 
     def cancel_job(self, job_id: UUID, *, session: Session | None = None) -> bool | None:
         self.cancel_calls.append(job_id)
@@ -877,7 +902,44 @@ def test_trigger_default_audio_wires_through_a_real_scheduler(settings: Settings
         )
 
     assert response.status_code == 202, response.text
-    assert response.json() == {"enqueued": False, "job": None}
+    assert response.json() == {
+        "enqueued": False,
+        "job": None,
+        "skip_reason": "no_preference",
+    }
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        DefaultAudioSkipReason.NO_PREFERENCE,
+        DefaultAudioSkipReason.ALREADY_CORRECT,
+        DefaultAudioSkipReason.UNPROBEABLE,
+        DefaultAudioSkipReason.DUPLICATE,
+    ],
+)
+def test_trigger_default_audio_reports_the_skip_reason_when_the_file_is_skipped(
+    client: TestClient, reason: DefaultAudioSkipReason
+) -> None:
+    """COL-207: each of the scheduler's four skip reasons surfaces on the response."""
+    fake = _FakeScheduler(default_audio_trigger_job=None, default_audio_skip_reason=reason)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/trigger-default-audio",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is False
+    assert body["job"] is None
+    assert body["skip_reason"] == reason.value
 
 
 # --- POST /api/jobs/trigger-default-audio/bulk (COL-156) ---------------------
@@ -1008,12 +1070,56 @@ def test_bulk_trigger_default_audio_resolves_an_episode_reference_to_its_file(
             "file_path": "/media/pilot.mkv",
             "enqueued": True,
             "job": {"id": str(job.id), "file_path": "/media/pilot.mkv", "status": "pending"},
+            "skip_reason": None,
         }
     ]
     assert fake.default_audio_trigger_calls == ["/media/pilot.mkv"]
     # COL-206: the bulk endpoint is unaffected by the single-file trigger's
     # always-bypass change -- it still respects the Recently-Processed Window.
     assert fake.default_audio_trigger_bypass_calls == [False]
+
+
+def test_bulk_trigger_default_audio_reports_the_skip_reason_per_file(
+    client: TestClient,
+) -> None:
+    """COL-207: a per-file skip reason, distinct across files in the same batch."""
+    instance_id = _seed_library(client)
+    series_id = _node_id(client, instance_id, make_node_key(LibraryNodeKind.SERIES, series_id=1))
+    _bridge_file(
+        client, file_path="/media/e101.mkv", instance_id=instance_id, sonarr_episode_id=101
+    )
+    _bridge_file(
+        client, file_path="/media/e102.mkv", instance_id=instance_id, sonarr_episode_id=102
+    )
+
+    fake = _FakeScheduler(
+        default_audio_trigger_jobs_by_file={
+            "/media/e101.mkv": None,
+            "/media/e102.mkv": None,
+        },
+        default_audio_skip_reasons_by_file={
+            "/media/e101.mkv": DefaultAudioSkipReason.DUPLICATE,
+            "/media/e102.mkv": DefaultAudioSkipReason.UNPROBEABLE,
+        },
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/trigger-default-audio/bulk",
+            json={"references": [{"node_type": "series", "node_id": series_id}]},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    results = response.json()["results"]
+    assert {(r["file_path"], r["skip_reason"]) for r in results} == {
+        ("/media/e101.mkv", "duplicate"),
+        ("/media/e102.mkv", "unprobeable"),
+    }
 
 
 def test_bulk_trigger_default_audio_cascades_a_series_reference_to_descendant_files(
@@ -1362,7 +1468,14 @@ def test_bulk_trigger_default_audio_wires_through_a_real_scheduler(settings: Set
 
     assert response.status_code == 202, response.text
     assert response.json() == {
-        "results": [{"file_path": "/media/pilot.mkv", "enqueued": False, "job": None}]
+        "results": [
+            {
+                "file_path": "/media/pilot.mkv",
+                "enqueued": False,
+                "job": None,
+                "skip_reason": "no_preference",
+            }
+        ]
     }
 
 
