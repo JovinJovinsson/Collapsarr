@@ -303,6 +303,21 @@ a {
   flex-shrink: 0;
 }
 
+/* Opt-in "Download FFmpeg" action on the ffmpeg_missing row (COL-222) --
+   pushed to the row's end so it reads as a trailing action, not part of the
+   message text itself. */
+.health-banner__action {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.health-banner__error {
+  margin: 0;
+  color: var(--c-danger);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
 /* ---- Health checks page (COL-76) --------------------------------------- */
 
 .health-table__severity,

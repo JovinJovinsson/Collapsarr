@@ -49,6 +49,7 @@ def download_and_verify(
     *,
     timeout: float = _DEFAULT_TIMEOUT,
     transport: httpx.BaseTransport | None = None,
+    max_bytes: int | None = None,
 ) -> FfmpegDownloadResult:
     """Download ``url`` and verify its SHA-256 digest against ``expected_sha256``.
 
@@ -64,6 +65,25 @@ def download_and_verify(
     URLs redirect -- GitHub Releases assets 302 to a signed S3 URL, and
     evermeet.cx 302s to its current mirror host -- so a client that doesn't
     follow redirects would treat every real download as a failure.
+
+    ``max_bytes`` (COL-222) bounds the response body when given: the download
+    is streamed and aborted the instant more than ``max_bytes`` have been
+    received, rather than buffering the whole body via a plain ``client.get``
+    first and only rejecting it *after* the fact. This is a deliberate,
+    narrow hardening of this ticket's own call path -- COL-222's
+    ``download_and_install_ffmpeg`` is user-triggered, over the network, and
+    the manifest's pinned URLs redirect through providers this process
+    doesn't control (GitHub Releases' signed S3 redirect, evermeet.cx's
+    mirror redirect); without a bound, a compromised/misbehaving redirect
+    target could serve a response far larger than any real FFmpeg archive
+    (BtbN builds run 100-170MB, evermeet's ~25MB) and this process would
+    buffer all of it into memory before the SHA-256 check -- which only runs
+    once the full body has been read -- ever gets a chance to reject it.
+    ``None`` (the default) preserves the original unbounded behaviour exactly
+    -- used by :mod:`collapsarr.ffmpeg_download.verify_manifest`'s CI-only
+    release-blocking check, a trusted, non-request-triggered context where
+    this bound would only add a way for a legitimately larger future build to
+    fail CI for no security benefit.
     """
     client = (
         httpx.Client(timeout=timeout, transport=transport, follow_redirects=True)
@@ -72,16 +92,51 @@ def download_and_verify(
     )
 
     try:
-        with client:
-            response = client.get(url)
-        response.raise_for_status()
+        if max_bytes is None:
+            with client:
+                response = client.get(url)
+            response.raise_for_status()
+            content = response.content
+        else:
+            with client, client.stream("GET", url) as response:
+                if response.status_code >= 400:
+                    # Bounded the same way the success path is below -- an
+                    # error response is still an attacker-influenceable body
+                    # (the same compromised/misbehaving redirect target this
+                    # whole guard defends against could just as easily return
+                    # a huge 5xx body instead of a huge 200), so this reads at
+                    # most _ERROR_BODY_LIMIT bytes rather than the unbounded
+                    # `response.read()` a plain `raise_for_status()` would do.
+                    error_chunks: list[bytes] = []
+                    error_bytes = 0
+                    for chunk in response.iter_bytes():
+                        error_chunks.append(chunk)
+                        error_bytes += len(chunk)
+                        if error_bytes >= _ERROR_BODY_LIMIT:
+                            break
+                    error_text = b"".join(error_chunks).decode("utf-8", errors="replace")
+                    detail = f"HTTP {response.status_code}: {error_text}"[:_ERROR_BODY_LIMIT]
+                    return FfmpegDownloadResult(ok=False, error=detail)
+                chunks: list[bytes] = []
+                received = 0
+                for chunk in response.iter_bytes():
+                    received += len(chunk)
+                    if received > max_bytes:
+                        return FfmpegDownloadResult(
+                            ok=False,
+                            error=(
+                                f"Download from {url} exceeded the maximum allowed "
+                                f"size of {max_bytes} bytes and was aborted."
+                            ),
+                        )
+                    chunks.append(chunk)
+                content = b"".join(chunks)
     except httpx.HTTPStatusError as exc:
         detail = f"HTTP {exc.response.status_code}: {exc.response.text}"[:_ERROR_BODY_LIMIT]
         return FfmpegDownloadResult(ok=False, error=detail)
     except httpx.HTTPError as exc:
         return FfmpegDownloadResult(ok=False, error=str(exc))
 
-    content = response.content
     digest = hashlib.sha256(content).hexdigest()
     expected = expected_sha256.strip().lower()
     if digest != expected:
@@ -98,15 +153,19 @@ def download_manifest_entry(
     *,
     timeout: float = _DEFAULT_TIMEOUT,
     transport: httpx.BaseTransport | None = None,
+    max_bytes: int | None = None,
 ) -> FfmpegDownloadResult:
     """Download and verify the archive a manifest entry points at.
 
     Thin convenience wrapper over :func:`download_and_verify` so callers that
     already resolved a :class:`~collapsarr.ffmpeg_download.manifest.ManifestEntry`
     (via :func:`collapsarr.ffmpeg_download.manifest.get_manifest_entry`) don't
-    need to unpack ``url``/``sha256`` themselves.
+    need to unpack ``url``/``sha256`` themselves. ``max_bytes`` (COL-222) is
+    forwarded straight through -- see :func:`download_and_verify`'s docstring.
     """
-    return download_and_verify(entry.url, entry.sha256, timeout=timeout, transport=transport)
+    return download_and_verify(
+        entry.url, entry.sha256, timeout=timeout, transport=transport, max_bytes=max_bytes
+    )
 
 
 __all__ = [

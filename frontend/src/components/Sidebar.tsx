@@ -38,7 +38,7 @@ export function Sidebar() {
   // `null` while the fetch hasn't resolved yet, so the footer renders
   // nothing rather than flashing "Unknown" during normal load; "Unknown" is
   // reserved for an actual fetch failure.
-  const health = useHealth();
+  const { state: health } = useHealth();
   const version =
     health.status === "ready" ? health.health.version : health.status === "error" ? "Unknown" : null;
 

@@ -164,3 +164,96 @@ def test_download_manifest_entry_surfaces_checksum_mismatch() -> None:
 
     assert result.ok is False
     assert result.error is not None
+
+
+# --------------------------------------------------------------------------- #
+# `max_bytes` streaming guard (COL-222 design note -- see this module's
+# docstring on `download_and_verify`): bounds peak memory for the
+# user-triggered auto-download path against a compromised/misbehaving
+# redirect target serving an oversized response, without changing the
+# default (`max_bytes=None`) behaviour every case above already covers.
+# --------------------------------------------------------------------------- #
+
+
+def test_max_bytes_none_preserves_the_original_unbounded_behaviour() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_CONTENT)
+
+    result = download_and_verify(
+        _URL, _CONTENT_SHA256, transport=_transport(handler), max_bytes=None
+    )
+
+    assert result.ok is True
+    assert result.content == _CONTENT
+
+
+def test_response_within_max_bytes_still_succeeds() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_CONTENT)
+
+    result = download_and_verify(
+        _URL, _CONTENT_SHA256, transport=_transport(handler), max_bytes=len(_CONTENT) + 1
+    )
+
+    assert result.ok is True
+    assert result.content == _CONTENT
+
+
+def test_response_exceeding_max_bytes_is_aborted_without_raising() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_CONTENT)
+
+    result = download_and_verify(
+        _URL, _CONTENT_SHA256, transport=_transport(handler), max_bytes=len(_CONTENT) - 1
+    )
+
+    assert result.ok is False
+    assert result.content is None
+    assert result.error is not None
+    assert "exceeded" in result.error.lower()
+
+
+def test_max_bytes_still_follows_redirects() -> None:
+    redirect_url = "https://example.invalid/redirected-archive.tar.xz"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == _URL:
+            return httpx.Response(302, headers={"Location": redirect_url})
+        return httpx.Response(200, content=_CONTENT)
+
+    result = download_and_verify(
+        _URL, _CONTENT_SHA256, transport=_transport(handler), max_bytes=len(_CONTENT) + 1
+    )
+
+    assert result.ok is True
+    assert result.content == _CONTENT
+
+
+def test_max_bytes_reports_a_clear_error_on_a_non_2xx_response() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="Not Found")
+
+    result = download_and_verify(
+        _URL, _CONTENT_SHA256, transport=_transport(handler), max_bytes=1024
+    )
+
+    assert result.ok is False
+    assert result.content is None
+    assert "404" in (result.error or "")
+
+
+def test_download_manifest_entry_forwards_max_bytes() -> None:
+    entry = ManifestEntry(
+        platform="linux", arch="amd64", version="8.1.2", url=_URL, sha256=_CONTENT_SHA256
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_CONTENT)
+
+    result = download_manifest_entry(
+        entry, transport=_transport(handler), max_bytes=len(_CONTENT) - 1
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+    assert "exceeded" in result.error.lower()

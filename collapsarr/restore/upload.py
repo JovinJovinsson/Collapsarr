@@ -14,10 +14,12 @@ trusted-directory path needs:
    :data:`MAX_UPLOAD_ARCHIVE_BYTES`, so a malicious client can never make the
    server buffer an unbounded upload to disk.
 #. **Zip-slip rejection** -- every entry in the archive is checked
-   (:func:`_is_unsafe_zip_entry`) and the whole upload is rejected if *any*
-   entry is an absolute path, carries a drive/UNC prefix, or contains a ``..``
-   traversal component. This is defence-in-depth: the single member actually
-   extracted is addressed by its fixed name (:data:`ARCHIVE_MEMBER_NAME`, no
+   (:func:`collapsarr.archive_safety.is_unsafe_archive_entry_path`, shared
+   with :mod:`collapsarr.ffmpeg_download.service`'s own archive extraction,
+   COL-222) and the whole upload is rejected if *any* entry is an absolute
+   path, carries a drive/UNC prefix, or contains a ``..`` traversal
+   component. This is defence-in-depth: the single member actually extracted
+   is addressed by its fixed name (:data:`ARCHIVE_MEMBER_NAME`, no
    separators), but a hostile archive is refused outright rather than merely
    ignored.
 #. **Decompression-bomb cap** -- only the single expected DB entry is
@@ -38,11 +40,11 @@ leaves the running instance completely untouched.
 from __future__ import annotations
 
 import logging
-import ntpath
 import os
 import zipfile
 from pathlib import Path
 
+from collapsarr.archive_safety import is_unsafe_archive_entry_path
 from collapsarr.backup.service import ARCHIVE_MEMBER_NAME
 from collapsarr.config import Settings
 from collapsarr.restore.marker import write_restore_marker
@@ -81,25 +83,6 @@ class UploadTooLargeError(RuntimeError):
     """
 
 
-def _is_unsafe_zip_entry(name: str) -> bool:
-    """Return whether a zip entry name is a zip-slip / path-traversal attempt.
-
-    An entry is unsafe if it is an absolute path (POSIX ``/`` or Windows
-    ``\\``), carries a drive letter or UNC prefix, or contains a ``..``
-    component under either separator -- any of which, under a naive
-    ``extractall``, could write outside the extraction root. Both separators are
-    handled because a zip authored on Windows may use backslashes.
-    """
-    if not name:
-        return False
-    if name.startswith("/") or name.startswith("\\"):
-        return True
-    if ntpath.splitdrive(name)[0]:
-        return True
-    parts = name.replace("\\", "/").split("/")
-    return ".." in parts
-
-
 def _extract_upload_db_member(archive_path: Path, dest_path: Path) -> None:
     """Safely extract the single DB entry from an untrusted archive to ``dest_path``.
 
@@ -117,7 +100,7 @@ def _extract_upload_db_member(archive_path: Path, dest_path: Path) -> None:
     try:
         with zipfile.ZipFile(archive_path) as archive:
             for info in archive.infolist():
-                if _is_unsafe_zip_entry(info.filename):
+                if is_unsafe_archive_entry_path(info.filename):
                     raise RestoreGateError(
                         "The uploaded archive contains an unsafe entry path "
                         f"({info.filename!r}); it looks like a path-traversal "
