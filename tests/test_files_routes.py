@@ -13,13 +13,14 @@ endpoint exercises genuine data rather than a stub.
 
 from __future__ import annotations
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from collapsarr.arr.catalog import CatalogEpisode, CatalogSeries, SonarrCatalog
 from collapsarr.arr.models import ArrInstance, InstanceType
-from collapsarr.downmix.probe import AudioStreamInfo
+from collapsarr.downmix.probe import AudioStreamInfo, FfprobeError
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.library.service import sync_library
 from collapsarr.media.service import upsert_tracked_media
@@ -152,4 +153,120 @@ def test_files_endpoint_requires_the_api_key(client: TestClient, session: Sessio
     )
 
     response = client.get(f"/api/files/{media.id}")
+    assert response.status_code == 401
+
+
+# --- GET /api/files/{file_id}/audio-streams (COL-204) ------------------------
+
+
+def test_audio_streams_endpoint_returns_the_current_live_probe(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The response reuses `probe_audio_streams` -- the same probe the
+    downmix/default-audio pipelines call -- and reports each stream's
+    language, channel count, and whether it currently carries the Default
+    Audio Track disposition."""
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    probed = [
+        AudioStreamInfo(
+            index=0,
+            codec="eac3",
+            channels=6,
+            channel_layout="5.1",
+            language="eng",
+            is_default=True,
+        ),
+        AudioStreamInfo(
+            index=1,
+            codec="aac",
+            channels=2,
+            channel_layout="stereo",
+            language="jpn",
+            is_default=False,
+        ),
+    ]
+
+    def fake_probe(file_path: str, **_kwargs: object) -> list[AudioStreamInfo]:
+        assert file_path == media.file_path
+        return probed
+
+    monkeypatch.setattr("collapsarr.media.routes.probe_audio_streams", fake_probe)
+
+    response = client.get(f"/api/files/{media.id}/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["probeable"] is True
+    assert body["error"] is None
+    assert body["streams"] == [
+        {
+            "index": 0,
+            "codec": "eac3",
+            "channels": 6,
+            "channel_layout": "5.1",
+            "language": "eng",
+            "is_default": True,
+        },
+        {
+            "index": 1,
+            "codec": "aac",
+            "channels": 2,
+            "channel_layout": "stereo",
+            "language": "jpn",
+            "is_default": False,
+        },
+    ]
+
+
+def test_audio_streams_endpoint_degrades_gracefully_for_an_unprobeable_file(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A known file that can't currently be probed (e.g. missing on disk)
+    still returns 200 with `probeable=False`, rather than a 500 -- the file
+    detail page must not crash on this."""
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/missing.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    def fake_probe(file_path: str, **_kwargs: object) -> list[AudioStreamInfo]:
+        raise FfprobeError(f"no such file: {file_path!r}")
+
+    monkeypatch.setattr("collapsarr.media.routes.probe_audio_streams", fake_probe)
+
+    response = client.get(f"/api/files/{media.id}/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["probeable"] is False
+    assert body["streams"] == []
+    assert "no such file" in body["error"]
+
+
+def test_audio_streams_endpoint_returns_not_found_for_an_id_that_never_existed(
+    client: TestClient, session: Session
+) -> None:
+    response = client.get("/api/files/999999/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 404, response.text
+
+
+def test_audio_streams_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    response = client.get(f"/api/files/{media.id}/audio-streams")
     assert response.status_code == 401

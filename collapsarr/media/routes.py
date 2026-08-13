@@ -17,6 +17,18 @@ Two GET endpoints share the same ``WantedFile`` response shape:
   ``GET /api/wanted`` but must still be viewable by id. Returns ``404`` when
   ``file_id`` was never valid or no longer exists.
 
+A third endpoint, ``GET /api/files/{file_id}/audio-streams`` (COL-204),
+reuses the same id lookup to report the file's *current, live* audio-stream
+layout -- the same :func:`~collapsarr.downmix.probe.probe_audio_streams`
+call the downmix/default-audio pipelines use, run fresh on every request
+(never cached or stored), so the response always reflects the file's actual
+state on disk right now, including whichever stream currently carries the
+Default Audio Track disposition. An unprobeable file (missing on disk,
+corrupt, ffprobe unavailable) degrades to ``probeable=False`` with an
+``error`` message rather than raising -- this endpoint still 404s on an
+unknown ``file_id``, but a *known* file that merely can't be probed right
+now is a ``200`` with an empty/unprobeable payload, not a failed request.
+
 The "wanted-list" is every tracked file missing at least one *currently
 enabled* target -- the same notion Sonarr/Radarr's ``/wanted/missing`` view
 expresses. Which targets count as enabled is read live from the persisted
@@ -51,6 +63,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..database import get_session
+from ..downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_streams
 from ..downmix.targets import DownmixTarget
 from ..library.models import LibraryNode
 from ..library.service import get_node_by_source_id, list_nodes, resolve_tracked
@@ -89,6 +102,47 @@ class WantedFile(BaseModel):
     #: The bridged node's *resolved* Tracked value (ancestor-override
     #: resolution included), or ``None`` when the bridge hasn't resolved.
     tracked: bool | None = None
+
+
+class AudioStreamOut(BaseModel):
+    """One of a file's current audio streams, as live-probed via ffprobe (COL-204)."""
+
+    index: int
+    codec: str
+    channels: int
+    channel_layout: str
+    language: str
+    #: Whether this stream currently carries the container's Default Audio
+    #: Track disposition (ffprobe's ``disposition.default``).
+    is_default: bool
+
+    @classmethod
+    def from_probe(cls, stream: AudioStreamInfo) -> AudioStreamOut:
+        return cls(
+            index=stream.index,
+            codec=stream.codec,
+            channels=stream.channels,
+            channel_layout=stream.channel_layout,
+            language=stream.language,
+            is_default=stream.is_default,
+        )
+
+
+class AudioStreamsResponse(BaseModel):
+    """Response for ``GET /api/files/{file_id}/audio-streams`` (COL-204).
+
+    ``probeable`` is ``False`` when the file couldn't be probed right now
+    (missing on disk, corrupt, ffprobe unavailable/timed out) -- ``streams``
+    is then always empty and ``error`` carries a human-readable reason, so
+    the file detail page can render a graceful "unavailable" message instead
+    of a broken table. ``probeable=True`` always reflects the file's actual
+    current state: this is never cached or stored, so a request made right
+    after a downmix/Set-Default-Audio job completes sees the *new* layout.
+    """
+
+    probeable: bool
+    error: str | None = None
+    streams: list[AudioStreamOut] = []
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -202,3 +256,35 @@ def get_file_endpoint(file_id: int, session: Session = Depends(get_session)) -> 
     enabled_targets = as_downmix_settings(get_global_settings(session)).enabled_targets
     nodes_cache: dict[int, dict[int, LibraryNode]] = {}
     return _to_wanted_file(session, media, enabled_targets=enabled_targets, nodes_cache=nodes_cache)
+
+
+@router.get("/files/{file_id}/audio-streams", response_model=AudioStreamsResponse)
+def get_file_audio_streams_endpoint(
+    file_id: int, session: Session = Depends(get_session)
+) -> AudioStreamsResponse:
+    """Return ``file_id``'s current audio streams, live-probed via ffprobe (COL-204).
+
+    Shares :func:`~collapsarr.downmix.probe.probe_audio_streams` with the
+    downmix/default-audio pipelines -- the same probe, run fresh on every
+    call, never cached or stored, so the response always matches the file's
+    actual state on disk right now. Raises ``404`` when ``file_id`` was never
+    valid or no longer exists (same as ``GET /api/files/{file_id}``); a
+    *known* file that can't currently be probed (missing on disk, corrupt,
+    ffprobe unavailable/timed out) degrades to a ``200`` with
+    ``probeable=False`` instead, matching how the manual-trigger endpoints
+    treat an unprobeable file as a reportable outcome rather than a hard
+    failure.
+    """
+    media = get_tracked_media_by_id(session, file_id)
+    if media is None:
+        raise HTTPException(status_code=404, detail=f"No tracked file with id={file_id}.")
+
+    try:
+        streams = probe_audio_streams(media.file_path)
+    except FfprobeError as exc:
+        return AudioStreamsResponse(probeable=False, error=str(exc), streams=[])
+
+    return AudioStreamsResponse(
+        probeable=True,
+        streams=[AudioStreamOut.from_probe(stream) for stream in streams],
+    )
