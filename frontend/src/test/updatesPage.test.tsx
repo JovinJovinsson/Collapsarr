@@ -16,7 +16,7 @@ const upToDate: UpdateCheckState = {
   checked_at: "2026-08-02T10:00:00Z",
   update_available: false,
   dismissed_at: null,
-  is_docker: false,
+  install_method: "pipx",
 };
 
 const updateAvailable: UpdateCheckState = {
@@ -27,12 +27,17 @@ const updateAvailable: UpdateCheckState = {
   checked_at: "2026-08-02T10:00:00Z",
   update_available: true,
   dismissed_at: null,
-  is_docker: false,
+  install_method: "pipx",
 };
 
 const updateAvailableDocker: UpdateCheckState = {
   ...updateAvailable,
-  is_docker: true,
+  install_method: "docker",
+};
+
+const updateAvailableNative: UpdateCheckState = {
+  ...updateAvailable,
+  install_method: "native",
 };
 
 const updateDismissed: UpdateCheckState = {
@@ -48,7 +53,7 @@ const neverChecked: UpdateCheckState = {
   checked_at: null,
   update_available: true,
   dismissed_at: null,
-  is_docker: false,
+  install_method: "pipx",
 };
 
 afterEach(() => {
@@ -121,9 +126,9 @@ describe("UpdatesPage", () => {
     expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
   });
 
-  // COL-90: install-method instructions.
+  // COL-90/COL-219: install-method instructions.
 
-  it("shows docker pull + recreate-container instructions when the API reports Docker", async () => {
+  it("shows docker pull + recreate-container instructions when install_method is docker", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(updateAvailableDocker)));
     render(<UpdatesPage />);
 
@@ -132,9 +137,10 @@ describe("UpdatesPage", () => {
     expect(screen.getByText(/docker compose up -d/)).toBeInTheDocument();
     expect(screen.queryByText(/pipx upgrade collapsarr/)).not.toBeInTheDocument();
     expect(screen.queryByText(/pip install --upgrade collapsarr/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/release page/i)).not.toBeInTheDocument();
   });
 
-  it("shows pipx and pip instructions when the API does not report Docker", async () => {
+  it("shows pipx and pip instructions when install_method is pipx", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(updateAvailable)));
     render(<UpdatesPage />);
 
@@ -142,6 +148,26 @@ describe("UpdatesPage", () => {
     expect(screen.getByText(/pipx upgrade collapsarr/)).toBeInTheDocument();
     expect(screen.getByText(/pip install --upgrade collapsarr/)).toBeInTheDocument();
     expect(screen.queryByText(/docker pull/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/release page/i)).not.toBeInTheDocument();
+  });
+
+  it("shows download/replace/restart instructions and a data-safety note when install_method is native", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(updateAvailableNative)));
+    render(<UpdatesPage />);
+
+    await waitFor(() => expect(screen.getByText(/how to update/i)).toBeInTheDocument());
+    expect(screen.getByRole("link", { name: /release page/i })).toHaveAttribute(
+      "href",
+      "https://github.com/JovinJovinsson/Collapsarr/releases"
+    );
+    expect(screen.getByText(/replace the install folder/i)).toBeInTheDocument();
+    expect(screen.getByText(/restart collapsarr/i)).toBeInTheDocument();
+    // Data-safety note: DB/config live outside the install folder being replaced.
+    expect(screen.getByText(/database and settings are safe/i)).toBeInTheDocument();
+    expect(screen.getByText(/os user-data directory/i)).toBeInTheDocument();
+    expect(screen.queryByText(/docker pull/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/pipx upgrade collapsarr/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/pip install --upgrade collapsarr/)).not.toBeInTheDocument();
   });
 
   it("does not show install instructions when there is no update available", async () => {
