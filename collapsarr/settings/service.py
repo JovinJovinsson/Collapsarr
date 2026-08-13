@@ -353,6 +353,31 @@ def update_global_settings(
     return settings
 
 
+def set_ffmpeg_path(session: Session, ffmpeg_path: str) -> GlobalSettings:
+    """Persist a resolved absolute FFmpeg executable path (COL-218/COL-222).
+
+    A narrow, single-purpose setter -- deliberately **not** folded into
+    :func:`update_global_settings`'s generic kwarg list, unlike every other
+    field there. ``ffmpeg_path`` is not part of the generic Settings form
+    (``GET``/``PUT /api/settings``); it is only ever written by the FFmpeg
+    auto-download flow (:func:`collapsarr.ffmpeg_download.service.
+    download_and_install_ffmpeg`), and only once that flow's download,
+    checksum verification, and archive extraction have *all* already
+    succeeded -- never with a partial or unverified path. The FFmpeg
+    presence health check (:func:`collapsarr.health.ffmpeg.
+    make_ffmpeg_check_run`) and the job queue's pipeline-kwarg resolution
+    (:meth:`collapsarr.jobs.queue.JobQueue._resolve_pipeline_kwargs`) both
+    already read this column live from the row on every use, so a value
+    written here takes effect immediately -- no restart, no separate
+    "apply" step.
+    """
+    settings = get_global_settings(session)
+    settings.ffmpeg_path = ffmpeg_path
+    session.commit()
+    session.refresh(settings)
+    return settings
+
+
 def rotate_session_secret(session: Session) -> GlobalSettings:
     """Mint a fresh session-signing secret and persist it (COL-55).
 
