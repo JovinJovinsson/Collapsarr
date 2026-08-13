@@ -168,43 +168,64 @@ def test_get_updates_before_any_successful_fetch(client: TestClient) -> None:
     # No confirmed match -- "unknown" reports as an update possibly being
     # available rather than falsely claiming the instance is current.
     assert body["update_available"] is True
-    # The test process itself is never running inside a Docker container.
-    assert body["is_docker"] is False
+    # The test process itself is never running inside a Docker container,
+    # nor a frozen (PyInstaller) build.
+    assert body["install_method"] == "pipx"
 
 
 # --------------------------------------------------------------------------- #
-# COL-90: `is_docker` install-method detection
+# COL-90/COL-215: `install_method` install-method detection
 # --------------------------------------------------------------------------- #
 
 
-def test_get_updates_reports_is_docker_true_when_the_marker_file_is_present(
+def test_get_updates_reports_install_method_docker_when_the_marker_file_is_present(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("collapsarr.update_check.routes.is_docker_environment", lambda: True)
+    monkeypatch.setattr(
+        "collapsarr.update_check.routes.install_method", lambda: "docker"
+    )
     headers = _auth_headers(client)
 
     response = client.get("/api/system/updates", headers=headers)
 
     assert response.status_code == 200
-    assert response.json()["is_docker"] is True
+    assert response.json()["install_method"] == "docker"
 
 
-def test_get_updates_reports_is_docker_false_when_the_marker_file_is_absent(
+def test_get_updates_reports_install_method_native_when_frozen(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("collapsarr.update_check.routes.is_docker_environment", lambda: False)
+    monkeypatch.setattr(
+        "collapsarr.update_check.routes.install_method", lambda: "native"
+    )
     headers = _auth_headers(client)
 
     response = client.get("/api/system/updates", headers=headers)
 
     assert response.status_code == 200
-    assert response.json()["is_docker"] is False
+    assert response.json()["install_method"] == "native"
 
 
-def test_recheck_also_reports_is_docker(
+def test_get_updates_reports_install_method_pipx_when_neither(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "collapsarr.update_check.routes.install_method", lambda: "pipx"
+    )
+    headers = _auth_headers(client)
+
+    response = client.get("/api/system/updates", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["install_method"] == "pipx"
+
+
+def test_recheck_also_reports_install_method(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("collapsarr.update_check.routes.is_docker_environment", lambda: True)
+    monkeypatch.setattr(
+        "collapsarr.update_check.routes.install_method", lambda: "docker"
+    )
     app = _app_with_release(settings, "v2.0.0")
     with TestClient(app) as test_client:
         headers = _auth_headers(test_client)
@@ -212,7 +233,7 @@ def test_recheck_also_reports_is_docker(
         response = test_client.post("/api/system/updates/recheck", headers=headers)
 
         assert response.status_code == 200
-        assert response.json()["is_docker"] is True
+        assert response.json()["install_method"] == "docker"
 
 
 def test_get_updates_reports_up_to_date_when_latest_tag_matches_running_version(

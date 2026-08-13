@@ -42,10 +42,12 @@ Public surface, by concern:
   as ``health_checks_router``.
 - **Install-method detection** -- :func:`is_docker_environment`
   (:mod:`~collapsarr.update_check.environment`, COL-90): a ``/.dockerenv``
-  presence probe, surfaced as ``is_docker`` on ``GET /api/system/updates`` so
-  the frontend renders the matching Docker vs. pipx/pip upgrade instructions
-  without any detection logic of its own (see ``docs/adr/
-  0001-update-check-detect-notify-only.md``).
+  presence probe. Combined with the ``sys.frozen`` (PyInstaller) check by
+  :func:`~collapsarr.system.info.install_method` (COL-215) into the closed
+  ``docker``/``pipx``/``native`` :data:`~collapsarr.system.info.InstallMethod`
+  enum, surfaced as ``install_method`` on ``GET /api/system/updates`` so the
+  frontend renders the matching upgrade instructions without any detection
+  logic of its own (see ``docs/adr/0001-update-check-detect-notify-only.md``).
 
 The Updates page and the app-wide "update available" indicator are COL-87's
 frontend half (``frontend/src/pages/UpdatesPage.tsx``,

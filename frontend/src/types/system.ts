@@ -10,8 +10,15 @@ export interface DiskUsageInfo {
   total_bytes: number;
 }
 
-/** How this instance is running (`CONTEXT.md`'s "Install Method"), matching `collapsarr/system/info.py::InstallMethod`. */
-export type InstallMethod = "docker" | "pipx";
+/**
+ * How this instance is running (`CONTEXT.md`'s "Install Method"), matching
+ * `collapsarr/system/info.py::InstallMethod` -- the same closed, three-valued
+ * enum backend-reused by both `GET /api/system/info` (this file's
+ * `SystemInfo.install_method`, the About panel) and `GET /api/system/updates`
+ * (`types/updates.ts`'s `UpdateCheckState.install_method`, COL-219), so it's
+ * defined once here and imported rather than duplicated.
+ */
+export type InstallMethod = "docker" | "pipx" | "native";
 
 /**
  * The About panel's environment/runtime facts, as returned by

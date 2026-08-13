@@ -13,6 +13,9 @@ import type { UpdateCheckState } from "../types/updates";
 /** The Docker Hub repository the release pipeline publishes to (`.github/workflows/release.yml`'s `IMAGE_NAME`). */
 const DOCKER_IMAGE = "odxnsson/collapsarr";
 
+/** GitHub Releases page, source of the native (PyInstaller) archives (`StatusPage`'s `SOURCE_URL` origin). */
+const RELEASES_URL = "https://github.com/JovinJovinsson/Collapsarr/releases";
+
 /** Formats an ISO timestamp in the viewer's local time, or an em dash when absent/unparseable. */
 function formatTimestamp(value: string | null): string {
   if (!value) return "—";
@@ -54,16 +57,24 @@ type LoadState =
  * error/warning-oriented styling.
  *
  * Changelog rendering and install-method-specific upgrade instructions
- * (COL-90): the changelog (raw Markdown from the GitHub Release body,
- * `UpdateCheckState.changelog`) renders via `react-markdown` -- no
- * `dangerouslySetInnerHTML`, and the `rehype-raw` plugin is deliberately not
- * enabled, so raw HTML embedded in a changelog body is never rendered as
- * HTML (that content is externally sourced, from a GitHub Release body).
- * The "How to update" block renders Docker instructions
- * (`docker pull`/recreate) when the API's `is_docker` field is true,
- * otherwise both `pipx upgrade`/`pip install --upgrade` -- see
- * `docs/adr/0001-update-check-detect-notify-only.md` for why detection is
- * backend-only and why no code path here executes either command itself.
+ * (COL-90, three-way switch added in COL-219 for `"native"`): the changelog
+ * (raw Markdown from the GitHub Release body, `UpdateCheckState.changelog`)
+ * renders via `react-markdown` -- no `dangerouslySetInnerHTML`, and the
+ * `rehype-raw` plugin is deliberately not enabled, so raw HTML embedded in a
+ * changelog body is never rendered as HTML (that content is externally
+ * sourced, from a GitHub Release body). The "How to update" block switches on
+ * the API's `install_method` field (`"docker"` | `"pipx"` | `"native"`,
+ * formerly the `is_docker` boolean, COL-215): `docker pull`/recreate for
+ * `"docker"`, `pipx upgrade`/`pip install --upgrade` for `"pipx"`, and a
+ * download-the-archive-and-replace-the-install-folder walkthrough for
+ * `"native"` (PyInstaller build, COL-216+) -- the native branch also calls
+ * out that the database/config are safe because they live in the OS
+ * user-data directory (`platformdirs.user_data_dir("collapsarr")`,
+ * `collapsarr/system/info.py`'s `data_dir`), not inside the install folder
+ * being replaced. See `docs/adr/0001-update-check-detect-notify-only.md` for
+ * why detection is backend-only and why no code path here executes any of
+ * these commands itself -- purely informational, same as the docker/pipx
+ * branches.
  *
  * COL-89 adds Dismiss/Undismiss actions (`POST /api/system/updates/dismiss` /
  * `.../undismiss`, `api/updates.ts`), mirroring `HealthChecksPage`'s per-row
@@ -252,7 +263,7 @@ export function UpdatesPage() {
           {state.state.update_available && (
             <div className="update-panel__instructions">
               <h2 className="update-panel__instructions-title">How to update</h2>
-              {state.state.is_docker ? (
+              {state.state.install_method === "docker" && (
                 <ol className="update-panel__instructions-steps">
                   <li>
                     Pull the new image:
@@ -272,7 +283,8 @@ export function UpdatesPage() {
                     re-run your <code>docker run</code> command.)
                   </li>
                 </ol>
-              ) : (
+              )}
+              {state.state.install_method === "pipx" && (
                 <ol className="update-panel__instructions-steps">
                   <li>
                     Using pipx:
@@ -287,6 +299,25 @@ export function UpdatesPage() {
                     </pre>
                   </li>
                 </ol>
+              )}
+              {state.state.install_method === "native" && (
+                <>
+                  <ol className="update-panel__instructions-steps">
+                    <li>
+                      Download the new archive for your platform from the{" "}
+                      <a href={RELEASES_URL} target="_blank" rel="noreferrer">
+                        release page
+                      </a>
+                      .
+                    </li>
+                    <li>Replace the install folder with the contents of the new archive.</li>
+                    <li>Restart Collapsarr.</li>
+                  </ol>
+                  <p className="update-panel__instructions-note">
+                    Your database and settings are safe: they&apos;re stored in your OS user-data
+                    directory, not inside the install folder you&apos;re replacing.
+                  </p>
+                </>
               )}
             </div>
           )}
