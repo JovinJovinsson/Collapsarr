@@ -94,9 +94,14 @@ def test_rehydrate_reconstructs_every_pending_row_as_a_live_pending_job(
     assert {job.id for job in jobs} == {job.id for job in queue.list_jobs()}
 
 
-def test_rehydrate_ignores_terminal_and_running_rows(session: Session) -> None:
-    _seed_history(session, file_path="/media/done.mkv", priority=0, status=JobStatus.SUCCEEDED)
-    _seed_history(session, file_path="/media/failed.mkv", priority=1, status=JobStatus.FAILED)
+def test_rehydrate_ignores_terminal_rows_and_orphans_running_ones(session: Session) -> None:
+    """SUCCEEDED/FAILED rows stay untouched; a RUNNING row is orphaned instead (COL-200)."""
+    done = _seed_history(
+        session, file_path="/media/done.mkv", priority=0, status=JobStatus.SUCCEEDED
+    )
+    failed = _seed_history(
+        session, file_path="/media/failed.mkv", priority=1, status=JobStatus.FAILED
+    )
     _seed_history(session, file_path="/media/running.mkv", priority=2, status=JobStatus.RUNNING)
     queue = JobQueue(pipeline_runner=_RecordingRunner())
 
@@ -104,6 +109,48 @@ def test_rehydrate_ignores_terminal_and_running_rows(session: Session) -> None:
 
     assert jobs == []
     assert queue.list_jobs() == []
+    session.refresh(done)
+    session.refresh(failed)
+    assert done.status is JobStatus.SUCCEEDED
+    assert failed.status is JobStatus.FAILED and failed.error_text is None
+
+
+def test_rehydrate_marks_an_orphaned_running_row_failed_not_left_a_ghost(
+    session: Session,
+) -> None:
+    """AC: a RUNNING row at startup has no live Job behind it (a hard kill mid-run) and
+    must not display as "running" forever. Mirrors
+    ``test_a_row_that_cannot_be_rehydrated_is_marked_failed_not_left_a_ghost`` for
+    unrehydratable PENDING rows.
+    """
+    row = _seed_history(
+        session, file_path="/media/running.mkv", priority=0, status=JobStatus.RUNNING
+    )
+    queue = JobQueue(pipeline_runner=_RecordingRunner())
+
+    jobs = rehydrate_pending_jobs(session, queue)
+
+    assert jobs == []
+    assert queue.list_jobs() == []
+    session.refresh(row)
+    assert row.status is JobStatus.FAILED
+    assert row.ended_at is not None
+    assert row.error_text is not None and "still RUNNING at startup" in row.error_text
+
+
+def test_rehydrate_still_rehydrates_a_pending_row_alongside_an_orphaned_running_one(
+    session: Session,
+) -> None:
+    """AC: a genuinely rehydratable PENDING row is unaffected by a RUNNING row also present."""
+    _seed_history(session, file_path="/media/running.mkv", priority=0, status=JobStatus.RUNNING)
+    _seed_history(session, file_path="/media/pending.mkv", priority=1)
+    queue = JobQueue(pipeline_runner=_RecordingRunner())
+
+    jobs = rehydrate_pending_jobs(session, queue)
+
+    assert len(jobs) == 1
+    assert jobs[0].file_path == Path("/media/pending.mkv")
+    assert jobs[0].status is JobStatus.PENDING
 
 
 def test_rehydrated_job_keeps_the_history_rows_job_id(session: Session) -> None:
