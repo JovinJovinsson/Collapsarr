@@ -103,16 +103,13 @@ def update_plex_connection_endpoint(
 ) -> PlexConnectionRead:
     """Update the provided fields and re-validate connectivity.
 
-    Only fields present in the request body are changed. Saving always
+    A ``None`` field (whether omitted or explicitly sent as ``null``) is left
+    unchanged by :func:`~collapsarr.plex.service.update_plex_connection` --
+    there is no "clear to empty" affordance for ``base_url``/``token``
+    (matching :class:`PlexConnectionUpdate`'s own docstring), so fields can be
+    passed straight through by name, the same direct form
+    :func:`collapsarr.arr.routes.update_instance_endpoint` uses. Saving always
     re-runs the connectivity check and persists the outcome, the same way
     ``PUT /api/instances/{id}`` does for Sonarr/Radarr.
     """
-    provided = body.model_fields_set
-    kwargs: dict[str, object] = {}
-
-    if "base_url" in provided:
-        kwargs["base_url"] = body.base_url
-    if "token" in provided:
-        kwargs["token"] = body.token
-
-    return _to_read(update_plex_connection(session, **kwargs))  # type: ignore[arg-type]
+    return _to_read(update_plex_connection(session, base_url=body.base_url, token=body.token))
