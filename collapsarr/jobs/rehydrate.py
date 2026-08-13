@@ -97,10 +97,30 @@ def rehydrate_pending_jobs(session: Session, queue: JobQueue) -> list[Job]:
     visible terminal state instead -- surfaced by the Activity/History view
     like any other failed job, and a user who still wants it done can
     manually retrigger it.
+
+    A ``RUNNING`` row gets the same treatment (COL-200), for the same
+    reason: only ``PENDING`` rows are ever reconstructed into a live Job
+    here, so a row still ``RUNNING`` when the process died abruptly (a
+    graceful :meth:`~collapsarr.jobs.queue.JobQueue.shutdown` drains running
+    jobs first, so this only happens on a hard kill) has no live Job to
+    resume it and would otherwise sit ``RUNNING`` forever -- indistinguishable
+    from an actually-in-progress job to ``GET /api/jobs/queue`` and to
+    :meth:`~collapsarr.jobs.queue.JobQueue.cancel_job`/``bump_job_to_front``
+    (which look it up by id in ``queue`` and find nothing, surfacing a
+    confusing "No such job" instead of the truth: it isn't running, it's
+    dead).
     """
     all_rows = list_job_history(session)
     if all_rows:
         queue.seed_next_priority(max(row.priority for row in all_rows) + 1)
+
+    for row in all_rows:
+        if row.status is JobStatus.RUNNING:
+            _mark_unrehydratable(
+                session,
+                row,
+                "orphaned: still RUNNING at startup, no live Job could survive the restart",
+            )
 
     pending_rows = sorted(
         (row for row in all_rows if row.status is JobStatus.PENDING),
@@ -218,17 +238,21 @@ def _reconstruct_job(
 
 
 def _mark_unrehydratable(session: Session, row: JobHistory, reason: str) -> None:
-    """Flip a ``PENDING`` row :func:`_reconstruct_job` can't rebuild to ``FAILED`` (COL-166).
+    """Flip a ``PENDING`` or ``RUNNING`` row with no live Job behind it to ``FAILED``.
 
-    Without this, a row that :func:`_reconstruct_job` can't turn into a Job
-    would stay silently ``PENDING`` forever with no backing live Job --
+    Covers two callers: a ``PENDING`` row :func:`_reconstruct_job` can't
+    rebuild (COL-166), and a ``RUNNING`` row orphaned by an abrupt restart,
+    for which no reconstruction is even attempted (COL-200) -- only
+    ``PENDING`` rows are ever turned into a live Job. Without this, either
+    row would stay silently stuck forever with no backing live Job --
     re-attempted (and re-skipped, for the same reason) on every future
-    restart -- exactly the permanent "ghost pending row" this ticket exists
-    to eliminate (see the module docstring). ``FAILED`` moves it out of
-    ``PENDING`` into a normal, visible terminal state instead, surfaced by
-    the Activity/History view like any other failed job, with ``error_text``
-    explaining why -- so a user can see it and manually retrigger the work if
-    they still want it done, rather than it silently never running again.
+    restart in the ``PENDING`` case, or simply never revisited again in the
+    ``RUNNING`` case -- exactly the permanent "ghost row" both tickets exist
+    to eliminate (see the module docstring). ``FAILED`` moves it into a
+    normal, visible terminal state instead, surfaced by the Activity/History
+    view like any other failed job, with ``error_text`` explaining why -- so
+    a user can see it and manually retrigger the work if they still want it
+    done, rather than it silently never running again.
     """
     row.status = JobStatus.FAILED
     row.error_text = reason
