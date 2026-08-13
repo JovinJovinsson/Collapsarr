@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { fetchJobHistory, triggerDownmix, triggerSetDefaultAudio } from "../api/activity";
-import { FileNotFoundError, fetchFileById } from "../api/files";
+import { FileNotFoundError, fetchAudioStreams, fetchFileById } from "../api/files";
 import { updateTracked } from "../api/library";
 import { fetchSettings } from "../api/settings";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
@@ -15,6 +15,7 @@ import type {
   ManualTriggerResult,
   SetDefaultAudioTriggerResult,
 } from "../types/activity";
+import type { AudioStreamsResponse } from "../types/audioStreams";
 import type { GlobalSettings } from "../types/settings";
 import type { DownmixTarget, WantedFile } from "../types/wanted";
 
@@ -53,6 +54,11 @@ type SettingsLoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "ready"; settings: GlobalSettings };
+
+type AudioStreamsLoadState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; response: AudioStreamsResponse };
 
 type TriggerState<TResult> =
   | { status: "idle" }
@@ -155,6 +161,18 @@ function buildStatusRows(file: WantedFile, history: JobHistoryEntry[]): StatusRo
  * history `kind` field) distinguishes a row produced by a `DOWNMIX` job from
  * one produced by a `SET_DEFAULT_AUDIO` job, since both can land in the same
  * `(language, target)` key (see `buildStatusRows`).
+ *
+ * Also shows this file's **current** audio streams (COL-204,
+ * `GET /api/files/:id/audio-streams`) -- language, channel count, and which
+ * stream currently carries the Default Audio Track disposition. Re-fetched
+ * (and re-probed server-side, never cached) whenever the loaded file's id
+ * changes, so every page load reflects the file's actual state on disk at
+ * that moment -- a fresh navigation or reload after a "Set Default Audio
+ * Track" or downmix job completes picks up the new layout, though the table
+ * doesn't itself poll or auto-refresh while a triggered job is in flight on
+ * the same page view. An unprobeable file (missing on disk, corrupt)
+ * degrades to a message instead of a table, matching the backend's
+ * `probeable: false` response rather than crashing the page.
  */
 export function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
@@ -162,6 +180,9 @@ export function FileDetailPage() {
   const [fileState, setFileState] = useState<FileLoadState>({ status: "loading" });
   const [historyState, setHistoryState] = useState<HistoryLoadState>({ status: "loading" });
   const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
+  const [audioStreamsState, setAudioStreamsState] = useState<AudioStreamsLoadState>({
+    status: "loading",
+  });
   const [triggerState, setTriggerState] = useState<TriggerState<ManualTriggerResult>>({
     status: "idle",
   });
@@ -205,6 +226,7 @@ export function FileDetailPage() {
   }, [fileId]);
 
   const filePath = fileState.status === "ready" ? fileState.file.file_path : null;
+  const readyFileId = fileState.status === "ready" ? fileState.file.id : null;
 
   useEffect(() => {
     if (!filePath) return;
@@ -228,6 +250,36 @@ export function FileDetailPage() {
       cancelled = true;
     };
   }, [filePath]);
+
+  /**
+   * Re-probes this file's current audio streams (COL-204) whenever the
+   * loaded file's id changes -- `readyFileId` (rather than `fileId` from the
+   * route params directly) so this only fires once the file lookup itself
+   * has resolved, avoiding a redundant probe of a file that turns out not to
+   * exist.
+   */
+  useEffect(() => {
+    if (readyFileId === null) return;
+    let cancelled = false;
+    setAudioStreamsState({ status: "loading" });
+
+    fetchAudioStreams(readyFileId)
+      .then((response) => {
+        if (!cancelled) setAudioStreamsState({ status: "ready", response });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setAudioStreamsState({
+            status: "error",
+            message: error instanceof Error ? error.message : "Unknown error.",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [readyFileId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -505,6 +557,70 @@ export function FileDetailPage() {
                 )}
               </p>
             )}
+          </div>
+
+          <div className="panel file-detail__panel">
+            <h2 className="settings-form__subtitle">Current audio streams</h2>
+            <p className="panel__message file-detail__hint">
+              Live-probed from the file on disk on every page load — never a stored value — so this
+              always reflects its actual current state.
+            </p>
+
+            {audioStreamsState.status === "loading" && (
+              <p className="panel__message">Probing current audio streams…</p>
+            )}
+
+            {audioStreamsState.status === "error" && (
+              <p className="form-error">
+                Couldn&apos;t probe audio streams: {audioStreamsState.message}
+              </p>
+            )}
+
+            {audioStreamsState.status === "ready" && !audioStreamsState.response.probeable && (
+              <p className="panel__message">
+                This file couldn&apos;t be probed right now (it may be missing on disk or
+                unreadable){audioStreamsState.response.error ? `: ${audioStreamsState.response.error}` : "."}
+              </p>
+            )}
+
+            {audioStreamsState.status === "ready" &&
+              audioStreamsState.response.probeable &&
+              (audioStreamsState.response.streams.length === 0 ? (
+                <p className="panel__message">No audio streams found in this file.</p>
+              ) : (
+                <table className="wanted-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Language</th>
+                      <th scope="col">Channels</th>
+                      <th scope="col">Codec</th>
+                      <th scope="col">Default Audio Track</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {audioStreamsState.response.streams.map((stream) => (
+                      <tr key={stream.index}>
+                        <td>{stream.language}</td>
+                        <td>
+                          {stream.channel_layout} ({stream.channels}ch)
+                        </td>
+                        <td>{stream.codec}</td>
+                        <td>
+                          {stream.is_default ? (
+                            <span className="activity-table__status activity-table__status--succeeded">
+                              Default
+                            </span>
+                          ) : (
+                            <span className="activity-table__status activity-table__status--missing">
+                              —
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ))}
           </div>
 
           <div className="panel file-detail__panel">

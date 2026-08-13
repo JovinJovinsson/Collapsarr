@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FileDetailPage } from "../pages/FileDetailPage";
 import type { JobHistoryEntry } from "../types/activity";
+import type { AudioStreamsResponse } from "../types/audioStreams";
 import type { GlobalSettings } from "../types/settings";
 import type { WantedFile } from "../types/wanted";
 
@@ -38,6 +39,15 @@ const historyResponse: JobHistoryEntry[] = [
     updated_at: "2026-07-10T10:05:00Z",
   },
 ];
+
+const audioStreamsResponse: AudioStreamsResponse = {
+  probeable: true,
+  error: null,
+  streams: [
+    { index: 0, codec: "eac3", channels: 6, channel_layout: "5.1", language: "eng", is_default: true },
+    { index: 1, codec: "aac", channels: 2, channel_layout: "stereo", language: "jpn", is_default: false },
+  ],
+};
 
 const settingsResponse: GlobalSettings = {
   enabled_targets: ["stereo", "5.1"],
@@ -98,12 +108,20 @@ function defaultHandler(
     fileNotFound: boolean;
     history: unknown;
     settings: unknown;
+    audioStreams: unknown;
+    audioStreamsNotFound: boolean;
     trigger: { ok: boolean; status?: number; body: unknown };
     defaultAudioTrigger: { ok: boolean; status?: number; body: unknown };
     tracked: { ok: boolean; status?: number; body: unknown };
   }> = {},
 ): Handler {
   return (url, init) => {
+    if (url.endsWith("/audio-streams")) {
+      if (overrides.audioStreamsNotFound) {
+        return { ok: false, status: 404, body: { detail: "No tracked file with this id." } };
+      }
+      return { ok: true, body: overrides.audioStreams ?? audioStreamsResponse };
+    }
     if (url === "/api/jobs/trigger-default-audio") {
       return (
         overrides.defaultAudioTrigger ?? {
@@ -522,5 +540,51 @@ describe("FileDetailPage", () => {
 
     expect(await screen.findByText(/couldn't update tracked: boom/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^tracked$/i })).not.toBeDisabled();
+  });
+
+  // --- Current audio streams (COL-204) ----------------------------------------
+
+  it("shows every current audio stream's language and channel count, with the current Default Audio Track indicated", async () => {
+    mockFetchRouter(defaultHandler());
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    const defaultRow = (await screen.findByText("eng")).closest("tr") as HTMLElement;
+    expect(within(defaultRow).getByText(/5\.1 \(6ch\)/)).toBeInTheDocument();
+    expect(within(defaultRow).getByText("eac3")).toBeInTheDocument();
+    expect(within(defaultRow).getByText("Default")).toBeInTheDocument();
+
+    const nonDefaultRow = (await screen.findByText("jpn")).closest("tr") as HTMLElement;
+    expect(within(nonDefaultRow).getByText(/stereo \(2ch\)/)).toBeInTheDocument();
+    expect(within(nonDefaultRow).queryByText("Default")).not.toBeInTheDocument();
+  });
+
+  it("degrades gracefully instead of crashing when the file can't currently be probed (e.g. missing on disk)", async () => {
+    mockFetchRouter(
+      defaultHandler({
+        audioStreams: { probeable: false, error: "no such file: '/media/gone.mkv'", streams: [] },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(
+      await screen.findByText(/couldn't be probed right now.*no such file/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an error message rather than crashing when the audio-streams request itself fails", async () => {
+    mockFetchRouter(
+      defaultHandler({ audioStreamsNotFound: true }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(
+      await screen.findByText(/couldn't probe audio streams/i),
+    ).toBeInTheDocument();
   });
 });

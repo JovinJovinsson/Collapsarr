@@ -1,3 +1,4 @@
+import type { AudioStreamsResponse } from "../types/audioStreams";
 import type { WantedFile } from "../types/wanted";
 import { apiErrorMessage, apiFetch } from "./client";
 
@@ -31,4 +32,33 @@ export async function fetchFileById(fileId: string | number): Promise<WantedFile
     throw new Error(message);
   }
   return (await response.json()) as WantedFile;
+}
+
+/**
+ * Fetches a single file's *current, live-probed* audio streams
+ * (`GET /api/files/:id/audio-streams`, COL-204) -- re-probed by the backend
+ * on every call (never cached/stored), so this always reflects the file's
+ * actual state on disk right now, including which stream currently carries
+ * the Default Audio Track disposition.
+ *
+ * Unlike {@link fetchFileById}, an unprobeable file (missing on disk,
+ * corrupt) is still a `200` with `probeable: false` -- only a genuinely
+ * unknown `file_id` throws {@link FileNotFoundError} here, matching
+ * `fetchFileById`'s 404 handling.
+ */
+export async function fetchAudioStreams(fileId: string | number): Promise<AudioStreamsResponse> {
+  const response = await apiFetch(
+    `/api/files/${encodeURIComponent(String(fileId))}/audio-streams`,
+  );
+  if (!response.ok) {
+    const message = await apiErrorMessage(
+      response,
+      `Failed to load audio streams (${response.status})`,
+    );
+    if (response.status === 404) {
+      throw new FileNotFoundError(message);
+    }
+    throw new Error(message);
+  }
+  return (await response.json()) as AudioStreamsResponse;
 }
