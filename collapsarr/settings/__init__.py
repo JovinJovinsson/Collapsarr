@@ -24,6 +24,7 @@ from .service import (
     as_downmix_settings,
     get_global_settings,
     rotate_session_secret,
+    set_ffmpeg_path,
     update_global_settings,
     verify_auth_password,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "hash_password",
     "rotate_session_secret",
     "seed_auth_from_env",
+    "set_ffmpeg_path",
     "update_global_settings",
     "verify_auth_password",
     "verify_password",

@@ -37,6 +37,7 @@ from .database import (
     create_session_factory,
     get_session,
 )
+from .ffmpeg_download.routes import router as ffmpeg_download_router
 from .frontend import mount_frontend
 from .health import (
     DiskUsage,
@@ -129,6 +130,7 @@ def create_app(
     update_check_transport: httpx.BaseTransport | None = None,
     plex_transport: httpx.BaseTransport | None = None,
     system_probe: SystemProbe | None = None,
+    ffmpeg_download_transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -174,7 +176,16 @@ def create_app(
     version / OS platform / FFmpeg version probe (see
     :class:`~collapsarr.system.probe.SystemProbe`); production leaves it
     ``None`` for the real, ``platform``/subprocess-backed
-    :class:`~collapsarr.system.probe.DefaultSystemProbe`.
+    :class:`~collapsarr.system.probe.DefaultSystemProbe`. ``ffmpeg_download_transport``
+    (COL-222) is forwarded to ``POST /api/system/ffmpeg/download``'s
+    download-and-verify call (see
+    :func:`collapsarr.ffmpeg_download.service.download_and_install_ffmpeg`),
+    letting tests inject an ``httpx.MockTransport`` instead of a real network
+    call; production leaves it ``None``. Unlike the transports above, this one
+    is not consumed by any background scheduler -- the download only ever
+    runs synchronously inside that one request handler -- so it is stashed
+    directly on ``app.state.ffmpeg_download_transport`` for the route to read,
+    rather than threaded into a scheduler constructor.
     """
     resolved_settings = settings or get_settings()
 
@@ -385,6 +396,7 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.on_file_ready = on_file_ready or default_on_file_ready_hook
+    app.state.ffmpeg_download_transport = ffmpeg_download_transport
 
     # Exposed for GET /api/system/tasks (COL-122) to tell whether a Scheduled
     # Task's computed next-run time is actually meaningful: the health/update
@@ -483,6 +495,15 @@ def create_app(
     # architectural split; both are thin /api/system aggregation views over
     # existing state (docs/adr/0005-system-tasks-endpoint-not-shared-scheduler.md).
     app.include_router(info_router)
+
+    # Opt-in FFmpeg auto-download trigger POST /api/system/ffmpeg/download
+    # (COL-222): downloads the pinned, checksum-verified build for this
+    # platform (COL-217), extracts it into <data_dir>/ffmpeg/, and persists
+    # the resolved path onto GlobalSettings.ffmpeg_path (COL-218) -- gated to
+    # install_method != "docker" (COL-215). Surfaced from the ffmpeg_missing
+    # health-check banner's opt-in "Download FFmpeg" action; never triggered
+    # automatically (ADR 0001/0002).
+    app.include_router(ffmpeg_download_router)
 
     # Tail-read GET /api/system/logs (COL-131): the most recent lines of the
     # current rotating log file COL-128's configure_logging() writes to
