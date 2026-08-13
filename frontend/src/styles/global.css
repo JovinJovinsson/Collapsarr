@@ -1847,6 +1847,13 @@ a {
   color: var(--c-text-muted);
 }
 
+.update-panel__instructions-note {
+  margin: var(--sp-3) 0 0;
+  padding-left: var(--sp-5);
+  font-size: var(--fs-sm);
+  color: var(--c-text-muted);
+}
+
 .update-panel__command {
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
