@@ -1,10 +1,21 @@
-"""HTTP REST endpoint for the wanted-list (COL-28).
+"""HTTP REST endpoints for the wanted-list and single-file lookup (COL-28, COL-203).
 
 Thin GET layer over :mod:`collapsarr.media.service`, exposed as a FastAPI
 :class:`~fastapi.APIRouter` mounted under ``/api`` by
 :func:`collapsarr.main.create_app`. Everything under ``/api`` is gated by the
-API-key middleware (COL-26), so this route inherits key-based auth with no
+API-key middleware (COL-26), so these routes inherit key-based auth with no
 per-route wiring.
+
+Two GET endpoints share the same ``WantedFile`` response shape:
+
+- ``GET /api/wanted`` -- every **Tracked** file missing at least one
+  currently-enabled target (COL-28), the Wanted view's data source.
+- ``GET /api/files/{file_id}`` (COL-203) -- a single file by id, regardless
+  of whether it currently has any missing targets or is Tracked. This is
+  what the file detail page (``FileDetailPage``) reads from, since a
+  fully-processed file (zero missing targets) is deliberately excluded from
+  ``GET /api/wanted`` but must still be viewable by id. Returns ``404`` when
+  ``file_id`` was never valid or no longer exists.
 
 The "wanted-list" is every tracked file missing at least one *currently
 enabled* target -- the same notion Sonarr/Radarr's ``/wanted/missing`` view
@@ -35,7 +46,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -45,7 +56,7 @@ from ..library.models import LibraryNode
 from ..library.service import get_node_by_source_id, list_nodes, resolve_tracked
 from ..settings.service import as_downmix_settings, get_global_settings
 from .models import MediaTargetStatus, TrackedMediaFile
-from .service import list_files_missing_targets, list_target_statuses
+from .service import get_tracked_media_by_id, list_files_missing_targets, list_target_statuses
 
 router = APIRouter(prefix="/api", tags=["wanted"])
 
@@ -120,6 +131,40 @@ def _resolve_library_tracked(
     return node.id, node.kind.value, tracked
 
 
+def _to_wanted_file(
+    session: Session,
+    media: TrackedMediaFile,
+    *,
+    enabled_targets: frozenset[DownmixTarget],
+    nodes_cache: dict[int, dict[int, LibraryNode]],
+) -> WantedFile:
+    """Build a :class:`WantedFile` response row for ``media``.
+
+    Shared by both ``GET /api/wanted`` and ``GET /api/files/{file_id}``
+    (COL-203) -- the two endpoints return the identical shape, differing only
+    in which files they select (a Wanted-membership query vs. a single id
+    lookup independent of Wanted-queue membership).
+    """
+    missing = [
+        WantedTarget(language=status.language, target=status.target)
+        for status in list_target_statuses(session, media.file_path)
+        if status.status == MediaTargetStatus.MISSING and status.target in enabled_targets
+    ]
+    library_node_id, node_type, tracked = _resolve_library_tracked(
+        session, media, nodes_cache=nodes_cache
+    )
+    return WantedFile(
+        id=media.id,
+        file_path=media.file_path,
+        missing_targets=missing,
+        created_at=media.created_at,
+        updated_at=media.updated_at,
+        library_node_id=library_node_id,
+        node_type=node_type,
+        tracked=tracked,
+    )
+
+
 @router.get("/wanted", response_model=list[WantedFile])
 def list_wanted_endpoint(session: Session = Depends(get_session)) -> list[WantedFile]:
     """List tracked files missing at least one currently-enabled downmix target.
@@ -134,26 +179,26 @@ def list_wanted_endpoint(session: Session = Depends(get_session)) -> list[Wanted
     files = list_files_missing_targets(session, enabled_targets=enabled_targets)
 
     nodes_cache: dict[int, dict[int, LibraryNode]] = {}
-    result: list[WantedFile] = []
-    for media in files:
-        missing = [
-            WantedTarget(language=status.language, target=status.target)
-            for status in list_target_statuses(session, media.file_path)
-            if status.status == MediaTargetStatus.MISSING and status.target in enabled_targets
-        ]
-        library_node_id, node_type, tracked = _resolve_library_tracked(
-            session, media, nodes_cache=nodes_cache
-        )
-        result.append(
-            WantedFile(
-                id=media.id,
-                file_path=media.file_path,
-                missing_targets=missing,
-                created_at=media.created_at,
-                updated_at=media.updated_at,
-                library_node_id=library_node_id,
-                node_type=node_type,
-                tracked=tracked,
-            )
-        )
-    return result
+    return [
+        _to_wanted_file(session, media, enabled_targets=enabled_targets, nodes_cache=nodes_cache)
+        for media in files
+    ]
+
+
+@router.get("/files/{file_id}", response_model=WantedFile)
+def get_file_endpoint(file_id: int, session: Session = Depends(get_session)) -> WantedFile:
+    """Return a single tracked file by id, independent of Wanted-queue membership (COL-203).
+
+    Unlike ``GET /api/wanted``, this doesn't filter on whether the file has
+    any currently-missing targets -- a fully-processed file (every enabled
+    target already present) still resolves here with an empty
+    ``missing_targets`` list, since the file detail page needs to render it
+    too. Raises ``404`` when ``file_id`` was never valid or no longer exists.
+    """
+    media = get_tracked_media_by_id(session, file_id)
+    if media is None:
+        raise HTTPException(status_code=404, detail=f"No tracked file with id={file_id}.")
+
+    enabled_targets = as_downmix_settings(get_global_settings(session)).enabled_targets
+    nodes_cache: dict[int, dict[int, LibraryNode]] = {}
+    return _to_wanted_file(session, media, enabled_targets=enabled_targets, nodes_cache=nodes_cache)

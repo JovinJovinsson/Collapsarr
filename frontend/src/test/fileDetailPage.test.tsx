@@ -9,18 +9,16 @@ import type { WantedFile } from "../types/wanted";
 
 const FILE_PATH = "/media/movies/Interstellar (2014)/Interstellar.mkv";
 
-const wantedResponse: WantedFile[] = [
-  {
-    id: 1,
-    file_path: FILE_PATH,
-    missing_targets: [{ language: "en", target: "5.1" }],
-    created_at: "2026-07-01T00:00:00Z",
-    updated_at: "2026-07-02T00:00:00Z",
-    library_node_id: 42,
-    node_type: "movie",
-    tracked: true,
-  },
-];
+const fileResponse: WantedFile = {
+  id: 1,
+  file_path: FILE_PATH,
+  missing_targets: [{ language: "en", target: "5.1" }],
+  created_at: "2026-07-01T00:00:00Z",
+  updated_at: "2026-07-02T00:00:00Z",
+  library_node_id: 42,
+  node_type: "movie",
+  tracked: true,
+};
 
 const historyResponse: JobHistoryEntry[] = [
   {
@@ -96,7 +94,8 @@ function mockFetchRouter(handler: Handler): { calls: FetchCall[] } {
 
 function defaultHandler(
   overrides: Partial<{
-    wanted: unknown;
+    file: unknown;
+    fileNotFound: boolean;
     history: unknown;
     settings: unknown;
     trigger: { ok: boolean; status?: number; body: unknown };
@@ -139,8 +138,11 @@ function defaultHandler(
         },
       };
     }
-    if (url.startsWith("/api/wanted")) {
-      return { ok: true, body: overrides.wanted ?? wantedResponse };
+    if (url.startsWith("/api/files/")) {
+      if (overrides.fileNotFound) {
+        return { ok: false, status: 404, body: { detail: "No tracked file with this id." } };
+      }
+      return { ok: true, body: overrides.file ?? fileResponse };
     }
     throw new Error(`Unexpected fetch: ${String(init?.method ?? "GET")} ${url}`);
   };
@@ -148,9 +150,9 @@ function defaultHandler(
 
 function renderFileDetailPage(fileId = "1") {
   return render(
-    <MemoryRouter initialEntries={[`/wanted/${fileId}`]}>
+    <MemoryRouter initialEntries={[`/files/${fileId}`]}>
       <Routes>
-        <Route path="/wanted/:fileId" element={<FileDetailPage />} />
+        <Route path="/files/:fileId" element={<FileDetailPage />} />
       </Routes>
     </MemoryRouter>,
   );
@@ -179,13 +181,11 @@ describe("FileDetailPage", () => {
     expect(screen.getByText("en, fr")).toBeInTheDocument();
   });
 
-  it("renders a not-found state when no wanted file matches the id", async () => {
-    mockFetchRouter(defaultHandler({ wanted: [] }));
+  it("renders a not-found state when the endpoint returns a 404", async () => {
+    mockFetchRouter(defaultHandler({ fileNotFound: true }));
     renderFileDetailPage("999");
 
-    expect(
-      await screen.findByText(/no tracked file with this id is currently in the wanted list/i),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/no tracked file exists with this id/i)).toBeInTheDocument();
   });
 
   it("renders an error state when the file fails to load", async () => {
@@ -472,14 +472,12 @@ describe("FileDetailPage", () => {
   it("shows a status-unavailable message when the file has no resolved Library node bridge", async () => {
     mockFetchRouter(
       defaultHandler({
-        wanted: [
-          {
-            ...wantedResponse[0],
-            library_node_id: null,
-            node_type: null,
-            tracked: null,
-          },
-        ],
+        file: {
+          ...fileResponse,
+          library_node_id: null,
+          node_type: null,
+          tracked: null,
+        },
       }),
     );
     renderFileDetailPage("1");

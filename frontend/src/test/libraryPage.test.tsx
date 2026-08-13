@@ -488,9 +488,9 @@ describe("LibraryPage (COL-100)", () => {
     fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
 
     // "Pilot" has a resolved file_id (900) -- same route WantedPage links to
-    // for the same file (`/wanted/:fileId`, matched against `WantedFile.id`).
+    // for the same file (`/files/:fileId`, COL-203).
     const pilotLink = await screen.findByRole("link", { name: /pilot/i });
-    expect(pilotLink).toHaveAttribute("href", "/wanted/900");
+    expect(pilotLink).toHaveAttribute("href", "/files/900");
 
     // "Cat's in the Bag..." has no file at all (has_file: false, file_id:
     // null) -- unaffected, no link.
@@ -595,7 +595,7 @@ describe("LibraryPage (COL-100)", () => {
     // "Interstellar" has a resolved file_id (901) -- same route WantedPage
     // links to for the same file.
     const interstellarLink = await screen.findByRole("link", { name: "Interstellar" });
-    expect(interstellarLink).toHaveAttribute("href", "/wanted/901");
+    expect(interstellarLink).toHaveAttribute("href", "/files/901");
 
     // "Dune: Part Two" has no file at all -- unaffected, no link.
     const duneRow = screen.getByText("Dune: Part Two").closest("tr") as HTMLElement;

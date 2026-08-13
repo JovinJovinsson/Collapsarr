@@ -200,7 +200,7 @@ export function WantedPage() {
                 return (
                   <tr key={file.id}>
                     <td className="wanted-table__title">
-                      <Link to={`/wanted/${file.id}`}>{titleFromPath(file.file_path)}</Link>
+                      <Link to={`/files/${file.id}`}>{titleFromPath(file.file_path)}</Link>
                     </td>
                     <td className="wanted-table__path">{file.file_path}</td>
                     <td>

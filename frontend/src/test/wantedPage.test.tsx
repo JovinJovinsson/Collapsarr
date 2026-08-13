@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { WantedPage } from "../pages/WantedPage";
 import type { WantedFile } from "../types/wanted";
 
-/** `WantedPage` links each row to `/wanted/:fileId` (COL-34), so it needs a router. */
+/** `WantedPage` links each row to `/files/:fileId` (COL-34, COL-203), so it needs a router. */
 function renderWantedPage() {
   return render(
     <MemoryRouter>
