@@ -62,3 +62,36 @@ export async function fetchAudioStreams(fileId: string | number): Promise<AudioS
   }
   return (await response.json()) as AudioStreamsResponse;
 }
+
+/**
+ * Poster metadata for a file (`GET /api/files/:id/poster`, COL-205).
+ *
+ * No Plex integration exists yet, so the backend always responds with
+ * `status: "placeholder"` / `poster_url: null` for a file that exists --
+ * this is a deliberately stable contract Phase 2 (COL-212) satisfies by
+ * populating `poster_url` and flipping `status` to `"available"`, without
+ * this shape (or how callers read it) needing to change.
+ */
+export interface FilePosterResponse {
+  file_id: number;
+  status: "available" | "placeholder";
+  poster_url: string | null;
+}
+
+/**
+ * Fetches poster metadata for a file (`GET /api/files/:id/poster`, COL-205).
+ *
+ * A poster is decorative, never load-bearing: `poster_url: null` is the
+ * normal (current-phase) response, not a failure, and any rejection here
+ * (network error, non-2xx, a malformed body) should be treated identically
+ * by callers -- fall back to the placeholder graphic, never surface an
+ * error state for a missing poster.
+ */
+export async function fetchFilePoster(fileId: string | number): Promise<FilePosterResponse> {
+  const response = await apiFetch(`/api/files/${encodeURIComponent(String(fileId))}/poster`);
+  if (!response.ok) {
+    const message = await apiErrorMessage(response, `Failed to load poster (${response.status})`);
+    throw new Error(message);
+  }
+  return (await response.json()) as FilePosterResponse;
+}

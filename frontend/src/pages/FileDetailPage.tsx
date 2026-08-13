@@ -1,9 +1,9 @@
-import { CakeSlice } from "lucide-react";
+import { CakeSlice, ImageOff } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { fetchJobHistory, triggerDownmix, triggerSetDefaultAudio } from "../api/activity";
-import { FileNotFoundError, fetchAudioStreams, fetchFileById } from "../api/files";
+import { FileNotFoundError, fetchAudioStreams, fetchFileById, fetchFilePoster } from "../api/files";
 import { updateTracked } from "../api/library";
 import { fetchSettings } from "../api/settings";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
@@ -44,6 +44,14 @@ type FileLoadState =
   | { status: "not-found" }
   | { status: "error"; message: string }
   | { status: "ready"; file: WantedFile };
+
+/**
+ * The poster slot's state (COL-205). Deliberately has no "error" variant --
+ * a poster is decorative, so a failed/placeholder fetch and a genuinely
+ * missing poster both render the same local placeholder graphic rather than
+ * surfacing an error to the user (see `fetchFilePoster`).
+ */
+type PosterLoadState = { status: "loading" } | { status: "ready"; url: string } | { status: "placeholder" };
 
 type HistoryLoadState =
   | { status: "loading" }
@@ -178,6 +186,7 @@ export function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
 
   const [fileState, setFileState] = useState<FileLoadState>({ status: "loading" });
+  const [posterState, setPosterState] = useState<PosterLoadState>({ status: "loading" });
   const [historyState, setHistoryState] = useState<HistoryLoadState>({ status: "loading" });
   const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
   const [audioStreamsState, setAudioStreamsState] = useState<AudioStreamsLoadState>({
@@ -218,6 +227,37 @@ export function FileDetailPage() {
           status: "error",
           message: error instanceof Error ? error.message : "Unknown error.",
         });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fileId]);
+
+  /**
+   * Loads this file's poster (`GET /api/files/:id/poster`, COL-205).
+   * Deliberately swallows every failure into the `"placeholder"` state
+   * rather than an error one -- a poster is decorative, so a missing poster
+   * (the only outcome in this phase, with no Plex integration yet) or a
+   * transient fetch failure both just fall back to the placeholder graphic.
+   */
+  useEffect(() => {
+    if (!fileId) {
+      setPosterState({ status: "placeholder" });
+      return;
+    }
+    let cancelled = false;
+    setPosterState({ status: "loading" });
+
+    fetchFilePoster(fileId)
+      .then((poster) => {
+        if (cancelled) return;
+        setPosterState(
+          poster.poster_url ? { status: "ready", url: poster.poster_url } : { status: "placeholder" },
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setPosterState({ status: "placeholder" });
       });
 
     return () => {
@@ -391,12 +431,36 @@ export function FileDetailPage() {
         <p className="file-detail__back">
           <Link to="/wanted">&larr; Back to Wanted</Link>
         </p>
-        <h1 className="view__title">
-          {fileState.status === "ready" ? titleFromPath(fileState.file.file_path) : "File detail"}
-        </h1>
-        {fileState.status === "ready" && (
-          <p className="view__summary file-detail__path">{fileState.file.file_path}</p>
-        )}
+        <div className="file-detail__header-main">
+          {fileState.status === "ready" && (
+            <div className="file-detail__poster">
+              {posterState.status === "ready" ? (
+                <img
+                  src={posterState.url}
+                  alt={`Poster for ${titleFromPath(fileState.file.file_path)}`}
+                  className="file-detail__poster-image"
+                  onError={() => setPosterState({ status: "placeholder" })}
+                />
+              ) : (
+                <div
+                  className="file-detail__poster-placeholder"
+                  role="img"
+                  aria-label="No poster available"
+                >
+                  <ImageOff width={28} height={28} aria-hidden />
+                </div>
+              )}
+            </div>
+          )}
+          <div>
+            <h1 className="view__title">
+              {fileState.status === "ready" ? titleFromPath(fileState.file.file_path) : "File detail"}
+            </h1>
+            {fileState.status === "ready" && (
+              <p className="view__summary file-detail__path">{fileState.file.file_path}</p>
+            )}
+          </div>
+        </div>
       </header>
 
       {fileState.status === "loading" && (

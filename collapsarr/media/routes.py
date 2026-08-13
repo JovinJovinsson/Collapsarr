@@ -29,6 +29,17 @@ corrupt, ffprobe unavailable) degrades to ``probeable=False`` with an
 unknown ``file_id``, but a *known* file that merely can't be probed right
 now is a ``200`` with an empty/unprobeable payload, not a failed request.
 
+A fourth endpoint, ``GET /api/files/{file_id}/poster`` (COL-205), returns
+poster metadata for a file. No Plex integration exists yet, so it always
+responds with the placeholder state (``status="placeholder"``,
+``poster_url=None``) for a ``file_id`` that resolves to a tracked file --
+this is a deliberately stable contract Phase 2 (COL-212) will satisfy by
+resolving a real Plex poster URL without changing the response shape, so the
+frontend never needs to change how it reads this endpoint. Like the other
+two, it raises ``404`` only when ``file_id`` itself doesn't resolve -- a
+*missing poster* is the normal state in this phase, not an error, and is
+never represented as one.
+
 The "wanted-list" is every tracked file missing at least one *currently
 enabled* target -- the same notion Sonarr/Radarr's ``/wanted/missing`` view
 expresses. Which targets count as enabled is read live from the persisted
@@ -57,6 +68,7 @@ is exactly the ``node_id`` reference the row toggle
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -143,6 +155,22 @@ class AudioStreamsResponse(BaseModel):
     probeable: bool
     error: str | None = None
     streams: list[AudioStreamOut] = []
+
+
+class FilePosterResponse(BaseModel):
+    """Poster metadata for a tracked file (COL-205).
+
+    No Plex integration exists yet, so ``status`` is always
+    ``"placeholder"`` and ``poster_url`` is always ``None`` in this phase --
+    this shape is a deliberately stable contract: Phase 2 (COL-212) resolves
+    a real Plex poster URL by populating ``poster_url`` and flipping
+    ``status`` to ``"available"``, without changing this shape or requiring
+    any frontend change to consume it.
+    """
+
+    file_id: int
+    status: Literal["available", "placeholder"]
+    poster_url: str | None = None
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -288,3 +316,25 @@ def get_file_audio_streams_endpoint(
         probeable=True,
         streams=[AudioStreamOut.from_probe(stream) for stream in streams],
     )
+
+
+@router.get("/files/{file_id}/poster", response_model=FilePosterResponse)
+def get_file_poster_endpoint(
+    file_id: int, session: Session = Depends(get_session)
+) -> FilePosterResponse:
+    """Return poster metadata for a tracked file (COL-205).
+
+    No Plex integration exists yet, so this always returns the placeholder
+    state (``status="placeholder"``, ``poster_url=None``) for a ``file_id``
+    that resolves to a tracked file -- see the module docstring and
+    :class:`FilePosterResponse` for why this shape is deliberately stable
+    across the Phase 2 (COL-212) swap. Raises ``404`` only when ``file_id``
+    itself was never valid or no longer exists, matching
+    ``GET /api/files/{file_id}`` (COL-203) -- a missing *poster* is not an
+    error condition in this phase and is never surfaced as one.
+    """
+    media = get_tracked_media_by_id(session, file_id)
+    if media is None:
+        raise HTTPException(status_code=404, detail=f"No tracked file with id={file_id}.")
+
+    return FilePosterResponse(file_id=media.id, status="placeholder", poster_url=None)
