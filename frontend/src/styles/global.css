@@ -1230,6 +1230,43 @@ a {
   word-break: break-all;
 }
 
+/* Poster slot (COL-205): backend has no Plex integration yet, so the
+   placeholder graphic (an icon over a tinted box) is the normal state, not
+   an error/loading fallback specifically -- see FileDetailPage's
+   `posterState`. */
+.file-detail__header-main {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-4);
+}
+
+.file-detail__poster {
+  flex-shrink: 0;
+  width: 96px;
+  aspect-ratio: 2 / 3;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+}
+
+.file-detail__poster-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.file-detail__poster-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--c-text-muted);
+  background: var(--c-accent-tint);
+}
+
 .file-detail__panel {
   padding: var(--sp-5);
   margin-bottom: var(--sp-4);
@@ -1583,15 +1620,6 @@ a {
   .app-shell__content {
     padding: var(--sp-4);
   }
-}
-
-/* ---- System nav section + Backups page (COL-63) ------------------------ */
-
-/* System (COL-141) renders through `NavSection` now, styled like every other
-   `sidebar__nav-group`; this modifier just keeps the visual gap the old
-   always-visible `.sidebar__section` label gave it above the primary items. */
-.sidebar__nav-group--system {
-  margin-top: var(--sp-4);
 }
 
 /* Header variant that seats page-level actions beside the title block. */

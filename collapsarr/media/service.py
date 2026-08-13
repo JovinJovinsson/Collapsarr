@@ -92,6 +92,17 @@ def get_tracked_media(session: Session, file_path: str | Path) -> TrackedMediaFi
     ).one_or_none()
 
 
+def get_tracked_media_by_id(session: Session, media_id: int) -> TrackedMediaFile | None:
+    """Return the tracked media row for ``media_id``, or ``None`` if it doesn't exist.
+
+    The single-file lookup path (COL-203, ``GET /api/files/{id}``): looks up
+    by primary key rather than ``file_path``, independent of whether the file
+    currently qualifies for :func:`list_files_missing_targets` (a
+    fully-processed file with no missing targets still resolves here).
+    """
+    return session.get(TrackedMediaFile, media_id)
+
+
 def list_tracked_media(session: Session) -> list[TrackedMediaFile]:
     """Return every tracked media file, ordered by id (insertion order)."""
     return list(session.scalars(select(TrackedMediaFile).order_by(TrackedMediaFile.id)))

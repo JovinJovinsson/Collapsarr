@@ -43,7 +43,8 @@ function renderWithSettingsNav(path: string) {
  * COL-142 established this suite; COL-143 (Targets/Connect) and COL-144
  * (Sonarr/Radarr, plus the composed `SettingsPage`'s removal) extended it.
  * COL-146 (Phase 2) appended Scheduler as the sixth entry; COL-147 appends
- * Logging as the seventh and last. Settings is now fully migrated --
+ * Logging as the seventh; COL-209 (Phase 2) inserts Plex after Radarr,
+ * alongside the other connection pages. Settings is now fully migrated --
  * `/settings` is a bare redirect to `/settings/general` (mirroring
  * `/system` -> `/system/tasks`), so the `NavSection` `to`/expand-base
  * tension COL-142's review flagged (the sidebar staying collapsed while the
@@ -52,9 +53,18 @@ function renderWithSettingsNav(path: string) {
  * exactly like System's `to={SYSTEM_PATH}`, so every `/settings/*` route
  * expands the group correctly.
  */
-describe("Settings navigation (COL-142, COL-143, COL-144, COL-146, COL-147)", () => {
-  it("orders settingsNavItems as General, Sonarr, Radarr, Targets, Connect, Scheduler, Logging", () => {
-    const expectedOrder = ["General", "Sonarr", "Radarr", "Targets", "Connect", "Scheduler", "Logging"];
+describe("Settings navigation (COL-142, COL-143, COL-144, COL-146, COL-147, COL-209)", () => {
+  it("orders settingsNavItems as General, Sonarr, Radarr, Plex, Targets, Connect, Scheduler, Logging", () => {
+    const expectedOrder = [
+      "General",
+      "Sonarr",
+      "Radarr",
+      "Plex",
+      "Targets",
+      "Connect",
+      "Scheduler",
+      "Logging",
+    ];
     const actualOrder = settingsNavItems.map((item) => item.label);
 
     expect(actualOrder).toEqual(expectedOrder);
@@ -89,14 +99,15 @@ describe("Settings navigation (COL-142, COL-143, COL-144, COL-146, COL-147)", ()
     // systemNav.test.tsx's equivalent assertion.
     const settingsHrefs = new Set(settingsNavItems.map((item) => item.to));
     const settingsLinks = links.filter((link) => settingsHrefs.has(link.getAttribute("href") ?? ""));
-    expect(settingsLinks).toHaveLength(7);
+    expect(settingsLinks).toHaveLength(8);
     expect(settingsLinks[0]).toHaveTextContent("General");
     expect(settingsLinks[1]).toHaveTextContent("Sonarr");
     expect(settingsLinks[2]).toHaveTextContent("Radarr");
-    expect(settingsLinks[3]).toHaveTextContent("Targets");
-    expect(settingsLinks[4]).toHaveTextContent("Connect");
-    expect(settingsLinks[5]).toHaveTextContent("Scheduler");
-    expect(settingsLinks[6]).toHaveTextContent("Logging");
+    expect(settingsLinks[3]).toHaveTextContent("Plex");
+    expect(settingsLinks[4]).toHaveTextContent("Targets");
+    expect(settingsLinks[5]).toHaveTextContent("Connect");
+    expect(settingsLinks[6]).toHaveTextContent("Scheduler");
+    expect(settingsLinks[7]).toHaveTextContent("Logging");
   });
 
   // COL-142/COL-144: Settings renders through the shared `NavSection`

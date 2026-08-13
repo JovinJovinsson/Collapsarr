@@ -1,0 +1,12 @@
+{
+  "MediaContainer": {
+    "size": 0,
+    "allowSync": true,
+    "friendlyName": "Media Server",
+    "machineIdentifier": "abc123def456",
+    "myPlex": true,
+    "platform": "Linux",
+    "platformVersion": "22.04",
+    "version": "1.32.5.7349-8f4248874"
+  }
+}

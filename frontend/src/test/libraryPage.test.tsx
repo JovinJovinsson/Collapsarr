@@ -488,9 +488,9 @@ describe("LibraryPage (COL-100)", () => {
     fireEvent.click(await screen.findByRole("button", { name: /season 1/i }));
 
     // "Pilot" has a resolved file_id (900) -- same route WantedPage links to
-    // for the same file (`/wanted/:fileId`, matched against `WantedFile.id`).
+    // for the same file (`/files/:fileId`, COL-203).
     const pilotLink = await screen.findByRole("link", { name: /pilot/i });
-    expect(pilotLink).toHaveAttribute("href", "/wanted/900");
+    expect(pilotLink).toHaveAttribute("href", "/files/900");
 
     // "Cat's in the Bag..." has no file at all (has_file: false, file_id:
     // null) -- unaffected, no link.
@@ -595,7 +595,7 @@ describe("LibraryPage (COL-100)", () => {
     // "Interstellar" has a resolved file_id (901) -- same route WantedPage
     // links to for the same file.
     const interstellarLink = await screen.findByRole("link", { name: "Interstellar" });
-    expect(interstellarLink).toHaveAttribute("href", "/wanted/901");
+    expect(interstellarLink).toHaveAttribute("href", "/files/901");
 
     // "Dune: Part Two" has no file at all -- unaffected, no link.
     const duneRow = screen.getByText("Dune: Part Two").closest("tr") as HTMLElement;
@@ -965,6 +965,7 @@ describe("LibraryPage (COL-100)", () => {
                 file_path: "/media/breaking-bad-s1e2.mkv",
                 enqueued: false,
                 job: null,
+                skip_reason: "already_correct",
               },
             ],
           });
@@ -1016,10 +1017,10 @@ describe("LibraryPage (COL-100)", () => {
     });
 
     // The trigger response's real, synchronously-known result is surfaced --
-    // one job enqueued, one file already correct/skipped -- not a fabricated
-    // claim that the column values already updated.
+    // one job enqueued, one file skipped for a specific reason -- not a
+    // fabricated claim that the column values already updated.
     expect(
-      await screen.findByText(/1 job enqueued, 1 already correct or skipped/i),
+      await screen.findByText(/1 job enqueued, 1 skipped \(already correct\)/i),
     ).toBeInTheDocument();
 
     // The refetch landed (the tree endpoint was hit again after the trigger)
@@ -1032,6 +1033,72 @@ describe("LibraryPage (COL-100)", () => {
     expect(treeCallCount).toBeGreaterThanOrEqual(2);
     const siblingRowAfter = (await screen.findByText(/cat's in the bag/i)).closest("tr") as HTMLElement;
     expect(within(siblingRowAfter).getByText("Unknown")).toBeInTheDocument();
+  });
+
+  it("breaks the skipped count down per skip reason in the bulk Set Default Audio Track summary (COL-208)", async () => {
+    // Four resolved files, each landing in a distinct bucket: one enqueued,
+    // and one skipped file per DefaultAudioSkipReason (COL-207) except
+    // `no_preference` -- covers a mixed, multi-reason response rather than
+    // just the single-reason case the "applies the bulk..." test already
+    // exercises.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === "/api/instances") return jsonResponse([sonarrInstance]);
+        if (/^\/api\/library\/instances\/\d+\/tree$/.test(url)) return jsonResponse(seriesTree);
+        if (url === "/api/jobs/trigger-default-audio/bulk" && init?.method === "POST") {
+          return jsonResponse({
+            results: [
+              {
+                file_path: "/media/breaking-bad-s1e1.mkv",
+                enqueued: true,
+                job: { id: "job-1", file_path: "/media/breaking-bad-s1e1.mkv", status: "pending" },
+              },
+              {
+                file_path: "/media/breaking-bad-s1e2.mkv",
+                enqueued: false,
+                job: null,
+                skip_reason: "duplicate",
+              },
+              {
+                file_path: "/media/breaking-bad-s1e3.mkv",
+                enqueued: false,
+                job: null,
+                skip_reason: "duplicate",
+              },
+              {
+                file_path: "/media/breaking-bad-s1e4.mkv",
+                enqueued: false,
+                job: null,
+                skip_reason: "already_correct",
+              },
+              {
+                file_path: "/media/breaking-bad-s1e5.mkv",
+                enqueued: false,
+                job: null,
+                skip_reason: "unprobeable",
+              },
+            ],
+          });
+        }
+        throw new Error(`Unhandled request in test mock: ${String(init?.method ?? "GET")} ${url}`);
+      }),
+    );
+    renderLibraryPage(1);
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: /select breaking bad$/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /set default audio track/i }));
+    });
+
+    // One count per reason, in `DEFAULT_AUDIO_SKIP_REASONS` order
+    // (`types/activity.ts`) -- `already_correct` before `unprobeable` before
+    // `duplicate` -- not response order, so repeat runs read consistently.
+    expect(
+      await screen.findByText(
+        /1 job enqueued, 1 skipped \(already correct\), 1 skipped \(unprobeable\), 2 skipped \(duplicate\)/i,
+      ),
+    ).toBeInTheDocument();
   });
 
   it("shows an inline error, distinct from the Tracked error, when the bulk Set Default Audio Track request fails (COL-158)", async () => {

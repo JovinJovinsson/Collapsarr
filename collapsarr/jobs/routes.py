@@ -69,7 +69,13 @@ Eleven endpoints, each wrapping an existing service without adding new job logic
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`,
   COL-155), mirroring ``POST /api/jobs/trigger``'s shape: same request
   (a bare ``file_path``), same response shape (``enqueued`` + the job, or
-  ``enqueued=False``/``job=null`` when the file needs no change).
+  ``enqueued=False``/``job=null`` when the file needs no change). As of
+  COL-206 it also always bypasses the Recently-Processed Window (COL-167) --
+  a behavior change from before, when it respected the window like every
+  other trigger -- matching ``POST /api/jobs/trigger``'s own COL-170
+  behavior: an explicit single-file trigger is now always a deliberate
+  request that overrides the cooldown, not silently no-op'd by an unrelated
+  prior job (e.g. a ``DOWNMIX`` job) on the same file.
 - ``POST /api/jobs/trigger-default-audio/bulk`` -- the multi-select
   counterpart of the above (COL-156): accepts one or more Library
   ``{node_type, node_id}`` references (the same shape
@@ -83,7 +89,12 @@ Eleven endpoints, each wrapping an existing service without adding new job logic
   :meth:`~collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`
   once per resulting file -- always against the current global Preferred
   Default Audio setting; there is no per-call override, unlike
-  ``trigger``'s ``extra_languages``.
+  ``trigger``'s ``extra_languages``. Unlike the single-file endpoint above,
+  this one does **not** pass ``bypass_dedup_window`` (COL-206) -- it still
+  respects the Recently-Processed Window, the same rationale as ``POST
+  /api/jobs/requeue-failed``'s bulk behavior: a bulk trigger across a
+  multi-select is closer in spirit to the automatic paths the window
+  protects against than to one explicit single-file action.
 - ``DELETE /api/jobs/{job_id}`` -- cancels one specific Job, ``PENDING`` or
   ``RUNNING`` (COL-168; hard-kill COL-192)
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.cancel_job`). Cancelling a
@@ -155,7 +166,7 @@ from ..media.service import list_tracked_media_by_instance
 from .history import list_job_history, list_queue_jobs
 from .models import JobHistory
 from .queue import Job, JobKind, JobStatus
-from .scheduler import JobScheduler
+from .scheduler import DefaultAudioSkipReason, JobScheduler
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 
@@ -329,19 +340,25 @@ class SetDefaultAudioTriggerRequest(BaseModel):
 
 
 class SetDefaultAudioTriggerResult(BaseModel):
-    """Response for ``POST /api/jobs/trigger-default-audio`` (COL-155).
+    """Response for ``POST /api/jobs/trigger-default-audio`` (COL-155; ``skip_reason`` COL-207).
 
     ``enqueued`` is ``True`` with the created ``job`` when a
-    ``SET_DEFAULT_AUDIO`` job was queued. It is ``False`` with ``job`` ``null``
-    when the file was skipped -- no Default Audio Track preference is
-    configured, a duplicate (already queued / recently processed), unprobeable,
-    or the file already carries the correct disposition -- mirroring
-    :meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`
-    returning ``None``.
+    ``SET_DEFAULT_AUDIO`` job was queued, and ``skip_reason`` is ``null``. It
+    is ``False`` with ``job`` ``null`` when the file was skipped, and
+    ``skip_reason`` names which :class:`~collapsarr.jobs.scheduler.
+    DefaultAudioSkipReason` explains why -- no Default Audio Track preference
+    is configured, a duplicate (already queued / recently processed --
+    reachable here only via the still-unbypassable active-job check, since
+    this endpoint always bypasses the Recently-Processed Window, COL-206),
+    unprobeable, or the file already carries the correct disposition --
+    mirroring :meth:`collapsarr.jobs.scheduler.JobScheduler.
+    trigger_set_default_audio` returning a :class:`~collapsarr.jobs.
+    scheduler.SetDefaultAudioOutcome`.
     """
 
     enqueued: bool
     job: EnqueuedJob | None
+    skip_reason: DefaultAudioSkipReason | None = None
 
 
 class DefaultAudioNodeReference(BaseModel):
@@ -372,18 +389,21 @@ class BulkSetDefaultAudioTriggerRequest(BaseModel):
     references: list[DefaultAudioNodeReference] = Field(min_length=1)
 
 
-class FileSetDefaultAudioResult(BaseModel):
-    """One resolved file's outcome within a bulk trigger response (COL-156).
+class FileSetDefaultAudioResult(SetDefaultAudioTriggerResult):
+    """One resolved file's outcome within a bulk trigger response (COL-156; COL-207 skip_reason).
 
-    Mirrors :class:`SetDefaultAudioTriggerResult`'s ``enqueued``/``job``
-    pair, per file, plus the ``file_path`` identifying which resolved file
-    this result belongs to (the bulk response has no other way to attribute
-    an outcome back to a specific file).
+    Extends :class:`SetDefaultAudioTriggerResult` with the ``file_path``
+    identifying which resolved file this result belongs to (the bulk
+    response has no other way to attribute an outcome back to a specific
+    file) -- so the two response shapes share one definition of the
+    ``enqueued``/``job``/``skip_reason`` triple rather than two copies that
+    could drift. Unlike the single-file endpoint, this one never bypasses
+    the Recently-Processed Window, so ``skip_reason=DUPLICATE`` here can
+    mean either the active-job check or the window -- see
+    :class:`~collapsarr.jobs.scheduler.DefaultAudioSkipReason`.
     """
 
     file_path: str
-    enqueued: bool
-    job: EnqueuedJob | None
 
 
 class BulkSetDefaultAudioTriggerResult(BaseModel):
@@ -713,11 +733,22 @@ def manual_set_default_audio_trigger_endpoint(
     enqueued; the ``enqueued`` flag distinguishes the two (a skipped file --
     no preference configured, duplicate, unprobeable, or already correct --
     is not an error).
+
+    Always passes ``bypass_dedup_window=True`` (COL-206), matching ``POST
+    /api/jobs/trigger``'s "Trigger downmix" behavior: an explicit single-file
+    "Set Default Audio Track" click is a deliberate request that overrides
+    the Recently-Processed Window cooldown, so it is never silently no-op'd
+    by an unrelated prior job (e.g. a ``DOWNMIX`` job) on the same file. The
+    window is the only thing bypassed; the "does this file need anything"
+    gate is unchanged, so a file that's already correct is still skipped.
+    The bulk endpoint below is unaffected -- it still respects the window.
     """
-    job = scheduler.trigger_set_default_audio(body.file_path)
-    if job is None:
-        return SetDefaultAudioTriggerResult(enqueued=False, job=None)
-    return SetDefaultAudioTriggerResult(enqueued=True, job=EnqueuedJob.from_job(job))
+    outcome = scheduler.trigger_set_default_audio(body.file_path, bypass_dedup_window=True)
+    if outcome.job is None:
+        return SetDefaultAudioTriggerResult(
+            enqueued=False, job=None, skip_reason=outcome.skip_reason
+        )
+    return SetDefaultAudioTriggerResult(enqueued=True, job=EnqueuedJob.from_job(outcome.job))
 
 
 @router.post(
@@ -753,13 +784,20 @@ def bulk_set_default_audio_trigger_endpoint(
 
     results: list[FileSetDefaultAudioResult] = []
     for file_path in file_paths:
-        job = scheduler.trigger_set_default_audio(file_path, session=session)
-        if job is None:
-            results.append(FileSetDefaultAudioResult(file_path=file_path, enqueued=False, job=None))
+        outcome = scheduler.trigger_set_default_audio(file_path, session=session)
+        if outcome.job is None:
+            results.append(
+                FileSetDefaultAudioResult(
+                    file_path=file_path,
+                    enqueued=False,
+                    job=None,
+                    skip_reason=outcome.skip_reason,
+                )
+            )
         else:
             results.append(
                 FileSetDefaultAudioResult(
-                    file_path=file_path, enqueued=True, job=EnqueuedJob.from_job(job)
+                    file_path=file_path, enqueued=True, job=EnqueuedJob.from_job(outcome.job)
                 )
             )
 

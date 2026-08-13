@@ -94,14 +94,69 @@ export interface SetDefaultAudioTriggerRequest {
   file_path: string;
 }
 
+/** Matches `collapsarr.jobs.scheduler.DefaultAudioSkipReason`'s enum values (COL-207). */
+export type DefaultAudioSkipReason =
+  | "no_preference"
+  | "already_correct"
+  | "unprobeable"
+  | "duplicate";
+
+/**
+ * Human-readable explanation for each {@link DefaultAudioSkipReason} (COL-207)
+ * -- shared by File Detail's single-file result message and, once COL-208
+ * lands, the Library page's bulk-result-summary breakdown, so the wording
+ * stays consistent between the two "Set Default Audio Track" entry points.
+ */
+export const DEFAULT_AUDIO_SKIP_REASON_MESSAGE: Record<DefaultAudioSkipReason, string> = {
+  no_preference: "No Preferred Default Audio setting is configured yet.",
+  already_correct: "This file's Default Audio Track is already set correctly.",
+  unprobeable: "The file's audio streams could not be probed.",
+  duplicate: "A job for this file is already queued, running, or was processed too recently.",
+};
+
+/**
+ * Short, lowercase label for each {@link DefaultAudioSkipReason} (COL-208) --
+ * fits inline in a bulk-result count like "2 skipped (duplicate)", unlike
+ * {@link DEFAULT_AUDIO_SKIP_REASON_MESSAGE}'s full sentences, which are
+ * written for a single-file result paragraph instead. The Library page's
+ * bulk "Set Default Audio Track" summary uses this to break its skipped
+ * count down per reason.
+ */
+export const DEFAULT_AUDIO_SKIP_REASON_SHORT_LABEL: Record<DefaultAudioSkipReason, string> = {
+  no_preference: "no preference configured",
+  already_correct: "already correct",
+  unprobeable: "unprobeable",
+  duplicate: "duplicate",
+};
+
+/**
+ * Stable enumeration order for {@link DefaultAudioSkipReason} (COL-208) --
+ * drives the order per-reason counts appear in the Library page's bulk
+ * "Set Default Audio Track" summary, so repeat runs render deterministically
+ * rather than depending on `Map`/object key insertion order of whichever
+ * reasons happened to appear in a given response.
+ */
+export const DEFAULT_AUDIO_SKIP_REASONS: readonly DefaultAudioSkipReason[] = [
+  "no_preference",
+  "already_correct",
+  "unprobeable",
+  "duplicate",
+];
+
 /**
  * Response for `POST /api/jobs/trigger-default-audio` (COL-155,
- * `SetDefaultAudioTriggerResult`). Same shape as {@link ManualTriggerResult}:
- * `enqueued` is `true` with the created `job` when a `SET_DEFAULT_AUDIO` job
- * was queued, `false` with `job` `null` when the file was skipped -- no
- * preference configured, a duplicate, unprobeable, or already correct.
+ * `SetDefaultAudioTriggerResult`; `skip_reason` COL-207). `enqueued` is
+ * `true` with the created `job` when a `SET_DEFAULT_AUDIO` job was queued
+ * (`skip_reason` is `null`). It is `false` with `job` `null` when the file
+ * was skipped, and `skip_reason` names which {@link DefaultAudioSkipReason}
+ * explains why -- no preference configured, a duplicate, unprobeable, or
+ * already correct.
  */
-export type SetDefaultAudioTriggerResult = ManualTriggerResult;
+export interface SetDefaultAudioTriggerResult {
+  enqueued: boolean;
+  job: EnqueuedJob | null;
+  skip_reason: DefaultAudioSkipReason | null;
+}
 
 /**
  * Request body for `POST /api/jobs/trigger-default-audio/bulk` (COL-156,
@@ -121,15 +176,16 @@ export interface BulkSetDefaultAudioTriggerRequest {
 
 /**
  * One resolved file's outcome within a bulk trigger response (COL-156,
- * `FileSetDefaultAudioResult`). Mirrors {@link SetDefaultAudioTriggerResult}'s
- * `enqueued`/`job` pair, per file, plus the `file_path` identifying which
- * resolved file this result belongs to -- a bulk selection can cascade to
- * several files, so there's no other way to attribute an outcome back to one.
+ * `FileSetDefaultAudioResult`; `skip_reason` COL-207). Extends
+ * {@link SetDefaultAudioTriggerResult} with the `file_path` identifying
+ * which resolved file this result belongs to -- a bulk selection can
+ * cascade to several files, so there's no other way to attribute an
+ * outcome back to one -- so the two response shapes share one definition
+ * of the `enqueued`/`job`/`skip_reason` triple rather than two copies that
+ * could drift.
  */
-export interface FileSetDefaultAudioResult {
+export interface FileSetDefaultAudioResult extends SetDefaultAudioTriggerResult {
   file_path: string;
-  enqueued: boolean;
-  job: EnqueuedJob | null;
 }
 
 /**
