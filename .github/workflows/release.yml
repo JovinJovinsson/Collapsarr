@@ -5,6 +5,14 @@
 #   2. test-*             — backend (pytest/ruff/mypy) + frontend (vitest/tsc/
 #                           eslint); any failure fails the pipeline before
 #                           anything is published.
+#   2b. verify-ffmpeg-manifest — real-network check (COL-217) that every
+#                           (platform, arch) pin in
+#                           collapsarr/ffmpeg_download/manifest.json still
+#                           resolves and checksum-verifies, per ADR 0002.
+#                           Deliberately separate from test-backend: this is
+#                           the one job in the pipeline allowed to hit the
+#                           real network (BtbN/FFmpeg-Builds + evermeet.cx);
+#                           the unit tests use httpx.MockTransport only.
 #   3. build-wheel        — build the frontend FIRST, then `python -m build` so
 #                           the wheel bundles frontend/dist -> collapsarr/static
 #                           (COL-40).
@@ -125,12 +133,35 @@ jobs:
       - name: Test
         run: npm run test
 
+  # ---- Verify the FFmpeg download manifest (release-blocking, COL-217) --------
+  # Every (platform, arch) pin in collapsarr/ffmpeg_download/manifest.json
+  # must still resolve and checksum-verify before a release ships -- catches
+  # a rotated/removed upstream asset or a stale sha256 pin before it reaches
+  # a user's FFmpeg auto-download (ADR 0002: "CI verifying the pin resolves
+  # for every target platform/arch before shipping"). Makes real network
+  # calls against BtbN/FFmpeg-Builds + evermeet.cx -- deliberately NOT part
+  # of test-backend's `pytest` run, which uses httpx.MockTransport only
+  # (tests/test_ffmpeg_download_client.py).
+  verify-ffmpeg-manifest:
+    name: Verify FFmpeg manifest (real network)
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install backend
+        run: pip install -e .
+      - name: Verify every manifest entry resolves + checksum-verifies
+        run: python -m collapsarr.ffmpeg_download.verify_manifest
+
   # ---- Build the wheel + sdist ------------------------------------------------
   # Order matters: the frontend is built FIRST so frontend/dist exists when
   # `python -m build` runs, otherwise the wheel ships without the UI (COL-40).
   build-wheel:
     name: Build wheel + sdist
-    needs: [test-backend, test-frontend]
+    needs: [test-backend, test-frontend, verify-ffmpeg-manifest]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -178,7 +209,7 @@ jobs:
   # ---- Multi-arch Docker image build & push -----------------------------------
   docker:
     name: Build & push multi-arch image
-    needs: [test-backend, test-frontend]
+    needs: [test-backend, test-frontend, verify-ffmpeg-manifest]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
