@@ -23,7 +23,13 @@ from collapsarr.health import DiskUsage
 from collapsarr.main import create_app
 from collapsarr.settings.service import get_global_settings
 
-EXPECTED_TASK_NAMES = ["Library scan", "Health checks", "Backups", "Update check"]
+EXPECTED_TASK_NAMES = [
+    "Library scan",
+    "Health checks",
+    "Backups",
+    "Update check",
+    "Plex Sync",
+]
 
 
 class _FakeUsage(NamedTuple):
@@ -95,6 +101,8 @@ def test_interval_labels_reflect_each_tasks_configured_cadence(client: TestClien
     assert by_name["Backups"]["interval_label"] == "Every 7 days"
     # UpdateCheckScheduler.INTERVAL_SECONDS is a fixed 24h.
     assert by_name["Update check"]["interval_label"] == "Every 24 hours"
+    # PlexSyncScheduler.INTERVAL_SECONDS is a fixed weekly cadence.
+    assert by_name["Plex Sync"]["interval_label"] == "Every 1 week"
 
 
 # --------------------------------------------------------------------------- #
@@ -133,6 +141,14 @@ def test_disabled_scheduler_and_never_run_tasks_report_null_next_run(client: Tes
     assert update_check["last_run_at"] is not None
     assert update_check["next_run_at"] is None
 
+    # Plex Sync is wired unconditionally (so "Run now" always has a target) but
+    # -- unlike Health/Update -- takes no synchronous startup tick, so with the
+    # loop disabled it has neither run nor a computed next run.
+    plex_sync = by_name["Plex Sync"]
+    assert plex_sync["scheduler_enabled"] is False
+    assert plex_sync["last_run_at"] is None
+    assert plex_sync["next_run_at"] is None
+
 
 # --------------------------------------------------------------------------- #
 # enable_scheduler=True: a real run computes a genuine next_run_at
@@ -159,6 +175,7 @@ def test_enabled_scheduler_reports_true_and_a_real_run_computes_next_run_at(
         )
         assert test_client.post("/api/system/backup", headers=headers).status_code == 202
         assert test_client.post("/api/system/updates/recheck", headers=headers).status_code == 200
+        assert test_client.post("/api/plex/sync", headers=headers).status_code == 202
 
         body = test_client.get("/api/system/tasks", headers=headers).json()
         by_name = {row["name"]: row for row in body}

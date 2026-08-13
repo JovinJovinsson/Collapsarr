@@ -1,7 +1,14 @@
 import { ListChecks } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { fetchTasks, runBackup, runHealthChecks, runLibraryScan, runUpdateCheck } from "../api/tasks";
+import {
+  fetchTasks,
+  runBackup,
+  runHealthChecks,
+  runLibraryScan,
+  runPlexSync,
+  runUpdateCheck,
+} from "../api/tasks";
 import type { ScheduledTask } from "../types/tasks";
 
 /** Formats an ISO timestamp in the viewer's local time, or an em dash when absent/unparseable. */
@@ -28,14 +35,15 @@ const TASK_RUNNERS: Record<string, () => Promise<void>> = {
   "Health checks": runHealthChecks,
   Backups: runBackup,
   "Update check": runUpdateCheck,
+  "Plex Sync": runPlexSync,
 };
 
 /**
  * The System → Tasks view (COL-122): the Scheduled Task registry -- one row
  * per background scheduler (library scan, health checks, backups, update
- * check; `CONTEXT.md`'s "Scheduled Task") with its cadence, next execution
- * time, and a manual "Run" action, sourced from `GET /api/system/tasks`
- * (`fetchTasks`, `collapsarr/system/tasks.py`).
+ * check, Plex sync; `CONTEXT.md`'s "Scheduled Task") with its cadence, next
+ * execution time, and a manual "Run" action, sourced from
+ * `GET /api/system/tasks` (`fetchTasks`, `collapsarr/system/tasks.py`).
  *
  * "Next Execution" reads `—` when the server reports `next_run_at: null`:
  * that happens either because the task's scheduler isn't currently running
@@ -109,8 +117,8 @@ export function TasksPage() {
           <h1 className="view__title">Tasks</h1>
           <p className="view__summary">
             Every background Scheduled Task Collapsarr runs on a cadence — library scan, health
-            checks, backups, and the update check — with its next execution time and a manual
-            trigger.
+            checks, backups, the update check, and Plex sync — with its next execution time and a
+            manual trigger.
           </p>
         </div>
       </header>

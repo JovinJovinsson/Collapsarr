@@ -96,14 +96,18 @@ _POST_BASELINE_INDEXES: tuple[str, ...] = (
 )
 
 #: Whole tables a post-baseline migration adds (COL-75's ``health_check_state``,
-#: COL-80's ``health_write_probe``) -- dropped after ``create_all`` for the same
-#: reason as ``_POST_BASELINE_COLUMNS``, so the migration that creates them does
-#: not collide with a table ``create_all`` already built.
+#: COL-80's ``health_write_probe``, COL-98's ``library_nodes``, COL-209's
+#: ``plex_connection``, COL-210's ``plex_library_items``) -- dropped after
+#: ``create_all`` for the same reason as ``_POST_BASELINE_COLUMNS``, so the
+#: migration that creates them does not collide with a table ``create_all``
+#: already built.
 _POST_BASELINE_TABLES: tuple[str, ...] = (
     "health_check_state",
     "health_write_probe",
     "update_check_state",
     "library_nodes",
+    "plex_connection",
+    "plex_library_items",
 )
 
 

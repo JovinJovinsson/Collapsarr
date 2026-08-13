@@ -664,6 +664,78 @@ def test_no_failure_notifier_configured_is_a_noop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# plex_analyzer hook (COL-211): called only for a job that reached SUCCEEDED.
+# ---------------------------------------------------------------------------
+
+
+def test_plex_analyzer_is_called_for_a_succeeded_job() -> None:
+    analyzed: list[Job] = []
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS), plex_analyzer=analyzed.append)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    queue.wait_idle()
+
+    assert analyzed == [job]
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_plex_analyzer_is_not_called_for_a_failed_job() -> None:
+    analyzed: list[Job] = []
+    queue = JobQueue(pipeline_runner=_stub_runner(_FAILED), plex_analyzer=analyzed.append)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    queue.wait_idle()
+
+    assert analyzed == []
+
+
+def test_plex_analyzer_is_not_called_when_the_runner_raises_unexpectedly() -> None:
+    """An unexpected runner exception fails the job -- FAILED, not SUCCEEDED -- so
+    plex_analyzer (success-gated, unlike failure_notifier) must not fire for it."""
+
+    def raising_runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        raise RuntimeError("boom")
+
+    analyzed: list[Job] = []
+    queue = JobQueue(pipeline_runner=raising_runner, plex_analyzer=analyzed.append)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    queue.wait_idle()
+
+    assert analyzed == []
+    assert job.status is JobStatus.FAILED
+
+
+def test_a_raising_plex_analyzer_does_not_fail_the_job_or_the_worker() -> None:
+    """AC: a deliberately raising plex_analyzer must never fail the job or hang the queue."""
+
+    def raising_analyzer(job: Job) -> None:
+        raise RuntimeError("plex unreachable")
+
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS), plex_analyzer=raising_analyzer)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True  # must not hang or crash the worker
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_no_plex_analyzer_configured_is_a_noop() -> None:
+    """Default (no plex_analyzer passed) behaves exactly as before COL-211."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+# ---------------------------------------------------------------------------
 # Job lifecycle logging (COL-129): INFO on start/success, ERROR on a crash.
 # ---------------------------------------------------------------------------
 

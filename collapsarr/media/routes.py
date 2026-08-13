@@ -29,16 +29,35 @@ corrupt, ffprobe unavailable) degrades to ``probeable=False`` with an
 unknown ``file_id``, but a *known* file that merely can't be probed right
 now is a ``200`` with an empty/unprobeable payload, not a failed request.
 
-A fourth endpoint, ``GET /api/files/{file_id}/poster`` (COL-205), returns
-poster metadata for a file. No Plex integration exists yet, so it always
-responds with the placeholder state (``status="placeholder"``,
-``poster_url=None``) for a ``file_id`` that resolves to a tracked file --
-this is a deliberately stable contract Phase 2 (COL-212) will satisfy by
-resolving a real Plex poster URL without changing the response shape, so the
-frontend never needs to change how it reads this endpoint. Like the other
-two, it raises ``404`` only when ``file_id`` itself doesn't resolve -- a
-*missing poster* is the normal state in this phase, not an error, and is
-never represented as one.
+A fourth endpoint, ``GET /api/files/{file_id}/poster`` (COL-205, wired to a
+real Plex poster by COL-212), returns poster metadata for a file. It resolves
+the file's Plex ``ratingKey`` the same way the Analyze hook does (mapping
+table first, then a live fallback query -- see
+:func:`collapsarr.plex.resolve_rating_key`) and, on a hit, responds with
+``status="available"`` and a same-origin ``poster_url`` pointing at the fifth
+endpoint below. A resolution failure at *any* stage -- Plex not configured
+(a blank ``base_url``/``token`` on the singleton
+:class:`~collapsarr.plex.models.PlexConnection` row), a mapping-table miss
+with no live-fallback match, or any other soft-fail outcome
+``resolve_rating_key`` reports -- falls back to the original
+``status="placeholder"``/``poster_url=None`` shape with no error surfaced;
+this is still the deliberately stable contract COL-205 established, so the
+frontend needs no changes to consume either outcome. Like the other three, it
+raises ``404`` only when ``file_id`` itself doesn't resolve -- a *missing
+poster* is a normal outcome, not an error, and is never represented as one.
+
+A fifth endpoint, ``GET /api/files/{file_id}/poster/image`` (COL-212), is
+what a returned ``poster_url`` points at: it re-resolves the same
+``ratingKey`` and streams the poster's actual image bytes back from Plex
+(:func:`collapsarr.plex.fetch_poster_image`), proxied entirely server-side so
+the ``X-Plex-Token`` never reaches the browser. The frontend's ``<img>`` tag
+hits this directly (same-origin, authenticated by the browser's session
+cookie -- see ``collapsarr/auth/enforcement.py``), so no token or Plex URL is
+ever present in a JSON response body. Raises ``404`` for an unknown
+``file_id`` or whenever the poster can't currently be resolved/fetched --
+the frontend's existing ``<img onError>`` handler already swaps to the local
+placeholder graphic on any failure, so this endpoint doesn't need its own
+placeholder-image fallback.
 
 The "wanted-list" is every tracked file missing at least one *currently
 enabled* target -- the same notion Sonarr/Radarr's ``/wanted/missing`` view
@@ -70,7 +89,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -79,7 +98,9 @@ from ..downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_streams
 from ..downmix.targets import DownmixTarget
 from ..library.models import LibraryNode
 from ..library.service import get_node_by_source_id, list_nodes, resolve_tracked
+from ..plex import PlexConnection, fetch_poster_image, get_plex_connection, resolve_rating_key
 from ..settings.service import as_downmix_settings, get_global_settings
+from ..url_base import external_path
 from .models import MediaTargetStatus, TrackedMediaFile
 from .service import get_tracked_media_by_id, list_files_missing_targets, list_target_statuses
 
@@ -158,14 +179,13 @@ class AudioStreamsResponse(BaseModel):
 
 
 class FilePosterResponse(BaseModel):
-    """Poster metadata for a tracked file (COL-205).
+    """Poster metadata for a tracked file (COL-205, real Plex resolution since COL-212).
 
-    No Plex integration exists yet, so ``status`` is always
-    ``"placeholder"`` and ``poster_url`` is always ``None`` in this phase --
-    this shape is a deliberately stable contract: Phase 2 (COL-212) resolves
-    a real Plex poster URL by populating ``poster_url`` and flipping
-    ``status`` to ``"available"``, without changing this shape or requiring
-    any frontend change to consume it.
+    ``status="available"`` with a same-origin ``poster_url`` (pointing at
+    ``GET /api/files/{file_id}/poster/image``) once the file's Plex
+    ``ratingKey`` resolves; ``status="placeholder"``/``poster_url=None``
+    otherwise -- the same shape COL-205 established, so no frontend change is
+    needed to consume either outcome.
     """
 
     file_id: int
@@ -318,23 +338,100 @@ def get_file_audio_streams_endpoint(
     )
 
 
+def _resolve_poster_rating_key(
+    session: Session, media: TrackedMediaFile, connection: PlexConnection
+) -> str | None:
+    """Resolve ``media``'s Plex ``ratingKey`` for the poster endpoints, or ``None``.
+
+    Shared by both poster endpoints below, each of which fetches ``connection``
+    once (:func:`collapsarr.plex.get_plex_connection`) and passes it in here,
+    rather than this helper re-fetching it itself -- the image endpoint needs
+    the same row's ``base_url``/``token`` again right after this call to fetch
+    the actual bytes, so fetching it once per request avoids a redundant round
+    trip. Returns ``None`` (soft-fail, never raises) whenever
+    :attr:`~collapsarr.plex.models.PlexConnection.is_configured` is ``False``,
+    so neither endpoint issues a live query against a still-blank connection;
+    otherwise defers entirely to :func:`collapsarr.plex.resolve_rating_key`
+    (mapping table, then a single live fallback query, then give up silently
+    -- see its own docstring).
+    """
+    if not connection.is_configured:
+        return None
+    return resolve_rating_key(
+        session, media.file_path, base_url=connection.base_url, token=connection.token
+    )
+
+
 @router.get("/files/{file_id}/poster", response_model=FilePosterResponse)
 def get_file_poster_endpoint(
-    file_id: int, session: Session = Depends(get_session)
+    request: Request, file_id: int, session: Session = Depends(get_session)
 ) -> FilePosterResponse:
-    """Return poster metadata for a tracked file (COL-205).
+    """Return poster metadata for a tracked file (COL-205, real Plex resolution since COL-212).
 
-    No Plex integration exists yet, so this always returns the placeholder
-    state (``status="placeholder"``, ``poster_url=None``) for a ``file_id``
-    that resolves to a tracked file -- see the module docstring and
-    :class:`FilePosterResponse` for why this shape is deliberately stable
-    across the Phase 2 (COL-212) swap. Raises ``404`` only when ``file_id``
-    itself was never valid or no longer exists, matching
-    ``GET /api/files/{file_id}`` (COL-203) -- a missing *poster* is not an
-    error condition in this phase and is never surfaced as one.
+    Resolves the file's Plex ``ratingKey`` (:func:`_resolve_poster_rating_key`)
+    and, on a hit, returns ``status="available"`` with ``poster_url`` pointing
+    at ``GET /api/files/{file_id}/poster/image`` -- the endpoint below that
+    actually streams the image bytes. ``poster_url`` is re-prefixed with the
+    configured reverse-proxy ``url_base`` (:func:`collapsarr.url_base.
+    external_path`, COL-117/COL-118), the same treatment a redirect
+    ``Location`` header or the session cookie's path already get -- this is a
+    path sent straight to the browser as an ``<img src>`` (see the module
+    docstring), bypassing the frontend's own ``apiFetch``/``prefixPath``
+    layer, so it has to already carry the prefix itself under a subpath
+    deployment. A resolution failure at any stage (Plex not configured,
+    mapping-table miss + live-fallback miss, or any other soft-fail outcome)
+    falls back to ``status="placeholder"``/``poster_url=None`` with no error
+    surfaced -- see the module docstring and :class:`FilePosterResponse`.
+    Raises ``404`` only when ``file_id`` itself was never valid or no longer
+    exists, matching ``GET /api/files/{file_id}`` (COL-203) -- a missing
+    *poster* is not an error condition and is never surfaced as one.
     """
     media = get_tracked_media_by_id(session, file_id)
     if media is None:
         raise HTTPException(status_code=404, detail=f"No tracked file with id={file_id}.")
 
-    return FilePosterResponse(file_id=media.id, status="placeholder", poster_url=None)
+    connection = get_plex_connection(session)
+    rating_key = _resolve_poster_rating_key(session, media, connection)
+    if rating_key is None:
+        return FilePosterResponse(file_id=media.id, status="placeholder", poster_url=None)
+
+    url_base: str = request.app.state.settings.url_base
+    poster_url = external_path(url_base, f"/api/files/{media.id}/poster/image")
+    return FilePosterResponse(file_id=media.id, status="available", poster_url=poster_url)
+
+
+@router.get("/files/{file_id}/poster/image")
+def get_file_poster_image_endpoint(
+    file_id: int, session: Session = Depends(get_session)
+) -> Response:
+    """Stream a tracked file's actual Plex poster image bytes, server-side (COL-212).
+
+    What a ``poster_url`` from ``GET /api/files/{file_id}/poster`` points at.
+    Re-resolves the same ``ratingKey`` (:func:`_resolve_poster_rating_key`)
+    and, on a hit, fetches the image via
+    :func:`collapsarr.plex.fetch_poster_image` and returns it directly with
+    Plex's reported ``Content-Type`` -- the ``X-Plex-Token`` this proxies with
+    is read server-side from the singleton
+    :class:`~collapsarr.plex.models.PlexConnection` row and never appears in
+    this response or any request the browser makes.
+
+    Raises ``404`` for an unknown ``file_id``, an unresolvable ``ratingKey``,
+    or a failed upstream fetch -- there is no placeholder-*image* fallback
+    here: the frontend's ``<img onError>`` handler already swaps to the local
+    placeholder graphic on any load failure (see the module docstring), so a
+    plain ``404`` is exactly what it expects.
+    """
+    media = get_tracked_media_by_id(session, file_id)
+    if media is None:
+        raise HTTPException(status_code=404, detail=f"No tracked file with id={file_id}.")
+
+    connection = get_plex_connection(session)
+    rating_key = _resolve_poster_rating_key(session, media, connection)
+    if rating_key is None:
+        raise HTTPException(status_code=404, detail="No poster available for this file.")
+
+    result = fetch_poster_image(connection.base_url, connection.token, rating_key)
+    if not result.ok or result.content is None:
+        raise HTTPException(status_code=404, detail="Poster image could not be retrieved.")
+
+    return Response(content=result.content, media_type=result.content_type or "image/jpeg")

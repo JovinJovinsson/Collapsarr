@@ -56,6 +56,8 @@ from .logging_setup import apply_log_level, configure_logging
 from .media.routes import router as wanted_router
 from .migrations import upgrade_to_head
 from .notify.routes import router as notifiers_router
+from .plex.routes import router as plex_router
+from .plex.scheduler import PlexSyncScheduler
 from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .settings.env_seed import seed_auth_from_env
@@ -125,6 +127,7 @@ def create_app(
     arr_transport: httpx.BaseTransport | None = None,
     disk_usage: Callable[[str], DiskUsage] | None = None,
     update_check_transport: httpx.BaseTransport | None = None,
+    plex_transport: httpx.BaseTransport | None = None,
     system_probe: SystemProbe | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
@@ -164,7 +167,10 @@ def create_app(
     ``settings.data_dir``. ``update_check_transport`` (COL-86) is forwarded to
     the Update Check scheduler's GitHub Releases fetch (tests inject an
     ``httpx.MockTransport``; production leaves it ``None`` for a real network
-    call). ``system_probe`` (COL-123) overrides the About panel's Python
+    call). ``plex_transport`` (COL-210) is forwarded to the Plex Sync
+    scheduler's Plex Media Server calls (tests inject an ``httpx.MockTransport``;
+    production leaves it ``None`` for a real network call). ``system_probe``
+    (COL-123) overrides the About panel's Python
     version / OS platform / FFmpeg version probe (see
     :class:`~collapsarr.system.probe.SystemProbe`); production leaves it
     ``None`` for the real, ``platform``/subprocess-backed
@@ -319,6 +325,25 @@ def create_app(
         if enable_scheduler:
             update_check_scheduler.start(run_immediately=False)
 
+        # Plex Sync scheduler (COL-210): a dedicated daemon-thread scheduler,
+        # structurally a sibling of the four above, that rebuilds the Plex
+        # Library Item mapping table (path -> ratingKey) on a fixed weekly
+        # cadence. Wired on app.state unconditionally so the manual
+        # `POST /api/plex/sync` "Run now" and the on-save `request_sync` hook
+        # (PUT /api/plex/connection) always have a target -- but, unlike the
+        # health/update schedulers, its first tick is NOT run synchronously at
+        # startup (a full Plex walk is heavy and its output only feeds the
+        # resolution *fallback*, so there's no "accurate the instant we boot"
+        # requirement). The background loop -- which takes an immediate first
+        # tick itself -- runs only when enable_scheduler is set, matching the
+        # job/backup schedulers. Cleanly stopped in the `finally` below.
+        plex_sync_scheduler = PlexSyncScheduler(
+            resolved_settings, session_factory, transport=plex_transport
+        )
+        app.state.plex_sync_scheduler = plex_sync_scheduler
+        if enable_scheduler:
+            plex_sync_scheduler.start()
+
         # About-panel system info (COL-123): the injectable Python-version/
         # OS-platform/FFmpeg-version probe (collapsarr.system.probe.SystemProbe)
         # backing GET /api/system/info. FFmpeg version alone requires a
@@ -349,6 +374,7 @@ def create_app(
                 backup_scheduler.stop()
             health_scheduler.stop()
             update_check_scheduler.stop()
+            plex_sync_scheduler.stop()
             engine.dispose()
 
     app = FastAPI(
@@ -414,6 +440,10 @@ def create_app(
 
     # Notifier config GET/PUT (COL-36), under /api.
     app.include_router(notifiers_router)
+
+    # Plex connection GET/PUT (COL-209), under /api. The Plex token never
+    # leaves this router's PUT request body -- every response omits it.
+    app.include_router(plex_router)
 
     # Database backup list/create (COL-63), under /api/system.
     app.include_router(backup_router)
