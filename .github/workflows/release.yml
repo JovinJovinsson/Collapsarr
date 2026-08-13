@@ -17,6 +17,12 @@
 #                           packaging/pyinstaller/. Each smoke-tests its binary
 #                           (starts it, polls /health) before the tarball is
 #                           uploaded.
+#   5b. native-build-macos — the same recipe/CI pattern (COL-220), targeting
+#                           macOS amd64 (Intel) + arm64 (Apple Silicon) native
+#                           runners. Ships unsigned -- code signing /
+#                           notarization is explicitly out of scope (tracked
+#                           separately); Gatekeeper will flag the unsigned
+#                           binary on first run, which is expected here.
 #   6. pypi-publish       — publish the wheel/sdist to PyPI via OIDC Trusted
 #                           Publishing.
 #   7. github-release     — cut a GitHub Release with the built artifacts
@@ -278,6 +284,93 @@ jobs:
           path: ${{ env.TARBALL }}
           if-no-files-found: error
 
+  # ---- Runtime-free native binaries (macOS amd64 + arm64) ---------------------
+  # Same recipe/CI pattern as native-build-linux above (COL-220) -- installs the
+  # exact wheel `build-wheel` produced, runs packaging/pyinstaller/build.py
+  # unmodified, and smoke-tests the resulting binary via /health before the
+  # tarball is uploaded. Ships unsigned: no codesign/notarization step is
+  # added here (explicitly out of scope for this ticket -- see release.yml's
+  # header comment).
+  #
+  # amd64 runs on GitHub's `macos-15-intel` hosted runner (Intel-based macOS
+  # image; `macos-13`, the previous Intel image, has been retired) and arm64
+  # on `macos-15` (Apple Silicon -- the default `macos-latest` architecture),
+  # both native -- not cross-compiled or emulated -- so PyInstaller's
+  # bootloader and the smoke test each target real hardware for their
+  # architecture.
+  native-build-macos:
+    name: Native build (macOS ${{ matrix.arch }})
+    needs: build-wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Derive version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Download the built wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Install the built wheel + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          WHEEL=$(ls dist/*.whl)
+          pip install "$WHEEL" pyinstaller
+      - name: Build the --onedir bundle
+        run: python packaging/pyinstaller/build.py
+      - name: Smoke test — start the binary and poll /health
+        run: |
+          set -euo pipefail
+          cd packaging/pyinstaller/dist/collapsarr
+          export COLLAPSARR_DATA_DIR="${RUNNER_TEMP}/collapsarr-smoke-data"
+          export COLLAPSARR_HOST=127.0.0.1
+          export COLLAPSARR_PORT=8282
+          ./collapsarr &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          ok=""
+          for _ in $(seq 1 30); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "::error::collapsarr process exited before becoming healthy"
+              exit 1
+            fi
+            if curl -fsS "http://127.0.0.1:${COLLAPSARR_PORT}/health"; then
+              echo
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::collapsarr did not respond 200 on /health within 30s"
+            exit 1
+          fi
+      - name: Create tarball of the onedir build
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          TARBALL="collapsarr-${VERSION}-macos-${{ matrix.arch }}.tar.gz"
+          tar -czf "${TARBALL}" -C packaging/pyinstaller/dist collapsarr
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+      - name: Upload native build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collapsarr-macos-${{ matrix.arch }}
+          path: ${{ env.TARBALL }}
+          if-no-files-found: error
+
   # ---- Publish to PyPI (OIDC Trusted Publishing — no API token needed) --------
   pypi-publish:
     name: Publish to PyPI
@@ -299,7 +392,7 @@ jobs:
   # ---- Cut the GitHub Release -------------------------------------------------
   github-release:
     name: Create GitHub Release
-    needs: [build-wheel, docker, native-build-linux, pypi-publish]
+    needs: [build-wheel, docker, native-build-linux, native-build-macos, pypi-publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -309,10 +402,16 @@ jobs:
         with:
           name: dist
           path: dist/
-      - name: Download native build tarballs
+      - name: Download native build tarballs (Linux)
         uses: actions/download-artifact@v4
         with:
           pattern: collapsarr-linux-*
+          path: native-builds/
+          merge-multiple: true
+      - name: Download native build tarballs (macOS)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: collapsarr-macos-*
           path: native-builds/
           merge-multiple: true
       - name: Create GitHub Release
