@@ -535,7 +535,7 @@ class JobQueue:
         construction that doesn't want DB writes, e.g. COL-20's concurrency
         tests), this factory is the production path: when any isn't passed
         explicitly, it defaults to a *real* one -- ``history_recorder`` via
-        :func:`collapsarr.jobs.history.make_history_recorder``,
+        :func:`collapsarr.jobs.history.make_history_recorder`,
         ``failure_notifier`` via :func:`collapsarr.jobs.failure_notify.
         make_failure_notifier`, ``tracked_media_recorder`` via
         :func:`collapsarr.jobs.tracked_media.make_tracked_media_recorder`,
