@@ -338,6 +338,21 @@ class GlobalSettings(Base):
     additive migration backfills existing installs to ``False`` (auto-fill
     stays on unless an operator explicitly pauses it) rather than leaving the
     column ``NULL``.
+
+    ``ffmpeg_path`` (COL-218) is an optional override for the FFmpeg
+    executable Collapsarr invokes -- e.g. the absolute path to a
+    runtime-free native build (Epic COL-214) rather than one resolved off
+    ``PATH``. Nullable with no ``server_default``, same treatment as
+    ``default_audio_language``/``log_level`` above: ``None`` (unset) is a
+    *meaningful* value, not just "not migrated yet" -- it means "keep
+    resolving the bare ``\"ffmpeg\"`` command off ``PATH``", which is exactly
+    today's behaviour, so an existing install's row is backfilled to
+    ``NULL`` and sees no change. Read live from this row -- no restart
+    required -- by :meth:`collapsarr.jobs.queue.JobQueue._resolve_pipeline_kwargs`
+    (threaded into every enqueued downmix/default-audio job's ``ffmpeg_path``
+    kwarg when set) and by :func:`collapsarr.health.ffmpeg.
+    make_ffmpeg_check_run`'s ``run`` callable (probes this path instead of
+    the bare default when set).
     """
 
     __tablename__ = "global_settings"
@@ -448,6 +463,8 @@ class GlobalSettings(Base):
         default=DEFAULT_AUTO_QUEUE_PAUSED,
         server_default=text("0"),
     )
+
+    ffmpeg_path: Mapped[str | None] = mapped_column(String(500), nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)

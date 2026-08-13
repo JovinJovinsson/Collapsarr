@@ -659,25 +659,37 @@ class JobQueue:
         pipeline_kwargs: Mapping[str, Any] | None,
         global_settings: GlobalSettings,
     ) -> dict[str, Any]:
-        """Fold the persisted Default Audio Track preference into ``pipeline_kwargs`` (COL-152).
+        """Fold persisted Settings-driven overrides into ``pipeline_kwargs``.
 
         Takes ``global_settings`` -- the same singleton
         :class:`~collapsarr.settings.models.GlobalSettings` row
         :meth:`from_settings` already reads once for ``concurrency_limit``
-        (COL-165), reused here rather than opening a second session -- and,
-        **only** when its opt-in ``auto_set_default_audio`` toggle is on,
-        threads ``auto_set_default_audio=True`` plus the adapted
+        (COL-165), reused here rather than opening a second session.
+
+        **Only** when its opt-in ``auto_set_default_audio`` toggle is on
+        (COL-152), threads ``auto_set_default_audio=True`` plus the adapted
         ``default_audio_preference`` (:func:`~collapsarr.settings.service.
         as_default_audio_preference`) into the kwargs every enqueued downmix job
         passes to :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`. This
         is the production wiring that makes the automatic in-band fix reachable:
         a real downmix job dispatched through this queue now actually applies it.
 
-        With the toggle off (the default, every fresh install's state) nothing is
-        added, so a job's pipeline call is byte-for-byte what it was before this
-        feature. An explicit ``pipeline_kwargs`` from the caller always wins --
-        keys already present are never overwritten -- so a test (or a future
-        alternate wiring) can still pin its own values.
+        **Only** when ``ffmpeg_path`` is set (COL-218 -- e.g. an operator has
+        pointed Collapsarr at a runtime-free native FFmpeg build, Epic COL-214),
+        threads it into the kwargs both
+        :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline` and
+        :func:`~collapsarr.downmix.default_audio_pipeline.
+        run_default_audio_pipeline` already accept (``ffmpeg_path: str =
+        _DEFAULT_FFMPEG_PATH``), so a real job dispatched through this queue
+        invokes that FFmpeg binary instead of the bare ``"ffmpeg"`` resolved off
+        ``PATH``.
+
+        With both toggles at their default (unset/off -- every fresh install's
+        state, and every existing install's row after the additive migrations)
+        nothing is added, so a job's pipeline call is byte-for-byte what it was
+        before either feature. An explicit ``pipeline_kwargs`` from the caller
+        always wins -- keys already present are never overwritten -- so a test
+        (or a future alternate wiring) can still pin its own values.
 
         The import below is deferred, matching the surrounding factory: the
         settings service pulls in the ORM/adapters, which don't need to load for
@@ -692,6 +704,8 @@ class JobQueue:
                 "default_audio_preference",
                 as_default_audio_preference(global_settings),
             )
+        if global_settings.ffmpeg_path:
+            resolved.setdefault("ffmpeg_path", global_settings.ffmpeg_path)
         return resolved
 
     @property

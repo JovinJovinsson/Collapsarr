@@ -921,6 +921,74 @@ def test_from_settings_passes_no_default_audio_kwargs_when_toggle_off(tmp_path: 
 
 
 # ---------------------------------------------------------------------------
+# ffmpeg_path override wiring (COL-218): a configured FFmpeg path must reach
+# run_downmix_pipeline's ``ffmpeg_path`` kwarg for a real job dispatched
+# through a JobQueue built via from_settings; unset must add nothing.
+# ---------------------------------------------------------------------------
+
+
+def _write_ffmpeg_path(settings: Settings, ffmpeg_path: str | None) -> None:
+    """Persist ``ffmpeg_path`` directly on the singleton row.
+
+    Not routed through :func:`update_global_settings` -- ``ffmpeg_path`` has
+    no public setter there yet (COL-218 only wires the read path; a write
+    path -- e.g. an opt-in UI -- is COL-222's concern, which COL-218
+    deliberately blocks until this schema/wiring lands).
+    """
+    from collapsarr.settings.service import get_global_settings
+
+    upgrade_to_head(settings)
+    engine = create_engine_from_settings(settings)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        row = get_global_settings(session)
+        row.ffmpeg_path = ffmpeg_path
+        session.commit()
+    engine.dispose()
+
+
+def test_from_settings_threads_ffmpeg_path_when_set(tmp_path: Path) -> None:
+    """A configured ffmpeg_path reaches the pipeline runner's kwargs."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_ffmpeg_path(settings, "/opt/collapsarr/ffmpeg/ffmpeg")
+
+    runner = _KwargsCapturingRunner(_SUCCESS)
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+    queue.wait_idle()
+
+    assert len(runner.kwargs_calls) == 1
+    assert runner.kwargs_calls[0]["ffmpeg_path"] == "/opt/collapsarr/ffmpeg/ffmpeg"
+
+
+def test_from_settings_passes_no_ffmpeg_path_kwarg_when_unset(tmp_path: Path) -> None:
+    """Unset (the default, every fresh/existing install's row): no ffmpeg_path kwarg added --
+    a job's pipeline call is byte-for-byte what it was before COL-218."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    upgrade_to_head(settings)
+
+    runner = _KwargsCapturingRunner(_SUCCESS)
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+    queue.wait_idle()
+
+    assert len(runner.kwargs_calls) == 1
+    kwargs = runner.kwargs_calls[0]
+    assert "ffmpeg_path" not in kwargs
+    assert set(kwargs) == {"cancel_handle"}
+
+
+# ---------------------------------------------------------------------------
 # Job kinds (COL-155): SET_DEFAULT_AUDIO jobs run through their own injected
 # runner, sharing this queue's concurrency limit; DOWNMIX jobs are unaffected.
 # ---------------------------------------------------------------------------
