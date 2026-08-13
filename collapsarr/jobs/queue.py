@@ -176,6 +176,20 @@ PipelineRunner = Callable[..., PipelineResult]
 #: default_audio_pipeline.run_default_audio_pipeline` (COL-155).
 DefaultAudioPipelineRunner = Callable[..., PipelineResult]
 
+#: The subset of ``_pipeline_kwargs`` keys (COL-218) that
+#: :func:`~collapsarr.downmix.default_audio_pipeline.run_default_audio_pipeline`
+#: also accepts, so :meth:`JobQueue._run_job` can forward them to a
+#: ``SET_DEFAULT_AUDIO`` job's runner too. **Not** every key: ``pipeline_kwargs``
+#: can also carry ``auto_set_default_audio``/``default_audio_preference``
+#: (COL-152), which are :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`
+#: -only parameters -- :func:`run_default_audio_pipeline` has no matching
+#: parameters (nor a catch-all ``**kwargs``) for those, so passing the whole
+#: dict through unfiltered would raise ``TypeError`` on a real
+#: ``SET_DEFAULT_AUDIO`` job the moment the Default Audio Track auto-fix
+#: toggle is also on. ``ffmpeg_path`` is the only key both pipelines share
+#: today.
+_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS = frozenset({"ffmpeg_path"})
+
 
 def _enabled_targets_for_log(settings: DownmixSettings) -> str:
     """Render ``settings.enabled_targets`` for a log line, in a stable order."""
@@ -1100,10 +1114,14 @@ class JobQueue:
 
         Dispatches on ``job.kind`` (COL-155) for which runner actually
         executes the pipeline: ``DOWNMIX`` calls ``self._pipeline_runner``
-        with ``job.settings``, ``SET_DEFAULT_AUDIO`` calls
-        ``self._default_audio_pipeline_runner`` with ``job.preference``
-        instead -- everything else below (history/tracked-media/failure
-        handling) is identical for both kinds.
+        with ``job.settings`` and the full ``self._pipeline_kwargs``,
+        ``SET_DEFAULT_AUDIO`` calls ``self._default_audio_pipeline_runner``
+        with ``job.preference`` and only the
+        :data:`_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS` subset of
+        ``self._pipeline_kwargs`` (COL-218 -- today, just ``ffmpeg_path``; see
+        that constant's docstring for why the *whole* dict can't be forwarded)
+        -- everything else below (history/tracked-media/failure handling) is
+        identical for both kinds.
         """
         try:
             self._record_history(job)
@@ -1123,8 +1141,16 @@ class JobQueue:
                 # test stubs swallow it via **kwargs.
                 if job.kind is JobKind.SET_DEFAULT_AUDIO:
                     assert job.preference is not None  # enqueue_default_audio always sets this
+                    shared_kwargs = {
+                        key: value
+                        for key, value in self._pipeline_kwargs.items()
+                        if key in _SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS
+                    }
                     result = self._default_audio_pipeline_runner(
-                        job.file_path, job.preference, cancel_handle=job.cancellation
+                        job.file_path,
+                        job.preference,
+                        cancel_handle=job.cancellation,
+                        **shared_kwargs,
                     )
                 else:
                     result = self._pipeline_runner(
