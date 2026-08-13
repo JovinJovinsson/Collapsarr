@@ -90,13 +90,12 @@ function DefaultAudioTrackCell({ track }: { track: CurrentDefaultTrack | null })
  * detail page (COL-198), shared by `SeriesTree`'s episode rows and
  * `MovieTable`'s rows -- the same two levels `FileDetailLink`'s siblings
  * (`FileStatusBadge`/`DefaultAudioTrackCell`) already apply to. Links to
- * `/wanted/:fileId` (the same route `WantedPage` already links to for the
- * same file; `FileDetailPage` resolves `fileId` by matching `WantedFile.id`
- * from `GET /api/wanted`) whenever the row both has a file and carries a
- * resolved tracked-file id (COL-194's `file_id`) -- a row that's missing
- * either (no file yet, or `has_file: true` but no bridged tracked-media row,
- * so `file_id` is still `null`) renders its content unlinked, exactly as
- * before this ticket.
+ * `/files/:fileId` (COL-203; the same route `WantedPage` already links to
+ * for the same file, resolved by `FileDetailPage` via `GET /api/files/:id`)
+ * whenever the row both has a file and carries a resolved tracked-file id
+ * (COL-194's `file_id`) -- a row that's missing either (no file yet, or
+ * `has_file: true` but no bridged tracked-media row, so `file_id` is still
+ * `null`) renders its content unlinked, exactly as before this ticket.
  */
 function FileDetailLink({
   hasFile,
@@ -110,7 +109,7 @@ function FileDetailLink({
   if (!hasFile || fileId === null) {
     return <>{children}</>;
   }
-  return <Link to={`/wanted/${fileId}`}>{children}</Link>;
+  return <Link to={`/files/${fileId}`}>{children}</Link>;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { createBrowserRouter, Navigate, type RouteObject } from "react-router-dom";
 
 import { AppShell } from "../components/AppShell";
+import { WantedFileRedirect } from "../components/WantedFileRedirect";
 import { FileDetailPage } from "../pages/FileDetailPage";
 import { LibraryPage } from "../pages/LibraryPage";
 import { LoginPage } from "../pages/LoginPage";
@@ -45,14 +46,17 @@ export const routes: RouteObject[] = [
       // a bare `/settings` lands on the sub-nav's first entry (General).
       { path: SETTINGS_PATH, element: <Navigate to={SETTINGS_GENERAL_PATH} replace /> },
       ...settingsNavItems.map(({ to, element }) => ({ path: to, element })),
-      // Per-file detail (COL-34): not a primary nav destination, so it's
-      // wired directly here rather than through `navItems` (the sidebar's
-      // source of truth) -- it's reached from a file row, not the sidebar.
-      { path: "/wanted/:fileId", element: <FileDetailPage /> },
+      // Per-file detail (COL-34, COL-203): not a primary nav destination, so
+      // it's wired directly here rather than through `navItems` (the
+      // sidebar's source of truth) -- it's reached from a file row, not the
+      // sidebar. `/wanted/:fileId` is the pre-COL-203 path, kept as a
+      // redirect to the new `/files/:fileId` below.
+      { path: "/files/:fileId", element: <FileDetailPage /> },
+      { path: "/wanted/:fileId", element: <WantedFileRedirect /> },
       // Per-instance Library browsing (COL-100): `navItems` only wires the
       // bare `/libraries` redirect (`LibrariesIndexPage`); the per-instance
       // tree view takes an id param, so it's wired directly here, same as
-      // `/wanted/:fileId` above. Reached from the sidebar's expanded
+      // `/files/:fileId` above. Reached from the sidebar's expanded
       // Libraries sub-items or the index redirect, not a plain nav link.
       { path: "/libraries/:instanceId", element: <LibraryPage /> },
       { path: "*", element: <Navigate to="/wanted" replace /> },

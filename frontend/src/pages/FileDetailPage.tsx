@@ -3,9 +3,9 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { fetchJobHistory, triggerDownmix, triggerSetDefaultAudio } from "../api/activity";
+import { FileNotFoundError, fetchFileById } from "../api/files";
 import { updateTracked } from "../api/library";
 import { fetchSettings } from "../api/settings";
-import { fetchWantedList } from "../api/wanted";
 import { TrackedToggleButton } from "../components/TrackedToggleButton";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { JobHistoryEntry, JobKind, JobStatus, ManualTriggerResult } from "../types/activity";
@@ -66,9 +66,9 @@ interface StatusRow {
 
 /**
  * Combines this file's still-missing `(language, target)` pairs (from
- * `GET /api/wanted`) with its job history's latest attempt per pair, so one
- * table shows the current status of every target/language combo this file
- * is either still missing or has a recorded job attempt for.
+ * `GET /api/files/:id`) with its job history's latest attempt per pair, so
+ * one table shows the current status of every target/language combo this
+ * file is either still missing or has a recorded job attempt for.
  *
  * Job history (COL-29's `list_job_history`) is ordered oldest-to-newest, so
  * the last entry per `(language, target)` key -- applied after the
@@ -126,18 +126,19 @@ function buildStatusRows(file: WantedFile, history: JobHistoryEntry[]): StatusRo
  * decides whether the bypass qualifies, so the frontend doesn't need to
  * already know the file's excluded languages ahead of time.
  *
- * Sourced from `GET /api/wanted` (COL-28, matched by `fileId` -- there's no
- * dedicated per-file detail endpoint yet), `GET /api/jobs/history?file=`
+ * Sourced from `GET /api/files/:id` (COL-203, this file resolved by id
+ * independent of Wanted-queue membership -- so a fully-processed file with
+ * no missing targets still opens here), `GET /api/jobs/history?file=`
  * (COL-29, this file's past job runs), and `GET /api/settings` (COL-28, to
  * display the current language allow-list for context).
  *
  * Also shows and toggles this file's **Tracked** status (COL-101), bridged
- * from `GET /api/wanted`'s `library_node_id`/`node_type`/`tracked` fields
+ * from `GET /api/files/:id`'s `library_node_id`/`node_type`/`tracked` fields
  * (`collapsarr/media/routes.py`'s bridge from a tracked-media row back to
- * its owning `LibraryNode`). When the bridge hasn't resolved yet (no
- * instance/episode/movie id captured for this file), the panel shows a
- * "status unavailable" message rather than a broken toggle -- see that
- * module's docstring for when this happens.
+ * its owning `LibraryNode`, shared with `GET /api/wanted`). When the bridge
+ * hasn't resolved yet (no instance/episode/movie id captured for this
+ * file), the panel shows a "status unavailable" message rather than a
+ * broken toggle -- see that module's docstring for when this happens.
  *
  * Also exposes a manual "Set Default Audio Track" action (COL-157,
  * `POST /api/jobs/trigger-default-audio`, COL-155), enqueuing a
@@ -167,19 +168,25 @@ export function FileDetailPage() {
     let cancelled = false;
     setFileState({ status: "loading" });
 
-    fetchWantedList()
-      .then((files) => {
-        if (cancelled) return;
-        const match = files.find((candidate) => String(candidate.id) === fileId);
-        setFileState(match ? { status: "ready", file: match } : { status: "not-found" });
+    if (!fileId) {
+      setFileState({ status: "not-found" });
+      return;
+    }
+
+    fetchFileById(fileId)
+      .then((file) => {
+        if (!cancelled) setFileState({ status: "ready", file });
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
-          setFileState({
-            status: "error",
-            message: error instanceof Error ? error.message : "Unknown error.",
-          });
+        if (cancelled) return;
+        if (error instanceof FileNotFoundError) {
+          setFileState({ status: "not-found" });
+          return;
         }
+        setFileState({
+          status: "error",
+          message: error instanceof Error ? error.message : "Unknown error.",
+        });
       });
 
     return () => {
@@ -351,8 +358,7 @@ export function FileDetailPage() {
             <CakeSlice width={28} height={28} />
           </span>
           <p className="panel__message">
-            No tracked file with this id is currently in the wanted list. It may already have every
-            enabled target processed, or the id may be invalid.
+            No tracked file exists with this id. It may have been removed, or the id may be invalid.
           </p>
         </div>
       )}
