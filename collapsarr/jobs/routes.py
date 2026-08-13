@@ -69,7 +69,13 @@ Eleven endpoints, each wrapping an existing service without adding new job logic
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`,
   COL-155), mirroring ``POST /api/jobs/trigger``'s shape: same request
   (a bare ``file_path``), same response shape (``enqueued`` + the job, or
-  ``enqueued=False``/``job=null`` when the file needs no change).
+  ``enqueued=False``/``job=null`` when the file needs no change). As of
+  COL-206 it also always bypasses the Recently-Processed Window (COL-167) --
+  a behavior change from before, when it respected the window like every
+  other trigger -- matching ``POST /api/jobs/trigger``'s own COL-170
+  behavior: an explicit single-file trigger is now always a deliberate
+  request that overrides the cooldown, not silently no-op'd by an unrelated
+  prior job (e.g. a ``DOWNMIX`` job) on the same file.
 - ``POST /api/jobs/trigger-default-audio/bulk`` -- the multi-select
   counterpart of the above (COL-156): accepts one or more Library
   ``{node_type, node_id}`` references (the same shape
@@ -83,7 +89,12 @@ Eleven endpoints, each wrapping an existing service without adding new job logic
   :meth:`~collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`
   once per resulting file -- always against the current global Preferred
   Default Audio setting; there is no per-call override, unlike
-  ``trigger``'s ``extra_languages``.
+  ``trigger``'s ``extra_languages``. Unlike the single-file endpoint above,
+  this one does **not** pass ``bypass_dedup_window`` (COL-206) -- it still
+  respects the Recently-Processed Window, the same rationale as ``POST
+  /api/jobs/requeue-failed``'s bulk behavior: a bulk trigger across a
+  multi-select is closer in spirit to the automatic paths the window
+  protects against than to one explicit single-file action.
 - ``DELETE /api/jobs/{job_id}`` -- cancels one specific Job, ``PENDING`` or
   ``RUNNING`` (COL-168; hard-kill COL-192)
   (:meth:`collapsarr.jobs.scheduler.JobScheduler.cancel_job`). Cancelling a
@@ -713,8 +724,17 @@ def manual_set_default_audio_trigger_endpoint(
     enqueued; the ``enqueued`` flag distinguishes the two (a skipped file --
     no preference configured, duplicate, unprobeable, or already correct --
     is not an error).
+
+    Always passes ``bypass_dedup_window=True`` (COL-206), matching ``POST
+    /api/jobs/trigger``'s "Trigger downmix" behavior: an explicit single-file
+    "Set Default Audio Track" click is a deliberate request that overrides
+    the Recently-Processed Window cooldown, so it is never silently no-op'd
+    by an unrelated prior job (e.g. a ``DOWNMIX`` job) on the same file. The
+    window is the only thing bypassed; the "does this file need anything"
+    gate is unchanged, so a file that's already correct is still skipped.
+    The bulk endpoint below is unaffected -- it still respects the window.
     """
-    job = scheduler.trigger_set_default_audio(body.file_path)
+    job = scheduler.trigger_set_default_audio(body.file_path, bypass_dedup_window=True)
     if job is None:
         return SetDefaultAudioTriggerResult(enqueued=False, job=None)
     return SetDefaultAudioTriggerResult(enqueued=True, job=EnqueuedJob.from_job(job))

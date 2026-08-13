@@ -136,6 +136,13 @@ class _FakeScheduler:
         self.requeue_calls: list[str] = []
         self.requeue_all_failed_calls: int = 0
         self.default_audio_trigger_calls: list[str] = []
+        #: COL-206's ``bypass_dedup_window`` flag, recorded per call in the
+        #: same order as ``default_audio_trigger_calls`` above (a parallel
+        #: list rather than folding into that one's tuple shape, so the many
+        #: existing bulk-endpoint assertions against
+        #: ``default_audio_trigger_calls == [...]`` -- a list of bare paths
+        #: -- don't need to change).
+        self.default_audio_trigger_bypass_calls: list[bool] = []
         self.cancel_calls: list[UUID] = []
         self.bump_calls: list[UUID] = []
         self.clear_queue_calls: int = 0
@@ -173,8 +180,10 @@ class _FakeScheduler:
         file_path: str,
         *,
         session: Session | None = None,
+        bypass_dedup_window: bool = False,
     ) -> Job | None:
         self.default_audio_trigger_calls.append(file_path)
+        self.default_audio_trigger_bypass_calls.append(bypass_dedup_window)
         if self._default_audio_trigger_jobs_by_file is not None:
             return self._default_audio_trigger_jobs_by_file.get(file_path)
         return self._default_audio_trigger_job
@@ -788,6 +797,26 @@ def test_trigger_default_audio_enqueues_a_job_and_returns_it(client: TestClient)
     assert fake.default_audio_trigger_calls == ["/media/movie.mkv"]
 
 
+def test_trigger_default_audio_always_bypasses_the_recently_processed_window(
+    client: TestClient,
+) -> None:
+    """COL-206: every explicit single-file trigger now bypasses the window."""
+    fake = _FakeScheduler(default_audio_trigger_job=_job("/media/movie.mkv"))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        client.post(
+            "/api/jobs/trigger-default-audio",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert fake.default_audio_trigger_bypass_calls == [True]
+
+
 def test_trigger_default_audio_reports_not_enqueued_when_the_file_is_skipped(
     client: TestClient,
 ) -> None:
@@ -982,6 +1011,9 @@ def test_bulk_trigger_default_audio_resolves_an_episode_reference_to_its_file(
         }
     ]
     assert fake.default_audio_trigger_calls == ["/media/pilot.mkv"]
+    # COL-206: the bulk endpoint is unaffected by the single-file trigger's
+    # always-bypass change -- it still respects the Recently-Processed Window.
+    assert fake.default_audio_trigger_bypass_calls == [False]
 
 
 def test_bulk_trigger_default_audio_cascades_a_series_reference_to_descendant_files(

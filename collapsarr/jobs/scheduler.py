@@ -106,18 +106,24 @@ same file and each enqueue it.
 that skips only the "recently processed" half above -- the "already queued"
 half is never bypassable, since two enqueues for a file that's genuinely
 in-flight right now would be a real concurrent duplicate, not a cooldown to
-override. It defaults to ``False`` everywhere except :meth:`requeue_file`
+override. :meth:`trigger_set_default_audio` takes the same flag (COL-206).
+It defaults to ``False`` everywhere except :meth:`requeue_file`
 (the per-row "Requeue" action, always ``True``) and, as of COL-170,
 ``POST /api/jobs/trigger`` (:mod:`collapsarr.jobs.routes`, also always
 ``True`` now -- a behavior change from before COL-170, when it respected the
-window like every other trigger). The rationale: every *single, explicit*
-requeue/trigger action is a human asking for this file, right now -- the
-cooldown exists to stop *automatic* re-attempts (scan/webhook) from
+window like every other trigger), and, as of COL-206, ``POST
+/api/jobs/trigger-default-audio`` (also always ``True`` now, matching
+``POST /api/jobs/trigger``'s behavior -- a behavior change from before
+COL-206, when it respected the window). The rationale: every *single,
+explicit* requeue/trigger action is a human asking for this file, right now
+-- the cooldown exists to stop *automatic* re-attempts (scan/webhook) from
 hammering a persistently-failing file, not to second-guess a deliberate
 manual retry. Only a true *batch* action -- :meth:`requeue_all_failed`
-(COL-172's "Requeue all failed") -- still respects the window, since a bulk
-retry of every failed file is closer in spirit to the automatic paths this
-cooldown protects against.
+(COL-172's "Requeue all failed") and ``POST
+/api/jobs/trigger-default-audio/bulk`` (COL-156's bulk "Set Default Audio
+Track" trigger) -- still respects the window, since a bulk retry/trigger of
+every selected file is closer in spirit to the automatic paths this cooldown
+protects against.
 
 **Auto-Queue Limit (COL-171).** The scanner never auto-enqueues more than
 :data:`AUTO_QUEUE_LIMIT` (fixed at 5, not user-configurable) total ``PENDING``
@@ -718,6 +724,7 @@ class JobScheduler:
         file_path: str | Path,
         *,
         session: Session | None = None,
+        bypass_dedup_window: bool = False,
     ) -> Job | None:
         """Manually trigger a Default Audio Track fix job for one file on demand (COL-155).
 
@@ -759,6 +766,22 @@ class JobScheduler:
         :func:`~collapsarr.media.service.upsert_tracked_media` maintains for
         the Wanted view, so there is nothing of that shape to record here.
 
+        ``bypass_dedup_window`` (COL-206) is threaded straight through to both
+        :meth:`_is_duplicate` checks above -- see there for exactly what it
+        does and does not skip. It defaults to ``False`` (still respecting
+        the Recently-Processed Window, the shape :meth:`trigger_file`'s own
+        parameter had before COL-170), but ``POST
+        /api/jobs/trigger-default-audio`` (:mod:`collapsarr.jobs.routes`) now
+        always passes ``True``: an explicit single-file "Set Default Audio
+        Track" click must always attempt to enqueue, matching
+        ``POST /api/jobs/trigger``'s "Trigger downmix" behavior -- never
+        silently no-op'd by the window from an unrelated prior job (e.g. a
+        ``DOWNMIX`` job on the same file). ``POST
+        /api/jobs/trigger-default-audio/bulk`` is unaffected: it does not
+        pass this flag, so it keeps the default ``False`` and still respects
+        the window, the same way ``requeue_all_failed`` respects it for bulk
+        requeue.
+
         Returns the created :class:`~collapsarr.jobs.queue.Job`, or ``None``
         for any of the "nothing to do" reasons above (no preference
         configured, duplicate, unprobeable, or the file already correct).
@@ -772,7 +795,7 @@ class JobScheduler:
             )
             return None
 
-        if self._is_duplicate(path, session):
+        if self._is_duplicate(path, session, bypass_dedup_window=bypass_dedup_window):
             return None
 
         try:
@@ -786,7 +809,7 @@ class JobScheduler:
             return None
 
         with self._enqueue_lock:
-            if self._is_duplicate(path, session):
+            if self._is_duplicate(path, session, bypass_dedup_window=bypass_dedup_window):
                 return None
             return self._queue.enqueue_default_audio(path, preference)
 

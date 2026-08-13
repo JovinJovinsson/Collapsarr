@@ -1941,6 +1941,69 @@ def test_trigger_set_default_audio_re_enqueues_after_a_terminal_downmix_job(
     assert len(scheduler._queue.list_jobs()) == 2
 
 
+# --- bypass_dedup_window (COL-206) ------------------------------------------
+
+
+def test_trigger_set_default_audio_bypass_dedup_window_ignores_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """``trigger_set_default_audio``'s ``bypass_dedup_window`` mirrors ``trigger_file``'s."""
+    _configure_preference(session_factory)
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX), queue=queue
+    )
+
+    with session_factory() as session:
+        # Without the bypass this would be skipped (see
+        # test_trigger_set_default_audio_defaults_to_respecting_a_recently_processed_history_row).
+        job = scheduler.trigger_set_default_audio(
+            "/media/movie.mkv", session=session, bypass_dedup_window=True
+        )
+    assert job is not None
+
+
+def test_trigger_set_default_audio_bypass_dedup_window_still_treats_an_active_job_as_a_duplicate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """The bypass only skips the *recently processed* half -- not "already active" (mirrors
+    ``test_enqueue_file_bypass_dedup_window_still_treats_an_active_job_as_a_duplicate``).
+    """
+    _configure_preference(session_factory)
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX), queue=queue
+    )
+
+    job = scheduler.trigger_set_default_audio("/media/movie.mkv")
+    assert job is not None  # still PENDING -> active
+
+    second = scheduler.trigger_set_default_audio("/media/movie.mkv", bypass_dedup_window=True)
+
+    assert second is None
+    assert len(scheduler._queue.list_jobs()) == 1
+
+
+def test_trigger_set_default_audio_defaults_to_respecting_a_recently_processed_history_row(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Without the flag, the window is still respected (unchanged default -- COL-206)."""
+    _configure_preference(session_factory)
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_NEEDS_DEFAULT_AUDIO_FIX), queue=queue
+    )
+
+    with session_factory() as session:
+        assert scheduler.trigger_set_default_audio("/media/movie.mkv", session=session) is None
+
+
 # ---------------------------------------------------------------------------
 # Auto-Queue Limit / top-up (COL-171)
 # ---------------------------------------------------------------------------
