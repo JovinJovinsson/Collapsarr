@@ -101,9 +101,18 @@ function defaultHandler(
     trigger: { ok: boolean; status?: number; body: unknown };
     defaultAudioTrigger: { ok: boolean; status?: number; body: unknown };
     tracked: { ok: boolean; status?: number; body: unknown };
+    poster: { ok: boolean; status?: number; body: unknown };
   }> = {},
 ): Handler {
   return (url, init) => {
+    if (url.endsWith("/poster")) {
+      return (
+        overrides.poster ?? {
+          ok: true,
+          body: { file_id: 1, status: "placeholder", poster_url: null },
+        }
+      );
+    }
     if (url === "/api/jobs/trigger-default-audio") {
       return (
         overrides.defaultAudioTrigger ?? {
@@ -499,5 +508,72 @@ describe("FileDetailPage", () => {
 
     expect(await screen.findByText(/couldn't update tracked: boom/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^tracked$/i })).not.toBeDisabled();
+  });
+
+  // --- Poster slot (COL-205) --------------------------------------------------
+
+  it("shows the placeholder graphic when the poster endpoint returns no poster_url", async () => {
+    mockFetchRouter(defaultHandler());
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(screen.getByRole("img", { name: /no poster available/i })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /^poster for/i })).not.toBeInTheDocument();
+  });
+
+  it("renders the returned image when the poster endpoint resolves a poster_url", async () => {
+    mockFetchRouter(
+      defaultHandler({
+        poster: {
+          ok: true,
+          body: { file_id: 1, status: "available", poster_url: "https://example.com/poster.jpg" },
+        },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    const image = (await screen.findByRole("img", {
+      name: /^poster for interstellar$/i,
+    })) as HTMLImageElement;
+    expect(image.src).toBe("https://example.com/poster.jpg");
+  });
+
+  it("falls back to the placeholder graphic, never an error, when the poster request fails", async () => {
+    mockFetchRouter(
+      defaultHandler({ poster: { ok: false, status: 500, body: { detail: "boom" } } }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+
+    expect(await screen.findByRole("img", { name: /no poster available/i })).toBeInTheDocument();
+    expect(screen.queryByText(/boom/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/couldn't load poster/i)).not.toBeInTheDocument();
+  });
+
+  it("falls back to the placeholder graphic if the resolved poster image itself fails to load", async () => {
+    // Guards the Phase 2 (COL-212) handoff: once a real poster_url is
+    // returned, a broken/expired/hotlink-blocked image must still degrade to
+    // the placeholder graphic rather than a broken-image glyph.
+    mockFetchRouter(
+      defaultHandler({
+        poster: {
+          ok: true,
+          body: { file_id: 1, status: "available", poster_url: "https://example.com/poster.jpg" },
+        },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    const image = await screen.findByRole("img", { name: /^poster for interstellar$/i });
+
+    fireEvent.error(image);
+
+    expect(await screen.findByRole("img", { name: /no poster available/i })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /^poster for/i })).not.toBeInTheDocument();
   });
 });

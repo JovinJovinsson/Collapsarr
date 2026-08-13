@@ -1,4 +1,4 @@
-"""Contract tests for the single-file lookup REST endpoint (COL-203).
+"""Contract tests for the single-file lookup REST endpoints (COL-203, COL-205).
 
 Covers request/response shape and the API-key-required behaviour (COL-26) for
 ``GET /api/files/{file_id}``. Unlike ``GET /api/wanted`` (COL-28), this
@@ -9,6 +9,10 @@ fully-processed files entirely). Tracked media is seeded through the real
 :mod:`collapsarr.media.service` upsert path (via the shared ``session``
 fixture, which shares the SQLite file the ``client`` app reads), so the
 endpoint exercises genuine data rather than a stub.
+
+Also covers ``GET /api/files/{file_id}/poster`` (COL-205): with no Plex
+integration yet, it always returns the placeholder state for an existing
+file, and ``404`` only for a ``file_id`` that doesn't resolve at all.
 """
 
 from __future__ import annotations
@@ -152,4 +156,48 @@ def test_files_endpoint_requires_the_api_key(client: TestClient, session: Sessio
     )
 
     response = client.get(f"/api/files/{media.id}")
+    assert response.status_code == 401
+
+
+# --- GET /api/files/{id}/poster (COL-205) -------------------------------------
+
+
+def test_poster_endpoint_returns_the_placeholder_state_for_an_existing_file(
+    client: TestClient, session: Session
+) -> None:
+    """No Plex integration exists yet (COL-205) -- the endpoint always
+    returns the placeholder state for a file that exists, never a poster
+    URL and never an error."""
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    response = client.get(f"/api/files/{media.id}/poster", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {"file_id": media.id, "status": "placeholder", "poster_url": None}
+
+
+def test_poster_endpoint_returns_not_found_for_an_id_that_never_existed(
+    client: TestClient, session: Session
+) -> None:
+    response = client.get("/api/files/999999/poster", headers=_auth_headers(client))
+
+    assert response.status_code == 404, response.text
+
+
+def test_poster_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+
+    response = client.get(f"/api/files/{media.id}/poster")
     assert response.status_code == 401
