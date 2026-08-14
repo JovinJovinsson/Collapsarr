@@ -76,14 +76,22 @@ failure state (no severity, no Check Code), it is informational.
 
 ## Install Method
 
-How this instance is running — Docker vs. pipx/bare-metal — detected
-server-side via the presence of `/.dockerenv` (the frontend has no
-filesystem access to detect it itself). Surfaced as `is_docker` on
-`GET /api/system/updates`, and used solely to pick which upgrade
-*instructions* the Updates page displays (`docker pull` + recreate-container
-vs. `pipx upgrade`/`pip install --upgrade`) — see
-`docs/adr/0001-update-check-detect-notify-only.md`. No code path executes
-either command; the operator always runs it themselves.
+How this instance is running — Docker vs. pipx vs. native — detected
+server-side (the frontend has no filesystem access to detect it itself):
+Docker via the presence of `/.dockerenv`, checked first; else native
+(a PyInstaller-built binary) via `sys.frozen` being truthy; else pipx —
+the primary documented bare-metal install path. Docker detection always
+wins, even under a frozen build. Surfaced as the three-valued
+`install_method` (`docker`/`pipx`/`native`) on `GET /api/system/updates`,
+superseding the earlier `is_docker` boolean now that a third method
+exists, and used solely to pick which upgrade *instructions* the Updates
+page displays: `docker pull` + recreate-container for `docker`; `pipx
+upgrade`/`pip install --upgrade` for `pipx`; for `native`, a
+download-the-archive-and-replace-the-install-folder walkthrough that also
+calls out that the database/config are safe, since they live in the OS
+user-data directory rather than inside the install folder being replaced
+— see `docs/adr/0001-update-check-detect-notify-only.md`. No code path
+executes any of these commands; the operator always runs it themselves.
 
 ## Wanted (view)
 

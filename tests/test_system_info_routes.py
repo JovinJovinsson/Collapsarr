@@ -10,6 +10,7 @@ engine is actually configured with (not assumed to be SQLite) -- the two
 
 from __future__ import annotations
 
+import sys
 from typing import NamedTuple
 
 import httpx
@@ -113,7 +114,7 @@ def test_returns_the_about_panel_fields(settings: Settings) -> None:
             "disk",
         }
         assert body["app_version"] == __version__
-        assert body["install_method"] in {"docker", "pipx"}
+        assert body["install_method"] in {"docker", "pipx", "native"}
         assert body["python_version"] == "3.12.4"
         assert body["ffmpeg_version"] == "6.1.1"
         assert body["os"] == "Linux-test-x86_64-with-glibc2.31"
@@ -194,3 +195,70 @@ def test_db_schema_revision_is_read_live_not_the_packaged_head(settings: Setting
         body = test_client.get("/api/system/info", headers=headers).json()
 
         assert body["db_schema_revision"] != head_revision
+
+
+# --------------------------------------------------------------------------- #
+# COL-215: `install_method` -- native (PyInstaller/`sys.frozen`) detection,
+# mirroring `tests/test_update_check_environment.py`'s injectable-probe style
+# via monkeypatching the two inputs `collapsarr.system.info.install_method`
+# reads (`is_docker_environment` and `sys.frozen`).
+# --------------------------------------------------------------------------- #
+def test_install_method_reports_docker_when_the_marker_file_is_present(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "collapsarr.system.info.is_docker_environment", lambda: True
+    )
+    with _build_client(settings) as test_client:
+        headers = _auth_headers(test_client)
+
+        body = test_client.get("/api/system/info", headers=headers).json()
+
+        assert body["install_method"] == "docker"
+
+
+def test_install_method_reports_native_when_frozen_and_not_docker(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "collapsarr.system.info.is_docker_environment", lambda: False
+    )
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    with _build_client(settings) as test_client:
+        headers = _auth_headers(test_client)
+
+        body = test_client.get("/api/system/info", headers=headers).json()
+
+        assert body["install_method"] == "native"
+
+
+def test_install_method_reports_pipx_when_neither_docker_nor_frozen(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "collapsarr.system.info.is_docker_environment", lambda: False
+    )
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    with _build_client(settings) as test_client:
+        headers = _auth_headers(test_client)
+
+        body = test_client.get("/api/system/info", headers=headers).json()
+
+        assert body["install_method"] == "pipx"
+
+
+def test_install_method_docker_wins_over_native_when_both_apply(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing Docker-detection precedence is unchanged: Docker still wins
+    even under a frozen build (ticket's explicit acceptance criterion)."""
+    monkeypatch.setattr(
+        "collapsarr.system.info.is_docker_environment", lambda: True
+    )
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    with _build_client(settings) as test_client:
+        headers = _auth_headers(test_client)
+
+        body = test_client.get("/api/system/info", headers=headers).json()
+
+        assert body["install_method"] == "docker"

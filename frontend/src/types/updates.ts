@@ -4,6 +4,8 @@
  * yet, same convention as `types/health.ts`.
  */
 
+import type { InstallMethod } from "./system";
+
 /**
  * The singleton Update Check state, as returned by `GET /api/system/updates`
  * / `POST /api/system/updates/recheck` / `.../dismiss` / `.../undismiss`
@@ -38,12 +40,14 @@ export interface UpdateCheckState {
    */
   dismissed_at: string | null;
   /**
-   * Whether this instance is running under Docker (COL-90), detected
-   * server-side via `/.dockerenv` (`collapsarr/update_check/environment.py`)
-   * -- the frontend has no filesystem access, so it can't detect this
-   * itself. Selects which upgrade-instruction block `UpdatesPage` renders:
-   * `docker pull` + recreate-container when `true`, `pipx upgrade`/`pip
-   * install --upgrade` otherwise.
+   * How this instance is installed (COL-90/COL-215), detected server-side
+   * (`collapsarr/system/info.py::install_method` -- Docker via `/.dockerenv`,
+   * else native via `sys.frozen`, else pipx) -- the frontend has no
+   * filesystem access, so it can't detect this itself. Selects which
+   * upgrade-instruction block `UpdatesPage` renders: `docker pull` +
+   * recreate-container for `"docker"`, `pipx upgrade`/`pip install --upgrade`
+   * for `"pipx"`, download-and-replace for `"native"`. Formerly the
+   * `is_docker` boolean (COL-215 widened it to this three-valued field).
    */
-  is_docker: boolean;
+  install_method: InstallMethod;
 }

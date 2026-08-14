@@ -15,10 +15,11 @@ Endpoints:
 * ``GET /api/system/updates`` -- the running instance's version, the latest
   known release for the configured channel (or ``None`` before the first
   tick), when that data was last refreshed, whether an update is available,
-  and whether this instance is running under Docker (``is_docker``, COL-90 --
-  detected via :func:`~collapsarr.update_check.environment.
-  is_docker_environment`, so the frontend can render the matching install
-  instructions without any detection logic of its own).
+  and how this instance is installed (``install_method``, COL-90/COL-215 --
+  ``"docker"``/``"pipx"``/``"native"``, detected via
+  :func:`~collapsarr.system.info.install_method`, the same seam
+  ``GET /api/system/info`` uses, so the frontend can render the matching
+  install instructions without any detection logic of its own).
 * ``POST /api/system/updates/recheck`` -- runs the Update Check scheduler's
   tick synchronously (mirrors :meth:`collapsarr.health.scheduler.
   HealthCheckScheduler.run_once` via ``POST /api/system/health-checks/
@@ -48,7 +49,7 @@ from sqlalchemy.orm import Session
 
 from .. import __version__
 from ..database import get_session
-from .environment import is_docker_environment
+from ..system.info import InstallMethod, install_method
 from .scheduler import UpdateCheckScheduler
 from .service import (
     UpdateCheckStateNotFoundError,
@@ -110,10 +111,9 @@ class UpdateCheckStateRead(BaseModel):
     an operator has dismissed the current "update available" notice; it is
     automatically cleared the next time ``latest_tag`` changes (see
     :func:`~collapsarr.update_check.service.reconcile_update_check`).
-    ``is_docker`` (COL-90) is computed fresh on every read via
-    :func:`~collapsarr.update_check.environment.is_docker_environment` --
-    process-global and independent of the persisted row, unlike every other
-    field here.
+    ``install_method`` (COL-90/COL-215) is computed fresh on every read via
+    :func:`~collapsarr.system.info.install_method` -- process-global and
+    independent of the persisted row, unlike every other field here.
     """
 
     running_version: str
@@ -123,7 +123,7 @@ class UpdateCheckStateRead(BaseModel):
     checked_at: datetime | None
     update_available: bool
     dismissed_at: datetime | None
-    is_docker: bool
+    install_method: InstallMethod
 
 
 # --- helpers -------------------------------------------------------------
@@ -144,11 +144,11 @@ def _read_state(session: Session) -> UpdateCheckStateRead:
     applies for a given row, nor on the "unknown reports as available"
     handling of a ``None`` row/``latest_tag``.
 
-    ``is_docker`` (COL-90) is unrelated to the persisted row entirely -- it's
-    a fresh :func:`~collapsarr.update_check.environment.is_docker_environment`
+    ``install_method`` (COL-90/COL-215) is unrelated to the persisted row
+    entirely -- it's a fresh :func:`~collapsarr.system.info.install_method`
     call every time, referenced unqualified so tests can monkeypatch
-    ``collapsarr.update_check.routes.is_docker_environment`` the same way
-    they already monkeypatch ``__version__`` above.
+    ``collapsarr.update_check.routes.install_method`` the same way they
+    already monkeypatch ``__version__`` above.
     """
     state = get_update_check_state(session)
     return UpdateCheckStateRead(
@@ -159,7 +159,7 @@ def _read_state(session: Session) -> UpdateCheckStateRead:
         checked_at=state.checked_at if state is not None else None,
         update_available=is_update_available(state, __version__),
         dismissed_at=state.dismissed_at if state is not None else None,
-        is_docker=is_docker_environment(),
+        install_method=install_method(),
     )
 
 

@@ -24,6 +24,7 @@ Endpoint:
 
 from __future__ import annotations
 
+import sys
 import time
 from datetime import datetime
 from typing import Literal
@@ -42,20 +43,27 @@ from .probe import SystemProbe
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
-InstallMethod = Literal["docker", "pipx"]
-"""The two install methods reported by the About panel (CONTEXT.md's "Install
+InstallMethod = Literal["docker", "pipx", "native"]
+"""The three install methods reported by the About panel (CONTEXT.md's "Install
 Method") -- spelled out as literals (not plain ``str``) so mypy rejects an
 unrecognised value, matching :data:`collapsarr.settings.routes.
 AuthRequiredMode`/:data:`~collapsarr.settings.routes.AuthMethodMode`'s
 precedent for a closed, named mode field. ``"docker"`` when ``/.dockerenv``
-is present, otherwise ``"pipx"`` -- the primary documented bare-metal install
-path (README.md); pip-from-source (``pip install -e``) is a dev-only variant
-of the same non-Docker case and isn't distinguished separately, matching how
-``GET /api/system/updates``' ``is_docker`` boolean already collapses
-"not Docker" to one bucket."""
+is present; else ``"native"`` when ``sys.frozen`` is truthy (the flag
+PyInstaller sets on the running process at import time, COL-215's
+runtime-free packaging build); otherwise ``"pipx"`` -- the primary documented
+bare-metal install path (README.md); pip-from-source (``pip install -e``) is
+a dev-only variant of the same non-Docker, non-frozen case and isn't
+distinguished separately, matching how ``GET /api/system/updates``'
+``install_method`` field (formerly the ``is_docker`` boolean, COL-215)
+reuses this exact same enum. Docker detection always wins, even under a
+frozen build -- a PyInstaller-built binary could in principle still be
+invoked inside a Docker container, and the container's upgrade instructions
+apply regardless."""
 
 INSTALL_METHOD_DOCKER: InstallMethod = "docker"
 INSTALL_METHOD_PIPX: InstallMethod = "pipx"
+INSTALL_METHOD_NATIVE: InstallMethod = "native"
 
 
 # --- schemas -----------------------------------------------------------------
@@ -88,9 +96,22 @@ class SystemInfoRead(BaseModel):
 # --- helpers -------------------------------------------------------------
 
 
-def _install_method() -> InstallMethod:
-    """``"docker"`` under Docker (``/.dockerenv`` present), else ``"pipx"``."""
-    return INSTALL_METHOD_DOCKER if is_docker_environment() else INSTALL_METHOD_PIPX
+def install_method() -> InstallMethod:
+    """``"docker"`` under Docker (``/.dockerenv`` present); else ``"native"`` when
+    ``sys.frozen`` is truthy (a PyInstaller-built binary, COL-215); else
+    ``"pipx"``.
+
+    Public (not module-private) because :mod:`collapsarr.update_check.routes`
+    reuses this exact seam for ``GET /api/system/updates``' ``install_method``
+    field, rather than duplicating the detection precedence in two places.
+    Docker is checked first and wins even under a frozen build -- see
+    :data:`InstallMethod`'s docstring.
+    """
+    if is_docker_environment():
+        return INSTALL_METHOD_DOCKER
+    if getattr(sys, "frozen", False):
+        return INSTALL_METHOD_NATIVE
+    return INSTALL_METHOD_PIPX
 
 
 def _db_schema_revision(session: Session) -> str | None:
@@ -167,7 +188,7 @@ def get_system_info(request: Request, session: Session = Depends(get_session)) -
 
     return SystemInfoRead(
         app_version=__version__,
-        install_method=_install_method(),
+        install_method=install_method(),
         python_version=probe.python_version(),
         ffmpeg_version=request.app.state.ffmpeg_version,
         os=probe.os_platform(),
@@ -181,4 +202,13 @@ def get_system_info(request: Request, session: Session = Depends(get_session)) -
     )
 
 
-__all__ = ["DiskUsageRead", "SystemInfoRead", "router"]
+__all__ = [
+    "INSTALL_METHOD_DOCKER",
+    "INSTALL_METHOD_NATIVE",
+    "INSTALL_METHOD_PIPX",
+    "DiskUsageRead",
+    "InstallMethod",
+    "SystemInfoRead",
+    "install_method",
+    "router",
+]
