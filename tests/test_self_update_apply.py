@@ -570,6 +570,33 @@ def _live_pause_check(session_factory: sessionmaker[Session]) -> Callable[[], bo
     return _check
 
 
+def _ensure_singleton_rows_exist(session_factory: sessionmaker[Session]) -> None:
+    """Pre-create the ``GlobalSettings``/``SelfUpdateState`` singleton rows (COL-230-era race).
+
+    Both :func:`~collapsarr.settings.service.get_global_settings` and
+    :func:`~collapsarr.self_update.service.get_self_update_state` are
+    get-or-create: a ``SELECT``, then an ``INSERT`` only if nothing came
+    back. That's safe for a single caller, but every ``JobQueue`` this
+    module builds with a real ``pause_check`` (:func:`_live_pause_check`)
+    starts calling ``get_global_settings`` from its worker thread the
+    instant :meth:`~collapsarr.jobs.queue.JobQueue.start` runs (every
+    ``_claim_next`` poll reads it) -- concurrently with whatever the main
+    test thread does next (``scheduler.trigger_file``'s own dedup-window
+    read, ``apply_with_flow``'s pause stash, a second racing request's own
+    guard check, ...). If neither row exists yet, two concurrent first
+    reads can each see "nothing there" and both attempt the ``INSERT``,
+    raising a raw ``sqlite3.IntegrityError`` instead of either call
+    genuinely creating the row. Calling both get-or-create functions once,
+    synchronously, before any concurrency starts (in particular, before
+    :meth:`~collapsarr.jobs.queue.JobQueue.start`) closes that window for
+    every test in this module that would otherwise be racing on a
+    still-empty database.
+    """
+    with session_factory() as session:
+        get_global_settings(session)
+        get_self_update_state(session)
+
+
 def _make_queue_and_scheduler(
     settings: Settings,
     session_factory: sessionmaker[Session],
@@ -588,12 +615,57 @@ def _make_queue_and_scheduler(
     :func:`_live_pause_check`) so Auto-Processing Pause genuinely gates
     claiming, matching production (:meth:`JobQueue.from_settings`) rather
     than the raw ``__init__`` default most other ``test_jobs_queue.py``
-    fixtures rely on.
+    fixtures rely on. See :func:`_ensure_singleton_rows_exist` for why the
+    singleton settings/self-update rows are pre-created before the pool
+    starts.
     """
+    _ensure_singleton_rows_exist(session_factory)
     queue = JobQueue(
         max_concurrency=1,
         pipeline_runner=pipeline_runner,
         history_recorder=make_history_recorder(session_factory),
+        pause_check=_live_pause_check(session_factory),
+    )
+    queue.start()
+    scheduler = JobScheduler(queue, session_factory, settings, probe=_surround_probe)
+    return queue, scheduler
+
+
+def _make_queue_and_scheduler_without_history(
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    *,
+    pipeline_runner: PipelineRunner,
+) -> tuple[JobQueue, JobScheduler]:
+    """Like :func:`_make_queue_and_scheduler`, but without a ``history_recorder``.
+
+    For tests that need a genuinely ``RUNNING`` (or force-paused-``PENDING``)
+    Job in the live queue, but make no assertion about a persisted
+    ``JobHistory`` row -- the large majority of this module's
+    ``apply_with_flow`` end-to-end tests. Skipping ``history_recorder``
+    avoids a real, pre-existing (COL-230-era) race between
+    :meth:`~collapsarr.jobs.queue.JobQueue._enqueue` (which wakes a waiting
+    worker *before* writing the enqueued Job's ``PENDING`` history row) and
+    :func:`~collapsarr.jobs.history.record_job_history`'s non-atomic
+    select-then-insert: under real thread contention a worker can start
+    recording the same Job's ``RUNNING`` transition concurrently with that
+    still-in-flight ``PENDING`` write, and the two race to insert the same
+    ``job_id``, occasionally raising a raw ``IntegrityError`` instead of
+    either write cleanly succeeding. That race is out of this ticket's
+    scope to fix (a shared, heavily-used Job Queue module well beyond
+    COL-233's mandate) -- this is the workaround
+    :func:`test_apply_with_flow_two_genuinely_concurrent_calls_reject_the_second_before_any_stash`
+    already uses. Only the "Cancel & Restart Now" requeue-bypasses-the-window
+    test (which needs a *real* recent completion persisted, not merely an
+    absent one, to prove the bypass matters) still uses
+    :func:`_make_queue_and_scheduler` instead. See
+    :func:`_ensure_singleton_rows_exist` for the *other*, unrelated
+    get-or-create race this also closes.
+    """
+    _ensure_singleton_rows_exist(session_factory)
+    queue = JobQueue(
+        max_concurrency=1,
+        pipeline_runner=pipeline_runner,
         pause_check=_live_pause_check(session_factory),
     )
     queue.start()
@@ -683,31 +755,19 @@ def test_apply_with_flow_two_genuinely_concurrent_calls_reject_the_second_before
     """
     _patch_platform(monkeypatch, ("linux", "amd64"))
     runner = _GatedRunner()  # request A's victim Job blocks until released
-    # Deliberately built without _make_queue_and_scheduler's history_recorder:
-    # this test doesn't need persisted JobHistory rows at all, and wiring one
-    # exercises a separate, pre-existing race between JobQueue._enqueue
-    # (which notifies a waiting worker *before* it writes the PENDING history
-    # row -- see its own docstring) and record_job_history's non-atomic
-    # get-or-create -- unrelated to what this test guards (apply_with_flow's
-    # own guard-reservation timing), and only otherwise reachable here
-    # because a worker can race to claim+run the Job right after enqueue.
-    queue = JobQueue(
-        max_concurrency=1, pipeline_runner=runner, pause_check=_live_pause_check(session_factory)
+    # _make_queue_and_scheduler_without_history, not _make_queue_and_scheduler:
+    # this test doesn't need persisted JobHistory rows at all -- see that
+    # helper's own docstring for why wiring one would be actively harmful
+    # here (a separate, pre-existing race it works around).
+    queue, scheduler = _make_queue_and_scheduler_without_history(
+        settings, session_factory, pipeline_runner=runner
     )
-    queue.start()
-    scheduler = JobScheduler(queue, session_factory, settings, probe=_surround_probe)
     try:
-        # Pre-create the singleton self_update_state row *before* racing two
-        # requests against it -- get_self_update_state's own get-or-create is
-        # a separate, pre-existing (COL-230) race on the row's first-ever
-        # creation (two concurrent INSERTs -> a raw IntegrityError, not this
-        # module's friendly SelfUpdateAlreadyInProgressError) that has
-        # nothing to do with what this test is exercising; creating it
-        # up front keeps both requests on the UPDATE path this test cares
-        # about.
-        with session_factory() as seed_session:
-            get_self_update_state(seed_session)
-
+        # No need to pre-create the singleton self_update_state row here --
+        # _make_queue_and_scheduler_without_history already does (see
+        # _ensure_singleton_rows_exist), so both requests below race on the
+        # UPDATE path this test actually cares about, not on who wins the
+        # row's first-ever creation.
         victim = scheduler.trigger_file("/media/victim.mkv")
         assert victim is not None
         assert runner.started.wait(timeout=5)
@@ -853,7 +913,12 @@ def test_apply_with_flow_cancel_and_restart_restores_pause_when_the_apply_itself
     """
     _patch_platform(monkeypatch, ("linux", "amd64"))
     runner = _HardKillOnceRunner()
-    queue, scheduler = _make_queue_and_scheduler(settings, session_factory, pipeline_runner=runner)
+    # _make_queue_and_scheduler_without_history: this test asserts on the
+    # pause/guard outcome only, not on any persisted JobHistory row -- see
+    # that helper's own docstring for why history_recorder is skipped here.
+    queue, scheduler = _make_queue_and_scheduler_without_history(
+        settings, session_factory, pipeline_runner=runner
+    )
     try:
         victim = scheduler.trigger_file("/media/victim.mkv")
         assert victim is not None
@@ -888,7 +953,11 @@ def test_apply_with_flow_wait_and_restart_blocks_then_proceeds_without_cancellin
 ) -> None:
     _patch_platform(monkeypatch, ("linux", "amd64"))
     runner = _GatedRunner()
-    queue, scheduler = _make_queue_and_scheduler(settings, session_factory, pipeline_runner=runner)
+    # _make_queue_and_scheduler_without_history: no assertion here touches a
+    # persisted JobHistory row -- see that helper's own docstring.
+    queue, scheduler = _make_queue_and_scheduler_without_history(
+        settings, session_factory, pipeline_runner=runner
+    )
     try:
         victim = scheduler.trigger_file("/media/victim.mkv")
         assert victim is not None
@@ -951,7 +1020,11 @@ def test_apply_with_flow_wait_and_restart_times_out_and_restores_pause(
 ) -> None:
     _patch_platform(monkeypatch, ("linux", "amd64"))
     runner = _GatedRunner()  # never released -- the wait must time out
-    queue, scheduler = _make_queue_and_scheduler(settings, session_factory, pipeline_runner=runner)
+    # _make_queue_and_scheduler_without_history: no assertion here touches a
+    # persisted JobHistory row -- see that helper's own docstring.
+    queue, scheduler = _make_queue_and_scheduler_without_history(
+        settings, session_factory, pipeline_runner=runner
+    )
     try:
         # Trigger + wait for the victim Job to actually be claimed *before*
         # introducing the pre-existing manual pause below -- otherwise the
@@ -983,9 +1056,10 @@ def test_apply_with_flow_wait_and_restart_times_out_and_restores_pause(
             assert row.auto_processing_paused is True
             assert row.auto_processing_pause_restore_value is None
 
-        # The Self-Update in-progress guard was never actually taken (the
-        # wait failed before apply_pipx_update's own begin_self_update call
-        # ever ran) -- a fresh attempt is free to start.
+        # The Self-Update in-progress guard -- reserved by apply_with_flow
+        # itself before the wait even started -- was cleared back to idle by
+        # its own failure handling once the wait timed out: a fresh attempt
+        # is free to start.
         with session_factory() as check_session:
             state = get_self_update_state(check_session)
             assert state.in_progress is False
