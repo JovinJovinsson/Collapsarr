@@ -554,7 +554,7 @@ jobs:
           pattern: collapsarr-windows-*
           path: native-builds/
           merge-multiple: true
-      - name: Generate SHA256SUMS for the native platform archives (COL-227)
+      - name: Generate SHA256SUMS for the native platform archives
         # Covers only the native Linux/macOS/Windows archives -- not the
         # wheel/sdist -- per this ticket's scope. Written into native-builds/
         # so the existing `native-builds/*` glob below picks it up and
@@ -580,11 +580,9 @@ jobs:
   # matches" spirit as verify-ffmpeg-manifest above (COL-217 / ADR 0002),
   # applied here to this release's own native archives (COL-227).
   verify-release-checksums:
-    name: Verify published SHA256SUMS
+    name: Verify published SHA256SUMS (real network)
     needs: github-release
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Download the published native archives + SHA256SUMS
         env:
@@ -593,7 +591,9 @@ jobs:
           mkdir -p release-assets
           gh release download "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --pattern 'collapsarr-*' \
+            --pattern 'collapsarr-*-linux-*.tar.gz' \
+            --pattern 'collapsarr-*-macos-*.tar.gz' \
+            --pattern 'collapsarr-*-windows-*.zip' \
             --pattern 'SHA256SUMS' \
             --dir release-assets
       - name: Verify hashes against the published archives
