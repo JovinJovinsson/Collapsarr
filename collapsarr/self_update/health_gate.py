@@ -71,22 +71,66 @@ does not give its own phase -- it settles back to ``idle`` like every other
 unexpected failure, logged loudly (``logger.exception``) so it's visible in
 the log tail (``GET /api/system/logs``, COL-131) even though the status
 endpoint can't distinguish it from "never attempted."
+
+**Native rollback dispatch (COL-236).** Everything above describes the
+``pipx`` rollback mechanics -- but :mod:`collapsarr.self_update.native`'s
+:func:`~collapsarr.self_update.native.apply_native_update` (COL-235) *also*
+hands off across its process boundary by setting the exact same
+``phase = PHASE_AWAITING_HEALTH`` before its staged-handoff process exits
+(same shared phase vocabulary, same pickup contract). A native install's
+freshly-swapped-in process must **not** run the pipx pinned-reinstall path
+above -- there is no venv, no package index entry, and ``pip install
+collapsarr==<version>`` would simply fail. :func:`resolve_awaiting_health`
+therefore branches on this install's
+:func:`~collapsarr.system.info.install_method` (via the injectable
+``install_method_fn``, defaulting to the real
+:func:`~collapsarr.system.info.install_method`) immediately after the shared
+health-check retry loop settles into healthy/unhealthy, and for a native
+install runs the **swap-back** rollback instead: :func:`~collapsarr.
+self_update.native.swap_install_dir` -- the exact same atomic-rename-pair
+primitive COL-235's forward swap uses -- reused with the old/new roles
+reversed (the retained :data:`~collapsarr.self_update.native.
+NATIVE_BACKUP_DIRNAME` tree becomes the new "staged" source, the live,
+unhealthy install becomes the thing renamed aside into
+:data:`~collapsarr.self_update.native.NATIVE_QUARANTINE_DIRNAME`, deleted
+immediately once the swap-back commits -- see that constant's docstring),
+then re-execs from the now-restored ``live_dir``. On the healthy branch the
+native path additionally deletes the retained backup directory (best-effort,
+``shutil.rmtree(..., ignore_errors=True)``) before clearing the guard --
+this is where the AC's "old folder only deleted once the new process has
+proven healthy" is actually satisfied; nothing deletes it any earlier. Both
+branches stay inside the one broad ``try``/``except Exception`` described
+above, so a native swap-back failure (no backup directory found, or the
+:class:`OSError` :func:`~collapsarr.self_update.native.swap_install_dir`
+itself couldn't recover from) funnels through the identical
+guard-never-stuck discipline as a failed pinned reinstall.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from ..system.info import INSTALL_METHOD_NATIVE, InstallMethod, install_method
 from .apply import ReexecFn, SubprocessRunner
 from .models import PHASE_AWAITING_HEALTH, PHASE_IDLE, PHASE_ROLLED_BACK
+from .native import (
+    NATIVE_BACKUP_DIRNAME,
+    NATIVE_QUARANTINE_DIRNAME,
+    resolve_install_dir,
+    swap_install_dir,
+)
+from .native import ReexecFn as NativeReexecFn
+from .native import SwapFn as NativeSwapFn
 from .service import clear_self_update, get_self_update_state
 
 logger = logging.getLogger(__name__)
@@ -185,6 +229,78 @@ def _relaunch_process() -> None:
     os.execv(sys.argv[0], sys.argv)  # noqa: S606 - restarting this exact process, not an arbitrary command
 
 
+def _native_relaunch_process(live_dir: Path) -> None:
+    """The real, production :data:`~collapsarr.self_update.native.ReexecFn` for
+    the native swap-back rollback -- identical in shape and intent to
+    :func:`collapsarr.self_update.native._reexec_into` (duplicated rather than
+    imported across module-privacy boundaries, same rationale as
+    :func:`_relaunch_process` above and that function's docstring)."""
+    live_exe = live_dir / Path(sys.executable).name
+    os.execv(str(live_exe), [str(live_exe)])  # noqa: S606 - re-launching our own binary
+
+
+def _native_backup_dir(install_dir: Path) -> Path:
+    """The retained pre-update install directory beside ``install_dir`` (COL-236).
+
+    Recomputes the exact same path :func:`~collapsarr.self_update.native.
+    apply_native_update` used for its ``backup_dir`` -- a fixed, deterministic
+    sibling name (:data:`~collapsarr.self_update.native.NATIVE_BACKUP_DIRNAME`),
+    not a random tmp name, so no extra state needs to be persisted to find it
+    again on this later boot.
+    """
+    return install_dir.parent / NATIVE_BACKUP_DIRNAME
+
+
+def _swap_back_native(*, install_dir: Path, swap_fn: NativeSwapFn) -> None:
+    """Swap the retained old install back into place (COL-236). Does not re-exec.
+
+    The native counterpart of the pip-pinned-reinstall rollback above: reuses
+    :func:`~collapsarr.self_update.native.swap_install_dir` -- the exact same
+    atomic-rename-pair primitive COL-235's *forward* swap uses -- with the
+    old/new roles reversed. ``install_dir`` (the live, unhealthy new build) is
+    passed as that function's ``live_dir``, the retained
+    :func:`_native_backup_dir` tree as its ``staged_dir`` (the thing moved
+    *into* ``live_dir``), and a fresh quarantine directory
+    (:data:`~collapsarr.self_update.native.NATIVE_QUARANTINE_DIRNAME`) as its
+    ``backup_dir`` (the thing the unhealthy build is renamed *aside* to).
+    Postconditions after this returns: ``install_dir`` holds the old, proven-
+    healthy build; the quarantine directory -- and with it the failed new
+    build -- has been deleted (the AC only requires the *old* folder survive,
+    not that a failed new build be kept around; see
+    :data:`~collapsarr.self_update.native.NATIVE_QUARANTINE_DIRNAME`'s
+    docstring). Raises :class:`_HealthGateFailure` if there is no retained
+    backup to roll back to, or if the swap itself raises an
+    :class:`OSError` (already rolled back inline by ``swap_fn`` -- see
+    :func:`~collapsarr.self_update.native.swap_install_dir`'s own docstring);
+    both funnel through :func:`resolve_awaiting_health`'s single guard-never-
+    stuck ``except`` clause exactly like a failed pinned reinstall.
+
+    Deliberately does **not** re-exec -- :func:`resolve_awaiting_health`
+    clears the guard to :data:`~collapsarr.self_update.models.
+    PHASE_ROLLED_BACK` *between* this returning and the re-exec call, mirroring
+    the pipx path's own "persist the terminal state, then relaunch" ordering
+    exactly (a real ``os.execv`` never returns, so the persisted state must be
+    committed *before* that call, not after).
+    """
+    backup_dir = _native_backup_dir(install_dir)
+    if not backup_dir.exists():
+        raise _HealthGateFailure(
+            f"Health check failed after re-exec, but no retained backup install "
+            f"({backup_dir}) exists to roll back to."
+        )
+
+    quarantine_dir = install_dir.parent / NATIVE_QUARANTINE_DIRNAME
+    shutil.rmtree(quarantine_dir, ignore_errors=True)
+    try:
+        swap_fn(install_dir, backup_dir, quarantine_dir)
+    except OSError as exc:
+        raise _HealthGateFailure(f"Native install-directory swap-back failed: {exc}") from exc
+
+    # The swap-back committed: the old build is back at install_dir, and the
+    # failed new build is quarantined. Only the old build must survive.
+    shutil.rmtree(quarantine_dir, ignore_errors=True)
+
+
 def resolve_awaiting_health(
     session: Session,
     *,
@@ -195,29 +311,54 @@ def resolve_awaiting_health(
     poll_interval: float = DEFAULT_HEALTH_CHECK_POLL_INTERVAL,
     sleep_fn: Callable[[float], None] = time.sleep,
     subprocess_timeout: float = PIP_ROLLBACK_TIMEOUT,
+    install_method_fn: Callable[[], InstallMethod] = install_method,
+    native_install_dir: Path | None = None,
+    native_swap_fn: NativeSwapFn | None = None,
+    native_reexec_fn: NativeReexecFn | None = None,
 ) -> SelfUpdateHealthGateOutcome:
-    """Confirm health after a self-update re-exec, or roll back (COL-234).
+    """Confirm health after a self-update re-exec, or roll back (COL-234, COL-236).
 
     Called once, early in every process boot (see
     :func:`collapsarr.main.create_app`'s lifespan) -- a no-op
     (``action="noop"``) unless the persisted phase is exactly
     :data:`~collapsarr.self_update.models.PHASE_AWAITING_HEALTH`, i.e. this
-    boot is the one immediately following COL-232's apply-flow re-exec.
+    boot is the one immediately following COL-232's pipx apply-flow re-exec
+    *or* COL-235's native staged-handoff swap (both hand off across their
+    process boundary via this exact same phase -- see the module docstring's
+    "Native rollback dispatch" section).
 
     Calls ``health_check_fn`` up to ``max_attempts`` times, sleeping
     ``poll_interval`` seconds (via ``sleep_fn``) between failed attempts. On
     success, clears the guard to
     :data:`~collapsarr.self_update.models.PHASE_IDLE` -- the update stands,
-    exactly as if it had never needed watching. On a health check that never
-    passes within the attempt budget, reinstalls the exact previous version
-    by pin via ``subprocess_runner`` (defaults to :func:`_run_pip_install`)
-    and calls ``reexec_fn`` (defaults to :func:`_relaunch_process`) to
-    relaunch into it, leaving
+    exactly as if it had never needed watching -- and, for a native install
+    (``install_method_fn`` returns
+    :data:`~collapsarr.system.info.INSTALL_METHOD_NATIVE`), also deletes the
+    now-unneeded retained backup directory (best-effort). On a health check
+    that never passes within the attempt budget, this install's
+    ``install_method_fn`` decides *how* to roll back: a native install swaps
+    the retained old build back into ``live_dir`` and re-execs into it
+    (:func:`_swap_back_native`, via ``native_swap_fn``/``native_reexec_fn``);
+    every other install reinstalls the exact previous version by pin via
+    ``subprocess_runner`` (defaults to :func:`_run_pip_install`) and calls
+    ``reexec_fn`` (defaults to :func:`_relaunch_process`) to relaunch into
+    it. Either way this leaves
     :data:`~collapsarr.self_update.models.PHASE_ROLLED_BACK` (guard cleared,
-    ``previous_version`` left in place) for the status endpoint to report.
+    ``previous_version`` left in place) for the status endpoint to report --
+    the same terminal state shape regardless of which rollback mechanism ran.
     See the module docstring's "No failure can leave the guard stuck" section
-    for how every failure along this path -- including a reinstall that
-    itself fails -- is guaranteed not to leave the guard permanently held.
+    for how every failure along either path -- including a reinstall or a
+    swap-back that itself fails -- is guaranteed not to leave the guard
+    permanently held. ``native_swap_fn``/``native_reexec_fn`` default to the
+    real :func:`~collapsarr.self_update.native.swap_install_dir`/
+    :func:`_native_relaunch_process` when unset, same production-default
+    shape as ``subprocess_runner``/``reexec_fn`` above, and are likewise
+    threaded through :func:`collapsarr.main.create_app` so tests can inject
+    fakes there too. ``install_method_fn``/``native_install_dir`` are
+    test-only seams not exposed via ``create_app`` -- production always wants
+    the real :func:`~collapsarr.system.info.install_method` and the real
+    :func:`~collapsarr.self_update.native.resolve_install_dir`, since only the
+    actual running install's method and location are ever meaningful at boot.
     """
     row = get_self_update_state(session)
     if row.phase != PHASE_AWAITING_HEALTH:
@@ -225,7 +366,10 @@ def resolve_awaiting_health(
 
     run = subprocess_runner or _run_pip_install
     reexec = reexec_fn or _relaunch_process
+    native_swap = native_swap_fn or swap_install_dir
+    native_reexec = native_reexec_fn or _native_relaunch_process
     previous_version = row.previous_version
+    is_native = install_method_fn() == INSTALL_METHOD_NATIVE
 
     try:
         healthy = False
@@ -237,11 +381,34 @@ def resolve_awaiting_health(
                 sleep_fn(poll_interval)
 
         if healthy:
+            if is_native:
+                install_dir = native_install_dir or resolve_install_dir()
+                shutil.rmtree(_native_backup_dir(install_dir), ignore_errors=True)
             clear_self_update(session, phase=PHASE_IDLE)
             logger.info(
                 "Self-update health check passed after re-exec; now running the new version."
             )
             return SelfUpdateHealthGateOutcome(action="healthy")
+
+        if is_native:
+            logger.warning(
+                "Self-update health check failed after re-exec (%d attempt(s)); "
+                "rolling back to the retained install.",
+                max_attempts,
+            )
+            install_dir = native_install_dir or resolve_install_dir()
+            _swap_back_native(install_dir=install_dir, swap_fn=native_swap)
+
+            # Swap-back committed -- persist the terminal state *before*
+            # re-execing, since a real os.execv() below never returns.
+            clear_self_update(session, phase=PHASE_ROLLED_BACK)
+            logger.info("Native self-update rolled back; re-executing.")
+            native_reexec(install_dir)
+
+            # Reached only when `native_reexec_fn` is a test fake/spy that
+            # returns instead of replacing the process -- a real os.execv()
+            # never returns on success.
+            return SelfUpdateHealthGateOutcome(action="rolled_back")
 
         if not previous_version:
             raise _HealthGateFailure(

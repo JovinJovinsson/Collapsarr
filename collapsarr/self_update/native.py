@@ -173,6 +173,21 @@ FINISH_UPDATE_FLAG = "--finish-self-update"
 NATIVE_STAGING_DIRNAME = ".collapsarr-self-update-staging"
 NATIVE_BACKUP_DIRNAME = ".collapsarr-self-update-backup"
 
+#: The third sibling directory (COL-236): where the *new, unhealthy* build
+#: swapped-back out of ``live_dir`` is quarantined for the instant it takes
+#: to delete it. :func:`~collapsarr.self_update.health_gate.
+#: resolve_awaiting_health`'s native rollback reuses :func:`swap_install_dir`
+#: with the old/new roles reversed (``live_dir`` <-> :data:`NATIVE_BACKUP_DIRNAME`)
+#: -- that function's contract requires its own ``backup_dir`` argument to be a
+#: non-existent destination distinct from both of its other two arguments, so
+#: the failed new build can't be swapped directly into
+#: :data:`NATIVE_BACKUP_DIRNAME` (that name is about to hold the *old*,
+#: proven-healthy build the AC requires survive). The AC only requires the old
+#: build survive until proven healthy, not that a failed new build be kept
+#: around, so this directory is deleted again immediately after the swap-back
+#: commits -- it is never left on disk for an operator to find.
+NATIVE_QUARANTINE_DIRNAME = ".collapsarr-self-update-quarantine"
+
 #: How long the handoff process waits for the old PID to exit before giving up
 #: and aborting the swap (see :func:`finish_native_update`). Generous: a clean
 #: process exit is near-instant, but a live process finishing an in-flight
@@ -889,6 +904,7 @@ def run_finish_update(args: FinishUpdateArgs) -> None:  # pragma: no cover - pro
 __all__ = [
     "FINISH_UPDATE_FLAG",
     "NATIVE_BACKUP_DIRNAME",
+    "NATIVE_QUARANTINE_DIRNAME",
     "NATIVE_STAGING_DIRNAME",
     "PID_POLL_INTERVAL",
     "PID_WAIT_TIMEOUT",
