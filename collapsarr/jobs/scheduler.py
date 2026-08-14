@@ -1217,18 +1217,37 @@ class JobScheduler:
            section). The resulting Job is then force-started the same way as
            case 1.
 
-        Returns the acted-on :class:`~collapsarr.jobs.queue.Job` (its
-        ``status`` already ``RUNNING`` by the time this returns, for both the
-        force-started and the already-running case), or ``None`` for the same
-        reasons :meth:`trigger_file` would return ``None`` when no active Job
-        already exists -- unprobeable, or no qualifying target even with the
-        Tracked gate and Recently-Processed Window both bypassed. A narrow,
-        documented race -- a concurrent enqueue winning :meth:`trigger_file`'s
-        own re-checked duplicate guard between this method's
-        :meth:`_find_active_job` check and that call -- also returns ``None``
-        rather than reaching for the concurrently-created Job; the file
-        genuinely does have a Job in flight at that point, just not one this
-        call itself force-started.
+        Returns the acted-on :class:`~collapsarr.jobs.queue.Job` whenever
+        *something* is genuinely ``RUNNING`` (or already terminal) for
+        ``file_path`` by the time this returns -- covering three cases: it
+        was already ``RUNNING``, this call's own
+        :meth:`~collapsarr.jobs.queue.JobQueue.force_start` started it, or
+        (a narrow but real race) the ordinary pool claimed it first, in the
+        moment between this method finding/creating the Job and its own
+        :meth:`force_start` call landing -- see :meth:`_settled_job_or_none`
+        for exactly how that distinction is made. Returns ``None`` -- nothing
+        is running, the caller must not be told otherwise -- for either of
+        two genuinely different reasons that collapse to the same outcome:
+
+        * the same reasons :meth:`trigger_file` would return ``None`` when no
+          active Job already exists -- unprobeable, or no qualifying target
+          even with the Tracked gate and Recently-Processed Window both
+          bypassed; or a narrow, documented race where a concurrent enqueue
+          wins :meth:`trigger_file`'s own re-checked duplicate guard between
+          this method's :meth:`_find_active_job` check and that call (the
+          file genuinely does have a Job in flight at that point, just not
+          one this call itself force-started, so there is nothing new here to
+          hand back);
+        * :meth:`~collapsarr.jobs.queue.JobQueue.force_start` reported
+          ``False`` *and* the Job is still ``PENDING`` -- meaning nothing
+          actually started it: either the queue had already begun
+          :meth:`~collapsarr.jobs.queue.JobQueue.shutdown` (which makes
+          ``force_start`` a no-op by design, see its own docstring) or the
+          Job was cancelled out from under this call. Silently returning the
+          still-``PENDING`` Job here, as an earlier version of this method
+          did, would let ``POST /api/jobs/process-now`` report
+          ``enqueued=True`` for a Job that never actually ran -- this
+          explicitly does not.
 
         Whether starting this Job would exceed the Concurrency Limit is
         deliberately **not** checked here -- see
@@ -1242,13 +1261,45 @@ class JobScheduler:
         existing = self._find_active_job(path)
         if existing is not None:
             if existing.status is JobStatus.PENDING:
-                self._queue.force_start(existing.id)
+                started = self._queue.force_start(existing.id)
+                return self._settled_job_or_none(started, existing)
             return existing
         job = self.trigger_file(path, session=session, bypass_dedup_window=True)
         if job is None:
             return None
-        self._queue.force_start(job.id)
-        return job
+        started = self._queue.force_start(job.id)
+        return self._settled_job_or_none(started, job)
+
+    @staticmethod
+    def _settled_job_or_none(started: bool, job: Job) -> Job | None:
+        """Resolve one :meth:`~collapsarr.jobs.queue.JobQueue.force_start` outcome (COL-229).
+
+        ``started=True`` is the simple case -- ``job`` is already ``RUNNING``,
+        return it directly. ``started=False`` ("too late," per
+        :meth:`~collapsarr.jobs.queue.JobQueue.force_start`'s own contract)
+        is ambiguous on its own: it means either (a) the queue had already
+        begun shutdown (or ``job`` was cancelled out from under this call),
+        so genuinely nothing is running for it, or (b) an ordinary pool
+        worker (or a concurrent ``force_start``/``process_now`` call for the
+        same file) won the race and claimed -- or even finished -- it in the
+        meantime, which is still a real success, just not one *this* call
+        itself produced.
+
+        Disambiguated by re-reading ``job.status``: :class:`~collapsarr.jobs.
+        queue.Job` is a mutable dataclass, and ``job`` here is the *same*
+        object stored in the live queue's ``_jobs`` map (never a copy) --
+        so any concurrent mutation (a pool worker's claim, another
+        force-start) is visible through this exact reference with no need to
+        re-fetch via :meth:`~collapsarr.jobs.queue.JobQueue.get_job`. Still
+        ``PENDING`` means case (a) -- nothing happened, return ``None``.
+        Anything else (``RUNNING``, or already terminal if it finished
+        instantly) means case (b) -- return ``job``, a genuine success.
+        """
+        if started:
+            return job
+        if job.status is not JobStatus.PENDING:
+            return job
+        return None
 
     def _find_active_job(self, path: Path) -> Job | None:
         """The currently ``PENDING``/``RUNNING`` Job for ``path``, if any (COL-229).

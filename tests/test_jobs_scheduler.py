@@ -1310,6 +1310,69 @@ def test_process_now_returns_none_when_the_file_cannot_be_probed(
     assert scheduler.process_now("/media/movie.mkv") is None
 
 
+def test_process_now_returns_none_when_shutdown_has_already_begun_for_an_existing_pending_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Regression: force_start's new shutdown-no-op must not be reported as success.
+
+    An earlier version of ``process_now`` ignored ``force_start``'s return
+    value and always returned the (possibly still-``PENDING``) Job, which
+    would make ``POST /api/jobs/process-now`` report ``enqueued=True`` for a
+    Job that never actually started.
+    """
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    assert job.status is JobStatus.PENDING
+
+    scheduler._queue.shutdown()
+
+    result = scheduler.process_now("/media/movie.mkv")
+
+    assert result is None
+    assert job.status is JobStatus.PENDING  # never actually started
+
+
+def test_process_now_returns_none_when_shutdown_has_already_begun_for_a_newly_created_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Same regression as above, for the "no existing Job yet" creation path."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    scheduler._queue.shutdown()
+
+    result = scheduler.process_now("/media/movie.mkv")
+
+    assert result is None
+    created = [j for j in scheduler._queue.list_jobs() if j.file_path == Path("/media/movie.mkv")]
+    assert len(created) == 1
+    assert created[0].status is JobStatus.PENDING  # created (mirrors enqueue's own post-shutdown
+    # behavior), but never actually started -- process_now must not claim otherwise.
+
+
+def test_process_now_still_reports_success_when_the_pool_wins_the_race_to_claim_it(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """force_start returning False doesn't always mean failure -- the pool may win the race."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+
+    def fake_force_start(job_id: UUID) -> bool:
+        # Simulate a pool worker (JobQueue._claim_next) winning the race and
+        # claiming this exact Job object -- the same shared reference
+        # process_now already holds -- in the moment before force_start
+        # itself would have claimed it.
+        job.status = JobStatus.RUNNING
+        return False
+
+    monkeypatch.setattr(scheduler._queue, "force_start", fake_force_start)
+
+    result = scheduler.process_now("/media/movie.mkv")
+
+    assert result is job
+    assert result.status is JobStatus.RUNNING
+
+
 def test_would_exceed_concurrency_limit_false_when_under_the_limit(
     settings: Settings, session_factory: sessionmaker[Session]
 ) -> None:
