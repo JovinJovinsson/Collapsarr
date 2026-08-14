@@ -138,6 +138,16 @@ gate -- distinct from :data:`DEFAULT_AUTO_QUEUE_PAUSED`'s "Auto-Queuing
 Pause", which only gates the scanner's enqueue/top-up funnel and never
 touches an already-``PENDING``/``RUNNING`` Job."""
 
+DEFAULT_AUTO_PROCESSING_PAUSE_RESTORE_VALUE = None
+"""Default :attr:`GlobalSettings.auto_processing_pause_restore_value` for a
+fresh install / an existing row backfilled by the additive migration
+(COL-230). ``None`` (unset) is the only correct default -- unlike
+:data:`DEFAULT_AUTO_PROCESSING_PAUSED`, this is not itself an operator-facing
+toggle with a meaningful "off" state; it is scratch space the self-update
+apply flow (COL-233) writes to for its own one-shot bookkeeping. See
+:attr:`GlobalSettings.auto_processing_pause_restore_value`'s own docstring
+for the full mechanism."""
+
 LOG_LEVEL_DEBUG = "DEBUG"
 LOG_LEVEL_INFO = "INFO"
 LOG_LEVEL_WARNING = "WARNING"
@@ -386,6 +396,23 @@ class GlobalSettings(Base):
     kwarg when set) and by :func:`collapsarr.health.ffmpeg.
     make_ffmpeg_check_run`'s ``run`` callable (probes this path instead of
     the bare default when set).
+
+    ``auto_processing_pause_restore_value`` (COL-230, consumed by COL-233) is
+    a nullable *scratch* boolean backing the self-update apply flow's
+    one-shot "pause processing, apply the update, then restore whatever the
+    pause state was before" mechanism -- distinct from every other field on
+    this row, which are all operator-facing settings; this one is internal
+    bookkeeping the self-update flow itself reads and writes. ``None`` is the
+    steady-state value (no self-update is currently in flight, or the flow
+    hasn't yet decided it needs to touch ``auto_processing_paused``); COL-233
+    is expected to snapshot the current ``auto_processing_paused`` value here
+    immediately before force-pausing it for the duration of an apply, then
+    restore ``auto_processing_paused`` from it and reset this field back to
+    ``None`` once the update completes (success, failure, or rollback) -- so
+    an apply that force-paused processing never leaves it paused
+    indefinitely. Nullable with no ``server_default``, same treatment as
+    ``ffmpeg_path`` above -- an existing install's row is backfilled to
+    ``NULL`` (no in-flight self-update) and sees no change.
     """
 
     __tablename__ = "global_settings"
@@ -505,6 +532,10 @@ class GlobalSettings(Base):
     )
 
     ffmpeg_path: Mapped[str | None] = mapped_column(String(500), nullable=True, default=None)
+
+    auto_processing_pause_restore_value: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True, default=DEFAULT_AUTO_PROCESSING_PAUSE_RESTORE_VALUE
+    )
 
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)

@@ -61,6 +61,7 @@ from .plex.routes import router as plex_router
 from .plex.scheduler import PlexSyncScheduler
 from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
+from .self_update.routes import router as self_update_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
 from .settings.service import get_global_settings
@@ -504,6 +505,13 @@ def create_app(
     # health-check banner's opt-in "Download FFmpeg" action; never triggered
     # automatically (ADR 0001/0002).
     app.include_router(ffmpeg_download_router)
+
+    # Self-update status/liveness GET /api/system/self-update/status (COL-230,
+    # Epic COL-224): exposes the singleton self-update state's current phase
+    # and in-progress guard -- foundational for the apply flows (COL-232+)
+    # and the frontend's future polling screen; this ticket only wires up the
+    # read side, there is no start endpoint yet.
+    app.include_router(self_update_router)
 
     # Tail-read GET /api/system/logs (COL-131): the most recent lines of the
     # current rotating log file COL-128's configure_logging() writes to
