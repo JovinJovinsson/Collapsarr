@@ -27,15 +27,23 @@ Public surface, by concern:
   unauthenticated, never-raising fetch of a release's ``SHA256SUMS`` asset
   (published by ``release.yml`` since COL-227) and resolution of the entry
   matching this process's platform/arch.
-- **API routes** -- ``GET /api/system/self-update/status``
-  (:mod:`~collapsarr.self_update.routes`): exposes the persisted state to an
-  authenticated caller, mirroring :mod:`collapsarr.update_check.routes`'s
-  shape. Mounted directly in :func:`collapsarr.main.create_app` (not
-  re-exported here), same convention as ``update_checks_router``.
+- **The pipx apply flow (COL-232)** -- :func:`apply_pipx_update`
+  (:mod:`~collapsarr.self_update.apply`): the "no Jobs running" download
+  -verify-upgrade-re-exec sequence for ``pipx`` installs, plus
+  :func:`stable_update_target` (the shared "is a newer stable release even
+  available" gate).
+- **API routes** -- ``GET /api/system/self-update/status``,
+  ``POST /api/system/self-update/apply`` (COL-232)
+  (:mod:`~collapsarr.self_update.routes`): exposes the persisted state, and
+  triggers the apply flow, to an authenticated caller, mirroring
+  :mod:`collapsarr.update_check.routes`'s/:mod:`collapsarr.ffmpeg_download.
+  routes`'s shape. Mounted directly in :func:`collapsarr.main.create_app`
+  (not re-exported here), same convention as ``update_checks_router``.
 """
 
 from __future__ import annotations
 
+from .apply import SelfUpdateApplyOutcome, apply_pipx_update, stable_update_target
 from .client import (
     SelfUpdateChecksumResult,
     fetch_checksum_entry,
@@ -74,8 +82,10 @@ __all__ = [
     "SELF_UPDATE_PHASES",
     "SELF_UPDATE_STATE_ID",
     "SelfUpdateAlreadyInProgressError",
+    "SelfUpdateApplyOutcome",
     "SelfUpdateChecksumResult",
     "SelfUpdateState",
+    "apply_pipx_update",
     "begin_self_update",
     "clear_self_update",
     "fetch_checksum_entry",
@@ -86,4 +96,5 @@ __all__ = [
     "resolve_checksum_entry",
     "resolve_platform_arch",
     "set_self_update_phase",
+    "stable_update_target",
 ]

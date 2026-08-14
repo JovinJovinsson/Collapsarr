@@ -61,6 +61,7 @@ from .plex.routes import router as plex_router
 from .plex.scheduler import PlexSyncScheduler
 from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
+from .self_update.apply import ReexecFn, SubprocessRunner
 from .self_update.routes import router as self_update_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
@@ -132,6 +133,9 @@ def create_app(
     plex_transport: httpx.BaseTransport | None = None,
     system_probe: SystemProbe | None = None,
     ffmpeg_download_transport: httpx.BaseTransport | None = None,
+    self_update_transport: httpx.BaseTransport | None = None,
+    self_update_subprocess_runner: SubprocessRunner | None = None,
+    self_update_reexec_fn: ReexecFn | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -186,7 +190,17 @@ def create_app(
     is not consumed by any background scheduler -- the download only ever
     runs synchronously inside that one request handler -- so it is stashed
     directly on ``app.state.ffmpeg_download_transport`` for the route to read,
-    rather than threaded into a scheduler constructor.
+    rather than threaded into a scheduler constructor. ``self_update_transport``/
+    ``self_update_subprocess_runner``/``self_update_reexec_fn`` (COL-232) are
+    the same idea for ``POST /api/system/self-update/apply``'s pipx apply
+    flow (:func:`collapsarr.self_update.apply.apply_pipx_update`): the
+    transport stands in for a real network call, and the latter two stand in
+    for a real ``pipx upgrade`` subprocess spawn / a real :func:`os.execv`
+    re-exec, letting tests exercise the whole apply flow with fakes/spies.
+    All three are stashed directly on ``app.state`` (same as
+    ``ffmpeg_download_transport``) and default to ``None``, in which case
+    the route lets :func:`~collapsarr.self_update.apply.apply_pipx_update`'s
+    own production defaults apply.
     """
     resolved_settings = settings or get_settings()
 
@@ -398,6 +412,9 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.on_file_ready = on_file_ready or default_on_file_ready_hook
     app.state.ffmpeg_download_transport = ffmpeg_download_transport
+    app.state.self_update_transport = self_update_transport
+    app.state.self_update_subprocess_runner = self_update_subprocess_runner
+    app.state.self_update_reexec_fn = self_update_reexec_fn
 
     # Exposed for GET /api/system/tasks (COL-122) to tell whether a Scheduled
     # Task's computed next-run time is actually meaningful: the health/update
