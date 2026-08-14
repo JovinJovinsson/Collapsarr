@@ -84,14 +84,51 @@ the primary documented bare-metal install path. Docker detection always
 wins, even under a frozen build. Surfaced as the three-valued
 `install_method` (`docker`/`pipx`/`native`) on `GET /api/system/updates`,
 superseding the earlier `is_docker` boolean now that a third method
-exists, and used solely to pick which upgrade *instructions* the Updates
-page displays: `docker pull` + recreate-container for `docker`; `pipx
-upgrade`/`pip install --upgrade` for `pipx`; for `native`, a
-download-the-archive-and-replace-the-install-folder walkthrough that also
-calls out that the database/config are safe, since they live in the OS
-user-data directory rather than inside the install folder being replaced
-— see `docs/adr/0001-update-check-detect-notify-only.md`. No code path
-executes any of these commands; the operator always runs it themselves.
+exists, and used to pick which upgrade path the Updates page offers: for
+`docker`, static `docker pull` + recreate-container instructions only,
+since no code path can execute them (the operator always runs it
+themselves); for `native` and `pipx`, an in-app **Self-Update** ("Update
+Now") action, falling back to the same style of manual instructions (a
+download-and-replace-the-install-folder walkthrough for `native`, `pipx
+upgrade`/`pip install --upgrade` for `pipx`) when Self-Update itself has
+nothing to offer (e.g. no native build published yet for the current
+**Release Channel**). The install-folder-replace path for `native` is safe
+with respect to user data because the database/config live in the OS
+user-data directory, not inside the install folder being replaced — see
+`docs/adr/0001-update-check-detect-notify-only.md` and
+`docs/adr/0009-self-update-staged-handoff-with-auto-rollback.md`.
+
+## Self-Update
+
+The manually-triggered ("Update Now") in-app action that downloads,
+verifies, and installs a new Collapsarr release, then restarts the process
+into it — distinct from the **Update Check**, which only detects and
+notifies. Available only for the `native` and `pipx` **Install Method**s;
+`docker` remains manual, since an image cannot self-replace. Gated by a
+confirmation modal, not a separate settings-level opt-in, and by a
+persisted single-flight guard that rejects a second concurrent trigger.
+
+Two flows depending on in-flight Jobs at trigger time:
+
+- **Cancel & Restart Now** — hard-cancels running Jobs via the existing
+  **Cancel (job)** kill path, then immediately requeues them, bypassing the
+  Recently-Processed Window (this is an operator-forced interruption, not a
+  natural failure).
+- **Wait & Restart** — waits for the currently-running Jobs to finish
+  naturally.
+
+Both engage **Auto-Processing Pause** for the duration. Mechanically,
+`native` stages the new build in a separate directory and hands off to a
+new process that waits for the old one to exit before atomically swapping
+it into the live install dir and re-executing itself; `pipx` upgrades the
+installed package in place, then re-execs the current process — neither
+depends on an external process supervisor. Both auto-rollback to the
+previous version if the post-restart process fails a
+health-check-within-timeout: `native` by swapping the retained old install
+folder back in, `pipx` by reinstalling the previous version pinned by
+number. See `docs/adr/0009-self-update-staged-handoff-with-auto-rollback.md`.
+Scheduled/unattended auto-update and native builds for the `beta`
+**Release Channel** are deferred — see the relevant Stubs.
 
 ## Wanted (view)
 
@@ -214,6 +251,16 @@ the worker pool picks up next — lower runs sooner. Only ever moved by
 currently-pending Job); there is no general manual reordering. A newly
 enqueued Job (auto or manual) always joins at the back of the order.
 
+## Process Now
+
+An explicit per-file action that immediately dispatches a downmix Job for
+a **Wanted** file — creating a pending Job first if none exists yet —
+bypassing both **Auto-Processing Pause** and the **Concurrency Limit**
+(prompting for confirmation if starting it would exceed the configured
+limit). Distinct from **Job Priority**'s "Process next," which only
+reorders within the existing pending queue: Process Now starts the Job
+running immediately regardless of queue position or pause state.
+
 ## Cancel (job)
 
 Ending a Job on request — never a status a Job reaches; there is no
@@ -236,6 +283,10 @@ This supersedes ADR 0007's original stance that a `running` Job could not
 be interrupted (see
 `docs/adr/0007-job-queue-priority-pull-rearchitecture.md`).
 
+**Self-Update**'s Cancel & Restart Now path uses this same hard-cancel
+mechanism, but additionally requeues the cancelled Jobs immediately,
+bypassing the Recently-Processed Window — see **Self-Update**.
+
 ## Auto-Queue Limit
 
 The cap (default 5) on how many **Wanted** entries the scanner will
@@ -254,6 +305,20 @@ auto-fill (both the periodic/manual scan's initial enqueue and the
 processing, and manual triggers keep working, while paused. Persists
 across restarts, same as **Tracked** — an intentional pause is never
 silently undone by an unrelated restart.
+
+## Auto-Processing Pause
+
+A persisted global toggle halting the `JobQueue` worker pool's own
+automatic pull-next-pending-Job loop — distinct from **Auto-Queuing
+Pause**, which only halts the scanner's auto-fill. Already-`running` Jobs
+are unaffected, and **Process Now** bypasses it entirely for an explicit
+user action. User-settable directly, and persists until manually cleared
+like any other setting — but also force-set by **Self-Update**'s
+job-handling flows for the duration of an update. That usage is one-shot:
+the value in effect immediately before Self-Update force-set it is stashed
+in a restore-point field and written back on the next app boot, so a
+pre-existing manual pause survives the restart but a Self-Update-induced
+one doesn't linger.
 
 ## Recently-Processed Window
 
