@@ -88,15 +88,10 @@ from .models import (
     PHASE_AWAITING_HEALTH,
     PHASE_DOWNLOADING,
     PHASE_IDLE,
+    PHASE_PREPARING,
     PHASE_VERIFYING,
 )
-from .service import (
-    SelfUpdateAlreadyInProgressError,
-    begin_self_update,
-    clear_self_update,
-    get_self_update_state,
-    set_self_update_phase,
-)
+from .service import begin_self_update, clear_self_update, set_self_update_phase
 
 logger = logging.getLogger(__name__)
 
@@ -243,80 +238,47 @@ def _reexec_process() -> None:
     os.execv(sys.argv[0], sys.argv)  # noqa: S606 - restarting this exact process, not an arbitrary command
 
 
-def apply_pipx_update(
+def _run_guarded_apply(
     session: Session,
     *,
     target_tag: str,
-    transport: httpx.BaseTransport | None = None,
-    timeout: float = DOWNLOAD_TIMEOUT,
-    subprocess_timeout: float = PIPX_UPGRADE_TIMEOUT,
-    subprocess_runner: SubprocessRunner | None = None,
-    reexec_fn: ReexecFn | None = None,
+    platform_name: str,
+    arch: str,
+    version: str,
+    transport: httpx.BaseTransport | None,
+    timeout: float,
+    subprocess_timeout: float,
+    run: SubprocessRunner,
+    reexec: ReexecFn,
 ) -> SelfUpdateApplyOutcome:
-    """Download, verify, ``pipx upgrade``, and re-exec into ``target_tag`` (COL-232).
+    """The guarded body of the pipx apply flow -- assumes the guard is *already reserved*.
 
-    The core "no Jobs running" pipx apply flow -- see the module docstring
-    for the full sequencing contract and scope. Steps, in order:
+    Factored out of :func:`apply_pipx_update` (COL-232) so :func:`apply_with_flow`
+    (COL-233) can reserve the in-progress guard itself, *before* its own
+    cancel/wait phase, and then run this exact same verify/download/upgrade/
+    re-exec sequence once Jobs are clear -- without a second, redundant (and
+    would-be-rejected) :func:`~collapsarr.self_update.service.begin_self_update`
+    call. Every caller of this function must have already reserved the guard;
+    this function never reserves it, only clears it on failure (see below).
 
-    1. Resolve this process's ``(platform, arch)``
-       (:func:`~collapsarr.self_update.client.resolve_platform_arch``) --
-       ``ok=False`` immediately, before the in-progress guard is even taken,
-       if this platform/arch has no release archive.
-    2. Reserve the single-flight guard
-       (:func:`~collapsarr.self_update.service.begin_self_update`), stamping
-       the running version as the rollback target. Raises
-       :class:`~collapsarr.self_update.service.SelfUpdateAlreadyInProgressError`
-       -- **not caught here** -- if an attempt is already in progress; the
-       caller (:mod:`collapsarr.self_update.routes`) maps that to a ``409``.
-    3. Fetch + resolve the ``SHA256SUMS`` entry for ``target_tag``
-       (:func:`~collapsarr.self_update.client.fetch_checksum_entry`).
-       ``ok=False`` and the guard is cleared back to
-       :data:`~collapsarr.self_update.models.PHASE_IDLE` if no entry exists.
-    4. Download and SHA-256-verify the resolved archive
-       (:func:`~collapsarr.ffmpeg_download.client.download_and_verify`,
-       bounded by :data:`MAX_RELEASE_ARCHIVE_BYTES`). ``ok=False`` and the
-       guard is cleared on any network failure *or* a checksum mismatch --
-       ``pipx upgrade`` is never reached on this path (the AC's "verify
-       before upgrade, strictly sequential" requirement).
-    5. Run :data:`PIPX_UPGRADE_COMMAND` via ``subprocess_runner`` (defaults
-       to :func:`_run_pipx_upgrade`). ``ok=False`` and the guard is cleared
-       on a missing ``pipx`` executable, a timeout, or a non-zero exit --
-       the running install is provably untouched by every earlier abort
-       path, and here the failure is ``pipx``'s own to report.
-    6. On a successful upgrade, advance ``phase`` to
-       :data:`~collapsarr.self_update.models.PHASE_AWAITING_HEALTH` --
-       **without** clearing ``in_progress`` (see the module docstring's
-       "Guard handoff" section) -- and call ``reexec_fn`` (defaults to
-       :func:`_reexec_process`).
+    Steps, in order: fetch + resolve the ``SHA256SUMS`` entry for
+    ``target_tag`` (:func:`~collapsarr.self_update.client.fetch_checksum_entry`);
+    download and SHA-256-verify the resolved archive
+    (:func:`~collapsarr.ffmpeg_download.client.download_and_verify`, bounded
+    by :data:`MAX_RELEASE_ARCHIVE_BYTES`) -- ``pipx upgrade`` is never reached
+    on a network failure or checksum mismatch (the AC's "verify before
+    upgrade, strictly sequential" requirement); run
+    :data:`PIPX_UPGRADE_COMMAND` via ``run``; on success, advance ``phase`` to
+    :data:`~collapsarr.self_update.models.PHASE_AWAITING_HEALTH` --
+    **without** clearing ``in_progress`` (see the module docstring's "Guard
+    handoff" section) -- and call ``reexec``.
 
-    Once the guard is reserved (step 2), every failure -- expected or not --
-    is funneled through one ``except Exception`` clause that clears it back
-    to idle; see the module docstring's "No failure can leave the guard
-    stuck" section. ``transport`` is forwarded to every network call this
-    makes (tests inject an ``httpx.MockTransport``; production leaves it
-    ``None`` for a real network call), matching every other
-    transport-injectable seam in this codebase.
+    Every failure -- expected (a checksum mismatch, download error, missing
+    ``pipx``, subprocess timeout, non-zero ``pipx upgrade`` exit, each raised
+    internally as :class:`_ApplyFailure`) or not -- is funnelled through one
+    ``except Exception`` clause that clears the guard back to idle; see the
+    module docstring's "No failure can leave the guard stuck" section.
     """
-    run = subprocess_runner or _run_pipx_upgrade
-    reexec = reexec_fn or _reexec_process
-
-    resolved = resolve_platform_arch()
-    if resolved is None:
-        return SelfUpdateApplyOutcome(
-            ok=False,
-            error="Self-update is not available for this platform/architecture.",
-        )
-    platform_name, arch = resolved
-    version = target_tag[1:] if target_tag.startswith("v") else target_tag
-
-    # Reserve the single-flight guard before any network I/O -- a second
-    # concurrent trigger must be rejected right here, never partway through
-    # a download. Propagates SelfUpdateAlreadyInProgressError to the caller
-    # rather than catching it: that guard is COL-230's, this function adds
-    # no second one of its own. Deliberately outside the try/except below --
-    # a failure to even take the guard must never attempt to clear it.
-    begin_self_update(session, previous_version=__version__, phase=PHASE_DOWNLOADING)
-
     try:
         checksum_url = _release_asset_url(target_tag, "SHA256SUMS")
         checksum_result = fetch_checksum_entry(
@@ -388,6 +350,77 @@ def apply_pipx_update(
                 "Self-update apply to %s failed unexpectedly via pipx", target_tag
             )
         return SelfUpdateApplyOutcome(ok=False, error=str(exc) or repr(exc))
+
+
+def apply_pipx_update(
+    session: Session,
+    *,
+    target_tag: str,
+    transport: httpx.BaseTransport | None = None,
+    timeout: float = DOWNLOAD_TIMEOUT,
+    subprocess_timeout: float = PIPX_UPGRADE_TIMEOUT,
+    subprocess_runner: SubprocessRunner | None = None,
+    reexec_fn: ReexecFn | None = None,
+) -> SelfUpdateApplyOutcome:
+    """Download, verify, ``pipx upgrade``, and re-exec into ``target_tag`` (COL-232).
+
+    The core "no Jobs running" pipx apply flow -- see the module docstring
+    for the full sequencing contract and scope. Steps, in order:
+
+    1. Resolve this process's ``(platform, arch)``
+       (:func:`~collapsarr.self_update.client.resolve_platform_arch``) --
+       ``ok=False`` immediately, before the in-progress guard is even taken,
+       if this platform/arch has no release archive.
+    2. Reserve the single-flight guard
+       (:func:`~collapsarr.self_update.service.begin_self_update`), stamping
+       the running version as the rollback target. Raises
+       :class:`~collapsarr.self_update.service.SelfUpdateAlreadyInProgressError`
+       -- **not caught here** -- if an attempt is already in progress; the
+       caller (:mod:`collapsarr.self_update.routes`) maps that to a ``409``.
+    3. Runs :func:`_run_guarded_apply` -- fetch/verify the checksum, download
+       + verify the archive, run ``pipx upgrade``, and (on success) re-exec.
+       See that function's own docstring for the full step-by-step contract.
+
+    Once the guard is reserved (step 2), every failure -- expected or not --
+    is funneled through :func:`_run_guarded_apply`'s own ``except Exception``
+    clause, which clears it back to idle; see the module docstring's "No
+    failure can leave the guard stuck" section. ``transport`` is forwarded to
+    every network call this makes (tests inject an ``httpx.MockTransport``;
+    production leaves it ``None`` for a real network call), matching every
+    other transport-injectable seam in this codebase.
+    """
+    run = subprocess_runner or _run_pipx_upgrade
+    reexec = reexec_fn or _reexec_process
+
+    resolved = resolve_platform_arch()
+    if resolved is None:
+        return SelfUpdateApplyOutcome(
+            ok=False,
+            error="Self-update is not available for this platform/architecture.",
+        )
+    platform_name, arch = resolved
+    version = target_tag[1:] if target_tag.startswith("v") else target_tag
+
+    # Reserve the single-flight guard before any network I/O -- a second
+    # concurrent trigger must be rejected right here, never partway through
+    # a download. Propagates SelfUpdateAlreadyInProgressError to the caller
+    # rather than catching it: that guard is COL-230's, this function adds
+    # no second one of its own. Deliberately outside the try/except below --
+    # a failure to even take the guard must never attempt to clear it.
+    begin_self_update(session, previous_version=__version__, phase=PHASE_DOWNLOADING)
+
+    return _run_guarded_apply(
+        session,
+        target_tag=target_tag,
+        platform_name=platform_name,
+        arch=arch,
+        version=version,
+        transport=transport,
+        timeout=timeout,
+        subprocess_timeout=subprocess_timeout,
+        run=run,
+        reexec=reexec,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -507,42 +540,49 @@ def apply_with_flow(
 
     Steps, in order:
 
-    1. A best-effort early re-entrancy check: if the Self-Update in-progress
-       guard (:mod:`collapsarr.self_update.service`) is already held, raises
-       :class:`~collapsarr.self_update.service.SelfUpdateAlreadyInProgressError`
-       immediately, *before* touching Auto-Processing Pause or the Job Queue
-       at all -- so a second concurrent trigger during another attempt's
-       cancel/wait phase doesn't force-pause processing for an attempt that
-       is about to be rejected anyway. This is a peek, not itself a guard
-       acquisition (the guard is still only actually taken inside
-       :func:`apply_pipx_update`, once Jobs are cleared) -- a second trigger
-       that wins a narrow race against this peek is still caught below, when
-       :func:`apply_pipx_update` takes the real guard.
-    2. Stashes the pre-update ``auto_processing_paused`` value and force-sets
+    1. Resolve this process's ``(platform, arch)`` -- ``ok=False``
+       immediately, before the in-progress guard is even taken, if this
+       platform/arch has no release archive. Mirrors
+       :func:`apply_pipx_update` step 1 exactly.
+    2. Reserve the *real* single-flight guard
+       (:func:`~collapsarr.self_update.service.begin_self_update`, phase
+       :data:`~collapsarr.self_update.models.PHASE_PREPARING`) -- **before**
+       Auto-Processing Pause or the Job Queue is ever touched, and held for
+       the *entire* cancel/wait window that follows, not just the
+       download/upgrade steps afterward. This closes a real race an earlier
+       version of this function had: a bare "peek" at the guard's current
+       state (read, then act) leaves a window -- up to ``wait_timeout``/
+       ``cancel_drain_timeout`` wide -- during which a second concurrent
+       trigger could pass the same peek, stash its own snapshot of
+       ``auto_processing_paused`` (by then already forced ``True`` by the
+       first attempt), and corrupt the restore value. Reserving the real
+       guard here instead makes a second concurrent call fail immediately,
+       with :class:`~collapsarr.self_update.service.SelfUpdateAlreadyInProgressError`
+       propagating straight out -- **not caught here**, same contract as
+       :func:`apply_pipx_update` -- before it ever stashes anything.
+    3. Stashes the pre-update ``auto_processing_paused`` value and force-sets
        it ``True`` (:func:`~collapsarr.settings.service.
        stash_and_force_pause_processing`) -- both flows do this,
-       unconditionally, per this ticket's AC.
-    3. Runs the chosen flow: :data:`FLOW_CANCEL_AND_RESTART` hard-cancels and
+       unconditionally, per this ticket's AC. Safe now: the guard reserved
+       in step 2 guarantees no concurrent attempt can be mid-flight here too.
+    4. Runs the chosen flow: :data:`FLOW_CANCEL_AND_RESTART` hard-cancels and
        immediately requeues every ``RUNNING`` Job
        (:func:`_cancel_and_restart_running_jobs`); :data:`FLOW_WAIT_AND_RESTART`
        simply waits (:meth:`~collapsarr.jobs.queue.JobQueue.wait_no_running`,
        bounded by ``wait_timeout``) for them to finish naturally, cancelling
-       nothing. Any failure here (including a wait/drain timeout) restores
-       Auto-Processing Pause immediately (:func:`~collapsarr.settings.
-       service.restore_auto_processing_pause`) -- this process is not about
-       to restart, so there is no "next boot" to rely on -- and returns
-       ``ok=False`` without ever calling :func:`apply_pipx_update` (so its
-       own guard is never taken by this attempt at all).
-    4. Once Jobs are clear, calls :func:`apply_pipx_update` exactly as the
-       plain "no Jobs running" path would. If it raises
-       :class:`~collapsarr.self_update.service.SelfUpdateAlreadyInProgressError`
-       (the narrow race step 1 couldn't close), the just-forced pause is
-       restored and the exception re-raised, matching
-       :func:`apply_pipx_update`'s own contract for that error. If it
-       returns ``ok=False`` (a checksum mismatch, download failure, or
-       failed ``pipx upgrade`` -- it has already cleared its own guard), the
-       pause is likewise restored here, since this process keeps running.
-    5. On ``ok=True`` (pipx upgrade succeeded; re-exec is imminent -- or, in
+       nothing. Any failure here (including a wait/drain timeout) clears the
+       guard back to idle *and* restores Auto-Processing Pause immediately
+       (:func:`~collapsarr.settings.service.restore_auto_processing_pause`)
+       -- this process is not about to restart, so there is no "next boot"
+       to rely on -- and returns ``ok=False``.
+    5. Once Jobs are clear, runs :func:`_run_guarded_apply` -- the same
+       verify/download/upgrade/re-exec sequence :func:`apply_pipx_update`
+       runs, reusing the guard already reserved in step 2 rather than taking
+       a second one. ``ok=False`` (a checksum mismatch, download failure, or
+       failed ``pipx upgrade`` -- the guard has already been cleared by
+       :func:`_run_guarded_apply` itself) restores Auto-Processing Pause
+       here too, since this process keeps running.
+    6. On ``ok=True`` (pipx upgrade succeeded; re-exec is imminent -- or, in
        a test, a fake ``reexec_fn`` returned instead), Auto-Processing Pause
        is deliberately left forced and ``auto_processing_pause_restore_value``
        stays set -- there is no restart *in this process* to hang the
@@ -556,14 +596,29 @@ def apply_with_flow(
     if flow == FLOW_CANCEL_AND_RESTART and scheduler is None:
         raise ValueError("`scheduler` is required for the 'cancel_and_restart' flow.")
 
-    existing = get_self_update_state(session)
-    if existing.in_progress:
-        raise SelfUpdateAlreadyInProgressError(
-            f"A self-update is already in progress (phase={existing.phase!r})"
-        )
+    run = subprocess_runner or _run_pipx_upgrade
+    reexec = reexec_fn or _reexec_process
 
-    stash_and_force_pause_processing(session)
+    resolved = resolve_platform_arch()
+    if resolved is None:
+        return SelfUpdateApplyOutcome(
+            ok=False,
+            error="Self-update is not available for this platform/architecture.",
+        )
+    platform_name, arch = resolved
+    version = target_tag[1:] if target_tag.startswith("v") else target_tag
+
+    # Reserve the real guard *before* Auto-Processing Pause or the Job Queue
+    # is touched at all, and hold it across the whole cancel/wait phase --
+    # not just apply_pipx_update's download/upgrade steps. Propagates
+    # SelfUpdateAlreadyInProgressError to the caller rather than catching it
+    # -- deliberately outside the try/except below, same as
+    # apply_pipx_update's own guard reservation: a failure to even take the
+    # guard must never attempt to clear it or touch the pause.
+    begin_self_update(session, previous_version=__version__, phase=PHASE_PREPARING)
+
     try:
+        stash_and_force_pause_processing(session)
         if flow == FLOW_CANCEL_AND_RESTART:
             assert scheduler is not None  # checked above
             _cancel_and_restart_running_jobs(queue, scheduler, drain_timeout=cancel_drain_timeout)
@@ -573,6 +628,7 @@ def apply_with_flow(
                     f"Timed out after {wait_timeout}s waiting for running Jobs to finish."
                 )
     except Exception as exc:
+        clear_self_update(session, phase=PHASE_IDLE)
         restore_auto_processing_pause(session)
         if not isinstance(exc, _ApplyFailure):
             logger.exception(
@@ -580,20 +636,18 @@ def apply_with_flow(
             )
         return SelfUpdateApplyOutcome(ok=False, error=str(exc) or repr(exc))
 
-    try:
-        outcome = apply_pipx_update(
-            session,
-            target_tag=target_tag,
-            transport=transport,
-            timeout=timeout,
-            subprocess_timeout=subprocess_timeout,
-            subprocess_runner=subprocess_runner,
-            reexec_fn=reexec_fn,
-        )
-    except SelfUpdateAlreadyInProgressError:
-        restore_auto_processing_pause(session)
-        raise
-
+    outcome = _run_guarded_apply(
+        session,
+        target_tag=target_tag,
+        platform_name=platform_name,
+        arch=arch,
+        version=version,
+        transport=transport,
+        timeout=timeout,
+        subprocess_timeout=subprocess_timeout,
+        run=run,
+        reexec=reexec,
+    )
     if not outcome.ok:
         restore_auto_processing_pause(session)
     return outcome

@@ -654,7 +654,7 @@ def test_apply_with_flow_requires_a_scheduler_for_cancel_and_restart(session: Se
 def test_apply_with_flow_rejects_a_concurrent_trigger_before_touching_pause(
     session: Session,
 ) -> None:
-    """The early guard peek fires before Auto-Processing Pause is ever touched."""
+    """The real guard is reserved before Auto-Processing Pause is ever touched."""
     begin_self_update(session, previous_version="0.9.0")
     queue = JobQueue(pipeline_runner=lambda *a, **k: _SUCCESS)
 
@@ -664,6 +664,100 @@ def test_apply_with_flow_rejects_a_concurrent_trigger_before_touching_pause(
     settings_row = get_global_settings(session)
     assert settings_row.auto_processing_paused is False  # never forced
     assert settings_row.auto_processing_pause_restore_value is None  # never stashed
+
+
+def test_apply_with_flow_two_genuinely_concurrent_calls_reject_the_second_before_any_stash(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Code-review must-fix regression test: two apply_with_flow calls racing each other.
+
+    Unlike :func:`test_apply_with_flow_rejects_a_concurrent_trigger_before_touching_pause`
+    above (guard already held *before* ``apply_with_flow`` is even called --
+    the easy, sequential case), this drives request A into its wait step
+    first, confirms the guard is genuinely held mid-flight, and only *then*
+    fires request B -- proving the guard is reserved before the cancel/wait
+    phase begins, not after it (which would leave the whole phase -- up to
+    ``wait_timeout``/``cancel_drain_timeout`` wide -- open to a second
+    request corrupting the pause-restore stash; see ``apply_with_flow``'s own
+    docstring, step 2).
+    """
+    _patch_platform(monkeypatch, ("linux", "amd64"))
+    runner = _GatedRunner()  # request A's victim Job blocks until released
+    # Deliberately built without _make_queue_and_scheduler's history_recorder:
+    # this test doesn't need persisted JobHistory rows at all, and wiring one
+    # exercises a separate, pre-existing race between JobQueue._enqueue
+    # (which notifies a waiting worker *before* it writes the PENDING history
+    # row -- see its own docstring) and record_job_history's non-atomic
+    # get-or-create -- unrelated to what this test guards (apply_with_flow's
+    # own guard-reservation timing), and only otherwise reachable here
+    # because a worker can race to claim+run the Job right after enqueue.
+    queue = JobQueue(
+        max_concurrency=1, pipeline_runner=runner, pause_check=_live_pause_check(session_factory)
+    )
+    queue.start()
+    scheduler = JobScheduler(queue, session_factory, settings, probe=_surround_probe)
+    try:
+        # Pre-create the singleton self_update_state row *before* racing two
+        # requests against it -- get_self_update_state's own get-or-create is
+        # a separate, pre-existing (COL-230) race on the row's first-ever
+        # creation (two concurrent INSERTs -> a raw IntegrityError, not this
+        # module's friendly SelfUpdateAlreadyInProgressError) that has
+        # nothing to do with what this test is exercising; creating it
+        # up front keeps both requests on the UPDATE path this test cares
+        # about.
+        with session_factory() as seed_session:
+            get_self_update_state(seed_session)
+
+        victim = scheduler.trigger_file("/media/victim.mkv")
+        assert victim is not None
+        assert runner.started.wait(timeout=5)
+
+        result_holder: dict[str, SelfUpdateApplyOutcome] = {}
+
+        def _run_request_a() -> None:
+            with session_factory() as session:
+                result_holder["outcome"] = _call_apply_with_flow(
+                    session, flow=FLOW_WAIT_AND_RESTART, queue=queue
+                )
+
+        thread = threading.Thread(target=_run_request_a)
+        thread.start()
+
+        # Wait for request A to have genuinely reserved the guard (and, by
+        # extension, forced the pause) before firing request B -- otherwise
+        # this test isn't actually racing anything.
+        in_progress = False
+        for _ in range(50):
+            with session_factory() as poll_session:
+                in_progress = get_self_update_state(poll_session).in_progress
+            if in_progress:
+                break
+            time.sleep(0.05)
+        assert in_progress is True
+
+        # Request B: fired while A is still blocked in its own wait step.
+        # Must be rejected immediately by the real guard -- before it ever
+        # calls stash_and_force_pause_processing itself.
+        with session_factory() as session_b:
+            with pytest.raises(SelfUpdateAlreadyInProgressError):
+                _call_apply_with_flow(session_b, flow=FLOW_WAIT_AND_RESTART, queue=queue)
+
+        runner.release.set()  # let request A's victim Job finish naturally
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+        outcome = result_holder["outcome"]
+        assert outcome.ok is True, outcome.error
+
+        # The must-fix this test guards against: request B must never have
+        # overwritten request A's correct stash (auto_processing_paused was
+        # False before either request ran).
+        with session_factory() as session:
+            row = get_global_settings(session)
+            assert row.auto_processing_paused is True
+            assert row.auto_processing_pause_restore_value is False
+    finally:
+        queue.shutdown()
 
 
 # --------------------------------------------------------------------------- #
