@@ -63,6 +63,7 @@ from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .self_update.apply import ReexecFn, SubprocessRunner
 from .self_update.health_gate import HealthCheckFn, resolve_awaiting_health
+from .self_update.native import ExitFn, HandoffSpawner
 from .self_update.routes import router as self_update_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
@@ -138,6 +139,8 @@ def create_app(
     self_update_subprocess_runner: SubprocessRunner | None = None,
     self_update_reexec_fn: ReexecFn | None = None,
     self_update_health_check_fn: HealthCheckFn | None = None,
+    self_update_handoff_spawner: HandoffSpawner | None = None,
+    self_update_exit_fn: ExitFn | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -213,7 +216,14 @@ def create_app(
     rather than a real HTTP call to ``/health``, is what "healthy" means here.
     Unlike the other two self-update seams, this one is consumed once, here in
     the lifespan (the gate runs at most once per process boot), not stashed on
-    ``app.state`` for a route to read later.
+    ``app.state`` for a route to read later. ``self_update_handoff_spawner``/
+    ``self_update_exit_fn`` (COL-235) are the native equivalents of the pipx
+    subprocess/re-exec seams: they stand in for a real detached handoff-process
+    spawn and a real process exit in
+    :func:`collapsarr.self_update.native.apply_native_update`, letting tests
+    exercise the native staged-handoff apply flow without spawning a process or
+    terminating this one; both default to ``None`` (the native flow's own
+    production defaults apply).
     """
     resolved_settings = settings or get_settings()
 
@@ -468,6 +478,8 @@ def create_app(
     app.state.self_update_transport = self_update_transport
     app.state.self_update_subprocess_runner = self_update_subprocess_runner
     app.state.self_update_reexec_fn = self_update_reexec_fn
+    app.state.self_update_handoff_spawner = self_update_handoff_spawner
+    app.state.self_update_exit_fn = self_update_exit_fn
 
     # Exposed for GET /api/system/tasks (COL-122) to tell whether a Scheduled
     # Task's computed next-run time is actually meaningful: the health/update

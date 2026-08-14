@@ -11,26 +11,28 @@ needed here.
 
 Endpoints:
 
-* ``GET /api/system/self-update/status`` -- the current self-update phase and
-  in-progress guard state, for the frontend's future polling screen (COL-234+)
-  to consume.
-* ``POST /api/system/self-update/apply`` (COL-232, COL-233) -- triggers the
-  ``pipx`` apply flow: download + SHA-256-verify the target release, run
-  ``pipx upgrade collapsarr``, then re-exec into it
-  (:func:`~collapsarr.self_update.apply.apply_pipx_update`). ``403`` when
-  this install's :func:`~collapsarr.system.info.install_method` isn't
-  ``"pipx"`` (mirrors :mod:`collapsarr.ffmpeg_download.routes`'s
-  Docker-gating precedent); ``409`` when no newer *stable* release is
-  available to apply (:func:`~collapsarr.self_update.apply.
-  stable_update_target`), when an attempt is already in progress
+* ``POST /api/system/self-update/apply`` (COL-232, COL-233, COL-235) --
+  triggers the apply flow for this install's method: ``pipx``
+  (:func:`~collapsarr.self_update.apply.apply_pipx_update`/:func:`~collapsarr.
+  self_update.apply.apply_with_flow` -- download + SHA-256-verify, ``pipx
+  upgrade collapsarr``, re-exec) or ``native``
+  (:func:`~collapsarr.self_update.native.apply_native_update` -- verify into a
+  staging dir, spawn the finish-update handoff, exit; the handoff then swaps
+  and re-execs). ``403`` when this install's
+  :func:`~collapsarr.system.info.install_method` is neither (a Docker install
+  upgrades by pulling a new image, mirroring
+  :mod:`collapsarr.ffmpeg_download.routes`'s Docker-gating precedent);
+  ``409`` when no newer *stable* release is available to apply
+  (:func:`~collapsarr.self_update.apply.stable_update_target`), when an
+  attempt is already in progress
   (:class:`~collapsarr.self_update.service.SelfUpdateAlreadyInProgressError`,
   mirroring :mod:`collapsarr.backup.routes`'s ``BackupUnavailableError``
   ``409`` precedent), or when Jobs are currently running and the request
   body omitted ``flow`` (COL-233 -- see below); ``502`` on a downstream
-  failure (checksum mismatch, network error, a failed ``pipx upgrade``, or
-  an in-flight-Job-handling failure) with that failure's own human-readable
-  error as the response ``detail``, mirroring :mod:`collapsarr.
-  ffmpeg_download.routes`'s failure-reporting shape.
+  failure (checksum mismatch, network error, a failed ``pipx upgrade``, a
+  staging/extraction failure, or an in-flight-Job-handling failure) with that
+  failure's own human-readable error as the response ``detail``, mirroring
+  :mod:`collapsarr.ffmpeg_download.routes`'s failure-reporting shape.
 
   **In-flight Jobs (COL-233).** The request body's optional ``flow`` field
   (:class:`SelfUpdateApplyRequest`) picks how to handle downmix Jobs
@@ -41,7 +43,11 @@ Endpoints:
   ``flow`` preserves the original COL-232 behaviour *only* when nothing is
   currently running -- with Jobs running and no ``flow`` chosen, this
   endpoint refuses with ``409`` rather than guessing which flow the operator
-  wants.
+  wants. **Scope note (COL-233/COL-235 merge):** ``apply_with_flow`` only
+  wraps the ``pipx`` apply path today -- a ``native`` install with Jobs
+  running and an explicit ``flow`` also gets a ``409`` (flow-based Job
+  handling isn't yet wired into the native staged-handoff path); extending
+  it is left as follow-up work, not implemented here.
 """
 
 from __future__ import annotations
@@ -56,7 +62,7 @@ from .. import __version__
 from ..database import get_session
 from ..jobs.queue import JobQueue
 from ..jobs.scheduler import JobScheduler
-from ..system.info import INSTALL_METHOD_PIPX, install_method
+from ..system.info import INSTALL_METHOD_NATIVE, INSTALL_METHOD_PIPX, install_method
 from ..update_check.service import get_update_check_state
 from .apply import (
     ReexecFn,
@@ -65,6 +71,7 @@ from .apply import (
     apply_with_flow,
     stable_update_target,
 )
+from .native import ExitFn, HandoffSpawner, apply_native_update
 from .service import SelfUpdateAlreadyInProgressError, get_self_update_state
 
 router = APIRouter(prefix="/api/system/self-update", tags=["system"])
@@ -148,19 +155,27 @@ def apply_self_update_endpoint(
     body: SelfUpdateApplyRequest | None = None,
     session: Session = Depends(get_session),
 ) -> SelfUpdateApplyRead:
-    """Trigger the pipx self-update apply flow (COL-232, COL-233): verify, upgrade, re-exec.
+    """Trigger the self-update apply flow: verify, install, re-exec (COL-232, COL-233, COL-235).
 
-    ``403`` when this install's method isn't ``pipx``; ``409`` when no newer
-    stable release is available, an attempt is already in progress, or Jobs
-    are currently running with no ``flow`` chosen (COL-233); ``502`` on a
-    checksum mismatch, network failure, failed ``pipx upgrade``, or an
-    in-flight-Job-handling failure -- see the module docstring for the full
-    gating/error-mapping contract. ``self_update_transport``/
-    ``self_update_subprocess_runner``/``self_update_reexec_fn`` -- forwarded
-    from :func:`collapsarr.main.create_app` onto ``app.state`` -- let tests
-    inject an ``httpx.MockTransport`` and fake subprocess/re-exec doubles
-    instead of a real network call, a real ``pipx`` subprocess, or a real
-    :func:`os.execv`; production leaves all three unset.
+    Dispatches on this install's :func:`~collapsarr.system.info.install_method`:
+    ``pipx`` runs :func:`~collapsarr.self_update.apply.apply_pipx_update` (no
+    Jobs running) or :func:`~collapsarr.self_update.apply.apply_with_flow`
+    (Jobs running, COL-233) -- verify + ``pipx upgrade`` + re-exec, optionally
+    wrapped with in-flight-Job handling; ``native`` runs
+    :func:`~collapsarr.self_update.native.apply_native_update` (verify into a
+    staging dir + spawn the finish-update handoff + exit, which then swaps and
+    re-execs -- COL-233's Job-handling wrapper isn't wired into this path yet,
+    see the scope note below). ``403`` when the method is neither (a Docker
+    install upgrades by pulling a new image, not through this endpoint);
+    ``409`` when no newer stable release is available, an attempt is already
+    in progress, or Jobs are currently running with no ``flow`` chosen
+    (COL-233); ``502`` on a checksum mismatch, network failure, failed ``pipx
+    upgrade``, a staging/extraction failure, or an in-flight-Job-handling
+    failure -- see the module docstring for the full gating/error-mapping
+    contract. The ``self_update_*`` ``app.state`` seams (transport, and the
+    pipx subprocess/re-exec or native handoff-spawn/exit doubles) let tests
+    inject fakes instead of a real network call, subprocess, ``os.execv``,
+    process spawn, or process exit; production leaves them unset.
 
     ``body.flow`` (COL-233) is optional. ``None`` (the default) preserves the
     original COL-232 behaviour, but *only* when the Job Queue currently has
@@ -176,11 +191,15 @@ def apply_self_update_endpoint(
     handles an empty Job Queue for either flow just as correctly (an
     immediate no-op wait/cancel pass), so there is no need for this endpoint
     to duplicate the "is anything actually running" check for that branch.
+    **Scope note:** a non-``None`` ``flow`` on a ``native`` install is a
+    ``409`` today (see module docstring) -- ``apply_with_flow`` only wraps the
+    ``pipx`` path, a follow-up ticket's concern, not implemented here.
     """
-    if install_method() != INSTALL_METHOD_PIPX:
+    method = install_method()
+    if method not in (INSTALL_METHOD_PIPX, INSTALL_METHOD_NATIVE):
         raise HTTPException(
             status_code=403,
-            detail="Self-update apply is only available for pipx installs.",
+            detail="Self-update apply is only available for pipx and native installs.",
         )
 
     update_state = get_update_check_state(session)
@@ -192,26 +211,49 @@ def apply_self_update_endpoint(
         )
 
     transport = getattr(request.app.state, "self_update_transport", None)
-    subprocess_runner: SubprocessRunner | None = getattr(
-        request.app.state, "self_update_subprocess_runner", None
-    )
-    reexec_fn: ReexecFn | None = getattr(request.app.state, "self_update_reexec_fn", None)
 
     flow = body.flow if body is not None else None
     job_queue: JobQueue | None = getattr(request.app.state, "job_queue", None)
     job_scheduler: JobScheduler | None = getattr(request.app.state, "job_scheduler", None)
+    running_count = job_queue.count_running() if job_queue is not None else 0
+
+    if flow is None and running_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Jobs are currently running; choose a flow "
+                "('cancel_and_restart' or 'wait_and_restart') to proceed."
+            ),
+        )
+    if flow is not None and method == INSTALL_METHOD_NATIVE:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "In-flight Job handling ('flow') is not yet supported for native "
+                "installs; wait until no Jobs are running before applying."
+            ),
+        )
 
     try:
-        if flow is None:
-            running_count = job_queue.count_running() if job_queue is not None else 0
-            if running_count > 0:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Jobs are currently running; choose a flow "
-                        "('cancel_and_restart' or 'wait_and_restart') to proceed."
-                    ),
-                )
+        if method == INSTALL_METHOD_NATIVE:
+            spawn_handoff: HandoffSpawner | None = getattr(
+                request.app.state, "self_update_handoff_spawner", None
+            )
+            exit_fn: ExitFn | None = getattr(request.app.state, "self_update_exit_fn", None)
+            outcome = apply_native_update(
+                session,
+                target_tag=target_tag,
+                transport=transport,
+                spawn_handoff=spawn_handoff,
+                exit_fn=exit_fn,
+            )
+        elif flow is None:
+            subprocess_runner: SubprocessRunner | None = getattr(
+                request.app.state, "self_update_subprocess_runner", None
+            )
+            reexec_fn: ReexecFn | None = getattr(
+                request.app.state, "self_update_reexec_fn", None
+            )
             outcome = apply_pipx_update(
                 session,
                 target_tag=target_tag,
@@ -225,6 +267,8 @@ def apply_self_update_endpoint(
                     status_code=503,
                     detail="Job queue is not available; cannot process a flow-based apply request.",
                 )
+            subprocess_runner = getattr(request.app.state, "self_update_subprocess_runner", None)
+            reexec_fn = getattr(request.app.state, "self_update_reexec_fn", None)
             outcome = apply_with_flow(
                 session,
                 target_tag=target_tag,
