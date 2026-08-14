@@ -1,7 +1,7 @@
 import { ListOrdered } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { bumpJobToFront, cancelJob, clearQueue, fetchJobQueue } from "../api/activity";
+import { bumpJobToFront, cancelJob, clearQueue, fetchJobQueue, processNow } from "../api/activity";
 import { fetchSettings, updateSettings } from "../api/settings";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { ClearQueueResult, JobHistoryEntry, JobStatus } from "../types/activity";
@@ -44,8 +44,8 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ready"; entries: JobHistoryEntry[] };
 
-/** A per-row action `QueuePage` (COL-180) can run. */
-type RowActionKind = "bump" | "cancel";
+/** A per-row action `QueuePage` (COL-180, COL-229) can run. */
+type RowActionKind = "bump" | "cancel" | "processNow";
 
 /**
  * Which per-row action is currently in flight, keyed by `job_id` (COL-180).
@@ -77,6 +77,18 @@ type SettingsLoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "ready"; autoQueuePaused: boolean; autoProcessingPaused: boolean };
+
+/**
+ * The row currently showing the "Process Now" confirm step (COL-229) --
+ * `null` when none is. `POST /api/jobs/process-now` answers with
+ * `needs_confirmation: true` (and starts nothing) when force-starting this
+ * row's Job would push the number of currently-running Jobs past the
+ * configured Concurrency Limit; this holds the row so a confirm/dismiss
+ * panel can render under it. Only one row's confirm step is ever open at
+ * once -- clicking "Process Now" on a different row replaces it, same as
+ * `pendingActions` only tracking one in-flight action per row.
+ */
+type ProcessNowConfirmState = { entry: JobHistoryEntry } | null;
 
 /**
  * Result notice for the page-level "Clear queue" action (COL-181, COL-173).
@@ -146,10 +158,23 @@ function describeClearQueueResult(result: ClearQueueResult): string {
  * instead. Either way the queue is re-fetched immediately after the action
  * settles, rather than waiting on the next scheduled poll, so the row's
  * fate (moved to front / removed / updated to `failed` / unaffected) is
- * reflected right away. No confirm dialog -- these are single-item,
- * easily-reversible (pending) or immediately-visible (running, via the
- * refreshed row) actions per the plan (only page-level bulk actions,
- * COL-181, get a confirm dialog).
+ * reflected right away. Neither shows a confirm dialog -- these are
+ * single-item, easily-reversible (pending) or immediately-visible (running,
+ * via the refreshed row) actions per the plan (only page-level bulk actions,
+ * COL-181, and COL-229's "Process Now" below, get one).
+ *
+ * COL-229 adds a third per-row action, "Process Now" (`processNow`, `POST
+ * /api/jobs/process-now`), to every `pending` row alongside "Process next"
+ * and "Cancel" -- unlike "Process next" (which only reorders within the
+ * existing pending queue, still subject to Auto-Processing Pause and the
+ * Concurrency Limit once claimed), this force-starts the row's Job
+ * *immediately*, bypassing both. When the response reports
+ * `needs_confirmation: true` -- starting it now would exceed the configured
+ * Concurrency Limit -- nothing is started; an inline confirm panel opens
+ * (mirroring "Clear queue"'s `.view__confirm` pattern) and re-submits the
+ * same request with `confirm: true` on "Process now anyway". Declining
+ * (dismissing the panel) calls nothing further, leaving the file exactly as
+ * it was.
  *
  * COL-181 adds two page-level controls, both in the header next to the
  * title:
@@ -191,6 +216,7 @@ export function QueuePage() {
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [clearingQueue, setClearingQueue] = useState(false);
   const [clearQueueNotice, setClearQueueNotice] = useState<ClearQueueNotice>(null);
+  const [processNowConfirm, setProcessNowConfirm] = useState<ProcessNowConfirmState>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -344,6 +370,60 @@ export function QueuePage() {
       tooLateText,
       "Failed to cancel job.",
     );
+  }
+
+  /**
+   * The per-row "Process Now" action (COL-229): force-starts this row's Job
+   * immediately, bypassing both Auto-Processing Pause and the Concurrency
+   * Limit. Unlike {@link runRowAction}'s shared shape (a single
+   * request, `true`/`false` outcome), this can take a second round-trip: the
+   * first call omits `confirm`, and a `needs_confirmation: true` response
+   * (starting this Job would exceed the configured Concurrency Limit) opens
+   * an inline confirm step ({@link processNowConfirm}) instead of settling
+   * the row immediately. `fromConfirm` marks the second, explicitly-confirmed
+   * call so its outcome always closes the confirm step, success or failure.
+   */
+  async function handleProcessNow(entry: JobHistoryEntry, fromConfirm = false): Promise<void> {
+    setPendingActions((prev) => ({ ...prev, [entry.job_id]: "processNow" }));
+    setActionNotice(null);
+    try {
+      const result = await processNow(entry.file_path, fromConfirm);
+      if (result.needs_confirmation) {
+        setProcessNowConfirm({ entry });
+      } else {
+        if (fromConfirm) setProcessNowConfirm(null);
+        if (!result.enqueued) {
+          setActionNotice({
+            tone: "hint",
+            text: `"${titleFromPath(entry.file_path)}" could not be processed now -- it has no qualifying target, or its audio streams could not be probed.`,
+          });
+        }
+      }
+    } catch (error) {
+      if (fromConfirm) setProcessNowConfirm(null);
+      setActionNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to process job now.",
+      });
+    } finally {
+      setPendingActions((prev) => {
+        const next = { ...prev };
+        delete next[entry.job_id];
+        return next;
+      });
+    }
+    await refreshQueueSoon();
+  }
+
+  /** Re-submits "Process Now" for the confirming row with `confirm: true` (COL-229). */
+  async function handleConfirmProcessNow(): Promise<void> {
+    if (processNowConfirm === null) return;
+    await handleProcessNow(processNowConfirm.entry, true);
+  }
+
+  /** Dismisses the "Process Now" confirm step without calling the endpoint again (COL-229). */
+  function handleDismissProcessNowConfirm(): void {
+    setProcessNowConfirm(null);
   }
 
   /**
@@ -547,6 +627,35 @@ export function QueuePage() {
         </p>
       )}
 
+      {processNowConfirm && (
+        <div className="panel view__confirm" role="status">
+          <p>
+            Processing &quot;{titleFromPath(processNowConfirm.entry.file_path)}&quot; now would
+            exceed the configured Concurrency Limit. Start it anyway?
+          </p>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="btn btn--secondary"
+              onClick={() => void handleConfirmProcessNow()}
+              disabled={pendingActions[processNowConfirm.entry.job_id] !== undefined}
+            >
+              {pendingActions[processNowConfirm.entry.job_id] === "processNow"
+                ? "Starting…"
+                : "Process now anyway"}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={handleDismissProcessNowConfirm}
+              disabled={pendingActions[processNowConfirm.entry.job_id] !== undefined}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {hasEntries && (
         <div className="activity-filters">
           <input
@@ -651,6 +760,16 @@ export function QueuePage() {
                           disabled={rowAction !== null}
                         >
                           {rowAction === "bump" ? "Processing…" : "Process next"}
+                        </button>
+                      )}
+                      {isPendingRow && (
+                        <button
+                          type="button"
+                          className="btn btn--secondary btn--sm"
+                          onClick={() => void handleProcessNow(entry)}
+                          disabled={rowAction !== null}
+                        >
+                          {rowAction === "processNow" ? "Processing…" : "Process now"}
                         </button>
                       )}
                       {canCancel && (
