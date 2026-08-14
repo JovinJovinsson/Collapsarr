@@ -1279,3 +1279,138 @@ def test_run_job_start_log_reports_the_preference_for_a_set_default_audio_job(
     assert str(job.id) in message
     assert "set_default_audio" in message
     assert "eng/5.1" in message
+
+
+# ---------------------------------------------------------------------------
+# Auto-Processing Pause (COL-226): a distinct, injected ``pause_check`` gate
+# on the claim chokepoint itself -- direct queue-level tests, no DB. The
+# real, Settings-backed wiring (``JobQueue.from_settings``) is covered
+# separately below.
+# ---------------------------------------------------------------------------
+
+
+def test_no_pause_check_configured_claims_pending_jobs_as_normal() -> None:
+    """AC: with no pause_check (the __init__ default), claiming is unaffected."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED
+    assert runner.calls == [(Path("/media/movie.mkv"), DownmixSettings())]
+
+
+def test_pause_check_returning_false_claims_pending_jobs_as_normal() -> None:
+    """AC: a pause_check that always reports "not paused" behaves like no gate at all."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: False)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_pause_check_returning_true_blocks_a_pending_job_from_ever_being_claimed() -> None:
+    """AC: while paused, a free worker never claims a new PENDING Job."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: True)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    # No notify_all ever fires to wake a waiter early while paused, so a short
+    # real sleep is the only way to observe "nothing happened" -- long enough
+    # to be well past any scheduling jitter, short relative to the test suite.
+    time.sleep(0.2)
+
+    assert job.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+def test_pause_check_toggling_off_lets_a_previously_pending_job_be_claimed() -> None:
+    """AC: toggling the setting takes effect live -- no restart, no re-enqueue needed."""
+    paused = {"value": True}
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: paused["value"])
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    time.sleep(0.2)
+    assert job.status is JobStatus.PENDING  # still paused, nothing claimed yet
+
+    paused["value"] = False
+    # No event to wait on -- the worker only notices via its bounded poll
+    # (_PAUSE_POLL_INTERVAL_SECONDS), so wait_idle's own timeout comfortably
+    # covers the worst case.
+    assert queue.wait_idle(timeout=5) is True
+
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_pause_check_does_not_affect_an_already_running_job() -> None:
+    """AC: a Job a worker has already claimed keeps running to completion while paused."""
+    paused = {"value": False}
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner, pause_check=lambda: paused["value"])
+    queue.start()
+
+    job = queue.enqueue("/media/gate.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)  # the sole worker has claimed and is running it
+
+    paused["value"] = True  # pause kicks in only *after* the claim
+
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_pause_check_is_consulted_on_every_claim_attempt() -> None:
+    """The gate is re-evaluated per claim, not cached once -- a second job stays gated too."""
+    paused = {"value": True}
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: paused["value"])
+    first = queue.enqueue("/media/a.mkv", DownmixSettings())
+    second = queue.enqueue("/media/b.mkv", DownmixSettings())
+
+    queue.start()
+    time.sleep(0.2)
+
+    assert first.status is JobStatus.PENDING
+    assert second.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+def test_from_settings_wires_a_real_pause_check_reading_auto_processing_paused(
+    tmp_path: Path,
+) -> None:
+    """The production factory reads GlobalSettings.auto_processing_paused live (COL-226)."""
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    _write_global_settings(settings, auto_processing_paused=True)
+    runner = _stub_runner(_SUCCESS)
+
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+    time.sleep(0.2)
+
+    assert job.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+def test_from_settings_default_auto_processing_paused_claims_as_normal(tmp_path: Path) -> None:
+    """No GlobalSettings row written -- from_settings creates it with its documented default."""
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    runner = _stub_runner(_SUCCESS)
+
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED

@@ -67,11 +67,16 @@ type PendingActions = Partial<Record<string, RowActionKind>>;
  */
 type ActionNotice = { tone: "hint" | "error"; text: string } | null;
 
-/** Load state for the persisted Auto-Queuing Pause setting (COL-181, COL-174). */
+/**
+ * Load state for the persisted pause settings (COL-181/COL-174's
+ * Auto-Queuing Pause, and COL-226's Auto-Processing Pause) -- both come off
+ * the same `GET /api/settings` fetch, so they share one load state rather
+ * than each toggle managing its own.
+ */
 type SettingsLoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; autoQueuePaused: boolean };
+  | { status: "ready"; autoQueuePaused: boolean; autoProcessingPaused: boolean };
 
 /**
  * Result notice for the page-level "Clear queue" action (COL-181, COL-173).
@@ -165,6 +170,15 @@ function describeClearQueueResult(result: ClearQueueResult): string {
  *   (`.auto-queue-toggle--active`/`--paused`) so paused vs. active reads
  *   unambiguously at a glance, the same way `TrackedToggleButton`'s
  *   `.tracked-toggle--on`/`--off` does for the Tracked toggle.
+ * - "Pause auto-processing" (`fetchSettings`/`updateSettings`,
+ *   `GET`/`PUT /api/settings`'s `auto_processing_paused`, COL-226): sits
+ *   right next to "Pause auto-queuing", same toggle-button shape/palette
+ *   (`.auto-processing-toggle--active`/`--paused`), but gates a different
+ *   chokepoint -- the Job Queue's worker pool never claims a new `pending`
+ *   Job while set, regardless of how it got there (scan, manual trigger, or
+ *   requeue), whereas "Pause auto-queuing" only stops the scanner from
+ *   adding new pending Jobs in the first place. Already-`running` Jobs are
+ *   unaffected by either toggle.
  */
 export function QueuePage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
@@ -173,6 +187,7 @@ export function QueuePage() {
   const [actionNotice, setActionNotice] = useState<ActionNotice>(null);
   const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
   const [pauseTogglePending, setPauseTogglePending] = useState(false);
+  const [processingPauseTogglePending, setProcessingPauseTogglePending] = useState(false);
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [clearingQueue, setClearingQueue] = useState(false);
   const [clearQueueNotice, setClearQueueNotice] = useState<ClearQueueNotice>(null);
@@ -210,12 +225,13 @@ export function QueuePage() {
   }, []);
 
   /**
-   * Loads the persisted Auto-Queuing Pause setting once on mount (COL-181,
-   * COL-174) -- a single one-shot `GET /api/settings`, not part of the queue
-   * poll loop above: the setting doesn't change on its own (only this page's
-   * own toggle, or another client, writes it), so there's nothing to poll
-   * for -- {@link handleToggleAutoQueuePause} updates local state directly
-   * from its own `PUT` response instead.
+   * Loads the persisted Auto-Queuing Pause and Auto-Processing Pause
+   * settings once on mount (COL-181/COL-174, COL-226) -- a single one-shot
+   * `GET /api/settings`, not part of the queue poll loop above: neither
+   * setting changes on its own (only this page's own toggles, or another
+   * client, write them), so there's nothing to poll for --
+   * {@link handleToggleAutoQueuePause}/{@link handleToggleAutoProcessingPause}
+   * update local state directly from their own `PUT` response instead.
    */
   useEffect(() => {
     let cancelled = false;
@@ -223,7 +239,11 @@ export function QueuePage() {
       try {
         const settings = await fetchSettings();
         if (cancelled) return;
-        setSettingsState({ status: "ready", autoQueuePaused: settings.auto_queue_paused });
+        setSettingsState({
+          status: "ready",
+          autoQueuePaused: settings.auto_queue_paused,
+          autoProcessingPaused: settings.auto_processing_paused,
+        });
       } catch (error) {
         if (cancelled) return;
         setSettingsState({
@@ -342,7 +362,11 @@ export function QueuePage() {
     setPauseTogglePending(true);
     try {
       const updated = await updateSettings({ auto_queue_paused: next });
-      setSettingsState({ status: "ready", autoQueuePaused: updated.auto_queue_paused });
+      setSettingsState({
+        status: "ready",
+        autoQueuePaused: updated.auto_queue_paused,
+        autoProcessingPaused: updated.auto_processing_paused,
+      });
     } catch (error) {
       setActionNotice({
         tone: "error",
@@ -350,6 +374,36 @@ export function QueuePage() {
       });
     } finally {
       setPauseTogglePending(false);
+    }
+  }
+
+  /**
+   * Flips the persisted Auto-Processing Pause setting (COL-226) via `PUT
+   * /api/settings` -- mirrors {@link handleToggleAutoQueuePause} exactly,
+   * for the queue's own claim-step gate rather than the scanner's auto-fill
+   * funnel: applies the `PUT` response's own `auto_processing_paused` value
+   * directly, and a failure surfaces through the same shared
+   * {@link ActionNotice} banner, leaving the toggle at its last known-good
+   * state.
+   */
+  async function handleToggleAutoProcessingPause(): Promise<void> {
+    if (settingsState.status !== "ready" || processingPauseTogglePending) return;
+    const next = !settingsState.autoProcessingPaused;
+    setProcessingPauseTogglePending(true);
+    try {
+      const updated = await updateSettings({ auto_processing_paused: next });
+      setSettingsState({
+        status: "ready",
+        autoQueuePaused: updated.auto_queue_paused,
+        autoProcessingPaused: updated.auto_processing_paused,
+      });
+    } catch (error) {
+      setActionNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to update auto-processing setting.",
+      });
+    } finally {
+      setProcessingPauseTogglePending(false);
     }
   }
 
@@ -426,6 +480,25 @@ export function QueuePage() {
                 : settingsState.autoQueuePaused
                   ? "Auto-queuing: Paused"
                   : "Auto-queuing: Active"}
+            </button>
+          )}
+          {settingsState.status === "ready" && (
+            <button
+              type="button"
+              className={
+                settingsState.autoProcessingPaused
+                  ? "auto-processing-toggle auto-processing-toggle--paused"
+                  : "auto-processing-toggle auto-processing-toggle--active"
+              }
+              onClick={() => void handleToggleAutoProcessingPause()}
+              disabled={processingPauseTogglePending}
+              aria-pressed={settingsState.autoProcessingPaused}
+            >
+              {processingPauseTogglePending
+                ? "Updating…"
+                : settingsState.autoProcessingPaused
+                  ? "Auto-processing: Paused"
+                  : "Auto-processing: Active"}
             </button>
           )}
           {settingsState.status === "error" && (

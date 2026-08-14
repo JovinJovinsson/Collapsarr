@@ -60,11 +60,12 @@ const queueResponse: JobHistoryEntry[] = [runningJob, pendingJobLowerPriority, p
 
 /**
  * Default `GET /api/settings` body for tests that don't care about the
- * Auto-Queuing Pause toggle (COL-181, COL-174) -- every helper below routes
- * `/api/settings` here unless a test overrides it, so the toggle's mount-time
- * load doesn't have to be threaded through every queue-only test.
+ * Auto-Queuing Pause (COL-181, COL-174) or Auto-Processing Pause (COL-226)
+ * toggles -- every helper below routes `/api/settings` here unless a test
+ * overrides it, so neither toggle's mount-time load has to be threaded
+ * through every queue-only test.
  */
-const DEFAULT_SETTINGS_RESPONSE = { auto_queue_paused: false };
+const DEFAULT_SETTINGS_RESPONSE = { auto_queue_paused: false, auto_processing_paused: false };
 
 function mockFetch(handler: (url: string, init?: RequestInit) => { ok: boolean; status?: number; body: unknown }) {
   const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
@@ -648,6 +649,79 @@ describe("QueuePage", () => {
       fireEvent.click(toggle);
 
       expect(await screen.findByText(/settings boom/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /auto-queuing: active/i })).toBeInTheDocument();
+    });
+  });
+
+  describe('"Pause auto-processing" toggle (COL-226)', () => {
+    it("reflects the active state on load", async () => {
+      mockFetchQueue([queueResponse], { auto_queue_paused: false, auto_processing_paused: false });
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-processing: active/i });
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("reflects the paused state on load", async () => {
+      mockFetchQueue([queueResponse], { auto_queue_paused: false, auto_processing_paused: true });
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-processing: paused/i });
+      expect(toggle).toHaveAttribute("aria-pressed", "true");
+    });
+
+    it("flips the setting via PUT /api/settings when clicked, and reflects the response", async () => {
+      mockFetchWithAction(
+        [queueResponse],
+        (url, init) => {
+          expect(url).toContain("/api/settings");
+          expect(init?.method).toBe("PUT");
+          expect(JSON.parse(init?.body as string)).toEqual({ auto_processing_paused: true });
+          return { ok: true, body: { auto_processing_paused: true } };
+        },
+        { auto_queue_paused: false, auto_processing_paused: false },
+      );
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-processing: active/i });
+      fireEvent.click(toggle);
+
+      expect(
+        await screen.findByRole("button", { name: /auto-processing: paused/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("surfaces a page-level error notice and keeps the prior state when the write fails", async () => {
+      mockFetchWithAction(
+        [queueResponse],
+        () => ({ ok: false, status: 500, body: { detail: "processing settings boom" } }),
+        { auto_queue_paused: false, auto_processing_paused: false },
+      );
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-processing: active/i });
+      fireEvent.click(toggle);
+
+      expect(await screen.findByText(/processing settings boom/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /auto-processing: active/i })).toBeInTheDocument();
+    });
+
+    it("does not affect the independent Auto-Queuing Pause toggle", async () => {
+      mockFetchWithAction(
+        [queueResponse],
+        () => ({ ok: true, body: { auto_processing_paused: true, auto_queue_paused: false } }),
+        { auto_queue_paused: false, auto_processing_paused: false },
+      );
+      render(<QueuePage />);
+
+      const processingToggle = await screen.findByRole("button", {
+        name: /auto-processing: active/i,
+      });
+      fireEvent.click(processingToggle);
+
+      expect(
+        await screen.findByRole("button", { name: /auto-processing: paused/i }),
+      ).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /auto-queuing: active/i })).toBeInTheDocument();
     });
   });
