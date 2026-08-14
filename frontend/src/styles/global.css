@@ -1504,6 +1504,42 @@ a {
   border-color: var(--c-warning-tint);
 }
 
+/* The "Pause auto-processing" toggle (COL-226, QueuePage's page-level
+   control over the persisted `auto_processing_paused` setting): sits next
+   to .auto-queue-toggle above and shares its exact pill shape/palette --
+   both toggles read as one visual family, since they're both "pause"
+   controls in the same header, just gating different chokepoints (the
+   scanner's auto-fill funnel vs. the worker pool's claim step). */
+.auto-processing-toggle {
+  display: inline-flex;
+  align-items: center;
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.auto-processing-toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.auto-processing-toggle--active {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+  border-color: var(--c-success-tint);
+}
+
+.auto-processing-toggle--paused {
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+  border-color: var(--c-warning-tint);
+}
+
 /* Row-level Select checkbox (COL-103): first column of every Library
    tree/table row, backing the cross-level bulk selection. */
 .library-tree-table__select {

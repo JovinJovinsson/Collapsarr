@@ -160,11 +160,26 @@ from collapsarr.downmix.pipeline import PipelineResult, run_downmix_pipeline
 from collapsarr.downmix.targets import DownmixSettings
 
 if TYPE_CHECKING:
+    from sqlalchemy.orm import Session, sessionmaker
+
     from collapsarr.settings.models import GlobalSettings
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CONCURRENCY = 1
+
+_PAUSE_POLL_INTERVAL_SECONDS = 1.0
+"""How often a worker blocked purely because :data:`AutoProcessingPauseCheck`
+currently returns ``True`` re-checks it (COL-226). Toggling the persisted
+``auto_processing_paused`` setting off doesn't otherwise wake an idle
+worker -- only :meth:`JobQueue._enqueue`/:meth:`JobQueue.bump_to_front`/
+:meth:`JobQueue.shutdown` call ``notify_all`` on the condition a blocked
+worker waits on, and none of those fire from a ``PUT /api/settings`` write --
+so a paused worker instead polls at this cadence, the same "read fresh,
+bounded latency" shape :class:`~collapsarr.jobs.scheduler.JobScheduler`'s
+``recently_processed_window_minutes`` dedup cooldown already uses for a live
+Settings read. 1 second keeps the worst-case "un-pause to first claim"
+latency low without spinning the CPU or hammering the database."""
 
 #: Signature the ``DOWNMIX`` pipeline runner (real or injected-for-tests) must
 #: match: ``(file_path, settings, **pipeline_kwargs) -> PipelineResult``.
@@ -189,6 +204,53 @@ DefaultAudioPipelineRunner = Callable[..., PipelineResult]
 #: toggle is also on. ``ffmpeg_path`` is the only key both pipelines share
 #: today.
 _SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS = frozenset({"ffmpeg_path"})
+
+#: Signature the Auto-Processing Pause gate (COL-226, "Auto-Processing
+#: Pause") must match: a zero-arg callable returning whether pending-job
+#: claiming should currently be paused. Called from
+#: :meth:`JobQueue._claim_next` on every claim attempt -- unlike
+#: ``max_concurrency`` (read once at construction), a change takes effect on
+#: the very next claim, live, with no restart. Deliberately distinct from
+#: :class:`~collapsarr.jobs.scheduler.JobScheduler`'s own ``auto_queue_paused``
+#: gate (COL-174, "Auto-Queuing Pause"), which only stops the scanner's
+#: enqueue/top-up funnel from adding *new* ``PENDING`` Jobs: this callable
+#: instead gates the queue's sole pending -> running chokepoint, so it also
+#: halts a Job that is already sitting ``PENDING`` (enqueued before the
+#: pause, or added to it while paused, e.g. by a manual trigger) from ever
+#: starting, while a Job a worker has already claimed keeps running
+#: uninterrupted to completion. ``None`` (the default, used by the raw
+#: ``__init__`` and every existing test) means "never paused" --
+#: :meth:`JobQueue.from_settings` wires a real one reading
+#: ``GlobalSettings.auto_processing_paused`` live (see
+#: :func:`_make_live_pause_check`).
+AutoProcessingPauseCheck = Callable[[], bool]
+
+
+def _make_live_pause_check(
+    session_factory: sessionmaker[Session],
+) -> AutoProcessingPauseCheck:
+    """Build a real :data:`AutoProcessingPauseCheck` bound to ``session_factory`` (COL-226).
+
+    Opens a short-lived :class:`~sqlalchemy.orm.Session` per call -- the same
+    per-call-session pattern :func:`collapsarr.jobs.history.
+    make_history_recorder` already uses -- so a worker calling this from
+    :meth:`JobQueue._claim_next` (up to ``max_concurrency`` threads may call
+    it concurrently) always reads the *current* persisted
+    ``GlobalSettings.auto_processing_paused`` value, never one captured once
+    at :meth:`JobQueue.from_settings` construction time.
+
+    The import is deferred, matching every other Settings-service import in
+    this module: the settings service pulls in the ORM/adapters, which don't
+    need to load for a lightweight ``__init__`` construction that never
+    touches Settings.
+    """
+    from collapsarr.settings.service import get_global_settings
+
+    def _pause_check() -> bool:
+        with session_factory() as session:
+            return get_global_settings(session).auto_processing_paused
+
+    return _pause_check
 
 
 def _enabled_targets_for_log(settings: DownmixSettings) -> str:
@@ -440,6 +502,20 @@ class JobQueue:
     for it exactly as it does for a ``DOWNMIX`` job, though, since a Default
     Audio Track fix also rewrites the file's stream-level metadata Plex has
     cached.
+
+    ``pause_check`` (COL-226, "Auto-Processing Pause") is a zero-arg
+    :data:`AutoProcessingPauseCheck` callable :meth:`_claim_next` consults on
+    every claim attempt: while it returns ``True``, a free worker never
+    claims a new ``PENDING`` Job, so nothing new starts running -- a Job a
+    worker has already claimed keeps running to completion regardless (this
+    seam only ever guards the claim step). Defaults to ``None``, which reads
+    as "never paused" -- the right default for lightweight unit construction
+    (e.g. COL-20's concurrency tests) that never touches Settings, mirroring
+    every other optional seam on this class. :meth:`from_settings` wires a
+    real one (see :func:`_make_live_pause_check`) reading
+    ``GlobalSettings.auto_processing_paused`` live, so a ``PUT
+    /api/settings`` change takes effect on the very next claim attempt with
+    no restart.
     """
 
     def __init__(
@@ -453,6 +529,7 @@ class JobQueue:
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
         plex_analyzer: PlexAnalyzer | None = None,
+        pause_check: AutoProcessingPauseCheck | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
@@ -464,6 +541,9 @@ class JobQueue:
         self._failure_notifier = failure_notifier
         self._tracked_media_recorder = tracked_media_recorder
         self._plex_analyzer = plex_analyzer
+        #: The Auto-Processing Pause gate (COL-226) -- see the class
+        #: docstring's ``pause_check`` paragraph and :data:`AutoProcessingPauseCheck`.
+        self._pause_check = pause_check
         self._lock = threading.Lock()
         #: Guards every access to ``_jobs``/``_next_priority``/``_shutdown``
         #: and coordinates the worker pool. Workers ``wait`` on it for a
@@ -528,6 +608,7 @@ class JobQueue:
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
         plex_analyzer: PlexAnalyzer | None = None,
+        pause_check: AutoProcessingPauseCheck | None = None,
     ) -> JobQueue:
         """Build a :class:`JobQueue` whose concurrency cap comes from persisted Settings.
 
@@ -612,6 +693,15 @@ class JobQueue:
         deferred import to break the module cycle, the same reason the
         schema/engine helpers above are imported inside this method rather
         than at module scope.
+
+        ``pause_check`` (COL-226) defaults to a real
+        :func:`_make_live_pause_check` bound to this same ``session_factory``
+        when not passed explicitly -- unlike the raw :meth:`__init__` (where
+        it defaults to ``None``, "never paused"), this factory is the
+        production path, so a bare ``JobQueue.from_settings()`` call
+        genuinely honours a persisted Auto-Processing Pause, mirroring how
+        ``history_recorder``/``failure_notifier``/``tracked_media_recorder``/
+        ``plex_analyzer`` above all resolve to real ones here too.
         """
         resolved = settings or get_settings()
 
@@ -657,6 +747,10 @@ class JobQueue:
 
             resolved_plex_analyzer = make_plex_analyzer(session_factory)
 
+        resolved_pause_check = pause_check
+        if resolved_pause_check is None:
+            resolved_pause_check = _make_live_pause_check(session_factory)
+
         return cls(
             max_concurrency=global_settings.concurrency_limit,
             pipeline_runner=pipeline_runner,
@@ -666,6 +760,7 @@ class JobQueue:
             failure_notifier=resolved_failure_notifier,
             tracked_media_recorder=resolved_tracked_media_recorder,
             plex_analyzer=resolved_plex_analyzer,
+            pause_check=resolved_pause_check,
         )
 
     @staticmethod
@@ -1059,24 +1154,40 @@ class JobQueue:
         concurrent :meth:`cancel` correctly loses the race (sees it already
         non-``PENDING``). Returns ``None`` only when :meth:`shutdown` was
         signalled while this worker was idle -- the worker's cue to exit.
+
+        **Auto-Processing Pause (COL-226).** Before picking a job, checks
+        ``self._pause_check()`` (when configured) and, while it returns
+        ``True``, treats the claim as unclaimable regardless of what's
+        actually ``PENDING`` -- so no free worker starts a new Job while
+        paused. A Job a worker already claimed keeps running: this method is
+        only ever on the *claim* path, never called again for an
+        already-``RUNNING`` Job. While paused, the wait below uses
+        :data:`_PAUSE_POLL_INTERVAL_SECONDS` instead of blocking forever, so
+        toggling the setting back off is picked up within that bound even
+        though nothing explicitly wakes this worker (see that constant's
+        docstring for why) -- once claimable, the ordinary indefinite wait
+        (woken by :meth:`_enqueue`/:meth:`bump_to_front`/:meth:`shutdown`)
+        applies as before.
         """
         with self._cond:
             while True:
                 if self._shutdown:
                     return None
-                job = self._lowest_priority_pending_locked()
-                if job is not None:
-                    job.status = JobStatus.RUNNING
-                    job.started_at = datetime.now(UTC)
-                    # COL-192: attach a hard-kill handle under the same lock
-                    # that flips the job to RUNNING, so a concurrent
-                    # cancel_running() either sees it here (and kills the
-                    # subprocess once _run_job attaches one) or loses the race
-                    # cleanly against a job that already finished.
-                    job.cancellation = CancellationHandle()
-                    self._active += 1  # stays counted until _run_job fully finishes
-                    return job
-                self._cond.wait()
+                paused = self._pause_check is not None and self._pause_check()
+                if not paused:
+                    job = self._lowest_priority_pending_locked()
+                    if job is not None:
+                        job.status = JobStatus.RUNNING
+                        job.started_at = datetime.now(UTC)
+                        # COL-192: attach a hard-kill handle under the same lock
+                        # that flips the job to RUNNING, so a concurrent
+                        # cancel_running() either sees it here (and kills the
+                        # subprocess once _run_job attaches one) or loses the race
+                        # cleanly against a job that already finished.
+                        job.cancellation = CancellationHandle()
+                        self._active += 1  # stays counted until _run_job fully finishes
+                        return job
+                self._cond.wait(_PAUSE_POLL_INTERVAL_SECONDS if paused else None)
 
     def _lowest_priority_pending_locked(self) -> Job | None:
         """The pending job a free worker should claim next (call with the lock held).

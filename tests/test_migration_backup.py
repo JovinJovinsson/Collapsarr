@@ -55,7 +55,7 @@ from collapsarr.migrations import (
 #: Preferred Default Audio setting, COL-154's current-default-track snapshot,
 #: COL-155's job-history ``kind``, COL-163's job-history ``priority``, COL-167's
 #: recently-processed dedup window, COL-174's Auto-Queuing Pause toggle,
-#: COL-218's ``ffmpeg_path`` override) --
+#: COL-218's ``ffmpeg_path`` override, COL-226's Auto-Processing Pause toggle) --
 #: dropped after ``create_all`` below by :func:`_create_unversioned_db`,
 #: mirroring the same de-evolving idiom in ``test_migration_adoption.py``.
 #: Without this, ``create_all`` (which always builds from the *current*
@@ -75,6 +75,7 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "recently_processed_window_minutes"),
     ("global_settings", "auto_queue_paused"),
     ("global_settings", "ffmpeg_path"),
+    ("global_settings", "auto_processing_paused"),
     ("tracked_media_files", "sonarr_episode_id"),
     ("tracked_media_files", "radarr_movie_id"),
     ("tracked_media_files", "current_default_language"),
