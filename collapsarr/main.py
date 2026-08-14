@@ -65,7 +65,7 @@ from .self_update.apply import ReexecFn, SubprocessRunner
 from .self_update.routes import router as self_update_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
-from .settings.service import get_global_settings
+from .settings.service import get_global_settings, restore_auto_processing_pause
 from .system.info import router as info_router
 from .system.logs import router as logs_router
 from .system.probe import DefaultSystemProbe, SystemProbe
@@ -246,6 +246,21 @@ def create_app(
         app.state.engine = engine
         session_factory = create_session_factory(engine)
         app.state.session_factory = session_factory
+
+        # One-shot Auto-Processing Pause restore (COL-233): consume whatever
+        # the self-update apply flow stashed into `GlobalSettings.
+        # auto_processing_pause_restore_value` (collapsarr.self_update.apply,
+        # "Cancel & Restart Now"/"Wait & Restart") before force-pausing
+        # processing for the duration of an apply -- write it back onto
+        # `auto_processing_paused` and clear the restore column to `None`.
+        # Run early, right after the database is available and before the Job
+        # Queue below is even constructed, so a stashed pause never has a
+        # window where a fresh worker could claim a Job against the *forced*
+        # (not yet restored) pause state. A no-op on every ordinary boot (no
+        # self-update has ever run, or the previous boot already consumed
+        # it) -- see `collapsarr.settings.service.restore_auto_processing_pause`.
+        with session_factory() as restore_pause_session:
+            restore_auto_processing_pause(restore_pause_session)
 
         # Runtime log-level control (COL-130): a persisted `GlobalSettings.
         # log_level` override, applied now that the database is available --

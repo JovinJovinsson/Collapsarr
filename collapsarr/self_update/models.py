@@ -19,17 +19,20 @@ to (``previous_version``) if the newly-applied build fails its post-update
 health check.
 
 Phase vocabulary (:data:`SELF_UPDATE_PHASES`) -- chosen to fit the flow
-COL-232 onward implements: fetch the release archive (``downloading``),
-checksum-verify it (``verifying``), install it in place (``applying``), wait
-for the re-exec'd/restarted process to report healthy (``awaiting_health``),
-and -- only if that health check fails -- revert to ``previous_version``
-(``rolled_back``). ``idle`` is both the initial state (no attempt has ever
-run) and the terminal *success* state (:func:`~collapsarr.self_update.
-service.clear_self_update`'s default) once a self-update completes and the
-new version is confirmed healthy; ``rolled_back`` is the terminal *failure*
-state. This ticket only defines the vocabulary and the guard -- the actual
-phase transitions are driven by COL-232 onward via
-:func:`~collapsarr.self_update.service.set_self_update_phase`.
+COL-232 onward implements: optionally clear in-flight Jobs first
+(``preparing`` -- COL-233's "Cancel & Restart Now"/"Wait & Restart", held for
+the whole cancel/wait window so the in-progress guard genuinely covers it,
+not just the download that follows), fetch the release archive
+(``downloading``), checksum-verify it (``verifying``), install it in place
+(``applying``), wait for the re-exec'd/restarted process to report healthy
+(``awaiting_health``), and -- only if that health check fails -- revert to
+``previous_version`` (``rolled_back``). ``idle`` is both the initial state
+(no attempt has ever run) and the terminal *success* state
+(:func:`~collapsarr.self_update.service.clear_self_update`'s default) once a
+self-update completes and the new version is confirmed healthy;
+``rolled_back`` is the terminal *failure* state. This ticket only defines the
+vocabulary and the guard -- the actual phase transitions are driven by
+COL-232 onward via :func:`~collapsarr.self_update.service.set_self_update_phase`.
 
 This module is imported for its side effect of registering the model with
 :data:`collapsarr.database.Base.metadata` -- see :mod:`collapsarr.self_update`
@@ -52,6 +55,7 @@ from collapsarr.database import Base
 SELF_UPDATE_STATE_ID = 1
 
 PHASE_IDLE = "idle"
+PHASE_PREPARING = "preparing"
 PHASE_DOWNLOADING = "downloading"
 PHASE_VERIFYING = "verifying"
 PHASE_APPLYING = "applying"
@@ -66,6 +70,7 @@ PHASE_ROLLED_BACK = "rolled_back"
 #: schema level for a value set that may still grow as COL-232-236 land).
 SELF_UPDATE_PHASES = (
     PHASE_IDLE,
+    PHASE_PREPARING,
     PHASE_DOWNLOADING,
     PHASE_VERIFYING,
     PHASE_APPLYING,
@@ -116,6 +121,7 @@ __all__ = [
     "PHASE_AWAITING_HEALTH",
     "PHASE_DOWNLOADING",
     "PHASE_IDLE",
+    "PHASE_PREPARING",
     "PHASE_ROLLED_BACK",
     "PHASE_VERIFYING",
     "SELF_UPDATE_PHASES",

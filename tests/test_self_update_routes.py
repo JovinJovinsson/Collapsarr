@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import threading
 from collections.abc import Sequence
+from pathlib import Path
 
 import httpx
 import pytest
@@ -24,6 +26,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from collapsarr.config import Settings
+from collapsarr.downmix.cancellation import CancellationHandle
+from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
+from collapsarr.downmix.probe import AudioStreamInfo
+from collapsarr.downmix.targets import DownmixSettings
+from collapsarr.jobs.queue import JobQueue, JobStatus, PipelineRunner
+from collapsarr.jobs.scheduler import JobScheduler
 from collapsarr.main import create_app
 from collapsarr.self_update.apply import PIPX_UPGRADE_COMMAND
 from collapsarr.self_update.models import PHASE_AWAITING_HEALTH, PHASE_IDLE, PHASE_VERIFYING
@@ -310,3 +318,272 @@ def test_apply_checksum_mismatch_reports_a_clear_error_and_never_upgrades(
             state = get_self_update_state(session)
             assert state.in_progress is False
             assert state.phase == PHASE_IDLE
+
+
+# --------------------------------------------------------------------------- #
+# COL-233: in-flight Job handling (Cancel & Restart Now / Wait & Restart)
+# --------------------------------------------------------------------------- #
+
+_SURROUND: list[AudioStreamInfo] = [
+    AudioStreamInfo(index=0, codec="ac3", channels=6, channel_layout="5.1(side)", language="eng")
+]
+_SUCCESS_RESULT = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
+_FAILED_RESULT = PipelineResult(
+    outcome=PipelineOutcome.REMUX_FAILED, success=False, detail="killed"
+)
+
+
+def _surround_probe(_path: Path) -> Sequence[AudioStreamInfo]:
+    return _SURROUND
+
+
+class _FakeProcess:
+    """A stand-in for a job's live subprocess, killable by the cancel handle."""
+
+    def __init__(self) -> None:
+        self.pid = 2_000_000_000  # no such process -> os.getpgid raises, forcing kill()
+        self.killed = threading.Event()
+
+    def poll(self) -> int | None:
+        return None
+
+    def kill(self) -> None:
+        self.killed.set()
+
+
+class _HardKillOnceRunner:
+    """A pipeline_runner whose ``victim`` job blocks until killed -- once.
+
+    Mirrors ``tests/test_self_update_apply.py``'s runner of the same name --
+    only the *first* call for ``victim`` blocks/attaches a cancel handle; a
+    second call (the requeued Job "Cancel & Restart Now" creates) runs
+    straight to success.
+    """
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.process = _FakeProcess()
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def __call__(
+        self,
+        file_path: Path,
+        _settings: DownmixSettings,
+        *,
+        cancel_handle: CancellationHandle | None = None,
+        **_: object,
+    ) -> PipelineResult:
+        with self._lock:
+            self.calls += 1
+            first_call = self.calls == 1
+        if file_path.stem == "victim" and first_call:
+            assert cancel_handle is not None, "queue must thread a cancel handle into a RUNNING job"
+            cancel_handle.attach(self.process)
+            self.started.set()
+            assert self.process.killed.wait(timeout=5), "victim subprocess was never killed"
+            cancel_handle.detach(self.process)
+            return _FAILED_RESULT
+        return _SUCCESS_RESULT
+
+
+class _GatedRunner:
+    """A pipeline_runner whose ``victim`` job blocks until released, then succeeds."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, file_path: Path, _settings: DownmixSettings, **_: object) -> PipelineResult:
+        if file_path.stem == "victim":
+            self.started.set()
+            assert self.release.wait(timeout=5), "victim job was never released"
+        return _SUCCESS_RESULT
+
+
+def _attach_real_queue_and_scheduler(
+    client: TestClient, settings: Settings, *, pipeline_runner: PipelineRunner
+) -> tuple[JobQueue, JobScheduler]:
+    """Wire a real, started :class:`JobQueue` + :class:`JobScheduler` onto ``client.app.state``.
+
+    Mirrors ``tests/test_jobs_routes.py``'s ``test_cancel_job_hard_kills_a_
+    running_job_end_to_end`` -- the ``client`` fixture doesn't set
+    ``enable_scheduler=True`` (no real ffmpeg pipeline is available in CI),
+    so a real queue/scheduler pair (with an injected fake pipeline_runner)
+    is attached directly instead, driving this endpoint's in-flight-Job
+    handling genuinely end to end over HTTP.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+    queue = JobQueue(max_concurrency=1, pipeline_runner=pipeline_runner)
+    queue.start()
+    scheduler = JobScheduler(queue, session_factory, settings, probe=_surround_probe)
+    app.state.job_queue = queue
+    app.state.job_scheduler = scheduler
+    return queue, scheduler
+
+
+def test_apply_rejects_an_unknown_flow_value(client: TestClient) -> None:
+    response = client.post(
+        "/api/system/self-update/apply",
+        json={"flow": "not_a_real_flow"},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 422
+
+
+def test_apply_returns_503_for_a_flow_when_no_job_queue_is_wired(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("collapsarr.self_update.routes.install_method", lambda: "pipx")
+    with TestClient(_app(settings)) as client:
+        _seed_stable_update_available(client)
+
+        response = client.post(
+            "/api/system/self-update/apply",
+            json={"flow": "wait_and_restart"},
+            headers=_auth_headers(client),
+        )
+
+    assert response.status_code == 503
+
+
+def test_apply_rejects_when_jobs_running_and_no_flow_chosen(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("collapsarr.self_update.routes.install_method", lambda: "pipx")
+    with TestClient(_app(settings)) as client:
+        _seed_stable_update_available(client)
+        runner = _HardKillOnceRunner()
+        queue, scheduler = _attach_real_queue_and_scheduler(
+            client, settings, pipeline_runner=runner
+        )
+        try:
+            victim = scheduler.trigger_file("/media/victim.mkv")
+            assert victim is not None
+            assert runner.started.wait(timeout=5)
+
+            response = _apply(client)
+
+            assert response.status_code == 409
+            assert "flow" in response.json()["detail"].lower()
+        finally:
+            runner.process.kill()  # unblock the worker so shutdown() doesn't hang
+            queue.shutdown()
+
+
+def test_apply_cancel_and_restart_flow_over_http_end_to_end(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("collapsarr.self_update.routes.install_method", lambda: "pipx")
+    monkeypatch.setattr(
+        "collapsarr.self_update.apply.resolve_platform_arch", lambda: ("linux", "amd64")
+    )
+    runner = _HardKillOnceRunner()
+    subprocess_runner = _RunnerSpy(returncode=0)
+    reexec = _ReexecSpy()
+
+    with TestClient(
+        _app(
+            settings,
+            self_update_transport=_self_update_transport(),
+            self_update_subprocess_runner=subprocess_runner,
+            self_update_reexec_fn=reexec,
+        )
+    ) as client:
+        _seed_stable_update_available(client)
+        queue, scheduler = _attach_real_queue_and_scheduler(
+            client, settings, pipeline_runner=runner
+        )
+        try:
+            victim = scheduler.trigger_file("/media/victim.mkv")
+            assert victim is not None
+            assert runner.started.wait(timeout=5)
+
+            response = client.post(
+                "/api/system/self-update/apply",
+                json={"flow": "cancel_and_restart"},
+                headers=_auth_headers(client),
+            )
+
+            assert response.status_code == 200, response.text
+            assert response.json() == {"ok": True}
+            assert runner.process.killed.is_set()
+            assert victim.status is JobStatus.FAILED
+            assert len(subprocess_runner.calls) == 1
+            assert reexec.calls == 1
+
+            # A second, distinct Job for the same file now exists -- the
+            # hard-cancelled Job was immediately requeued.
+            requeued = [
+                job
+                for job in queue.list_jobs()
+                if job.file_path == Path("/media/victim.mkv") and job.id != victim.id
+            ]
+            assert len(requeued) == 1
+
+            with app_session(client) as session:
+                row = get_global_settings(session)
+                # Forced for the duration; left forced on success -- the
+                # next boot (collapsarr.main's lifespan) restores it.
+                assert row.auto_processing_paused is True
+                assert row.auto_processing_pause_restore_value is False
+        finally:
+            queue.shutdown()
+
+
+def test_apply_wait_and_restart_flow_over_http_end_to_end(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("collapsarr.self_update.routes.install_method", lambda: "pipx")
+    monkeypatch.setattr(
+        "collapsarr.self_update.apply.resolve_platform_arch", lambda: ("linux", "amd64")
+    )
+    runner = _GatedRunner()
+    subprocess_runner = _RunnerSpy(returncode=0)
+    reexec = _ReexecSpy()
+
+    with TestClient(
+        _app(
+            settings,
+            self_update_transport=_self_update_transport(),
+            self_update_subprocess_runner=subprocess_runner,
+            self_update_reexec_fn=reexec,
+        )
+    ) as client:
+        _seed_stable_update_available(client)
+        queue, scheduler = _attach_real_queue_and_scheduler(
+            client, settings, pipeline_runner=runner
+        )
+        try:
+            victim = scheduler.trigger_file("/media/victim.mkv")
+            assert victim is not None
+            assert runner.started.wait(timeout=5)
+
+            # Release the victim Job shortly after the request starts
+            # blocking in the wait step -- long enough that the request is
+            # genuinely mid-wait, short enough to keep the test fast.
+            threading.Timer(0.2, runner.release.set).start()
+
+            response = client.post(
+                "/api/system/self-update/apply",
+                json={"flow": "wait_and_restart"},
+                headers=_auth_headers(client),
+            )
+
+            assert response.status_code == 200, response.text
+            assert response.json() == {"ok": True}
+            assert victim.status is JobStatus.SUCCEEDED  # finished naturally, never FAILED
+            # Nothing was cancelled or requeued for this file.
+            assert [j for j in queue.list_jobs() if j.file_path == Path("/media/victim.mkv")] == [
+                victim
+            ]
+
+            with app_session(client) as session:
+                row = get_global_settings(session)
+                assert row.auto_processing_paused is True
+                assert row.auto_processing_pause_restore_value is False
+        finally:
+            queue.shutdown()
