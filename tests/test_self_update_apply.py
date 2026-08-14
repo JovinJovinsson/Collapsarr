@@ -311,6 +311,93 @@ def test_apply_pipx_update_reports_a_failed_pipx_upgrade_without_reexecing(
 
 
 # --------------------------------------------------------------------------- #
+# Code-review must-fix: any unexpected exception inside the guarded region
+# clears the guard too, not just the specific failure modes handled above --
+# a poisoned in_progress=True row would otherwise block every future
+# self-update attempt (begin_self_update refuses whenever it's already set),
+# and it's a persisted row that would survive a process restart.
+# --------------------------------------------------------------------------- #
+
+
+class _RaisingRunner:
+    """A fake :data:`~collapsarr.self_update.apply.SubprocessRunner` that raises.
+
+    ``PermissionError`` (a real-world case: a ``pipx`` on ``PATH`` that
+    exists but isn't executable) is deliberately *not* one of the two
+    exception types :func:`~collapsarr.self_update.apply.apply_pipx_update`
+    special-cases (``FileNotFoundError``/``subprocess.TimeoutExpired``), so
+    this exercises the broad catch-all rather than either specific branch.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    def __call__(
+        self, command: Sequence[str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls += 1
+        raise self.exc
+
+
+def test_apply_pipx_update_clears_the_guard_on_an_unexpected_subprocess_exception(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_platform(monkeypatch, ("linux", "amd64"))
+    runner = _RaisingRunner(PermissionError("[Errno 13] Permission denied: 'pipx'"))
+    reexec = _ReexecSpy()
+
+    outcome = apply_pipx_update(
+        session,
+        target_tag=_TAG,
+        transport=_transport(),
+        subprocess_runner=runner,
+        reexec_fn=reexec,
+    )
+
+    assert outcome.ok is False
+    assert outcome.error is not None
+    assert "permission" in outcome.error.lower()
+    assert runner.calls == 1
+    assert reexec.calls == 0
+
+    # The must-fix: the guard is cleared, not left poisoned -- a subsequent
+    # attempt must be able to start.
+    state = get_self_update_state(session)
+    assert state.in_progress is False
+    assert state.phase == PHASE_IDLE
+
+    # Proof the guard genuinely recovered: a fresh attempt can begin.
+    begin_self_update(session, previous_version="1.0.0")
+
+
+def test_apply_pipx_update_clears_the_guard_on_an_unexpected_reexec_exception(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_platform(monkeypatch, ("linux", "amd64"))
+    runner = _RunnerSpy(returncode=0)
+
+    def _exploding_reexec() -> None:
+        raise OSError("exec format error")
+
+    outcome = apply_pipx_update(
+        session,
+        target_tag=_TAG,
+        transport=_transport(),
+        subprocess_runner=runner,
+        reexec_fn=_exploding_reexec,
+    )
+
+    assert outcome.ok is False
+    assert outcome.error is not None
+    assert len(runner.calls) == 1  # pipx upgrade did run before the re-exec blew up
+
+    state = get_self_update_state(session)
+    assert state.in_progress is False
+    assert state.phase == PHASE_IDLE
+
+
+# --------------------------------------------------------------------------- #
 # Unsupported platform
 # --------------------------------------------------------------------------- #
 

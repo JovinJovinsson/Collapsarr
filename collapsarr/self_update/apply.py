@@ -36,6 +36,24 @@ health-check-within-timeout / auto-rollback
 (``docs/adr/0009-self-update-staged-handoff-with-auto-rollback.md``) is what
 eventually clears it back to idle (on success) or ``rolled_back`` (on
 failure) -- this module never does that itself.
+
+**No failure can leave the guard stuck.** Once :func:`apply_pipx_update`
+has reserved the in-progress guard (:func:`~collapsarr.self_update.service.
+begin_self_update`), everything through the successful hand-off above runs
+inside a single ``try``/``except Exception`` block: every *expected* failure
+(a checksum mismatch, a download error, a missing ``pipx`` executable, a
+subprocess timeout, a non-zero ``pipx upgrade`` exit) raises the internal
+:class:`_ApplyFailure`, and *any other, truly unexpected* exception (a
+``PermissionError`` from a non-executable ``pipx``, a database error, ...)
+is caught too -- both funnel through the exact same ``except`` clause, which
+clears the guard back to :data:`~collapsarr.self_update.models.PHASE_IDLE`
+before converting the failure into a :class:`SelfUpdateApplyOutcome`. This
+is deliberate: the guard is a **persisted** row that survives a process
+restart, and :func:`~collapsarr.self_update.service.begin_self_update`
+refuses every future attempt while it is held -- so an exception that
+skipped past an ad hoc ``clear_self_update`` call would poison every
+subsequent self-update attempt indefinitely, with no way to recover short of
+a manual DB edit.
 """
 
 from __future__ import annotations
@@ -104,6 +122,19 @@ SubprocessRunner = Callable[[Sequence[str], float], "subprocess.CompletedProcess
 #: process image); a test fake/spy returns normally instead, so a test that
 #: reaches this point doesn't have to survive a real process replacement.
 ReexecFn = Callable[[], None]
+
+
+class _ApplyFailure(RuntimeError):
+    """Internal control-flow signal: an expected failure inside the guarded region.
+
+    Raised for every one of :func:`apply_pipx_update`'s *expected* failure
+    modes (checksum mismatch, download error, missing ``pipx``, subprocess
+    timeout, non-zero ``pipx upgrade`` exit) so they funnel through the exact
+    same ``except`` clause as any genuinely unexpected exception -- see the
+    module docstring's "No failure can leave the guard stuck" section. Never
+    escapes :func:`apply_pipx_update` itself; always caught and converted
+    into a :class:`SelfUpdateApplyOutcome`.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,10 +275,13 @@ def apply_pipx_update(
        "Guard handoff" section) -- and call ``reexec_fn`` (defaults to
        :func:`_reexec_process`).
 
-    ``transport`` is forwarded to every network call this makes (tests
-    inject an ``httpx.MockTransport``; production leaves it ``None`` for a
-    real network call), matching every other transport-injectable seam in
-    this codebase.
+    Once the guard is reserved (step 2), every failure -- expected or not --
+    is funneled through one ``except Exception`` clause that clears it back
+    to idle; see the module docstring's "No failure can leave the guard
+    stuck" section. ``transport`` is forwarded to every network call this
+    makes (tests inject an ``httpx.MockTransport``; production leaves it
+    ``None`` for a real network call), matching every other
+    transport-injectable seam in this codebase.
     """
     run = subprocess_runner or _run_pipx_upgrade
     reexec = reexec_fn or _reexec_process
@@ -265,71 +299,81 @@ def apply_pipx_update(
     # concurrent trigger must be rejected right here, never partway through
     # a download. Propagates SelfUpdateAlreadyInProgressError to the caller
     # rather than catching it: that guard is COL-230's, this function adds
-    # no second one of its own.
+    # no second one of its own. Deliberately outside the try/except below --
+    # a failure to even take the guard must never attempt to clear it.
     begin_self_update(session, previous_version=__version__, phase=PHASE_DOWNLOADING)
 
-    checksum_url = _release_asset_url(target_tag, "SHA256SUMS")
-    checksum_result = fetch_checksum_entry(
-        checksum_url, version, platform_name, arch, transport=transport, timeout=timeout
-    )
-    if (
-        not checksum_result.ok
-        or checksum_result.filename is None
-        or checksum_result.sha256 is None
-    ):
-        clear_self_update(session, phase=PHASE_IDLE)
-        return SelfUpdateApplyOutcome(ok=False, error=checksum_result.error)
-
-    archive_url = _release_asset_url(target_tag, checksum_result.filename)
-    download_result = download_and_verify(
-        archive_url,
-        checksum_result.sha256,
-        timeout=timeout,
-        transport=transport,
-        max_bytes=MAX_RELEASE_ARCHIVE_BYTES,
-    )
-    if not download_result.ok:
-        # Network failure or a SHA-256 mismatch -- abort before pipx upgrade
-        # is ever invoked (AC: verify-then-upgrade, strictly sequential; the
-        # running install is untouched).
-        clear_self_update(session, phase=PHASE_IDLE)
-        return SelfUpdateApplyOutcome(ok=False, error=download_result.error)
-
-    # Verification has now completed successfully -- advance the phase
-    # marker before moving on to the actual upgrade step.
-    set_self_update_phase(session, PHASE_VERIFYING)
-    set_self_update_phase(session, PHASE_APPLYING)
-
     try:
-        result = run(PIPX_UPGRADE_COMMAND, subprocess_timeout)
-    except FileNotFoundError:
-        clear_self_update(session, phase=PHASE_IDLE)
-        return SelfUpdateApplyOutcome(ok=False, error="pipx executable not found on PATH.")
-    except subprocess.TimeoutExpired:
-        clear_self_update(session, phase=PHASE_IDLE)
-        return SelfUpdateApplyOutcome(
-            ok=False, error=f"pipx upgrade collapsarr timed out after {subprocess_timeout}s."
+        checksum_url = _release_asset_url(target_tag, "SHA256SUMS")
+        checksum_result = fetch_checksum_entry(
+            checksum_url, version, platform_name, arch, transport=transport, timeout=timeout
         )
+        if (
+            not checksum_result.ok
+            or checksum_result.filename is None
+            or checksum_result.sha256 is None
+        ):
+            raise _ApplyFailure(checksum_result.error or "Failed to resolve the release checksum.")
 
-    if result.returncode != 0:
-        clear_self_update(session, phase=PHASE_IDLE)
-        return SelfUpdateApplyOutcome(
-            ok=False,
-            error=(
+        archive_url = _release_asset_url(target_tag, checksum_result.filename)
+        download_result = download_and_verify(
+            archive_url,
+            checksum_result.sha256,
+            timeout=timeout,
+            transport=transport,
+            max_bytes=MAX_RELEASE_ARCHIVE_BYTES,
+        )
+        if not download_result.ok:
+            # Network failure or a SHA-256 mismatch -- abort before pipx
+            # upgrade is ever invoked (AC: verify-then-upgrade, strictly
+            # sequential; the running install is untouched).
+            raise _ApplyFailure(download_result.error or "Failed to download the release archive.")
+
+        # Verification has now completed successfully -- advance the phase
+        # marker before moving on to the actual upgrade step.
+        set_self_update_phase(session, PHASE_VERIFYING)
+        set_self_update_phase(session, PHASE_APPLYING)
+
+        try:
+            result = run(PIPX_UPGRADE_COMMAND, subprocess_timeout)
+        except FileNotFoundError as exc:
+            raise _ApplyFailure("pipx executable not found on PATH.") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise _ApplyFailure(
+                f"pipx upgrade collapsarr timed out after {subprocess_timeout}s."
+            ) from exc
+
+        if result.returncode != 0:
+            raise _ApplyFailure(
                 f"pipx upgrade collapsarr failed (exit {result.returncode}): {result.stderr}"
-            ),
-        )
+            )
 
-    # pipx upgrade succeeded -- the new code is installed on disk. Leave the
-    # guard held (in_progress stays True) and hand off to awaiting_health;
-    # see the module docstring's "Guard handoff across the re-exec" section.
-    set_self_update_phase(session, PHASE_AWAITING_HEALTH)
-    logger.info("Self-update to %s applied via pipx; re-executing.", target_tag)
-    reexec()
+        # pipx upgrade succeeded -- the new code is installed on disk. Leave
+        # the guard held (in_progress stays True) and hand off to
+        # awaiting_health; see the module docstring's "Guard handoff across
+        # the re-exec" section.
+        set_self_update_phase(session, PHASE_AWAITING_HEALTH)
+        logger.info("Self-update to %s applied via pipx; re-executing.", target_tag)
+        reexec()
 
-    # Reached only when `reexec` is a test fake/spy that returns instead of
-    # replacing the process -- a real os.execv() never returns on success.
-    return SelfUpdateApplyOutcome(ok=True)
+        # Reached only when `reexec` is a test fake/spy that returns instead
+        # of replacing the process -- a real os.execv() never returns on
+        # success.
+        return SelfUpdateApplyOutcome(ok=True)
+    except Exception as exc:
+        # Everything from here down is the single place every guarded-region
+        # failure -- a deliberate _ApplyFailure raised above, or any other,
+        # genuinely unexpected exception (a PermissionError from a
+        # non-executable pipx binary, a DB commit error, ...) -- funnels
+        # through. See the module docstring's "No failure can leave the
+        # guard stuck" section for why this must be broad rather than
+        # enumerating every possible exception type.
+        clear_self_update(session, phase=PHASE_IDLE)
+        if not isinstance(exc, _ApplyFailure):
+            logger.exception(
+                "Self-update apply to %s failed unexpectedly via pipx", target_tag
+            )
+        return SelfUpdateApplyOutcome(ok=False, error=str(exc) or repr(exc))
 
 
 __all__ = [
