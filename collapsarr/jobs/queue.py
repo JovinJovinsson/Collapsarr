@@ -596,9 +596,11 @@ class JobQueue:
         #: once at :meth:`start` and never resized), this list grows for the
         #: lifetime of the queue, one entry per force-started job, so
         #: :meth:`shutdown` can join every such thread too, not only the pool
-        #: it already knew about at construction time. Appended to under
-        #: ``self._cond`` by :meth:`force_start`, before the thread is
-        #: started; never otherwise pruned (a finished thread's ``join()``
+        #: it already knew about at construction time. Appended to (and its
+        #: thread started) under ``self._cond`` by :meth:`force_start`, so a
+        #: concurrent :meth:`shutdown` never snapshots this list mid-append
+        #: or joins a thread that hasn't started yet; never otherwise pruned
+        #: (a finished thread's ``join()``
         #: returns immediately, so a growing list of already-finished
         #: :class:`~threading.Thread` objects costs a shutdown-time no-op
         #: join each, not a hang) -- see that method's own docstring.
@@ -1074,13 +1076,20 @@ class JobQueue:
         all fire identically, and :meth:`wait_idle`/:meth:`shutdown` observe
         this job the same way too (``self._active`` is incremented under the
         same lock, right alongside the ``RUNNING`` transition, before the
-        new thread is even started). The thread itself is also appended to
-        ``self._force_start_threads`` under that same lock, before it is
-        started -- unlike :attr:`_workers` (the fixed pool, sized once at
-        :meth:`start`), this list grows one entry per force-started job, so
-        :meth:`shutdown` can find and join it too, alongside the pool
-        threads, rather than only ever waiting on the pool it already knew
-        about at construction time.
+        new thread is even started). The thread itself is created, appended
+        to ``self._force_start_threads``, *and* started, all under that same
+        lock (mirroring how :meth:`start` creates and starts every fixed-pool
+        worker inside its own ``with self._cond:`` block) -- unlike
+        :attr:`_workers` (the fixed pool, sized once at :meth:`start`), this
+        list grows one entry per force-started job, so :meth:`shutdown` can
+        find and join it too, alongside the pool threads, rather than only
+        ever waiting on the pool it already knew about at construction time.
+        Starting the thread inside the lock, rather than after releasing it,
+        closes a narrow race: a concurrent :meth:`shutdown` that acquired the
+        lock, snapshotted this list, and reached its join loop before this
+        call got around to ``.start()`` would otherwise call
+        :meth:`~threading.Thread.join` on a never-started thread, raising
+        ``RuntimeError``.
 
         Returns ``True`` if ``job_id`` was still ``PENDING`` and has now been
         claimed and started; ``False`` (not an error) if it names no job the
@@ -1119,7 +1128,21 @@ class JobQueue:
                 daemon=True,
             )
             self._force_start_threads.append(thread)
-        thread.start()
+            # Started *inside* the lock -- mirrors :meth:`start` (the fixed
+            # pool's own workers are created and started inside its own
+            # ``with self._cond:`` block) -- so append-to-list and
+            # actually-started happen atomically relative to a concurrent
+            # :meth:`shutdown` call's snapshot-then-join. If ``.start()`` ran
+            # after releasing the lock instead, a ``shutdown()`` that
+            # acquired the lock, took its snapshot (already including this
+            # thread, appended above), and reached its join loop in that
+            # narrow window -- before this call actually got to ``.start()``
+            # -- would call ``Thread.join()`` on a thread that was never
+            # started, raising ``RuntimeError``. Thread.start() itself is
+            # cheap (just spawns the OS thread; it does not wait for the
+            # target to run), so holding the lock a little longer here costs
+            # nothing meaningful.
+            thread.start()
         return True
 
     def count_running(self) -> int:
