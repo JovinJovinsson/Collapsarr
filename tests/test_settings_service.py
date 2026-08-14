@@ -802,6 +802,66 @@ def test_update_global_settings_auto_queue_paused_persists_across_a_fresh_read(
 
 
 # ---------------------------------------------------------------------------
+# Auto-Processing Pause (COL-226).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_auto_processing_paused_to_false(session: Session) -> None:
+    """AC: the new toggle defaults to off -- pending Jobs are claimed unless paused explicitly."""
+    settings = get_global_settings(session)
+
+    assert settings.auto_processing_paused is False
+
+
+def test_update_global_settings_updates_auto_processing_paused(session: Session) -> None:
+    updated = update_global_settings(session, auto_processing_paused=True)
+
+    assert updated.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_is_switchable_back_off(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    updated = update_global_settings(session, auto_processing_paused=False)
+
+    assert updated.auto_processing_paused is False
+
+
+def test_update_global_settings_omitting_auto_processing_paused_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    reread = get_global_settings(session)
+
+    assert reread.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_is_independent_of_auto_queue_paused(
+    session: Session,
+) -> None:
+    """AC: the two pause toggles are distinct fields -- setting one never touches the other."""
+    update_global_settings(session, auto_processing_paused=True)
+
+    unchanged = get_global_settings(session)
+
+    assert unchanged.auto_processing_paused is True
+    assert unchanged.auto_queue_paused is False
+
+
+# ---------------------------------------------------------------------------
 # Adapting to DownmixSettings.
 # ---------------------------------------------------------------------------
 

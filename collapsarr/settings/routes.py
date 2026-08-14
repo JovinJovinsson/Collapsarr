@@ -103,6 +103,18 @@ trigger (single-file trigger, single/bulk requeue) are unaffected -- see
 full scope. :class:`~collapsarr.jobs.scheduler.JobScheduler` reads it live
 on every top-up attempt, so a ``PUT`` here takes effect immediately with no
 restart.
+
+``auto_processing_paused`` (COL-226, "Auto-Processing Pause") is also
+read/write here -- a plain boolean, same treatment as ``auto_queue_paused``
+above, no dedicated endpoint. When set, :class:`~collapsarr.jobs.queue.
+JobQueue` stops claiming any new ``PENDING`` Job -- already-``RUNNING`` Jobs
+keep running to completion. Deliberately distinct from ``auto_queue_paused``:
+that field only stops the scanner from *adding* new pending Jobs, while this
+one stops already-pending Jobs (however they got there) from ever starting --
+see :class:`~collapsarr.settings.models.GlobalSettings`'s own docstring for
+the full scope. ``JobQueue`` reads it live on every claim attempt via its
+injected ``pause_check`` callable, so a ``PUT`` here takes effect on the very
+next claim with no restart.
 """
 
 from __future__ import annotations
@@ -179,6 +191,7 @@ class SettingsRead(BaseModel):
     auto_set_default_audio: bool
     recently_processed_window_minutes: int
     auto_queue_paused: bool
+    auto_processing_paused: bool
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -217,6 +230,7 @@ class SettingsUpdate(BaseModel):
     auto_set_default_audio: bool | None = None
     recently_processed_window_minutes: int | None = Field(default=None, ge=0)
     auto_queue_paused: bool | None = None
+    auto_processing_paused: bool | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -258,6 +272,7 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         auto_set_default_audio=settings.auto_set_default_audio,
         recently_processed_window_minutes=settings.recently_processed_window_minutes,
         auto_queue_paused=settings.auto_queue_paused,
+        auto_processing_paused=settings.auto_processing_paused,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -336,6 +351,8 @@ def update_settings_endpoint(
         kwargs["recently_processed_window_minutes"] = body.recently_processed_window_minutes
     if "auto_queue_paused" in provided:
         kwargs["auto_queue_paused"] = body.auto_queue_paused
+    if "auto_processing_paused" in provided:
+        kwargs["auto_processing_paused"] = body.auto_processing_paused
 
     updated = update_global_settings(session, **kwargs)  # type: ignore[arg-type]
     if "log_level" in provided:

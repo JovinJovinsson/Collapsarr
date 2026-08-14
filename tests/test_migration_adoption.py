@@ -210,13 +210,13 @@ def test_already_versioned_database_runs_only_pending_deltas(settings: Settings)
 #: Preferred Default Audio setting, COL-154's current-default-track snapshot,
 #: COL-155's job-history ``kind``, COL-163's job-history ``priority``, COL-167's
 #: recently-processed dedup window, COL-174's Auto-Queuing Pause toggle,
-#: COL-218's ``ffmpeg_path`` override).
+#: COL-218's ``ffmpeg_path`` override, COL-226's Auto-Processing Pause toggle).
 #: ``create_all`` below always builds the
 #: table from the live ``Base.metadata`` -- i.e. with these columns already
 #: present -- so they are dropped by raw DDL afterwards to de-evolve the
 #: stand-in back to what a real
 #: pre-COL-66/pre-COL-79/pre-COL-101/pre-COL-151/pre-COL-154/pre-COL-155/
-#: pre-COL-163/pre-COL-167/pre-COL-174/pre-COL-218
+#: pre-COL-163/pre-COL-167/pre-COL-174/pre-COL-218/pre-COL-226
 #: create_all-era release actually had on disk. This mirrors the ``DROP
 #: INDEX`` idiom just below for the same reason: the unversioned DB this
 #: function fabricates predates every post-baseline delta, not just the
@@ -235,6 +235,7 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "recently_processed_window_minutes"),
     ("global_settings", "auto_queue_paused"),
     ("global_settings", "ffmpeg_path"),
+    ("global_settings", "auto_processing_paused"),
     ("tracked_media_files", "instance_id"),
     ("tracked_media_files", "sonarr_episode_id"),
     ("tracked_media_files", "radarr_movie_id"),

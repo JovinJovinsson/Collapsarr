@@ -81,6 +81,16 @@ at the top of every :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up`
 call, so a change here takes effect on the very next auto-fill attempt with
 no restart or scheduler reconstruction -- see that method's docstring for
 exactly what it does and does not gate.
+
+``auto_processing_paused`` (COL-226, "Auto-Processing Pause") follows the
+same "only change what's passed" rule as every other boolean field here.
+:class:`~collapsarr.jobs.queue.JobQueue` reads it live via its injected
+``pause_check`` callable on every claim attempt
+(:meth:`~collapsarr.jobs.queue.JobQueue._claim_next`), so a change here
+takes effect on the next claim with no restart -- see
+:attr:`~collapsarr.settings.models.GlobalSettings.auto_processing_paused`'s
+own docstring for exactly what it does and does not gate, distinct from
+``auto_queue_paused`` above.
 """
 
 from __future__ import annotations
@@ -215,6 +225,7 @@ def update_global_settings(
     auto_set_default_audio: bool | None = None,
     recently_processed_window_minutes: int | None = None,
     auto_queue_paused: bool | None = None,
+    auto_processing_paused: bool | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -282,6 +293,14 @@ def update_global_settings(
 
     ``auto_set_default_audio`` (COL-151) follows the same "only change what's
     passed" rule as every other boolean field here.
+
+    ``auto_processing_paused`` (COL-226, "Auto-Processing Pause") follows the
+    same "only change what's passed" rule as every other boolean field here.
+    Unlike ``auto_queue_paused``, which only gates the scanner's auto-fill
+    funnel, this field gates :class:`~collapsarr.jobs.queue.JobQueue`'s
+    pending -> running claim step directly via an injected ``pause_check``
+    callable -- see :attr:`~collapsarr.settings.models.GlobalSettings.
+    auto_processing_paused`'s own docstring for the full scope.
     """
     settings = get_global_settings(session)
 
@@ -347,6 +366,8 @@ def update_global_settings(
         settings.recently_processed_window_minutes = recently_processed_window_minutes
     if auto_queue_paused is not None:
         settings.auto_queue_paused = auto_queue_paused
+    if auto_processing_paused is not None:
+        settings.auto_processing_paused = auto_processing_paused
 
     session.commit()
     session.refresh(settings)

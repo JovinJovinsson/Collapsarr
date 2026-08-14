@@ -55,6 +55,7 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["auto_set_default_audio"] is False  # COL-151 default
     assert body["recently_processed_window_minutes"] == 360  # COL-167 default
     assert body["auto_queue_paused"] is False  # COL-174 default
+    assert body["auto_processing_paused"] is False  # COL-226 default
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -590,6 +591,69 @@ def test_put_settings_leaves_auto_queue_paused_untouched_when_omitted(client: Te
     body = client.get("/api/settings", headers=_auth_headers(client)).json()
     assert body["auto_queue_paused"] is True
     assert body["concurrency_limit"] == 3
+
+
+# --- Auto-Processing Pause (COL-226) ---------------------------------------------
+
+
+def test_put_settings_sets_auto_processing_paused(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"auto_processing_paused": True},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["auto_processing_paused"] is True
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["auto_processing_paused"] is True
+
+
+def test_put_settings_auto_processing_paused_is_switchable_back_off(client: TestClient) -> None:
+    client.put(
+        "/api/settings", json={"auto_processing_paused": True}, headers=_auth_headers(client)
+    )
+
+    response = client.put(
+        "/api/settings",
+        json={"auto_processing_paused": False},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["auto_processing_paused"] is False
+
+
+def test_put_settings_leaves_auto_processing_paused_untouched_when_omitted(
+    client: TestClient,
+) -> None:
+    client.put(
+        "/api/settings", json={"auto_processing_paused": True}, headers=_auth_headers(client)
+    )
+
+    client.put("/api/settings", json={"concurrency_limit": 3}, headers=_auth_headers(client))
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["auto_processing_paused"] is True
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_auto_processing_paused_does_not_affect_auto_queue_paused(
+    client: TestClient,
+) -> None:
+    """AC: the two pause toggles are distinct fields, both independently settable."""
+    response = client.put(
+        "/api/settings",
+        json={"auto_processing_paused": True},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["auto_processing_paused"] is True
+    assert body["auto_queue_paused"] is False
 
 
 # --- auth-required behaviour ---------------------------------------------------

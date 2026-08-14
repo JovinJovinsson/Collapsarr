@@ -72,6 +72,7 @@ const settingsResponse: GlobalSettings = {
   auto_set_default_audio: false,
   recently_processed_window_minutes: 360,
   auto_queue_paused: false,
+  auto_processing_paused: false,
   api_key: "test-key",
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",

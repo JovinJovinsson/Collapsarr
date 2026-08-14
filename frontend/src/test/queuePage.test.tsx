@@ -60,11 +60,12 @@ const queueResponse: JobHistoryEntry[] = [runningJob, pendingJobLowerPriority, p
 
 /**
  * Default `GET /api/settings` body for tests that don't care about the
- * Auto-Queuing Pause toggle (COL-181, COL-174) -- every helper below routes
- * `/api/settings` here unless a test overrides it, so the toggle's mount-time
- * load doesn't have to be threaded through every queue-only test.
+ * Auto-Queuing Pause (COL-181, COL-174) or Auto-Processing Pause (COL-226)
+ * toggles -- every helper below routes `/api/settings` here unless a test
+ * overrides it, so neither toggle's mount-time load has to be threaded
+ * through every queue-only test.
  */
-const DEFAULT_SETTINGS_RESPONSE = { auto_queue_paused: false };
+const DEFAULT_SETTINGS_RESPONSE = { auto_queue_paused: false, auto_processing_paused: false };
 
 function mockFetch(handler: (url: string, init?: RequestInit) => { ok: boolean; status?: number; body: unknown }) {
   const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
@@ -402,6 +403,161 @@ describe("QueuePage", () => {
     });
   });
 
+  describe('"Process Now" (COL-229)', () => {
+    it('shows "Process now" only on pending rows', async () => {
+      mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      expect(
+        within(runningRow).queryByRole("button", { name: /process now/i }),
+      ).not.toBeInTheDocument();
+
+      const pendingRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
+      expect(within(pendingRow).getByRole("button", { name: /process now/i })).toBeInTheDocument();
+    });
+
+    it("calls the process-now endpoint with confirm=false first, and refreshes the queue on success", async () => {
+      const refreshedQueue = [pendingJobHigherPriority, runningJob, pendingJobLowerPriority];
+      const fetchMock = mockFetchWithAction([queueResponse, refreshedQueue], (url, init) => {
+        expect(url).toContain("/api/jobs/process-now");
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(init?.body as string)).toEqual({
+          file_path: pendingJobLowerPriority.file_path,
+          confirm: false,
+        });
+        return {
+          ok: true,
+          body: {
+            enqueued: true,
+            job: { id: "job-x", file_path: pendingJobLowerPriority.file_path, status: "running" },
+            needs_confirmation: false,
+          },
+        };
+      });
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      // Mount: queue poll + settings load; then the process-now POST + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    });
+
+    it("shows an inline confirm step, without calling the endpoint again, when the response needs confirmation", async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], (url) => {
+        expect(url).toContain("/api/jobs/process-now");
+        return { ok: true, body: { enqueued: false, job: null, needs_confirmation: true } };
+      });
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      const confirmPanel = (
+        await screen.findByText(/would exceed the configured concurrency limit/i)
+      ).closest(".view__confirm") as HTMLElement;
+      expect(
+        within(confirmPanel).getByRole("button", { name: /process now anyway/i }),
+      ).toBeInTheDocument();
+      // Mount: queue poll + settings load; then the process-now POST (needing
+      // confirmation) + refresh queue poll -- the endpoint was called once,
+      // not called again just for showing the confirm step.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    });
+
+    it('re-submits with confirm=true when "Process now anyway" is clicked, and dismisses the confirm step on success', async () => {
+      let processNowCalls = 0;
+      const fetchMock = mockFetchWithAction(
+        [queueResponse, queueResponse, queueResponse],
+        (url, init) => {
+          expect(url).toContain("/api/jobs/process-now");
+          const body = JSON.parse(init?.body as string);
+          processNowCalls += 1;
+          if (processNowCalls === 1) {
+            expect(body.confirm).toBe(false);
+            return { ok: true, body: { enqueued: false, job: null, needs_confirmation: true } };
+          }
+          expect(body.confirm).toBe(true);
+          return {
+            ok: true,
+            body: {
+              enqueued: true,
+              job: { id: "job-x", file_path: body.file_path, status: "running" },
+              needs_confirmation: false,
+            },
+          };
+        },
+      );
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      const confirmPanel = (
+        await screen.findByText(/would exceed the configured concurrency limit/i)
+      ).closest(".view__confirm") as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /process now anyway/i }));
+
+      await waitFor(() =>
+        expect(
+          screen.queryByText(/would exceed the configured concurrency limit/i),
+        ).not.toBeInTheDocument(),
+      );
+      expect(processNowCalls).toBe(2);
+      expect(fetchMock).toHaveBeenCalledTimes(6); // mount(2) + call 1 + refresh + call 2 + refresh
+    });
+
+    it('dismisses the confirm step via "Cancel" without calling the endpoint again', async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: true,
+        body: { enqueued: false, job: null, needs_confirmation: true },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      const confirmPanel = (
+        await screen.findByText(/would exceed the configured concurrency limit/i)
+      ).closest(".view__confirm") as HTMLElement;
+      const callsBeforeDismiss = fetchMock.mock.calls.length;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /^cancel$/i }));
+
+      expect(
+        screen.queryByText(/would exceed the configured concurrency limit/i),
+      ).not.toBeInTheDocument();
+      expect(fetchMock.mock.calls.length).toBe(callsBeforeDismiss); // dismiss makes no request
+    });
+
+    it("shows a graceful notice, not an error, when the file could not be processed now", async () => {
+      mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: true,
+        body: { enqueued: false, job: null, needs_confirmation: false },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      expect(await screen.findByText(/could not be processed now/i)).toBeInTheDocument();
+    });
+
+    it("surfaces a clear error message when the request fails outright", async () => {
+      mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: false,
+        status: 500,
+        body: { detail: "boom" },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      expect(await screen.findByText(/boom/i)).toBeInTheDocument();
+    });
+  });
+
   describe("polling", () => {
     beforeEach(() => {
       vi.useFakeTimers();
@@ -648,6 +804,79 @@ describe("QueuePage", () => {
       fireEvent.click(toggle);
 
       expect(await screen.findByText(/settings boom/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /auto-queuing: active/i })).toBeInTheDocument();
+    });
+  });
+
+  describe('"Pause auto-processing" toggle (COL-226)', () => {
+    it("reflects the active state on load", async () => {
+      mockFetchQueue([queueResponse], { auto_queue_paused: false, auto_processing_paused: false });
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-processing: active/i });
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("reflects the paused state on load", async () => {
+      mockFetchQueue([queueResponse], { auto_queue_paused: false, auto_processing_paused: true });
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-processing: paused/i });
+      expect(toggle).toHaveAttribute("aria-pressed", "true");
+    });
+
+    it("flips the setting via PUT /api/settings when clicked, and reflects the response", async () => {
+      mockFetchWithAction(
+        [queueResponse],
+        (url, init) => {
+          expect(url).toContain("/api/settings");
+          expect(init?.method).toBe("PUT");
+          expect(JSON.parse(init?.body as string)).toEqual({ auto_processing_paused: true });
+          return { ok: true, body: { auto_processing_paused: true } };
+        },
+        { auto_queue_paused: false, auto_processing_paused: false },
+      );
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-processing: active/i });
+      fireEvent.click(toggle);
+
+      expect(
+        await screen.findByRole("button", { name: /auto-processing: paused/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("surfaces a page-level error notice and keeps the prior state when the write fails", async () => {
+      mockFetchWithAction(
+        [queueResponse],
+        () => ({ ok: false, status: 500, body: { detail: "processing settings boom" } }),
+        { auto_queue_paused: false, auto_processing_paused: false },
+      );
+      render(<QueuePage />);
+
+      const toggle = await screen.findByRole("button", { name: /auto-processing: active/i });
+      fireEvent.click(toggle);
+
+      expect(await screen.findByText(/processing settings boom/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /auto-processing: active/i })).toBeInTheDocument();
+    });
+
+    it("does not affect the independent Auto-Queuing Pause toggle", async () => {
+      mockFetchWithAction(
+        [queueResponse],
+        () => ({ ok: true, body: { auto_processing_paused: true, auto_queue_paused: false } }),
+        { auto_queue_paused: false, auto_processing_paused: false },
+      );
+      render(<QueuePage />);
+
+      const processingToggle = await screen.findByRole("button", {
+        name: /auto-processing: active/i,
+      });
+      fireEvent.click(processingToggle);
+
+      expect(
+        await screen.findByRole("button", { name: /auto-processing: paused/i }),
+      ).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /auto-queuing: active/i })).toBeInTheDocument();
     });
   });

@@ -117,6 +117,16 @@ export interface GlobalSettings {
    * field. Default `false`.
    */
   auto_queue_paused: boolean;
+  /**
+   * Auto-Processing Pause (COL-226). When `true`, the Job Queue's worker
+   * pool stops claiming any new `pending` Job; already-`running` Jobs
+   * finish normally. Deliberately distinct from `auto_queue_paused`: that
+   * field only stops the scanner from *adding* new pending Jobs, while this
+   * one stops already-pending Jobs (however they got there) from ever
+   * starting. `QueuePage`'s page-level toggle reads/writes this field.
+   * Default `false`.
+   */
+  auto_processing_paused: boolean;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -153,4 +163,5 @@ export interface GlobalSettingsUpdateInput {
   auto_set_default_audio?: boolean;
   recently_processed_window_minutes?: number;
   auto_queue_paused?: boolean;
+  auto_processing_paused?: boolean;
 }

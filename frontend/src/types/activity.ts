@@ -273,6 +273,43 @@ export interface BumpJobResult {
 }
 
 /**
+ * Request body for `POST /api/jobs/process-now` (COL-229, `ProcessNowRequest`)
+ * -- `QueuePage`'s per-row "Process Now" action.
+ *
+ * `confirm` defaults to `false`: the first request for a file that would
+ * push the number of currently-`running` Jobs past the configured
+ * Concurrency Limit is answered with {@link ProcessNowResult.needs_confirmation}
+ * set and nothing started; re-submit with `confirm: true` to force-start it
+ * over the limit anyway.
+ */
+export interface ProcessNowRequest {
+  file_path: string;
+  confirm?: boolean;
+}
+
+/**
+ * Response for `POST /api/jobs/process-now` (COL-229, `ProcessNowResult`) --
+ * `QueuePage`'s per-row "Process Now" action.
+ *
+ * `needs_confirmation: true` (always paired with `enqueued: false`, `job:
+ * null`) means starting this Job right now would push the number of
+ * currently-`running` Jobs past the configured Concurrency Limit -- nothing
+ * was created or started. Resubmit the same request with `confirm: true` to
+ * force-start it anyway; declining (simply not resubmitting) leaves the file
+ * exactly as it was.
+ *
+ * Otherwise `needs_confirmation` is `false` and `enqueued` carries the usual
+ * meaning: `true` with the acted-on `job` (already `running`) on success,
+ * `false` with `job` `null` when the file was skipped -- unprobeable, or no
+ * qualifying target.
+ */
+export interface ProcessNowResult {
+  enqueued: boolean;
+  job: EnqueuedJob | null;
+  needs_confirmation: boolean;
+}
+
+/**
  * Response for `POST /api/jobs/clear` (COL-173, `ClearQueueResult`) --
  * `QueuePage`'s (COL-181) page-level "Clear queue" action.
  *
