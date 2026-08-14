@@ -62,6 +62,7 @@ from .plex.scheduler import PlexSyncScheduler
 from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
 from .self_update.apply import ReexecFn, SubprocessRunner
+from .self_update.health_gate import HealthCheckFn, resolve_awaiting_health
 from .self_update.routes import router as self_update_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
@@ -136,6 +137,7 @@ def create_app(
     self_update_transport: httpx.BaseTransport | None = None,
     self_update_subprocess_runner: SubprocessRunner | None = None,
     self_update_reexec_fn: ReexecFn | None = None,
+    self_update_health_check_fn: HealthCheckFn | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -200,7 +202,18 @@ def create_app(
     All three are stashed directly on ``app.state`` (same as
     ``ffmpeg_download_transport``) and default to ``None``, in which case
     the route lets :func:`~collapsarr.self_update.apply.apply_pipx_update`'s
-    own production defaults apply.
+    own production defaults apply. ``self_update_health_check_fn`` (COL-234)
+    is the equivalent seam for the post-re-exec health-check gate
+    (:func:`collapsarr.self_update.health_gate.resolve_awaiting_health`,
+    wired into this lifespan below): tests inject a fake that reports
+    healthy/unhealthy on demand; production leaves it ``None``, in which case
+    the lifespan wires a real one that reruns the Health Check Framework tick
+    just above and reads back its persisted state -- see
+    :mod:`collapsarr.self_update.health_gate`'s module docstring for why that,
+    rather than a real HTTP call to ``/health``, is what "healthy" means here.
+    Unlike the other two self-update seams, this one is consumed once, here in
+    the lifespan (the gate runs at most once per process boot), not stashed on
+    ``app.state`` for a route to read later.
     """
     resolved_settings = settings or get_settings()
 
@@ -324,6 +337,31 @@ def create_app(
         )
         app.state.health_scheduler = health_scheduler
         health_scheduler.run_once()
+
+        # Self-update health-check gate + pinned-reinstall rollback (COL-234):
+        # a no-op on every ordinary boot -- only the one boot immediately
+        # following COL-232's pipx apply-flow re-exec has
+        # `phase == PHASE_AWAITING_HEALTH` for this to act on. Placed right
+        # after the Health Check Framework's own first tick above so its
+        # default health_check_fn (rerun that tick, then read back
+        # list_failing_checks) reflects this exact boot, not a stale one.
+        # Deliberately before `health_scheduler.start()` below: a rollback
+        # here re-execs this process outright (see
+        # collapsarr.self_update.health_gate's module docstring), so nothing
+        # after it in a real boot ever runs anyway.
+        def _self_update_health_check_fn() -> bool:
+            health_scheduler.run_once()
+            with session_factory() as probe_session:
+                return not list_failing_checks(probe_session)
+
+        with session_factory() as self_update_session:
+            resolve_awaiting_health(
+                self_update_session,
+                health_check_fn=self_update_health_check_fn or _self_update_health_check_fn,
+                subprocess_runner=self_update_subprocess_runner,
+                reexec_fn=self_update_reexec_fn,
+            )
+
         if enable_scheduler:
             health_scheduler.start(run_immediately=False)
 
