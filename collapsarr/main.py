@@ -64,6 +64,8 @@ from .restore.routes import router as restore_router
 from .self_update.apply import ReexecFn, SubprocessRunner
 from .self_update.health_gate import HealthCheckFn, resolve_awaiting_health
 from .self_update.native import ExitFn, HandoffSpawner
+from .self_update.native import ReexecFn as NativeReexecFn
+from .self_update.native import SwapFn as NativeSwapFn
 from .self_update.routes import router as self_update_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
@@ -141,6 +143,8 @@ def create_app(
     self_update_health_check_fn: HealthCheckFn | None = None,
     self_update_handoff_spawner: HandoffSpawner | None = None,
     self_update_exit_fn: ExitFn | None = None,
+    self_update_native_swap_fn: NativeSwapFn | None = None,
+    self_update_native_reexec_fn: NativeReexecFn | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -223,7 +227,20 @@ def create_app(
     :func:`collapsarr.self_update.native.apply_native_update`, letting tests
     exercise the native staged-handoff apply flow without spawning a process or
     terminating this one; both default to ``None`` (the native flow's own
-    production defaults apply).
+    production defaults apply). ``self_update_native_swap_fn``/
+    ``self_update_native_reexec_fn`` (COL-236) are the native rollback's own
+    seams, forwarded to :func:`~collapsarr.self_update.health_gate.
+    resolve_awaiting_health` (the same call the ``self_update_health_check_fn``
+    paragraph above describes): they stand in for a real atomic
+    install-directory swap-back
+    (:func:`~collapsarr.self_update.native.swap_install_dir`) and a real
+    ``os.execv`` re-exec into the restored install dir, letting tests exercise
+    the native swap-back-on-unhealthy path without touching real directories
+    or replacing this process. Unlike the native apply seams above, this pair
+    is consumed once, here in the lifespan, not stashed on ``app.state`` --
+    same reasoning as ``self_update_health_check_fn``. Both default to
+    ``None``, in which case :func:`resolve_awaiting_health`'s own production
+    defaults apply.
     """
     resolved_settings = settings or get_settings()
 
@@ -385,6 +402,8 @@ def create_app(
                 health_check_fn=self_update_health_check_fn or _self_update_health_check_fn,
                 subprocess_runner=self_update_subprocess_runner,
                 reexec_fn=self_update_reexec_fn,
+                native_swap_fn=self_update_native_swap_fn,
+                native_reexec_fn=self_update_native_reexec_fn,
             )
 
         if enable_scheduler:
