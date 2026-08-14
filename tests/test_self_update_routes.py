@@ -14,8 +14,11 @@ checksum-mismatch failure shape (502).
 from __future__ import annotations
 
 import hashlib
+import io
 import subprocess
+import tarfile
 from collections.abc import Sequence
+from pathlib import Path
 
 import httpx
 import pytest
@@ -152,12 +155,30 @@ def _self_update_transport(
     return httpx.MockTransport(handler)
 
 
+class _SpawnSpy:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, args: object, staged_dir: object) -> None:
+        self.calls += 1
+
+
+class _ExitSpy:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+
+
 def _app(
     settings: Settings,
     *,
     self_update_transport: httpx.MockTransport | None = None,
     self_update_subprocess_runner: _RunnerSpy | None = None,
     self_update_reexec_fn: _ReexecSpy | None = None,
+    self_update_handoff_spawner: _SpawnSpy | None = None,
+    self_update_exit_fn: _ExitSpy | None = None,
 ) -> FastAPI:
     return create_app(
         settings=settings,
@@ -165,6 +186,8 @@ def _app(
         self_update_transport=self_update_transport,
         self_update_subprocess_runner=self_update_subprocess_runner,
         self_update_reexec_fn=self_update_reexec_fn,
+        self_update_handoff_spawner=self_update_handoff_spawner,
+        self_update_exit_fn=self_update_exit_fn,
     )
 
 
@@ -274,6 +297,60 @@ def test_apply_succeeds_downloads_verifies_upgrades_and_reexecs(
         with app_session(client) as session:
             state = get_self_update_state(session)
             # Guard handed off across the re-exec (COL-232), not cleared.
+            assert state.in_progress is True
+            assert state.phase == PHASE_AWAITING_HEALTH
+
+
+def _native_release_tar() -> bytes:
+    """A real ``.tar.gz`` wrapping the install tree in a top-level ``collapsarr/`` dir."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        data = b"#!/new-binary\n"
+        info = tarfile.TarInfo(name="collapsarr/collapsarr")
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def test_apply_native_install_stages_spawns_handoff_and_exits(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("collapsarr.self_update.routes.install_method", lambda: "native")
+    monkeypatch.setattr(
+        "collapsarr.self_update.native.resolve_platform_arch", lambda: ("linux", "amd64")
+    )
+    # Keep the swap machinery pointed at a throwaway install dir, never the real
+    # test-runner executable's directory.
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    (install_dir / "collapsarr").write_bytes(b"OLD")
+    monkeypatch.setattr(
+        "collapsarr.self_update.native.resolve_install_dir", lambda: install_dir
+    )
+    archive = _native_release_tar()
+    sums = f"{hashlib.sha256(archive).hexdigest()}  {_FILENAME}\n"
+    spawn = _SpawnSpy()
+    exit_fn = _ExitSpy()
+
+    with TestClient(
+        _app(
+            settings,
+            self_update_transport=_self_update_transport(sha256sums=sums, archive=archive),
+            self_update_handoff_spawner=spawn,
+            self_update_exit_fn=exit_fn,
+        )
+    ) as client:
+        _seed_stable_update_available(client)
+        response = _apply(client)
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+        assert spawn.calls == 1
+        assert exit_fn.calls == 1
+
+        with app_session(client) as session:
+            state = get_self_update_state(session)
+            # Guard handed off across the process boundary (COL-235), not cleared.
             assert state.in_progress is True
             assert state.phase == PHASE_AWAITING_HEALTH
 

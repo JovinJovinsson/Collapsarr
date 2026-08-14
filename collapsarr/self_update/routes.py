@@ -14,11 +14,15 @@ Endpoints:
 * ``GET /api/system/self-update/status`` -- the current self-update phase and
   in-progress guard state, for the frontend's future polling screen (COL-234+)
   to consume.
-* ``POST /api/system/self-update/apply`` (COL-232) -- triggers the ``pipx``
-  apply flow (:func:`~collapsarr.self_update.apply.apply_pipx_update`):
-  download + SHA-256-verify the target release, run ``pipx upgrade
-  collapsarr``, then re-exec into it. ``403`` when this install's
-  :func:`~collapsarr.system.info.install_method` isn't ``"pipx"`` (mirrors
+* ``POST /api/system/self-update/apply`` (COL-232, COL-235) -- triggers the
+  apply flow for this install's method: ``pipx``
+  (:func:`~collapsarr.self_update.apply.apply_pipx_update` -- download +
+  SHA-256-verify, ``pipx upgrade collapsarr``, re-exec) or ``native``
+  (:func:`~collapsarr.self_update.native.apply_native_update` -- verify into a
+  staging dir, spawn the finish-update handoff, exit; the handoff then swaps
+  and re-execs). ``403`` when this install's
+  :func:`~collapsarr.system.info.install_method` is neither (a Docker install
+  upgrades by pulling a new image, mirroring
   :mod:`collapsarr.ffmpeg_download.routes`'s Docker-gating precedent);
   ``409`` when no newer *stable* release is available to apply
   (:func:`~collapsarr.self_update.apply.stable_update_target`) or when an
@@ -41,9 +45,10 @@ from sqlalchemy.orm import Session
 
 from .. import __version__
 from ..database import get_session
-from ..system.info import INSTALL_METHOD_PIPX, install_method
+from ..system.info import INSTALL_METHOD_NATIVE, INSTALL_METHOD_PIPX, install_method
 from ..update_check.service import get_update_check_state
 from .apply import ReexecFn, SubprocessRunner, apply_pipx_update, stable_update_target
+from .native import ExitFn, HandoffSpawner, apply_native_update
 from .service import SelfUpdateAlreadyInProgressError, get_self_update_state
 
 router = APIRouter(prefix="/api/system/self-update", tags=["system"])
@@ -101,23 +106,28 @@ def apply_self_update_endpoint(
     request: Request,
     session: Session = Depends(get_session),
 ) -> SelfUpdateApplyRead:
-    """Trigger the pipx self-update apply flow (COL-232): verify, upgrade, re-exec.
+    """Trigger the self-update apply flow: verify, install, re-exec (COL-232, COL-235).
 
-    ``403`` when this install's method isn't ``pipx``; ``409`` when no newer
-    stable release is available or an attempt is already in progress;
-    ``502`` on a checksum mismatch, network failure, or failed ``pipx
-    upgrade`` -- see the module docstring for the full gating/error-mapping
-    contract. ``self_update_transport``/``self_update_subprocess_runner``/
-    ``self_update_reexec_fn`` -- forwarded from
-    :func:`collapsarr.main.create_app` onto ``app.state`` -- let tests inject
-    an ``httpx.MockTransport`` and fake subprocess/re-exec doubles instead of
-    a real network call, a real ``pipx`` subprocess, or a real
-    :func:`os.execv`; production leaves all three unset.
+    Dispatches on this install's :func:`~collapsarr.system.info.install_method`:
+    ``pipx`` runs :func:`~collapsarr.self_update.apply.apply_pipx_update`
+    (verify + ``pipx upgrade`` + re-exec); ``native`` runs
+    :func:`~collapsarr.self_update.native.apply_native_update` (verify into a
+    staging dir + spawn the finish-update handoff + exit, which then swaps and
+    re-execs). ``403`` when the method is neither (a Docker install upgrades by
+    pulling a new image, not through this endpoint); ``409`` when no newer
+    stable release is available or an attempt is already in progress; ``502``
+    on a checksum mismatch, network failure, failed ``pipx upgrade``, or a
+    staging/extraction failure -- see the module docstring for the full
+    gating/error-mapping contract. The ``self_update_*`` ``app.state`` seams
+    (transport, and the pipx subprocess/re-exec or native handoff-spawn/exit
+    doubles) let tests inject fakes instead of a real network call, subprocess,
+    ``os.execv``, process spawn, or process exit; production leaves them unset.
     """
-    if install_method() != INSTALL_METHOD_PIPX:
+    method = install_method()
+    if method not in (INSTALL_METHOD_PIPX, INSTALL_METHOD_NATIVE):
         raise HTTPException(
             status_code=403,
-            detail="Self-update apply is only available for pipx installs.",
+            detail="Self-update apply is only available for pipx and native installs.",
         )
 
     update_state = get_update_check_state(session)
@@ -129,19 +139,34 @@ def apply_self_update_endpoint(
         )
 
     transport = getattr(request.app.state, "self_update_transport", None)
-    subprocess_runner: SubprocessRunner | None = getattr(
-        request.app.state, "self_update_subprocess_runner", None
-    )
-    reexec_fn: ReexecFn | None = getattr(request.app.state, "self_update_reexec_fn", None)
 
     try:
-        outcome = apply_pipx_update(
-            session,
-            target_tag=target_tag,
-            transport=transport,
-            subprocess_runner=subprocess_runner,
-            reexec_fn=reexec_fn,
-        )
+        if method == INSTALL_METHOD_NATIVE:
+            spawn_handoff: HandoffSpawner | None = getattr(
+                request.app.state, "self_update_handoff_spawner", None
+            )
+            exit_fn: ExitFn | None = getattr(request.app.state, "self_update_exit_fn", None)
+            outcome = apply_native_update(
+                session,
+                target_tag=target_tag,
+                transport=transport,
+                spawn_handoff=spawn_handoff,
+                exit_fn=exit_fn,
+            )
+        else:
+            subprocess_runner: SubprocessRunner | None = getattr(
+                request.app.state, "self_update_subprocess_runner", None
+            )
+            reexec_fn: ReexecFn | None = getattr(
+                request.app.state, "self_update_reexec_fn", None
+            )
+            outcome = apply_pipx_update(
+                session,
+                target_tag=target_tag,
+                transport=transport,
+                subprocess_runner=subprocess_runner,
+                reexec_fn=reexec_fn,
+            )
     except SelfUpdateAlreadyInProgressError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
