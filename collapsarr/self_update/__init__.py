@@ -32,6 +32,14 @@ Public surface, by concern:
   -verify-upgrade-re-exec sequence for ``pipx`` installs, plus
   :func:`stable_update_target` (the shared "is a newer stable release even
   available" gate).
+- **Post-re-exec health-check gate + pinned-reinstall rollback (COL-234)** --
+  :func:`resolve_awaiting_health` (:mod:`~collapsarr.self_update.
+  health_gate`): picks up COL-232's ``awaiting_health`` hand-off on the boot
+  immediately following its re-exec, confirming the new build is healthy
+  (guard cleared to ``idle``) or reinstalling the pinned previous version and
+  relaunching into it (``rolled_back``). Wired into
+  :func:`collapsarr.main.create_app`'s lifespan, not exposed as its own
+  endpoint.
 - **API routes** -- ``GET /api/system/self-update/status``,
   ``POST /api/system/self-update/apply`` (COL-232)
   (:mod:`~collapsarr.self_update.routes`): exposes the persisted state, and
@@ -52,6 +60,11 @@ from .client import (
     resolve_asset_filename,
     resolve_checksum_entry,
     resolve_platform_arch,
+)
+from .health_gate import (
+    HealthCheckFn,
+    SelfUpdateHealthGateOutcome,
+    resolve_awaiting_health,
 )
 from .models import (
     PHASE_APPLYING,
@@ -81,9 +94,11 @@ __all__ = [
     "PHASE_VERIFYING",
     "SELF_UPDATE_PHASES",
     "SELF_UPDATE_STATE_ID",
+    "HealthCheckFn",
     "SelfUpdateAlreadyInProgressError",
     "SelfUpdateApplyOutcome",
     "SelfUpdateChecksumResult",
+    "SelfUpdateHealthGateOutcome",
     "SelfUpdateState",
     "apply_pipx_update",
     "begin_self_update",
@@ -93,6 +108,7 @@ __all__ = [
     "get_self_update_state",
     "parse_sha256sums",
     "resolve_asset_filename",
+    "resolve_awaiting_health",
     "resolve_checksum_entry",
     "resolve_platform_arch",
     "set_self_update_phase",
