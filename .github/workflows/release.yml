@@ -39,7 +39,13 @@
 #   6. pypi-publish       — publish the wheel/sdist to PyPI via OIDC Trusted
 #                           Publishing.
 #   7. github-release     — cut a GitHub Release with the built artifacts
-#                           (wheel/sdist + native tarballs/zip) attached.
+#                           (wheel/sdist + native tarballs/zip) attached,
+#                           plus a SHA256SUMS file (COL-227) covering the
+#                           native platform archives.
+#   8. verify-release-checksums — real-network check (COL-227) that the
+#                           published SHA256SUMS matches the archives as
+#                           actually downloaded back from the GitHub Release,
+#                           mirroring verify-ffmpeg-manifest's spirit above.
 #
 # Credentials come from GitHub Actions secrets / OIDC that the HITL epic (COL-9)
 # populates; this workflow only wires them up. It is intentionally reviewable and
@@ -548,6 +554,14 @@ jobs:
           pattern: collapsarr-windows-*
           path: native-builds/
           merge-multiple: true
+      - name: Generate SHA256SUMS for the native platform archives
+        # Covers only the native Linux/macOS/Windows archives -- not the
+        # wheel/sdist -- per this ticket's scope. Written into native-builds/
+        # so the existing `native-builds/*` glob below picks it up and
+        # uploads it as a release asset with no separate `files:` entry
+        # (no change to existing artifact naming/structure).
+        working-directory: native-builds
+        run: sha256sum -- * > SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -557,3 +571,31 @@ jobs:
             native-builds/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---- Verify the published SHA256SUMS (real network, mirrors COL-217) --------
+  # Re-downloads the native archives + SHA256SUMS from the just-published
+  # GitHub Release itself (not the local build artifacts) and checks them
+  # with `sha256sum -c` -- confirms the checksums file matches what a user
+  # actually fetches, the same "hit the real network, verify the hash still
+  # matches" spirit as verify-ffmpeg-manifest above (COL-217 / ADR 0002),
+  # applied here to this release's own native archives (COL-227).
+  verify-release-checksums:
+    name: Verify published SHA256SUMS (real network)
+    needs: github-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the published native archives + SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p release-assets
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'collapsarr-*-linux-*.tar.gz' \
+            --pattern 'collapsarr-*-macos-*.tar.gz' \
+            --pattern 'collapsarr-*-windows-*.zip' \
+            --pattern 'SHA256SUMS' \
+            --dir release-assets
+      - name: Verify hashes against the published archives
+        working-directory: release-assets
+        run: sha256sum -c SHA256SUMS
