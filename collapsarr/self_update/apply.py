@@ -19,12 +19,17 @@ guard back to :data:`~collapsarr.self_update.models.PHASE_IDLE` *before*
 spies -- never a real subprocess spawn or a real :func:`os.execv` call, per
 this ticket's acceptance criteria.
 
-**Scope.** Deliberately covers only the "no Jobs running" case (COL-232's
-own ticket title): neither **Wait & Restart**'s job-drain nor **Cancel &
-Restart Now**'s hard-cancel (``CONTEXT.md``'s **Self-Update** entry) is
-implemented here -- a later ticket in this epic adds the Jobs-in-flight
-branches. This module's caller (:mod:`collapsarr.self_update.routes`) does
-not check the Job Queue at all.
+**Scope.** :func:`apply_pipx_update` itself deliberately covers only the "no
+Jobs running" case (COL-232's own ticket title) -- it never touches the Job
+Queue. :func:`apply_with_flow` (COL-233) is the layer above it that does:
+given an operator-selected **Cancel & Restart Now**/**Wait & Restart** flow
+(``CONTEXT.md``'s **Self-Update** entry), it clears the Job Queue of
+currently-``RUNNING`` Jobs -- either hard-killing and immediately requeuing
+them, or simply waiting for them to finish naturally -- then calls straight
+into :func:`apply_pipx_update` once none are left running. See
+:func:`apply_with_flow`'s own docstring for the full contract, including how
+it force-pauses (and, on any failure of its own, un-pauses) Auto-Processing
+Pause around that wait.
 
 **Guard handoff across the re-exec, not a clear.** Unlike every other
 failure path here, a *successful* ``pipx upgrade`` deliberately leaves the
@@ -70,7 +75,10 @@ from sqlalchemy.orm import Session
 
 from .. import __version__
 from ..ffmpeg_download.client import download_and_verify
+from ..jobs.queue import JobQueue, JobStatus
+from ..jobs.scheduler import JobScheduler
 from ..settings.models import UPDATE_CHANNEL_STABLE
+from ..settings.service import restore_auto_processing_pause, stash_and_force_pause_processing
 from ..update_check.client import GITHUB_REPO
 from ..update_check.comparison import is_up_to_date
 from ..update_check.models import UpdateCheckState
@@ -82,7 +90,13 @@ from .models import (
     PHASE_IDLE,
     PHASE_VERIFYING,
 )
-from .service import begin_self_update, clear_self_update, set_self_update_phase
+from .service import (
+    SelfUpdateAlreadyInProgressError,
+    begin_self_update,
+    clear_self_update,
+    get_self_update_state,
+    set_self_update_phase,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -376,14 +390,229 @@ def apply_pipx_update(
         return SelfUpdateApplyOutcome(ok=False, error=str(exc) or repr(exc))
 
 
+# --------------------------------------------------------------------------- #
+# In-flight Job handling: Cancel & Restart Now / Wait & Restart (COL-233)
+# --------------------------------------------------------------------------- #
+
+FLOW_CANCEL_AND_RESTART = "cancel_and_restart"
+FLOW_WAIT_AND_RESTART = "wait_and_restart"
+
+#: Every ``flow`` value :func:`apply_with_flow` accepts.
+IN_FLIGHT_FLOWS = (FLOW_CANCEL_AND_RESTART, FLOW_WAIT_AND_RESTART)
+
+#: "Wait & Restart"'s ceiling on how long the request blocks for currently-
+#: ``RUNNING`` Jobs to finish naturally before giving up. A genuinely
+#: unbounded wait inside one HTTP request is a real UX/timeout risk (a
+#: reverse proxy or browser has its own ceiling far below "however long the
+#: longest ffmpeg remux takes"), so this flow is bounded rather than passing
+#: ``timeout=None`` through to :meth:`~collapsarr.jobs.queue.JobQueue.
+#: wait_no_running` -- a operator whose Jobs are still running after ten
+#: minutes gets a clear failure (guard cleared, pause restored, nothing left
+#: paused) and can retry, rather than a request that never returns. Generous
+#: enough to cover a normal-sized remux; a future ticket could move this
+#: whole wait off the request-handling thread (background it, poll via the
+#: status endpoint) if operators hit this ceiling in practice, but that is a
+#: bigger structural change than this ticket's scope.
+WAIT_AND_RESTART_TIMEOUT = 600.0
+
+#: "Cancel & Restart Now"'s ceiling on how long it waits, after firing the
+#: hard-kill signal at every ``RUNNING`` Job, for them to actually finish
+#: transitioning to their terminal ``FAILED`` status (:meth:`~collapsarr.
+#: jobs.queue.JobQueue.cancel_running` only *signals* the kill -- see its own
+#: docstring -- the worker thread still has to observe the dead subprocess
+#: and run the ordinary terminal path). Needed before requeuing: a Job whose
+#: status hasn't yet flipped past ``RUNNING`` still reads as "active" to
+#: :meth:`~collapsarr.jobs.scheduler.JobScheduler._is_duplicate`, so
+#: requeuing too early would be silently dropped as a duplicate. Far shorter
+#: than :data:`WAIT_AND_RESTART_TIMEOUT` -- killing a subprocess and letting
+#: the worker observe it is fast; this is not "wait for the Job to finish its
+#: work" like that constant is.
+CANCEL_DRAIN_TIMEOUT = 30.0
+
+
+def _cancel_and_restart_running_jobs(
+    queue: JobQueue, scheduler: JobScheduler, *, drain_timeout: float
+) -> None:
+    """Cancel & Restart Now: hard-cancel every ``RUNNING`` Job, then requeue each (COL-233).
+
+    Enumerates every currently-``RUNNING`` Job (a plain filter over
+    :meth:`~collapsarr.jobs.queue.JobQueue.list_jobs` -- there is no
+    dedicated "list running" primitive on :class:`JobQueue` worth adding for
+    this one caller) and hard-kills each via :meth:`~collapsarr.jobs.queue.
+    JobQueue.cancel_running` -- exactly the existing manual mid-flight cancel
+    path (COL-192): the killed subprocess makes the pipeline call fail
+    naturally, and the worker transitions the Job to ``FAILED`` through the
+    ordinary terminal path, so no new terminal status is needed here (per
+    this ticket's own AC).
+
+    Waits (:meth:`~collapsarr.jobs.queue.JobQueue.wait_no_running`, bounded
+    by ``drain_timeout``) for every one of those kills to actually land
+    before requeuing anything -- a Job still reading as ``RUNNING`` is still
+    "active" as far as :meth:`~collapsarr.jobs.scheduler.
+    JobScheduler._is_duplicate` is concerned, so requeuing before the kill
+    has actually taken effect would be silently swallowed as a duplicate
+    trigger rather than genuinely restarting the file. Raises
+    :class:`_ApplyFailure` if the drain itself times out -- funnelled by
+    :func:`apply_with_flow`'s caller through the same broad-except path
+    every other expected failure here uses.
+
+    Once drained, requeues each cancelled Job's file
+    (:meth:`~collapsarr.jobs.scheduler.JobScheduler.trigger_file`,
+    ``bypass_dedup_window=True``) -- the same bypass the existing per-row
+    Requeue action uses, so a hard-cancelled Job restarts immediately rather
+    than being blocked by the Recently-Processed Window it would otherwise
+    just have tripped (per this ticket's own AC). A file with nothing left
+    to do, or one a concurrent enqueue/top-up already re-queued in the
+    meantime, is silently skipped (``trigger_file`` returning ``None``) --
+    the same "too late, not an error" shape every other trigger path in this
+    codebase already has.
+    """
+    running = [job for job in queue.list_jobs() if job.status is JobStatus.RUNNING]
+    for job in running:
+        queue.cancel_running(job.id)
+    if running and not queue.wait_no_running(timeout=drain_timeout):
+        raise _ApplyFailure(
+            f"Timed out after {drain_timeout}s waiting for hard-cancelled Jobs to "
+            "stop running."
+        )
+    for job in running:
+        scheduler.trigger_file(job.file_path, bypass_dedup_window=True)
+
+
+def apply_with_flow(
+    session: Session,
+    *,
+    target_tag: str,
+    flow: str,
+    queue: JobQueue,
+    scheduler: JobScheduler | None = None,
+    transport: httpx.BaseTransport | None = None,
+    timeout: float = DOWNLOAD_TIMEOUT,
+    subprocess_timeout: float = PIPX_UPGRADE_TIMEOUT,
+    subprocess_runner: SubprocessRunner | None = None,
+    reexec_fn: ReexecFn | None = None,
+    wait_timeout: float = WAIT_AND_RESTART_TIMEOUT,
+    cancel_drain_timeout: float = CANCEL_DRAIN_TIMEOUT,
+) -> SelfUpdateApplyOutcome:
+    """Handle in-flight Jobs per ``flow``, then apply the update (COL-233).
+
+    The layer :mod:`collapsarr.self_update.routes`' apply endpoint calls
+    when the operator has picked an explicit in-flight-Job flow (as opposed
+    to the plain "no Jobs running" :func:`apply_pipx_update` path it still
+    calls directly when there is nothing to handle). ``flow`` is
+    :data:`FLOW_CANCEL_AND_RESTART` or :data:`FLOW_WAIT_AND_RESTART`
+    (:data:`IN_FLIGHT_FLOWS`) -- anything else raises :class:`ValueError`.
+    ``scheduler`` is required for :data:`FLOW_CANCEL_AND_RESTART` (it
+    requeues through it); ``ValueError`` if omitted for that flow.
+
+    Steps, in order:
+
+    1. A best-effort early re-entrancy check: if the Self-Update in-progress
+       guard (:mod:`collapsarr.self_update.service`) is already held, raises
+       :class:`~collapsarr.self_update.service.SelfUpdateAlreadyInProgressError`
+       immediately, *before* touching Auto-Processing Pause or the Job Queue
+       at all -- so a second concurrent trigger during another attempt's
+       cancel/wait phase doesn't force-pause processing for an attempt that
+       is about to be rejected anyway. This is a peek, not itself a guard
+       acquisition (the guard is still only actually taken inside
+       :func:`apply_pipx_update`, once Jobs are cleared) -- a second trigger
+       that wins a narrow race against this peek is still caught below, when
+       :func:`apply_pipx_update` takes the real guard.
+    2. Stashes the pre-update ``auto_processing_paused`` value and force-sets
+       it ``True`` (:func:`~collapsarr.settings.service.
+       stash_and_force_pause_processing`) -- both flows do this,
+       unconditionally, per this ticket's AC.
+    3. Runs the chosen flow: :data:`FLOW_CANCEL_AND_RESTART` hard-cancels and
+       immediately requeues every ``RUNNING`` Job
+       (:func:`_cancel_and_restart_running_jobs`); :data:`FLOW_WAIT_AND_RESTART`
+       simply waits (:meth:`~collapsarr.jobs.queue.JobQueue.wait_no_running`,
+       bounded by ``wait_timeout``) for them to finish naturally, cancelling
+       nothing. Any failure here (including a wait/drain timeout) restores
+       Auto-Processing Pause immediately (:func:`~collapsarr.settings.
+       service.restore_auto_processing_pause`) -- this process is not about
+       to restart, so there is no "next boot" to rely on -- and returns
+       ``ok=False`` without ever calling :func:`apply_pipx_update` (so its
+       own guard is never taken by this attempt at all).
+    4. Once Jobs are clear, calls :func:`apply_pipx_update` exactly as the
+       plain "no Jobs running" path would. If it raises
+       :class:`~collapsarr.self_update.service.SelfUpdateAlreadyInProgressError`
+       (the narrow race step 1 couldn't close), the just-forced pause is
+       restored and the exception re-raised, matching
+       :func:`apply_pipx_update`'s own contract for that error. If it
+       returns ``ok=False`` (a checksum mismatch, download failure, or
+       failed ``pipx upgrade`` -- it has already cleared its own guard), the
+       pause is likewise restored here, since this process keeps running.
+    5. On ``ok=True`` (pipx upgrade succeeded; re-exec is imminent -- or, in
+       a test, a fake ``reexec_fn`` returned instead), Auto-Processing Pause
+       is deliberately left forced and ``auto_processing_pause_restore_value``
+       stays set -- there is no restart *in this process* to hang the
+       restore off, so it is consumed at the next boot instead
+       (:func:`~collapsarr.settings.service.restore_auto_processing_pause`,
+       called early in :func:`collapsarr.main.create_app`'s ``lifespan``,
+       before the Job Queue starts accepting work again).
+    """
+    if flow not in IN_FLIGHT_FLOWS:
+        raise ValueError(f"Unknown self-update flow: {flow!r}; expected one of {IN_FLIGHT_FLOWS!r}")
+    if flow == FLOW_CANCEL_AND_RESTART and scheduler is None:
+        raise ValueError("`scheduler` is required for the 'cancel_and_restart' flow.")
+
+    existing = get_self_update_state(session)
+    if existing.in_progress:
+        raise SelfUpdateAlreadyInProgressError(
+            f"A self-update is already in progress (phase={existing.phase!r})"
+        )
+
+    stash_and_force_pause_processing(session)
+    try:
+        if flow == FLOW_CANCEL_AND_RESTART:
+            assert scheduler is not None  # checked above
+            _cancel_and_restart_running_jobs(queue, scheduler, drain_timeout=cancel_drain_timeout)
+        else:
+            if not queue.wait_no_running(timeout=wait_timeout):
+                raise _ApplyFailure(
+                    f"Timed out after {wait_timeout}s waiting for running Jobs to finish."
+                )
+    except Exception as exc:
+        restore_auto_processing_pause(session)
+        if not isinstance(exc, _ApplyFailure):
+            logger.exception(
+                "Self-update in-flight Job handling failed unexpectedly (flow=%s)", flow
+            )
+        return SelfUpdateApplyOutcome(ok=False, error=str(exc) or repr(exc))
+
+    try:
+        outcome = apply_pipx_update(
+            session,
+            target_tag=target_tag,
+            transport=transport,
+            timeout=timeout,
+            subprocess_timeout=subprocess_timeout,
+            subprocess_runner=subprocess_runner,
+            reexec_fn=reexec_fn,
+        )
+    except SelfUpdateAlreadyInProgressError:
+        restore_auto_processing_pause(session)
+        raise
+
+    if not outcome.ok:
+        restore_auto_processing_pause(session)
+    return outcome
+
+
 __all__ = [
+    "CANCEL_DRAIN_TIMEOUT",
     "DOWNLOAD_TIMEOUT",
+    "FLOW_CANCEL_AND_RESTART",
+    "FLOW_WAIT_AND_RESTART",
+    "IN_FLIGHT_FLOWS",
     "MAX_RELEASE_ARCHIVE_BYTES",
     "PIPX_UPGRADE_COMMAND",
     "PIPX_UPGRADE_TIMEOUT",
+    "WAIT_AND_RESTART_TIMEOUT",
     "ReexecFn",
     "SelfUpdateApplyOutcome",
     "SubprocessRunner",
     "apply_pipx_update",
+    "apply_with_flow",
     "stable_update_target",
 ]
