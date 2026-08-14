@@ -403,6 +403,161 @@ describe("QueuePage", () => {
     });
   });
 
+  describe('"Process Now" (COL-229)', () => {
+    it('shows "Process now" only on pending rows', async () => {
+      mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      expect(
+        within(runningRow).queryByRole("button", { name: /process now/i }),
+      ).not.toBeInTheDocument();
+
+      const pendingRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
+      expect(within(pendingRow).getByRole("button", { name: /process now/i })).toBeInTheDocument();
+    });
+
+    it("calls the process-now endpoint with confirm=false first, and refreshes the queue on success", async () => {
+      const refreshedQueue = [pendingJobHigherPriority, runningJob, pendingJobLowerPriority];
+      const fetchMock = mockFetchWithAction([queueResponse, refreshedQueue], (url, init) => {
+        expect(url).toContain("/api/jobs/process-now");
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(init?.body as string)).toEqual({
+          file_path: pendingJobLowerPriority.file_path,
+          confirm: false,
+        });
+        return {
+          ok: true,
+          body: {
+            enqueued: true,
+            job: { id: "job-x", file_path: pendingJobLowerPriority.file_path, status: "running" },
+            needs_confirmation: false,
+          },
+        };
+      });
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      // Mount: queue poll + settings load; then the process-now POST + refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    });
+
+    it("shows an inline confirm step, without calling the endpoint again, when the response needs confirmation", async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], (url) => {
+        expect(url).toContain("/api/jobs/process-now");
+        return { ok: true, body: { enqueued: false, job: null, needs_confirmation: true } };
+      });
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      const confirmPanel = (
+        await screen.findByText(/would exceed the configured concurrency limit/i)
+      ).closest(".view__confirm") as HTMLElement;
+      expect(
+        within(confirmPanel).getByRole("button", { name: /process now anyway/i }),
+      ).toBeInTheDocument();
+      // Mount: queue poll + settings load; then the process-now POST (needing
+      // confirmation) + refresh queue poll -- the endpoint was called once,
+      // not called again just for showing the confirm step.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    });
+
+    it('re-submits with confirm=true when "Process now anyway" is clicked, and dismisses the confirm step on success', async () => {
+      let processNowCalls = 0;
+      const fetchMock = mockFetchWithAction(
+        [queueResponse, queueResponse, queueResponse],
+        (url, init) => {
+          expect(url).toContain("/api/jobs/process-now");
+          const body = JSON.parse(init?.body as string);
+          processNowCalls += 1;
+          if (processNowCalls === 1) {
+            expect(body.confirm).toBe(false);
+            return { ok: true, body: { enqueued: false, job: null, needs_confirmation: true } };
+          }
+          expect(body.confirm).toBe(true);
+          return {
+            ok: true,
+            body: {
+              enqueued: true,
+              job: { id: "job-x", file_path: body.file_path, status: "running" },
+              needs_confirmation: false,
+            },
+          };
+        },
+      );
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      const confirmPanel = (
+        await screen.findByText(/would exceed the configured concurrency limit/i)
+      ).closest(".view__confirm") as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /process now anyway/i }));
+
+      await waitFor(() =>
+        expect(
+          screen.queryByText(/would exceed the configured concurrency limit/i),
+        ).not.toBeInTheDocument(),
+      );
+      expect(processNowCalls).toBe(2);
+      expect(fetchMock).toHaveBeenCalledTimes(6); // mount(2) + call 1 + refresh + call 2 + refresh
+    });
+
+    it('dismisses the confirm step via "Cancel" without calling the endpoint again', async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: true,
+        body: { enqueued: false, job: null, needs_confirmation: true },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      const confirmPanel = (
+        await screen.findByText(/would exceed the configured concurrency limit/i)
+      ).closest(".view__confirm") as HTMLElement;
+      const callsBeforeDismiss = fetchMock.mock.calls.length;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /^cancel$/i }));
+
+      expect(
+        screen.queryByText(/would exceed the configured concurrency limit/i),
+      ).not.toBeInTheDocument();
+      expect(fetchMock.mock.calls.length).toBe(callsBeforeDismiss); // dismiss makes no request
+    });
+
+    it("shows a graceful notice, not an error, when the file could not be processed now", async () => {
+      mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: true,
+        body: { enqueued: false, job: null, needs_confirmation: false },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      expect(await screen.findByText(/could not be processed now/i)).toBeInTheDocument();
+    });
+
+    it("surfaces a clear error message when the request fails outright", async () => {
+      mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: false,
+        status: 500,
+        body: { detail: "boom" },
+      }));
+      render(<QueuePage />);
+
+      const pendingRow = (await screen.findByText("Show.S01E01")).closest("tr") as HTMLElement;
+      fireEvent.click(within(pendingRow).getByRole("button", { name: /process now/i }));
+
+      expect(await screen.findByText(/boom/i)).toBeInTheDocument();
+    });
+  });
+
   describe("polling", () => {
     beforeEach(() => {
       vi.useFakeTimers();

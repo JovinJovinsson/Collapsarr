@@ -8,6 +8,8 @@ import type {
   JobHistoryEntry,
   ManualTriggerRequest,
   ManualTriggerResult,
+  ProcessNowRequest,
+  ProcessNowResult,
   RequeueFileRequest,
   RequeueFileResult,
   SetDefaultAudioTriggerRequest,
@@ -188,6 +190,32 @@ export async function cancelJob(jobId: string): Promise<CancelJobResult> {
     throw new Error(await apiErrorMessage(response, `Failed to cancel job (${response.status})`));
   }
   return (await response.json()) as CancelJobResult;
+}
+
+/**
+ * Force-starts a downmix Job for one file immediately (`POST
+ * /api/jobs/process-now`, COL-229) -- `QueuePage`'s per-row "Process Now"
+ * action, bypassing both Auto-Processing Pause and the Concurrency Limit.
+ * Creates the Job first if the file has none yet.
+ *
+ * `confirm` defaults to `false`; pass `true` to re-submit after a first
+ * response came back with `needs_confirmation: true` (starting this Job
+ * would exceed the configured Concurrency Limit). A `202` is returned either
+ * way -- the response's `enqueued`/`needs_confirmation` flags (not the HTTP
+ * status) distinguish "started", "needs confirmation", and "skipped", so
+ * this only throws on a genuine error response.
+ */
+export async function processNow(filePath: string, confirm = false): Promise<ProcessNowResult> {
+  const body: ProcessNowRequest = { file_path: filePath, confirm };
+  const response = await apiFetch("/api/jobs/process-now", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to process job now (${response.status})`));
+  }
+  return (await response.json()) as ProcessNowResult;
 }
 
 /**

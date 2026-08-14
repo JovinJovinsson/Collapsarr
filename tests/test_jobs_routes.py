@@ -103,6 +103,8 @@ class _FakeScheduler:
         cancel_result: bool | None = True,
         bump_result: bool | None = True,
         clear_queue_result: ClearQueueResult | None = None,
+        process_now_job: Job | None = None,
+        would_exceed_concurrency_limit: bool = False,
     ) -> None:
         self._scan_jobs = scan_jobs or []
         self._trigger_job = trigger_job
@@ -149,6 +151,14 @@ class _FakeScheduler:
         self._clear_queue_result = clear_queue_result or ClearQueueResult(
             cancelled=0, already_running=0
         )
+        #: COL-229's ``process_now`` result -- the "Process Now" endpoint's
+        #: fixed return value. Defaults to ``None`` (skipped) so a test that
+        #: doesn't care still gets a sane, unenqueued response.
+        self._process_now_job = process_now_job
+        #: COL-229's ``would_exceed_concurrency_limit`` result. Defaults to
+        #: ``False`` (under the limit) so a test that doesn't care about the
+        #: confirmation gate still reaches ``process_now`` as normal.
+        self._would_exceed_concurrency_limit = would_exceed_concurrency_limit
         self.trigger_calls: list[tuple[str, frozenset[str], bool]] = []
         self.requeue_calls: list[str] = []
         self.requeue_all_failed_calls: int = 0
@@ -163,6 +173,8 @@ class _FakeScheduler:
         self.cancel_calls: list[UUID] = []
         self.bump_calls: list[UUID] = []
         self.clear_queue_calls: int = 0
+        self.process_now_calls: list[str] = []
+        self.would_exceed_concurrency_limit_calls: int = 0
 
     def scan_now(self) -> list[Job]:
         return self._scan_jobs
@@ -224,6 +236,14 @@ class _FakeScheduler:
     def clear_queue(self, *, session: Session | None = None) -> ClearQueueResult:
         self.clear_queue_calls += 1
         return self._clear_queue_result
+
+    def would_exceed_concurrency_limit(self) -> bool:
+        self.would_exceed_concurrency_limit_calls += 1
+        return self._would_exceed_concurrency_limit
+
+    def process_now(self, file_path: str, *, session: Session | None = None) -> Job | None:
+        self.process_now_calls.append(file_path)
+        return self._process_now_job
 
 
 def _job(file_path: str) -> Job:
@@ -1897,6 +1917,212 @@ def test_bump_job_wires_through_a_real_scheduler(settings: Settings) -> None:
     assert response.status_code == 404
 
 
+# --- POST /api/jobs/process-now (COL-229) -------------------------------------
+#
+# These are HTTP-contract tests -- request/response shape, the confirm-gate
+# short-circuit (the scheduler's ``process_now`` must not even be called when
+# confirmation is needed and not given), and the
+# would_exceed_concurrency_limit/process_now call sequence -- via the same
+# fake-scheduler dependency_overrides pattern as every other endpoint above.
+# The real force-start/bypass behaviour (JobQueue.force_start,
+# JobScheduler.process_now) is exercised directly, with a real queue, in
+# tests/test_jobs_queue.py and tests/test_jobs_scheduler.py. The final test
+# below drives the full confirm/decline/confirm-and-proceed flow end to end
+# through this HTTP endpoint against a real JobScheduler + JobQueue, covering
+# this ticket's AC explicitly.
+
+
+def test_process_now_returns_the_started_job_when_under_the_limit(client: TestClient) -> None:
+    job = _job("/media/movie.mkv")
+    fake = _FakeScheduler(process_now_job=job, would_exceed_concurrency_limit=False)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/process-now",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {
+        "enqueued": True,
+        "job": {"id": str(job.id), "file_path": "/media/movie.mkv", "status": "pending"},
+        "needs_confirmation": False,
+    }
+    assert fake.would_exceed_concurrency_limit_calls == 1
+    assert fake.process_now_calls == ["/media/movie.mkv"]
+
+
+def test_process_now_returns_enqueued_false_when_the_scheduler_declines(
+    client: TestClient,
+) -> None:
+    fake = _FakeScheduler(process_now_job=None, would_exceed_concurrency_limit=False)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/process-now",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"enqueued": False, "job": None, "needs_confirmation": False}
+
+
+def test_process_now_requires_confirmation_when_it_would_exceed_the_limit(
+    client: TestClient,
+) -> None:
+    """AC: the API returns a response requiring explicit confirmation, not a silent block."""
+    fake = _FakeScheduler(
+        process_now_job=_job("/media/movie.mkv"), would_exceed_concurrency_limit=True
+    )
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/process-now",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"enqueued": False, "job": None, "needs_confirmation": True}
+    # Declining (never re-submitting with confirm=True) means process_now is
+    # never even called -- nothing was created or started.
+    assert fake.process_now_calls == []
+
+
+def test_process_now_proceeds_when_confirmed_despite_exceeding_the_limit(
+    client: TestClient,
+) -> None:
+    """AC: confirming proceeds and starts the Job over the limit."""
+    job = _job("/media/movie.mkv")
+    fake = _FakeScheduler(process_now_job=job, would_exceed_concurrency_limit=True)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/process-now",
+            json={"file_path": "/media/movie.mkv", "confirm": True},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["enqueued"] is True
+    assert body["needs_confirmation"] is False
+    assert fake.process_now_calls == ["/media/movie.mkv"]
+
+
+def test_process_now_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> process-now fails loudly, not silently."""
+    response = client.post(
+        "/api/jobs/process-now",
+        json={"file_path": "/media/movie.mkv"},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 503
+
+
+def test_process_now_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, a Wanted file -> not probeable -> declined."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs/process-now",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"enqueued": False, "job": None, "needs_confirmation": False}
+
+
+def test_process_now_confirm_flow_end_to_end_against_a_real_scheduler_and_queue(
+    client: TestClient, settings: Settings
+) -> None:
+    """Drives the full confirm/decline/confirm-and-proceed flow through the real HTTP endpoint.
+
+    ``max_concurrency=1``: a first file is force-started via
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.process_now` directly
+    (simulating an earlier "Process Now" click), occupying the sole slot.
+    Without ``confirm``, requesting a second file must ask for confirmation
+    and start nothing at all; with ``confirm=True`` it proceeds and both
+    files genuinely run concurrently -- a real, over-the-limit bypass, not
+    just a reordering.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_runner(
+        file_path: Path, _settings: DownmixSettings, **_: object
+    ) -> PipelineResult:
+        started.set()
+        assert release.wait(timeout=5), "job was never released"
+        return PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
+
+    surround = [
+        AudioStreamInfo(
+            index=0, codec="ac3", channels=6, channel_layout="5.1(side)", language="eng"
+        )
+    ]
+
+    queue = JobQueue(max_concurrency=1, pipeline_runner=blocking_runner)
+    try:
+        scheduler = JobScheduler(queue, session_factory, settings, probe=lambda path: surround)
+        app.state.job_scheduler = scheduler
+
+        first = scheduler.process_now("/media/first.mkv")
+        assert first is not None
+        assert started.wait(timeout=5)  # the sole slot is now occupied
+
+        # Without confirm: at the limit -> declined, nothing created for the second file.
+        response = client.post(
+            "/api/jobs/process-now",
+            json={"file_path": "/media/second.mkv"},
+            headers=_auth_headers(client),
+        )
+        assert response.status_code == 202, response.text
+        assert response.json() == {"enqueued": False, "job": None, "needs_confirmation": True}
+        assert len(queue.list_jobs()) == 1  # nothing created for the declined file
+
+        # Confirmed: proceeds despite exceeding the limit -- a genuine second
+        # concurrent run, not just queued behind the first.
+        response = client.post(
+            "/api/jobs/process-now",
+            json={"file_path": "/media/second.mkv", "confirm": True},
+            headers=_auth_headers(client),
+        )
+        assert response.status_code == 202, response.text
+        body = response.json()
+        assert body["enqueued"] is True
+        assert body["job"]["status"] == "running"
+
+        release.set()
+        assert queue.wait_idle(timeout=5) is True
+        assert all(job.status is JobStatus.SUCCEEDED for job in queue.list_jobs())
+    finally:
+        queue.shutdown()
+
+
 # --- auth-required behaviour --------------------------------------------------
 
 
@@ -1965,6 +2191,12 @@ def test_cancel_job_endpoint_requires_the_api_key(client: TestClient, session: S
 def test_bump_job_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     response = client.post(f"/api/jobs/{uuid4()}/bump")
+    assert response.status_code == 401
+
+
+def test_process_now_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post("/api/jobs/process-now", json={"file_path": "/media/movie.mkv"})
     assert response.status_code == 401
 
 

@@ -28,6 +28,11 @@ moment a worker claims a Job:
   "no interruption of an in-flight ffmpeg."
 * :meth:`bump_to_front` reassigns a still-``PENDING`` Job's ``priority`` below
   every other pending Job's, so it is claimed next.
+* :meth:`force_start` (COL-229, "Process Now") claims a still-``PENDING`` Job
+  and runs it *immediately*, on a dedicated thread outside the fixed pool --
+  unlike :meth:`bump_to_front`, which only reorders within the existing
+  pending queue (still subject to Auto-Processing Pause and the Concurrency
+  Limit once claimed), this bypasses both.
 
 Callers that need to block until the queue has drained (tests, orderly
 shutdown) use :meth:`wait_idle`; :meth:`shutdown` stops the pool, letting any
@@ -1025,6 +1030,82 @@ class JobQueue:
             job.priority = min_pending - 1
             self._cond.notify_all()
             return True
+
+    def force_start(self, job_id: UUID) -> bool:
+        """Force-start a still-``PENDING`` job immediately, bypassing pause and the concurrency cap.
+
+        The queue-level primitive behind "Process Now" (COL-229,
+        ``CONTEXT.md``): unlike the ordinary claim path (:meth:`_claim_next`,
+        run only by the pool's fixed ``max_concurrency`` worker threads),
+        this claims ``job`` directly -- under the same lock, flipping it
+        ``PENDING`` -> ``RUNNING`` exactly the way :meth:`_claim_next` does,
+        so no pool worker can race to claim it out from under this call --
+        and then runs it (:meth:`_run_job`) on a brand-new, dedicated thread
+        rather than waiting for one of the pool's own threads to free up.
+
+        That is what makes this a genuine bypass of both gates "Process Now"
+        must clear:
+
+        * **Auto-Processing Pause** (COL-226) -- ``self._pause_check`` is
+          consulted only inside :meth:`_claim_next`, never here, so a paused
+          queue still force-starts a job through this method.
+        * **Concurrency Limit** (COL-165) -- the limit is nothing more than
+          "how many worker threads the pool has" (``self._max_concurrency``
+          fixed at construction); spinning up one more thread outside that
+          fixed pool genuinely runs this job *alongside* however many pool
+          workers are already busy, rather than waiting for one to free up.
+
+        Every other side effect of a normal run is unaffected: the new
+        thread calls :meth:`_run_job` exactly as a pool worker would, so
+        history/tracked-media/failure-notification/Plex-analyze/the
+        job-terminal hook (and so the Auto-Queue Limit's top-up, COL-171)
+        all fire identically, and :meth:`wait_idle`/:meth:`shutdown` observe
+        this job the same way too (``self._active`` is incremented under the
+        same lock, right alongside the ``RUNNING`` transition, before the
+        new thread is even started).
+
+        Returns ``True`` if ``job_id`` was still ``PENDING`` and has now been
+        claimed and started; ``False`` (not an error) if it names no job the
+        live queue knows about, or one that is no longer ``PENDING`` (already
+        ``RUNNING`` or terminal) -- "too late," mirroring :meth:`bump_to_front`
+        (and :meth:`cancel`)'s contract exactly. A caller that already has the
+        target job in hand and only cares whether *some* job is now running
+        for it (rather than specifically whether *this* call is what started
+        it) can treat ``False`` as "already handled" -- see
+        :meth:`~collapsarr.jobs.scheduler.JobScheduler.process_now`.
+        """
+        with self._cond:
+            job = self._jobs.get(job_id)
+            if job is None or job.status is not JobStatus.PENDING:
+                return False
+            job.status = JobStatus.RUNNING
+            job.started_at = datetime.now(UTC)
+            # COL-192: attach a hard-kill handle exactly like _claim_next
+            # does, so a force-started job can still be cancelled mid-flight
+            # like any other RUNNING job.
+            job.cancellation = CancellationHandle()
+            self._active += 1  # stays counted until _run_job fully finishes
+        thread = threading.Thread(
+            target=self._run_job,
+            args=(job,),
+            name=f"collapsarr-jobworker-forced-{job.id}",
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def count_running(self) -> int:
+        """Count of currently ``RUNNING`` jobs, any origin -- pool-claimed or force-started.
+
+        Mirrors :meth:`~collapsarr.jobs.scheduler.JobScheduler._count_pending`'s
+        shape (a plain filtered count over the live jobs), for the
+        ``RUNNING`` status instead of ``PENDING`` -- what
+        :meth:`~collapsarr.jobs.scheduler.JobScheduler.would_exceed_concurrency_limit`
+        compares against :attr:`max_concurrency` to decide whether "Process
+        Now" needs to ask for confirmation before force-starting one more.
+        """
+        with self._lock:
+            return sum(1 for job in self._jobs.values() if job.status is JobStatus.RUNNING)
 
     def seed_next_priority(self, min_value: int) -> None:
         """Raise :attr:`_next_priority` to at least ``min_value`` (COL-166).

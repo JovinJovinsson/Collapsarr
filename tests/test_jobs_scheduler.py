@@ -1195,6 +1195,161 @@ def test_bump_job_to_front_repeated_calls_move_each_new_bump_strictly_ahead(
 
 
 # ---------------------------------------------------------------------------
+# process_now / would_exceed_concurrency_limit (COL-229, "Process Now")
+# ---------------------------------------------------------------------------
+
+
+def test_process_now_force_starts_an_already_pending_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: Process Now on an already-pending Job immediately starts it running."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    assert job.status is JobStatus.PENDING  # the pool was never started -- still pending
+
+    result = scheduler.process_now("/media/movie.mkv")
+
+    assert result is job
+    # Fresh lookups rather than reusing `job.status` again below, since it's
+    # re-checked against a different terminal status once the pipeline runs.
+    running = scheduler._queue.get_job(job.id)
+    assert running is not None
+    assert running.status is JobStatus.RUNNING  # flipped synchronously by force_start
+
+    assert scheduler._queue.wait_idle(timeout=5) is True
+    finished = scheduler._queue.get_job(job.id)
+    assert finished is not None
+    assert finished.status is JobStatus.SUCCEEDED
+
+
+def test_process_now_creates_a_job_when_none_exists_and_force_starts_it(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: Process Now on a Wanted file with no existing Job creates it and starts it."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    assert scheduler._queue.list_jobs() == []
+
+    job = scheduler.process_now("/media/movie.mkv")
+
+    assert job is not None
+    assert job.file_path == Path("/media/movie.mkv")
+    assert job.status is JobStatus.RUNNING
+    assert scheduler._queue.list_jobs() == [job]
+
+
+def test_process_now_leaves_an_already_running_job_untouched(
+    settings: Settings, session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Job already RUNNING has nothing to force -- process_now doesn't call force_start again."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    job.status = JobStatus.RUNNING  # simulate a pool worker having already claimed it
+
+    def _fail_if_called(job_id: UUID) -> bool:
+        raise AssertionError("force_start must not be called for an already-RUNNING job")
+
+    monkeypatch.setattr(scheduler._queue, "force_start", _fail_if_called)
+
+    result = scheduler.process_now("/media/movie.mkv")
+
+    assert result is job
+    assert job.status is JobStatus.RUNNING
+
+
+def test_process_now_works_identically_whether_auto_processing_pause_is_on_or_off(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: Process Now works identically whether Auto-Processing Pause is on or off."""
+    queue = JobQueue(pipeline_runner=_stub_runner(), pause_check=lambda: True)
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+    )
+    queue.start()
+
+    job = scheduler.process_now("/media/movie.mkv")
+
+    assert job is not None
+    assert job.status is JobStatus.RUNNING  # started despite pause_check always returning True
+    assert queue.wait_idle(timeout=5) is True
+    finished = queue.get_job(job.id)
+    assert finished is not None
+    assert finished.status is JobStatus.SUCCEEDED
+
+
+def test_process_now_bypasses_the_recently_processed_window(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC-adjacent: an explicit Process Now, like any single-file trigger, bypasses the window."""
+    with session_factory() as session:
+        _record_terminal(session, "/media/movie.mkv", ended_at=_FIXED_NOW)
+
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    job = scheduler.process_now("/media/movie.mkv")
+
+    assert job is not None
+    assert job.status is JobStatus.RUNNING
+
+
+def test_process_now_returns_none_when_the_file_has_nothing_to_do(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_STEREO_ONLY))
+
+    assert scheduler.process_now("/media/movie.mkv") is None
+    assert scheduler._queue.list_jobs() == []
+
+
+def test_process_now_returns_none_when_the_file_cannot_be_probed(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_raising())
+
+    assert scheduler.process_now("/media/movie.mkv") is None
+
+
+def test_would_exceed_concurrency_limit_false_when_under_the_limit(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    queue = JobQueue(max_concurrency=2, pipeline_runner=_stub_runner())
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+    )
+
+    assert scheduler.would_exceed_concurrency_limit() is False
+
+
+def test_would_exceed_concurrency_limit_true_when_running_count_meets_max_concurrency(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """AC: at the Concurrency Limit, starting one more would exceed it."""
+    release = threading.Event()
+
+    def blocking_runner(
+        file_path: Path, downmix_settings: DownmixSettings, **_: object
+    ) -> PipelineResult:
+        assert release.wait(timeout=5)
+        return _SUCCESS
+
+    queue = JobQueue(max_concurrency=1, pipeline_runner=blocking_runner)
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_SURROUND), queue=queue
+    )
+
+    job = scheduler.process_now("/media/movie.mkv")
+    assert job is not None
+    assert job.status is JobStatus.RUNNING
+
+    assert scheduler.would_exceed_concurrency_limit() is True
+
+    release.set()
+    assert queue.wait_idle(timeout=5) is True
+    assert scheduler.would_exceed_concurrency_limit() is False  # freed up again once it finished
+
+
+# ---------------------------------------------------------------------------
 # clear_queue (COL-173)
 # ---------------------------------------------------------------------------
 
