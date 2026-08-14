@@ -1442,6 +1442,59 @@ def test_force_start_returns_false_for_a_job_no_longer_pending() -> None:
     assert queue.wait_idle(timeout=5) is True
 
 
+def test_shutdown_waits_for_a_force_started_job_to_finish() -> None:
+    """Regression: shutdown(wait=True) must join a force_start thread, not just the pool.
+
+    force_start's dedicated thread isn't one of the fixed pool's ``_workers``
+    -- shutdown must track and join it separately (``_force_start_threads``),
+    or an orderly shutdown could return while a force-started job is still
+    mid-run.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        started.set()
+        assert release.wait(timeout=5)
+        finished.set()
+        return _SUCCESS
+
+    queue = JobQueue(pipeline_runner=runner)  # pool never started -- force_start only
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    assert queue.force_start(job.id) is True
+    assert started.wait(timeout=5)
+
+    shutdown_thread = threading.Thread(target=lambda: queue.shutdown(wait=True, timeout=5))
+    shutdown_thread.start()
+
+    # shutdown() must block until the forced job's thread is joined -- give it
+    # a moment, then prove it's still waiting before releasing the job.
+    time.sleep(0.2)
+    assert shutdown_thread.is_alive(), "shutdown() returned before the force-started job finished"
+    assert not finished.is_set()
+
+    release.set()
+    shutdown_thread.join(timeout=5)
+    assert not shutdown_thread.is_alive()
+    assert finished.is_set()
+    finished_job = queue.get_job(job.id)
+    assert finished_job is not None
+    assert finished_job.status is JobStatus.SUCCEEDED
+
+
+def test_force_start_returns_false_once_shutdown_has_begun() -> None:
+    """A force_start call racing (or following) shutdown() must not start new work."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.shutdown()
+
+    assert queue.force_start(job.id) is False
+    assert job.status is JobStatus.PENDING  # left exactly as it was, never ran
+
+
 def test_force_start_flips_a_pending_job_to_running_synchronously() -> None:
     """The status flip happens under the lock, before the new thread even starts."""
     release = threading.Event()

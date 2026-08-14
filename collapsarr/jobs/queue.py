@@ -591,6 +591,18 @@ class JobQueue:
         #: wake any workers already waiting for a claimable Job.
         self._workers: list[threading.Thread] = []
         self._started = False
+        #: One dedicated, ad-hoc thread per :meth:`force_start` call (COL-229,
+        #: "Process Now") -- unlike :attr:`_workers` (the fixed pool, sized
+        #: once at :meth:`start` and never resized), this list grows for the
+        #: lifetime of the queue, one entry per force-started job, so
+        #: :meth:`shutdown` can join every such thread too, not only the pool
+        #: it already knew about at construction time. Appended to under
+        #: ``self._cond`` by :meth:`force_start`, before the thread is
+        #: started; never otherwise pruned (a finished thread's ``join()``
+        #: returns immediately, so a growing list of already-finished
+        #: :class:`~threading.Thread` objects costs a shutdown-time no-op
+        #: join each, not a hang) -- see that method's own docstring.
+        self._force_start_threads: list[threading.Thread] = []
         #: Set by :meth:`shutdown`; tells every idle worker to exit its loop.
         self._shutdown = False
         #: Count of jobs a worker has claimed but not yet *fully* finished --
@@ -1062,7 +1074,13 @@ class JobQueue:
         all fire identically, and :meth:`wait_idle`/:meth:`shutdown` observe
         this job the same way too (``self._active`` is incremented under the
         same lock, right alongside the ``RUNNING`` transition, before the
-        new thread is even started).
+        new thread is even started). The thread itself is also appended to
+        ``self._force_start_threads`` under that same lock, before it is
+        started -- unlike :attr:`_workers` (the fixed pool, sized once at
+        :meth:`start`), this list grows one entry per force-started job, so
+        :meth:`shutdown` can find and join it too, alongside the pool
+        threads, rather than only ever waiting on the pool it already knew
+        about at construction time.
 
         Returns ``True`` if ``job_id`` was still ``PENDING`` and has now been
         claimed and started; ``False`` (not an error) if it names no job the
@@ -1072,9 +1090,18 @@ class JobQueue:
         target job in hand and only cares whether *some* job is now running
         for it (rather than specifically whether *this* call is what started
         it) can treat ``False`` as "already handled" -- see
-        :meth:`~collapsarr.jobs.scheduler.JobScheduler.process_now`.
+        :meth:`~collapsarr.jobs.scheduler.JobScheduler.process_now`. Also
+        returns ``False`` -- without touching ``job`` at all -- once
+        :meth:`shutdown` has begun (``self._shutdown`` set): "after shutdown
+        the queue accepts no new work" (see :meth:`shutdown`'s own docstring)
+        applies here exactly as it does to a fresh :meth:`enqueue`, and
+        checking this under the same lock :meth:`shutdown` sets the flag
+        under closes the race where a job could otherwise start running on a
+        thread :meth:`shutdown` already took its join-list snapshot without.
         """
         with self._cond:
+            if self._shutdown:
+                return False
             job = self._jobs.get(job_id)
             if job is None or job.status is not JobStatus.PENDING:
                 return False
@@ -1085,12 +1112,13 @@ class JobQueue:
             # like any other RUNNING job.
             job.cancellation = CancellationHandle()
             self._active += 1  # stays counted until _run_job fully finishes
-        thread = threading.Thread(
-            target=self._run_job,
-            args=(job,),
-            name=f"collapsarr-jobworker-forced-{job.id}",
-            daemon=True,
-        )
+            thread = threading.Thread(
+                target=self._run_job,
+                args=(job,),
+                name=f"collapsarr-jobworker-forced-{job.id}",
+                daemon=True,
+            )
+            self._force_start_threads.append(thread)
         thread.start()
         return True
 
@@ -1199,9 +1227,17 @@ class JobQueue:
         an in-flight ``ffmpeg`` (it drains gracefully); the manual, per-job
         hard kill COL-192 added (:meth:`cancel_running`, superseding ADR 0007's
         original blanket "no interruption") is a separate, explicit action, not
-        part of shutdown. When ``wait`` (the default), joins the worker threads
-        before returning. After shutdown the queue accepts no new work: a later
-        :meth:`enqueue` records the job but never starts a pool to run it.
+        part of shutdown. When ``wait`` (the default), joins both the pool's
+        worker threads *and* every still-live :meth:`force_start` (COL-229,
+        "Process Now") thread before returning -- a force-started job is a
+        genuine in-flight run too (``self._active`` counts it exactly like a
+        pool-claimed one), so an orderly shutdown must not return while one is
+        still running any more than it would for a pool worker's. After
+        shutdown the queue accepts no new work: a later :meth:`enqueue`
+        records the job but never starts a pool to run it, and a later
+        :meth:`force_start` call returns ``False`` without touching anything
+        (see that method's own docstring) rather than spinning up a thread
+        this call has no way to know about and join.
         """
         with self._cond:
             if self._shutdown:
@@ -1209,9 +1245,12 @@ class JobQueue:
             self._shutdown = True
             self._cond.notify_all()
             workers = list(self._workers)
+            forced_threads = list(self._force_start_threads)
         if wait:
             for worker in workers:
                 worker.join(timeout=timeout)
+            for thread in forced_threads:
+                thread.join(timeout=timeout)
 
     def __enter__(self) -> JobQueue:
         return self
