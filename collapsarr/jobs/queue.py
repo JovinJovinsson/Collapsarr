@@ -28,6 +28,11 @@ moment a worker claims a Job:
   "no interruption of an in-flight ffmpeg."
 * :meth:`bump_to_front` reassigns a still-``PENDING`` Job's ``priority`` below
   every other pending Job's, so it is claimed next.
+* :meth:`force_start` (COL-229, "Process Now") claims a still-``PENDING`` Job
+  and runs it *immediately*, on a dedicated thread outside the fixed pool --
+  unlike :meth:`bump_to_front`, which only reorders within the existing
+  pending queue (still subject to Auto-Processing Pause and the Concurrency
+  Limit once claimed), this bypasses both.
 
 Callers that need to block until the queue has drained (tests, orderly
 shutdown) use :meth:`wait_idle`; :meth:`shutdown` stops the pool, letting any
@@ -160,11 +165,26 @@ from collapsarr.downmix.pipeline import PipelineResult, run_downmix_pipeline
 from collapsarr.downmix.targets import DownmixSettings
 
 if TYPE_CHECKING:
+    from sqlalchemy.orm import Session, sessionmaker
+
     from collapsarr.settings.models import GlobalSettings
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CONCURRENCY = 1
+
+_PAUSE_POLL_INTERVAL_SECONDS = 1.0
+"""How often a worker blocked purely because :data:`AutoProcessingPauseCheck`
+currently returns ``True`` re-checks it (COL-226). Toggling the persisted
+``auto_processing_paused`` setting off doesn't otherwise wake an idle
+worker -- only :meth:`JobQueue._enqueue`/:meth:`JobQueue.bump_to_front`/
+:meth:`JobQueue.shutdown` call ``notify_all`` on the condition a blocked
+worker waits on, and none of those fire from a ``PUT /api/settings`` write --
+so a paused worker instead polls at this cadence, the same "read fresh,
+bounded latency" shape :class:`~collapsarr.jobs.scheduler.JobScheduler`'s
+``recently_processed_window_minutes`` dedup cooldown already uses for a live
+Settings read. 1 second keeps the worst-case "un-pause to first claim"
+latency low without spinning the CPU or hammering the database."""
 
 #: Signature the ``DOWNMIX`` pipeline runner (real or injected-for-tests) must
 #: match: ``(file_path, settings, **pipeline_kwargs) -> PipelineResult``.
@@ -189,6 +209,53 @@ DefaultAudioPipelineRunner = Callable[..., PipelineResult]
 #: toggle is also on. ``ffmpeg_path`` is the only key both pipelines share
 #: today.
 _SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS = frozenset({"ffmpeg_path"})
+
+#: Signature the Auto-Processing Pause gate (COL-226, "Auto-Processing
+#: Pause") must match: a zero-arg callable returning whether pending-job
+#: claiming should currently be paused. Called from
+#: :meth:`JobQueue._claim_next` on every claim attempt -- unlike
+#: ``max_concurrency`` (read once at construction), a change takes effect on
+#: the very next claim, live, with no restart. Deliberately distinct from
+#: :class:`~collapsarr.jobs.scheduler.JobScheduler`'s own ``auto_queue_paused``
+#: gate (COL-174, "Auto-Queuing Pause"), which only stops the scanner's
+#: enqueue/top-up funnel from adding *new* ``PENDING`` Jobs: this callable
+#: instead gates the queue's sole pending -> running chokepoint, so it also
+#: halts a Job that is already sitting ``PENDING`` (enqueued before the
+#: pause, or added to it while paused, e.g. by a manual trigger) from ever
+#: starting, while a Job a worker has already claimed keeps running
+#: uninterrupted to completion. ``None`` (the default, used by the raw
+#: ``__init__`` and every existing test) means "never paused" --
+#: :meth:`JobQueue.from_settings` wires a real one reading
+#: ``GlobalSettings.auto_processing_paused`` live (see
+#: :func:`_make_live_pause_check`).
+AutoProcessingPauseCheck = Callable[[], bool]
+
+
+def _make_live_pause_check(
+    session_factory: sessionmaker[Session],
+) -> AutoProcessingPauseCheck:
+    """Build a real :data:`AutoProcessingPauseCheck` bound to ``session_factory`` (COL-226).
+
+    Opens a short-lived :class:`~sqlalchemy.orm.Session` per call -- the same
+    per-call-session pattern :func:`collapsarr.jobs.history.
+    make_history_recorder` already uses -- so a worker calling this from
+    :meth:`JobQueue._claim_next` (up to ``max_concurrency`` threads may call
+    it concurrently) always reads the *current* persisted
+    ``GlobalSettings.auto_processing_paused`` value, never one captured once
+    at :meth:`JobQueue.from_settings` construction time.
+
+    The import is deferred, matching every other Settings-service import in
+    this module: the settings service pulls in the ORM/adapters, which don't
+    need to load for a lightweight ``__init__`` construction that never
+    touches Settings.
+    """
+    from collapsarr.settings.service import get_global_settings
+
+    def _pause_check() -> bool:
+        with session_factory() as session:
+            return get_global_settings(session).auto_processing_paused
+
+    return _pause_check
 
 
 def _enabled_targets_for_log(settings: DownmixSettings) -> str:
@@ -440,6 +507,20 @@ class JobQueue:
     for it exactly as it does for a ``DOWNMIX`` job, though, since a Default
     Audio Track fix also rewrites the file's stream-level metadata Plex has
     cached.
+
+    ``pause_check`` (COL-226, "Auto-Processing Pause") is a zero-arg
+    :data:`AutoProcessingPauseCheck` callable :meth:`_claim_next` consults on
+    every claim attempt: while it returns ``True``, a free worker never
+    claims a new ``PENDING`` Job, so nothing new starts running -- a Job a
+    worker has already claimed keeps running to completion regardless (this
+    seam only ever guards the claim step). Defaults to ``None``, which reads
+    as "never paused" -- the right default for lightweight unit construction
+    (e.g. COL-20's concurrency tests) that never touches Settings, mirroring
+    every other optional seam on this class. :meth:`from_settings` wires a
+    real one (see :func:`_make_live_pause_check`) reading
+    ``GlobalSettings.auto_processing_paused`` live, so a ``PUT
+    /api/settings`` change takes effect on the very next claim attempt with
+    no restart.
     """
 
     def __init__(
@@ -453,6 +534,7 @@ class JobQueue:
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
         plex_analyzer: PlexAnalyzer | None = None,
+        pause_check: AutoProcessingPauseCheck | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
@@ -464,6 +546,9 @@ class JobQueue:
         self._failure_notifier = failure_notifier
         self._tracked_media_recorder = tracked_media_recorder
         self._plex_analyzer = plex_analyzer
+        #: The Auto-Processing Pause gate (COL-226) -- see the class
+        #: docstring's ``pause_check`` paragraph and :data:`AutoProcessingPauseCheck`.
+        self._pause_check = pause_check
         self._lock = threading.Lock()
         #: Guards every access to ``_jobs``/``_next_priority``/``_shutdown``
         #: and coordinates the worker pool. Workers ``wait`` on it for a
@@ -506,6 +591,20 @@ class JobQueue:
         #: wake any workers already waiting for a claimable Job.
         self._workers: list[threading.Thread] = []
         self._started = False
+        #: One dedicated, ad-hoc thread per :meth:`force_start` call (COL-229,
+        #: "Process Now") -- unlike :attr:`_workers` (the fixed pool, sized
+        #: once at :meth:`start` and never resized), this list grows for the
+        #: lifetime of the queue, one entry per force-started job, so
+        #: :meth:`shutdown` can join every such thread too, not only the pool
+        #: it already knew about at construction time. Appended to (and its
+        #: thread started) under ``self._cond`` by :meth:`force_start`, so a
+        #: concurrent :meth:`shutdown` never snapshots this list mid-append
+        #: or joins a thread that hasn't started yet; never otherwise pruned
+        #: (a finished thread's ``join()``
+        #: returns immediately, so a growing list of already-finished
+        #: :class:`~threading.Thread` objects costs a shutdown-time no-op
+        #: join each, not a hang) -- see that method's own docstring.
+        self._force_start_threads: list[threading.Thread] = []
         #: Set by :meth:`shutdown`; tells every idle worker to exit its loop.
         self._shutdown = False
         #: Count of jobs a worker has claimed but not yet *fully* finished --
@@ -528,6 +627,7 @@ class JobQueue:
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
         plex_analyzer: PlexAnalyzer | None = None,
+        pause_check: AutoProcessingPauseCheck | None = None,
     ) -> JobQueue:
         """Build a :class:`JobQueue` whose concurrency cap comes from persisted Settings.
 
@@ -612,6 +712,15 @@ class JobQueue:
         deferred import to break the module cycle, the same reason the
         schema/engine helpers above are imported inside this method rather
         than at module scope.
+
+        ``pause_check`` (COL-226) defaults to a real
+        :func:`_make_live_pause_check` bound to this same ``session_factory``
+        when not passed explicitly -- unlike the raw :meth:`__init__` (where
+        it defaults to ``None``, "never paused"), this factory is the
+        production path, so a bare ``JobQueue.from_settings()`` call
+        genuinely honours a persisted Auto-Processing Pause, mirroring how
+        ``history_recorder``/``failure_notifier``/``tracked_media_recorder``/
+        ``plex_analyzer`` above all resolve to real ones here too.
         """
         resolved = settings or get_settings()
 
@@ -657,6 +766,10 @@ class JobQueue:
 
             resolved_plex_analyzer = make_plex_analyzer(session_factory)
 
+        resolved_pause_check = pause_check
+        if resolved_pause_check is None:
+            resolved_pause_check = _make_live_pause_check(session_factory)
+
         return cls(
             max_concurrency=global_settings.concurrency_limit,
             pipeline_runner=pipeline_runner,
@@ -666,6 +779,7 @@ class JobQueue:
             failure_notifier=resolved_failure_notifier,
             tracked_media_recorder=resolved_tracked_media_recorder,
             plex_analyzer=resolved_plex_analyzer,
+            pause_check=resolved_pause_check,
         )
 
     @staticmethod
@@ -931,6 +1045,119 @@ class JobQueue:
             self._cond.notify_all()
             return True
 
+    def force_start(self, job_id: UUID) -> bool:
+        """Force-start a still-``PENDING`` job immediately, bypassing pause and the concurrency cap.
+
+        The queue-level primitive behind "Process Now" (COL-229,
+        ``CONTEXT.md``): unlike the ordinary claim path (:meth:`_claim_next`,
+        run only by the pool's fixed ``max_concurrency`` worker threads),
+        this claims ``job`` directly -- under the same lock, flipping it
+        ``PENDING`` -> ``RUNNING`` exactly the way :meth:`_claim_next` does,
+        so no pool worker can race to claim it out from under this call --
+        and then runs it (:meth:`_run_job`) on a brand-new, dedicated thread
+        rather than waiting for one of the pool's own threads to free up.
+
+        That is what makes this a genuine bypass of both gates "Process Now"
+        must clear:
+
+        * **Auto-Processing Pause** (COL-226) -- ``self._pause_check`` is
+          consulted only inside :meth:`_claim_next`, never here, so a paused
+          queue still force-starts a job through this method.
+        * **Concurrency Limit** (COL-165) -- the limit is nothing more than
+          "how many worker threads the pool has" (``self._max_concurrency``
+          fixed at construction); spinning up one more thread outside that
+          fixed pool genuinely runs this job *alongside* however many pool
+          workers are already busy, rather than waiting for one to free up.
+
+        Every other side effect of a normal run is unaffected: the new
+        thread calls :meth:`_run_job` exactly as a pool worker would, so
+        history/tracked-media/failure-notification/Plex-analyze/the
+        job-terminal hook (and so the Auto-Queue Limit's top-up, COL-171)
+        all fire identically, and :meth:`wait_idle`/:meth:`shutdown` observe
+        this job the same way too (``self._active`` is incremented under the
+        same lock, right alongside the ``RUNNING`` transition, before the
+        new thread is even started). The thread itself is created, appended
+        to ``self._force_start_threads``, *and* started, all under that same
+        lock (mirroring how :meth:`start` creates and starts every fixed-pool
+        worker inside its own ``with self._cond:`` block) -- unlike
+        :attr:`_workers` (the fixed pool, sized once at :meth:`start`), this
+        list grows one entry per force-started job, so :meth:`shutdown` can
+        find and join it too, alongside the pool threads, rather than only
+        ever waiting on the pool it already knew about at construction time.
+        Starting the thread inside the lock, rather than after releasing it,
+        closes a narrow race: a concurrent :meth:`shutdown` that acquired the
+        lock, snapshotted this list, and reached its join loop before this
+        call got around to ``.start()`` would otherwise call
+        :meth:`~threading.Thread.join` on a never-started thread, raising
+        ``RuntimeError``.
+
+        Returns ``True`` if ``job_id`` was still ``PENDING`` and has now been
+        claimed and started; ``False`` (not an error) if it names no job the
+        live queue knows about, or one that is no longer ``PENDING`` (already
+        ``RUNNING`` or terminal) -- "too late," mirroring :meth:`bump_to_front`
+        (and :meth:`cancel`)'s contract exactly. A caller that already has the
+        target job in hand and only cares whether *some* job is now running
+        for it (rather than specifically whether *this* call is what started
+        it) can treat ``False`` as "already handled" -- see
+        :meth:`~collapsarr.jobs.scheduler.JobScheduler.process_now`. Also
+        returns ``False`` -- without touching ``job`` at all -- once
+        :meth:`shutdown` has begun (``self._shutdown`` set): "after shutdown
+        the queue accepts no new work" (see :meth:`shutdown`'s own docstring)
+        applies here exactly as it does to a fresh :meth:`enqueue`, and
+        checking this under the same lock :meth:`shutdown` sets the flag
+        under closes the race where a job could otherwise start running on a
+        thread :meth:`shutdown` already took its join-list snapshot without.
+        """
+        with self._cond:
+            if self._shutdown:
+                return False
+            job = self._jobs.get(job_id)
+            if job is None or job.status is not JobStatus.PENDING:
+                return False
+            job.status = JobStatus.RUNNING
+            job.started_at = datetime.now(UTC)
+            # COL-192: attach a hard-kill handle exactly like _claim_next
+            # does, so a force-started job can still be cancelled mid-flight
+            # like any other RUNNING job.
+            job.cancellation = CancellationHandle()
+            self._active += 1  # stays counted until _run_job fully finishes
+            thread = threading.Thread(
+                target=self._run_job,
+                args=(job,),
+                name=f"collapsarr-jobworker-forced-{job.id}",
+                daemon=True,
+            )
+            self._force_start_threads.append(thread)
+            # Started *inside* the lock -- mirrors :meth:`start` (the fixed
+            # pool's own workers are created and started inside its own
+            # ``with self._cond:`` block) -- so append-to-list and
+            # actually-started happen atomically relative to a concurrent
+            # :meth:`shutdown` call's snapshot-then-join. If ``.start()`` ran
+            # after releasing the lock instead, a ``shutdown()`` that
+            # acquired the lock, took its snapshot (already including this
+            # thread, appended above), and reached its join loop in that
+            # narrow window -- before this call actually got to ``.start()``
+            # -- would call ``Thread.join()`` on a thread that was never
+            # started, raising ``RuntimeError``. Thread.start() itself is
+            # cheap (just spawns the OS thread; it does not wait for the
+            # target to run), so holding the lock a little longer here costs
+            # nothing meaningful.
+            thread.start()
+        return True
+
+    def count_running(self) -> int:
+        """Count of currently ``RUNNING`` jobs, any origin -- pool-claimed or force-started.
+
+        Mirrors :meth:`~collapsarr.jobs.scheduler.JobScheduler._count_pending`'s
+        shape (a plain filtered count over the live jobs), for the
+        ``RUNNING`` status instead of ``PENDING`` -- what
+        :meth:`~collapsarr.jobs.scheduler.JobScheduler.would_exceed_concurrency_limit`
+        compares against :attr:`max_concurrency` to decide whether "Process
+        Now" needs to ask for confirmation before force-starting one more.
+        """
+        with self._lock:
+            return sum(1 for job in self._jobs.values() if job.status is JobStatus.RUNNING)
+
     def seed_next_priority(self, min_value: int) -> None:
         """Raise :attr:`_next_priority` to at least ``min_value`` (COL-166).
 
@@ -1015,6 +1242,43 @@ class JobQueue:
             return True
         return any(job.status is JobStatus.PENDING for job in self._jobs.values())
 
+    def wait_no_running(self, timeout: float | None = None) -> bool:
+        """Block until no job is currently ``RUNNING`` -- ignoring ``PENDING`` (COL-233).
+
+        The "Wait & Restart" self-update flow's own wait step
+        (:mod:`collapsarr.self_update.apply`): unlike :meth:`wait_idle`, this
+        deliberately does **not** also wait for every ``PENDING`` job to
+        drain. That distinction matters here specifically because the
+        self-update apply flow force-sets ``auto_processing_paused`` (COL-226)
+        *before* calling this -- while paused, :meth:`_claim_next` never
+        claims a new ``PENDING`` job, so a naive :meth:`wait_idle` call would
+        block forever on a Job that was already sitting ``PENDING`` (or one a
+        concurrent enqueue/top-up added) the moment claiming was paused. This
+        method only ever waits on ``self._active`` (the same counter
+        :meth:`wait_idle` checks, incremented under the lock the instant a
+        worker -- pool or force-started -- claims a Job, decremented only
+        once :meth:`_run_job` has fully finished it, success or failure
+        alike), which is exactly the set of Jobs an operator's browser tab
+        would see as "running" right now.
+
+        Returns ``True`` once no job is ``RUNNING``, or ``False`` if
+        ``timeout`` (seconds) elapsed first. With no ``timeout`` it waits
+        indefinitely. Returns immediately when nothing is currently
+        ``RUNNING``.
+        """
+        with self._cond:
+            if timeout is None:
+                while self._active > 0:
+                    self._cond.wait()
+                return True
+            deadline = time.monotonic() + timeout
+            while self._active > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._active == 0
+                self._cond.wait(remaining)
+            return True
+
     def shutdown(self, *, wait: bool = True, timeout: float | None = None) -> None:
         """Stop the worker pool; any job a worker already claimed still finishes.
 
@@ -1023,9 +1287,17 @@ class JobQueue:
         an in-flight ``ffmpeg`` (it drains gracefully); the manual, per-job
         hard kill COL-192 added (:meth:`cancel_running`, superseding ADR 0007's
         original blanket "no interruption") is a separate, explicit action, not
-        part of shutdown. When ``wait`` (the default), joins the worker threads
-        before returning. After shutdown the queue accepts no new work: a later
-        :meth:`enqueue` records the job but never starts a pool to run it.
+        part of shutdown. When ``wait`` (the default), joins both the pool's
+        worker threads *and* every still-live :meth:`force_start` (COL-229,
+        "Process Now") thread before returning -- a force-started job is a
+        genuine in-flight run too (``self._active`` counts it exactly like a
+        pool-claimed one), so an orderly shutdown must not return while one is
+        still running any more than it would for a pool worker's. After
+        shutdown the queue accepts no new work: a later :meth:`enqueue`
+        records the job but never starts a pool to run it, and a later
+        :meth:`force_start` call returns ``False`` without touching anything
+        (see that method's own docstring) rather than spinning up a thread
+        this call has no way to know about and join.
         """
         with self._cond:
             if self._shutdown:
@@ -1033,9 +1305,12 @@ class JobQueue:
             self._shutdown = True
             self._cond.notify_all()
             workers = list(self._workers)
+            forced_threads = list(self._force_start_threads)
         if wait:
             for worker in workers:
                 worker.join(timeout=timeout)
+            for thread in forced_threads:
+                thread.join(timeout=timeout)
 
     def __enter__(self) -> JobQueue:
         return self
@@ -1059,24 +1334,40 @@ class JobQueue:
         concurrent :meth:`cancel` correctly loses the race (sees it already
         non-``PENDING``). Returns ``None`` only when :meth:`shutdown` was
         signalled while this worker was idle -- the worker's cue to exit.
+
+        **Auto-Processing Pause (COL-226).** Before picking a job, checks
+        ``self._pause_check()`` (when configured) and, while it returns
+        ``True``, treats the claim as unclaimable regardless of what's
+        actually ``PENDING`` -- so no free worker starts a new Job while
+        paused. A Job a worker already claimed keeps running: this method is
+        only ever on the *claim* path, never called again for an
+        already-``RUNNING`` Job. While paused, the wait below uses
+        :data:`_PAUSE_POLL_INTERVAL_SECONDS` instead of blocking forever, so
+        toggling the setting back off is picked up within that bound even
+        though nothing explicitly wakes this worker (see that constant's
+        docstring for why) -- once claimable, the ordinary indefinite wait
+        (woken by :meth:`_enqueue`/:meth:`bump_to_front`/:meth:`shutdown`)
+        applies as before.
         """
         with self._cond:
             while True:
                 if self._shutdown:
                     return None
-                job = self._lowest_priority_pending_locked()
-                if job is not None:
-                    job.status = JobStatus.RUNNING
-                    job.started_at = datetime.now(UTC)
-                    # COL-192: attach a hard-kill handle under the same lock
-                    # that flips the job to RUNNING, so a concurrent
-                    # cancel_running() either sees it here (and kills the
-                    # subprocess once _run_job attaches one) or loses the race
-                    # cleanly against a job that already finished.
-                    job.cancellation = CancellationHandle()
-                    self._active += 1  # stays counted until _run_job fully finishes
-                    return job
-                self._cond.wait()
+                paused = self._pause_check is not None and self._pause_check()
+                if not paused:
+                    job = self._lowest_priority_pending_locked()
+                    if job is not None:
+                        job.status = JobStatus.RUNNING
+                        job.started_at = datetime.now(UTC)
+                        # COL-192: attach a hard-kill handle under the same lock
+                        # that flips the job to RUNNING, so a concurrent
+                        # cancel_running() either sees it here (and kills the
+                        # subprocess once _run_job attaches one) or loses the race
+                        # cleanly against a job that already finished.
+                        job.cancellation = CancellationHandle()
+                        self._active += 1  # stays counted until _run_job fully finishes
+                        return job
+                self._cond.wait(_PAUSE_POLL_INTERVAL_SECONDS if paused else None)
 
     def _lowest_priority_pending_locked(self) -> Job | None:
         """The pending job a free worker should claim next (call with the lock held).

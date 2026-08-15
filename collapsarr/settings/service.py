@@ -81,6 +81,16 @@ at the top of every :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up`
 call, so a change here takes effect on the very next auto-fill attempt with
 no restart or scheduler reconstruction -- see that method's docstring for
 exactly what it does and does not gate.
+
+``auto_processing_paused`` (COL-226, "Auto-Processing Pause") follows the
+same "only change what's passed" rule as every other boolean field here.
+:class:`~collapsarr.jobs.queue.JobQueue` reads it live via its injected
+``pause_check`` callable on every claim attempt
+(:meth:`~collapsarr.jobs.queue.JobQueue._claim_next`), so a change here
+takes effect on the next claim with no restart -- see
+:attr:`~collapsarr.settings.models.GlobalSettings.auto_processing_paused`'s
+own docstring for exactly what it does and does not gate, distinct from
+``auto_queue_paused`` above.
 """
 
 from __future__ import annotations
@@ -215,6 +225,7 @@ def update_global_settings(
     auto_set_default_audio: bool | None = None,
     recently_processed_window_minutes: int | None = None,
     auto_queue_paused: bool | None = None,
+    auto_processing_paused: bool | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -282,6 +293,14 @@ def update_global_settings(
 
     ``auto_set_default_audio`` (COL-151) follows the same "only change what's
     passed" rule as every other boolean field here.
+
+    ``auto_processing_paused`` (COL-226, "Auto-Processing Pause") follows the
+    same "only change what's passed" rule as every other boolean field here.
+    Unlike ``auto_queue_paused``, which only gates the scanner's auto-fill
+    funnel, this field gates :class:`~collapsarr.jobs.queue.JobQueue`'s
+    pending -> running claim step directly via an injected ``pause_check``
+    callable -- see :attr:`~collapsarr.settings.models.GlobalSettings.
+    auto_processing_paused`'s own docstring for the full scope.
     """
     settings = get_global_settings(session)
 
@@ -347,6 +366,8 @@ def update_global_settings(
         settings.recently_processed_window_minutes = recently_processed_window_minutes
     if auto_queue_paused is not None:
         settings.auto_queue_paused = auto_queue_paused
+    if auto_processing_paused is not None:
+        settings.auto_processing_paused = auto_processing_paused
 
     session.commit()
     session.refresh(settings)
@@ -373,6 +394,67 @@ def set_ffmpeg_path(session: Session, ffmpeg_path: str) -> GlobalSettings:
     """
     settings = get_global_settings(session)
     settings.ffmpeg_path = ffmpeg_path
+    session.commit()
+    session.refresh(settings)
+    return settings
+
+
+def stash_and_force_pause_processing(session: Session) -> GlobalSettings:
+    """Snapshot ``auto_processing_paused`` then force it ``True`` (COL-230/COL-233).
+
+    The write half of the self-update apply flow's one-shot pause mechanism
+    (:mod:`collapsarr.self_update.apply`'s "Cancel & Restart Now"/"Wait &
+    Restart" flows): stashes whatever ``auto_processing_paused`` currently
+    holds into ``auto_processing_pause_restore_value`` -- see that column's
+    own docstring on :class:`~collapsarr.settings.models.GlobalSettings` --
+    then forces ``auto_processing_paused`` to ``True`` so no *new* Job starts
+    claiming while the apply flow is cancelling/waiting for currently-running
+    ones. Unconditional: always overwrites the restore column with whatever
+    ``auto_processing_paused`` reads as *right now*, mirroring
+    :func:`collapsarr.self_update.service.begin_self_update`'s own
+    unconditional stamp of ``previous_version`` -- this is only ever called
+    once, at the very start of one apply attempt.
+
+    Paired with :func:`restore_auto_processing_pause`, which consumes
+    (writes back, then clears) the stashed value -- either inline, if the
+    apply attempt itself fails before a restart is ever triggered, or at the
+    next process boot (:func:`collapsarr.main.create_app`'s ``lifespan``),
+    which is the only place a *successful* apply's re-exec'd process can run
+    it.
+    """
+    settings = get_global_settings(session)
+    settings.auto_processing_pause_restore_value = settings.auto_processing_paused
+    settings.auto_processing_paused = True
+    session.commit()
+    session.refresh(settings)
+    return settings
+
+
+def restore_auto_processing_pause(session: Session) -> GlobalSettings:
+    """Consume the stashed pre-update ``auto_processing_paused`` value (COL-230/COL-233).
+
+    The read half of :func:`stash_and_force_pause_processing`'s one-shot
+    mechanism: writes ``auto_processing_pause_restore_value`` back onto
+    ``auto_processing_paused`` and clears the restore column to ``None`` --
+    so a pre-existing *manual* pause (the stashed value was ``True``) is
+    still paused after the update, while a pause this apply attempt itself
+    introduced (the stashed value was ``False``) resumes processing.
+
+    A no-op (returns the row unchanged, no write) when
+    ``auto_processing_pause_restore_value`` is already ``None`` -- the
+    steady state: no self-update has ever force-paused processing, or a
+    previous call already consumed it. Idempotent for the same reason
+    :func:`collapsarr.self_update.service.clear_self_update` is: called from
+    two different places (an apply attempt's own failure path, and every
+    process boot -- see :func:`stash_and_force_pause_processing`'s
+    docstring) that can't coordinate with each other about which one gets
+    there first.
+    """
+    settings = get_global_settings(session)
+    if settings.auto_processing_pause_restore_value is None:
+        return settings
+    settings.auto_processing_paused = settings.auto_processing_pause_restore_value
+    settings.auto_processing_pause_restore_value = None
     session.commit()
     session.refresh(settings)
     return settings

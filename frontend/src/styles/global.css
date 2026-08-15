@@ -1504,6 +1504,42 @@ a {
   border-color: var(--c-warning-tint);
 }
 
+/* The "Pause auto-processing" toggle (COL-226, QueuePage's page-level
+   control over the persisted `auto_processing_paused` setting): sits next
+   to .auto-queue-toggle above and shares its exact pill shape/palette --
+   both toggles read as one visual family, since they're both "pause"
+   controls in the same header, just gating different chokepoints (the
+   scanner's auto-fill funnel vs. the worker pool's claim step). */
+.auto-processing-toggle {
+  display: inline-flex;
+  align-items: center;
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.auto-processing-toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.auto-processing-toggle--active {
+  color: var(--c-success);
+  background: var(--c-success-tint);
+  border-color: var(--c-success-tint);
+}
+
+.auto-processing-toggle--paused {
+  color: var(--c-warning);
+  background: var(--c-warning-tint);
+  border-color: var(--c-warning-tint);
+}
+
 /* Row-level Select checkbox (COL-103): first column of every Library
    tree/table row, backing the cross-level bulk selection. */
 .library-tree-table__select {
@@ -1846,6 +1882,14 @@ a {
   padding-top: var(--sp-4);
 }
 
+/* Self-Update's "Update Now" action (COL-228) -- sits where
+   .update-panel__instructions would, when Self-Update has something to
+   offer for the current state (see UpdatesPage's canOfferSelfUpdate). */
+.update-panel__self-update {
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--sp-4);
+}
+
 .update-panel__instructions-title {
   font-size: var(--fs-base);
   font-weight: 650;
@@ -1888,6 +1932,66 @@ a {
   border: 1px solid var(--c-border);
   border-radius: var(--radius-sm);
   padding: 0 var(--sp-1);
+}
+
+/* ---- Self-Update progress screen (COL-231) -----------------------------
+   The dedicated "Updating — please wait" screen SelfUpdateProgress renders
+   in place of .update-panel while an apply attempt is under way. Neutral
+   accent tone while in progress (matching .update-panel's own "never a
+   failure state" precedent); switches to the danger palette only for the
+   terminal rolled-back state, same --c-danger/--c-danger-tint pairing used
+   throughout the rest of this stylesheet. */
+
+.self-update-progress {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  text-align: center;
+  padding: var(--sp-6);
+}
+
+.self-update-progress__spinner {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 3px solid var(--c-accent-tint);
+  border-top-color: var(--c-accent);
+  animation: self-update-progress-spin 0.8s linear infinite;
+}
+
+@keyframes self-update-progress-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.self-update-progress__title {
+  font-size: var(--fs-lg);
+  font-weight: 650;
+}
+
+.self-update-progress__message {
+  color: var(--c-text-muted);
+  max-width: 42ch;
+}
+
+.self-update-progress__footnote {
+  color: var(--c-text-muted);
+  font-size: var(--fs-xs);
+  max-width: 42ch;
+}
+
+.self-update-progress--failed .self-update-progress__title {
+  color: var(--c-danger);
+}
+
+.self-update-progress--failed .self-update-progress__message {
+  color: var(--c-danger);
+  background: var(--c-danger-tint);
+  border: 1px solid var(--c-danger);
+  border-radius: var(--radius-md);
+  padding: var(--sp-2) var(--sp-4);
 }
 
 /* ---- Status page (COL-123) ---------------------------------------------

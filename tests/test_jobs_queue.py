@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -239,6 +239,73 @@ def test_a_job_enqueued_while_workers_are_busy_is_picked_up_when_one_frees() -> 
     assert queue.get_job(later.id) is not None
     assert queue.get_job(later.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
     assert runner.order == ["gate", "later"]
+
+
+# ---------------------------------------------------------------------------
+# wait_no_running (COL-233): "Wait & Restart"'s own wait step -- unlike
+# wait_idle, ignores PENDING Jobs entirely (only cares whether anything is
+# currently RUNNING).
+# ---------------------------------------------------------------------------
+
+
+def test_wait_no_running_returns_immediately_when_nothing_is_running() -> None:
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+
+    assert queue.wait_no_running(timeout=1.0) is True
+
+
+def test_wait_no_running_ignores_a_pending_job_that_will_never_be_claimed() -> None:
+    """AC: unlike wait_idle, a PENDING Job blocked by Auto-Processing Pause never matters.
+
+    This is the exact scenario ``apply_with_flow``'s "Wait & Restart" flow
+    creates: it force-pauses claiming *before* calling this, so any Job still
+    sitting PENDING at that point will never be claimed until the pause
+    lifts -- a plain :meth:`wait_idle` call would block forever on it.
+    """
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: True)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+
+    assert queue.wait_no_running(timeout=1.0) is True  # never blocks on the PENDING job
+    assert job.status is JobStatus.PENDING  # still never claimed
+
+
+def test_wait_no_running_blocks_until_the_running_job_finishes() -> None:
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    queue.enqueue("/media/gate.mkv", DownmixSettings())  # the sole worker claims + blocks
+    assert runner.started.wait(timeout=5)
+
+    result: dict[str, bool] = {}
+
+    def _wait() -> None:
+        result["done"] = queue.wait_no_running(timeout=5)
+
+    thread = threading.Thread(target=_wait)
+    thread.start()
+    time.sleep(0.1)  # give the waiter a moment to actually start blocking
+    assert "done" not in result  # still running -- the wait hasn't returned yet
+
+    runner.release.set()
+    thread.join(timeout=5)
+    assert result.get("done") is True
+
+
+def test_wait_no_running_times_out_while_a_job_is_still_running() -> None:
+    runner = _GatedRunner()  # never released within this test
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    queue.enqueue("/media/gate.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)
+
+    assert queue.wait_no_running(timeout=0.2) is False
+
+    runner.release.set()  # unblock so the pool can shut down cleanly
+    queue.wait_idle(timeout=5)
 
 
 def _write_global_settings(settings: Settings, **fields: object) -> None:
@@ -1279,3 +1346,346 @@ def test_run_job_start_log_reports_the_preference_for_a_set_default_audio_job(
     assert str(job.id) in message
     assert "set_default_audio" in message
     assert "eng/5.1" in message
+
+
+# ---------------------------------------------------------------------------
+# Auto-Processing Pause (COL-226): a distinct, injected ``pause_check`` gate
+# on the claim chokepoint itself -- direct queue-level tests, no DB. The
+# real, Settings-backed wiring (``JobQueue.from_settings``) is covered
+# separately below.
+# ---------------------------------------------------------------------------
+
+
+def test_no_pause_check_configured_claims_pending_jobs_as_normal() -> None:
+    """AC: with no pause_check (the __init__ default), claiming is unaffected."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED
+    assert runner.calls == [(Path("/media/movie.mkv"), DownmixSettings())]
+
+
+def test_pause_check_returning_false_claims_pending_jobs_as_normal() -> None:
+    """AC: a pause_check that always reports "not paused" behaves like no gate at all."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: False)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_pause_check_returning_true_blocks_a_pending_job_from_ever_being_claimed() -> None:
+    """AC: while paused, a free worker never claims a new PENDING Job."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: True)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    # No notify_all ever fires to wake a waiter early while paused, so a short
+    # real sleep is the only way to observe "nothing happened" -- long enough
+    # to be well past any scheduling jitter, short relative to the test suite.
+    time.sleep(0.2)
+
+    assert job.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+def test_pause_check_toggling_off_lets_a_previously_pending_job_be_claimed() -> None:
+    """AC: toggling the setting takes effect live -- no restart, no re-enqueue needed."""
+    paused = {"value": True}
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: paused["value"])
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    time.sleep(0.2)
+    assert job.status is JobStatus.PENDING  # still paused, nothing claimed yet
+
+    paused["value"] = False
+    # No event to wait on -- the worker only notices via its bounded poll
+    # (_PAUSE_POLL_INTERVAL_SECONDS), so wait_idle's own timeout comfortably
+    # covers the worst case.
+    assert queue.wait_idle(timeout=5) is True
+
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_pause_check_does_not_affect_an_already_running_job() -> None:
+    """AC: a Job a worker has already claimed keeps running to completion while paused."""
+    paused = {"value": False}
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner, pause_check=lambda: paused["value"])
+    queue.start()
+
+    job = queue.enqueue("/media/gate.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)  # the sole worker has claimed and is running it
+
+    paused["value"] = True  # pause kicks in only *after* the claim
+
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_pause_check_is_consulted_on_every_claim_attempt() -> None:
+    """The gate is re-evaluated per claim, not cached once -- a second job stays gated too."""
+    paused = {"value": True}
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: paused["value"])
+    first = queue.enqueue("/media/a.mkv", DownmixSettings())
+    second = queue.enqueue("/media/b.mkv", DownmixSettings())
+
+    queue.start()
+    time.sleep(0.2)
+
+    assert first.status is JobStatus.PENDING
+    assert second.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+def test_from_settings_wires_a_real_pause_check_reading_auto_processing_paused(
+    tmp_path: Path,
+) -> None:
+    """The production factory reads GlobalSettings.auto_processing_paused live (COL-226)."""
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    _write_global_settings(settings, auto_processing_paused=True)
+    runner = _stub_runner(_SUCCESS)
+
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+    time.sleep(0.2)
+
+    assert job.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+def test_from_settings_default_auto_processing_paused_claims_as_normal(tmp_path: Path) -> None:
+    """No GlobalSettings row written -- from_settings creates it with its documented default."""
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    runner = _stub_runner(_SUCCESS)
+
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+# ---------------------------------------------------------------------------
+# Process Now (COL-229): force_start bypasses both Auto-Processing Pause and
+# the Concurrency Limit -- direct queue-level tests, no DB.
+# ---------------------------------------------------------------------------
+
+
+def test_force_start_returns_false_for_an_unknown_job() -> None:
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    assert queue.force_start(uuid4()) is False
+
+
+def test_force_start_returns_false_for_a_job_no_longer_pending() -> None:
+    """AC ("too late"): a Job a worker already claimed can't be force-started again."""
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    job = queue.enqueue("/media/gate.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)  # the sole worker has already claimed it
+
+    assert queue.force_start(job.id) is False
+
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True
+
+
+def test_shutdown_waits_for_a_force_started_job_to_finish() -> None:
+    """Regression: shutdown(wait=True) must join a force_start thread, not just the pool.
+
+    force_start's dedicated thread isn't one of the fixed pool's ``_workers``
+    -- shutdown must track and join it separately (``_force_start_threads``),
+    or an orderly shutdown could return while a force-started job is still
+    mid-run.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        started.set()
+        assert release.wait(timeout=5)
+        finished.set()
+        return _SUCCESS
+
+    queue = JobQueue(pipeline_runner=runner)  # pool never started -- force_start only
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    assert queue.force_start(job.id) is True
+    assert started.wait(timeout=5)
+
+    shutdown_thread = threading.Thread(target=lambda: queue.shutdown(wait=True, timeout=5))
+    shutdown_thread.start()
+
+    # shutdown() must block until the forced job's thread is joined -- give it
+    # a moment, then prove it's still waiting before releasing the job.
+    time.sleep(0.2)
+    assert shutdown_thread.is_alive(), "shutdown() returned before the force-started job finished"
+    assert not finished.is_set()
+
+    release.set()
+    shutdown_thread.join(timeout=5)
+    assert not shutdown_thread.is_alive()
+    assert finished.is_set()
+    finished_job = queue.get_job(job.id)
+    assert finished_job is not None
+    assert finished_job.status is JobStatus.SUCCEEDED
+
+
+def test_force_start_returns_false_once_shutdown_has_begun() -> None:
+    """A force_start call racing (or following) shutdown() must not start new work."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.shutdown()
+
+    assert queue.force_start(job.id) is False
+    assert job.status is JobStatus.PENDING  # left exactly as it was, never ran
+
+
+def test_force_start_flips_a_pending_job_to_running_synchronously() -> None:
+    """The status flip happens under the lock, before the new thread even starts."""
+    release = threading.Event()
+
+    def runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        assert release.wait(timeout=5)
+        return _SUCCESS
+
+    queue = JobQueue(pipeline_runner=runner)  # never started -- no pool at all
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    assert job.status is JobStatus.PENDING
+
+    assert queue.force_start(job.id) is True
+    # True immediately, before the pipeline even runs -- a fresh lookup rather
+    # than `job.status` again, since it's re-checked below against a
+    # different terminal status once the pipeline actually completes.
+    running = queue.get_job(job.id)
+    assert running is not None
+    assert running.status is JobStatus.RUNNING
+
+    release.set()
+    assert queue.wait_idle(timeout=5) is True
+    finished = queue.get_job(job.id)
+    assert finished is not None
+    assert finished.status is JobStatus.SUCCEEDED
+
+
+def test_force_start_runs_a_job_even_though_the_pool_was_never_started() -> None:
+    """AC: Process Now doesn't depend on the fixed worker pool at all."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))  # .start() deliberately never called
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    assert queue.force_start(job.id) is True
+    assert queue.wait_idle(timeout=5) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_force_start_bypasses_auto_processing_pause() -> None:
+    """AC: Process Now works identically whether Auto-Processing Pause is on or off."""
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner, pause_check=lambda: True)
+    queue.start()
+
+    job = queue.enqueue("/media/gate.mkv", DownmixSettings())
+    time.sleep(0.2)
+    assert job.status is JobStatus.PENDING  # the sole worker is paused, never claims it
+
+    assert queue.force_start(job.id) is True
+    assert runner.started.wait(timeout=5)  # force_start's own dedicated thread ran it anyway
+
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True
+    finished = queue.get_job(job.id)
+    assert finished is not None
+    assert finished.status is JobStatus.SUCCEEDED
+
+
+def test_force_start_runs_alongside_an_already_running_pool_job_over_the_limit() -> None:
+    """AC: Process Now genuinely exceeds the Concurrency Limit, not just reorders.
+
+    A strong, non-timing-based proof (mirrors
+    ``test_concurrency_two_lets_two_jobs_overlap_via_barrier_rendezvous``):
+    with ``max_concurrency=1``, the sole pool worker claims the first job and
+    blocks on the barrier; ``force_start`` runs the second job on its own
+    dedicated thread. If force_start didn't genuinely run concurrently with
+    the pool worker (e.g. it just waited for a pool slot to free), the
+    barrier would never be met and this test would hang/timeout instead of
+    passing.
+    """
+    barrier = threading.Barrier(2, timeout=5)
+
+    def runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        barrier.wait()
+        return _SUCCESS
+
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    pool_job = queue.enqueue("/media/a.mkv", DownmixSettings())
+    forced_job = queue.enqueue("/media/b.mkv", DownmixSettings())
+
+    assert queue.force_start(forced_job.id) is True
+    assert queue.wait_idle(timeout=5) is True
+
+    assert pool_job.status is JobStatus.SUCCEEDED
+    assert forced_job.status is JobStatus.SUCCEEDED
+    # count_running observed 0 once idle -- both finished, neither stuck.
+    assert queue.count_running() == 0
+
+
+def test_force_started_job_still_updates_via_history_recorder_and_terminal_hook() -> None:
+    """A force-started job is an ordinary run of ``_run_job`` -- its side effects still fire."""
+    recorded: list[JobStatus] = []
+    terminal_hook_calls: list[UUID] = []
+
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(_SUCCESS),
+        history_recorder=lambda job: recorded.append(job.status),
+    )
+    queue.set_job_terminal_hook(lambda job: terminal_hook_calls.append(job.id))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    assert queue.force_start(job.id) is True
+    assert queue.wait_idle(timeout=5) is True
+
+    assert recorded == [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCEEDED]
+    assert terminal_hook_calls == [job.id]
+
+
+def test_count_running_counts_only_running_jobs() -> None:
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    assert queue.count_running() == 0
+
+    gate_job = queue.enqueue("/media/gate.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)
+    queue.enqueue("/media/pending.mkv", DownmixSettings())  # stays PENDING behind the gate
+
+    assert queue.count_running() == 1
+
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True
+    assert queue.count_running() == 0
+    assert gate_job.status is JobStatus.SUCCEEDED

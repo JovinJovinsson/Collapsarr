@@ -33,7 +33,9 @@ from collapsarr.settings.service import (
     _default_update_channel,
     as_downmix_settings,
     get_global_settings,
+    restore_auto_processing_pause,
     rotate_session_secret,
+    stash_and_force_pause_processing,
     update_global_settings,
     verify_auth_password,
 )
@@ -799,6 +801,143 @@ def test_update_global_settings_auto_queue_paused_persists_across_a_fresh_read(
     reread = get_global_settings(session)
 
     assert reread.auto_queue_paused is True
+
+
+# ---------------------------------------------------------------------------
+# Auto-Processing Pause (COL-226).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_auto_processing_paused_to_false(session: Session) -> None:
+    """AC: the new toggle defaults to off -- pending Jobs are claimed unless paused explicitly."""
+    settings = get_global_settings(session)
+
+    assert settings.auto_processing_paused is False
+
+
+def test_update_global_settings_updates_auto_processing_paused(session: Session) -> None:
+    updated = update_global_settings(session, auto_processing_paused=True)
+
+    assert updated.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_is_switchable_back_off(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    updated = update_global_settings(session, auto_processing_paused=False)
+
+    assert updated.auto_processing_paused is False
+
+
+def test_update_global_settings_omitting_auto_processing_paused_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    reread = get_global_settings(session)
+
+    assert reread.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_is_independent_of_auto_queue_paused(
+    session: Session,
+) -> None:
+    """AC: the two pause toggles are distinct fields -- setting one never touches the other."""
+    update_global_settings(session, auto_processing_paused=True)
+
+    unchanged = get_global_settings(session)
+
+    assert unchanged.auto_processing_paused is True
+    assert unchanged.auto_queue_paused is False
+
+
+# ---------------------------------------------------------------------------
+# auto_processing_pause_restore_value stash/restore (COL-230, COL-233): the
+# self-update apply flow's one-shot "force-pause, then restore whatever it
+# was before" mechanism.
+# ---------------------------------------------------------------------------
+
+
+def test_stash_and_force_pause_processing_snapshots_false_and_forces_true(
+    session: Session,
+) -> None:
+    """Nothing was manually paused beforehand -- the stash records that False."""
+    assert get_global_settings(session).auto_processing_paused is False  # steady-state default
+
+    settings = stash_and_force_pause_processing(session)
+
+    assert settings.auto_processing_paused is True
+    assert settings.auto_processing_pause_restore_value is False
+
+
+def test_stash_and_force_pause_processing_snapshots_a_pre_existing_manual_pause(
+    session: Session,
+) -> None:
+    """An operator had already paused processing -- the stash preserves that fact."""
+    update_global_settings(session, auto_processing_paused=True)
+
+    settings = stash_and_force_pause_processing(session)
+
+    assert settings.auto_processing_paused is True  # unchanged -- already forced/True
+    assert settings.auto_processing_pause_restore_value is True
+
+
+def test_restore_auto_processing_pause_resumes_processing_when_nothing_was_manually_paused(
+    session: Session,
+) -> None:
+    stash_and_force_pause_processing(session)  # stashes False (the pre-update state)
+
+    settings = restore_auto_processing_pause(session)
+
+    assert settings.auto_processing_paused is False
+    assert settings.auto_processing_pause_restore_value is None
+
+
+def test_restore_auto_processing_pause_preserves_a_pre_existing_manual_pause(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+    stash_and_force_pause_processing(session)  # stashes True (the pre-update state)
+
+    settings = restore_auto_processing_pause(session)
+
+    assert settings.auto_processing_paused is True
+    assert settings.auto_processing_pause_restore_value is None
+
+
+def test_restore_auto_processing_pause_is_a_noop_when_nothing_was_ever_stashed(
+    session: Session,
+) -> None:
+    """Steady state (e.g. every ordinary boot): no self-update has ever force-paused processing."""
+    assert get_global_settings(session).auto_processing_pause_restore_value is None
+
+    settings = restore_auto_processing_pause(session)
+
+    assert settings.auto_processing_paused is False  # untouched
+    assert settings.auto_processing_pause_restore_value is None
+
+
+def test_restore_auto_processing_pause_is_idempotent(session: Session) -> None:
+    """Callable a second time (e.g. two boots in a row) without side effects."""
+    stash_and_force_pause_processing(session)
+    restore_auto_processing_pause(session)
+
+    settings = restore_auto_processing_pause(session)
+
+    assert settings.auto_processing_paused is False
+    assert settings.auto_processing_pause_restore_value is None
 
 
 # ---------------------------------------------------------------------------

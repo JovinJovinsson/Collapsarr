@@ -6,7 +6,7 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Eleven endpoints, each wrapping an existing service without adding new job logic:
+Twelve endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
@@ -140,6 +140,19 @@ Eleven endpoints, each wrapping an existing service without adding new job logic
   claimed/terminal) reports ``bumped=False`` rather than erroring (see
   :class:`BumpJobResult`), and a ``job_id`` not present in the live queue at
   all is a ``404``, same as the ``DELETE`` endpoint.
+- ``POST /api/jobs/process-now`` -- the per-row "Process Now" action
+  (COL-229): force-starts a downmix Job for one file *immediately*
+  (:meth:`collapsarr.jobs.scheduler.JobScheduler.process_now`), bypassing
+  both Auto-Processing Pause and the Concurrency Limit -- unlike ``POST
+  /api/jobs/{job_id}/bump`` above, which only reorders within the existing
+  pending queue and stays subject to both once a pool worker actually claims
+  it. Creates a pending Job first when the file has none yet, the same way
+  ``POST /api/jobs/trigger`` does. When force-starting would push the number
+  of currently-``RUNNING`` Jobs past the configured Concurrency Limit,
+  responds with ``needs_confirmation=True`` and starts nothing
+  (:meth:`collapsarr.jobs.scheduler.JobScheduler.would_exceed_concurrency_limit`,
+  checked first); the caller re-submits with ``confirm=True`` to proceed
+  anyway.
 
 The scan/trigger endpoints operate on the live
 :class:`~collapsarr.jobs.scheduler.JobScheduler` the app wired onto
@@ -476,6 +489,51 @@ class BumpJobResult(BaseModel):
     """
 
     bumped: bool
+
+
+class ProcessNowRequest(BaseModel):
+    """Request body for ``POST /api/jobs/process-now`` (COL-229).
+
+    ``file_path`` names the (host-local) file to force-start -- the same
+    file a queue row's ``file_path`` names, or a Wanted file with no
+    existing Job at all. ``confirm`` defaults to ``False``: the first
+    request for a file that would push the number of currently-``RUNNING``
+    Jobs past the configured Concurrency Limit is answered with
+    :attr:`ProcessNowResult.needs_confirmation` set and nothing started (see
+    that field's own doc comment); the frontend re-submits the same request
+    with ``confirm=True`` to force-start it over the limit anyway.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str
+    confirm: bool = False
+
+
+class ProcessNowResult(BaseModel):
+    """Response for ``POST /api/jobs/process-now`` (COL-229).
+
+    ``needs_confirmation=True`` (always paired with ``enqueued=False``,
+    ``job=null``) means starting this Job right now would push the number of
+    currently-``RUNNING`` Jobs past the configured Concurrency Limit --
+    checked via :meth:`~collapsarr.jobs.scheduler.JobScheduler.
+    would_exceed_concurrency_limit` *before* anything else, so nothing was
+    created or started; declining (simply not re-submitting) leaves the file
+    exactly as it was. Resubmit the same request with ``confirm=True`` to
+    force-start it anyway.
+
+    Otherwise ``needs_confirmation`` is ``False`` and ``enqueued`` carries
+    the usual meaning: ``True`` with the acted-on ``job`` (its ``status``
+    already ``running``) when a Job for the file was found and force-started,
+    or newly created and force-started. ``False`` with ``job`` ``null`` when
+    the file was skipped -- unprobeable, or no qualifying target -- mirroring
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.process_now` returning
+    ``None``.
+    """
+
+    enqueued: bool
+    job: EnqueuedJob | None
+    needs_confirmation: bool = False
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -882,3 +940,40 @@ def bump_job_endpoint(
     if outcome is None:
         raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
     return BumpJobResult(bumped=outcome)
+
+
+# --- POST /api/jobs/process-now (COL-229) -------------------------------------
+
+
+@router.post("/jobs/process-now", response_model=ProcessNowResult, status_code=202)
+def process_now_endpoint(
+    body: ProcessNowRequest,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+) -> ProcessNowResult:
+    """Force-start a downmix Job for one file immediately -- "Process Now" (COL-229).
+
+    Checks :meth:`~collapsarr.jobs.scheduler.JobScheduler.
+    would_exceed_concurrency_limit` *first*, before touching the scheduler's
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.process_now` at all: when
+    it reports ``True`` and the request didn't already set ``confirm=True``,
+    this returns immediately with ``needs_confirmation=True`` (``enqueued``
+    ``False``, ``job`` ``null``) -- nothing is created or started, so a
+    caller that never re-submits with ``confirm=True`` has left the file
+    exactly as it was (``CONTEXT.md``'s **Process Now** entry: "prompting for
+    confirmation if starting it would exceed the configured limit").
+
+    Otherwise -- under the limit, or already confirmed -- delegates to
+    :meth:`~collapsarr.jobs.scheduler.JobScheduler.process_now`: force-starts
+    an already-``PENDING``/``RUNNING`` Job for the file, or creates one first
+    if none exists yet, bypassing both Auto-Processing Pause and the
+    Concurrency Limit either way. A ``202`` is returned whether or not a Job
+    was force-started; ``enqueued`` distinguishes the two (a skipped file --
+    unprobeable, or no qualifying target -- is not an error).
+    """
+    if not body.confirm and scheduler.would_exceed_concurrency_limit():
+        return ProcessNowResult(enqueued=False, job=None, needs_confirmation=True)
+
+    job = scheduler.process_now(body.file_path)
+    if job is None:
+        return ProcessNowResult(enqueued=False, job=None)
+    return ProcessNowResult(enqueued=True, job=EnqueuedJob.from_job(job))

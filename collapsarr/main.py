@@ -61,9 +61,15 @@ from .plex.routes import router as plex_router
 from .plex.scheduler import PlexSyncScheduler
 from .restore.engine import apply_pending_restore
 from .restore.routes import router as restore_router
+from .self_update.apply import ReexecFn, SubprocessRunner
+from .self_update.health_gate import HealthCheckFn, resolve_awaiting_health
+from .self_update.native import ExitFn, HandoffSpawner
+from .self_update.native import ReexecFn as NativeReexecFn
+from .self_update.native import SwapFn as NativeSwapFn
+from .self_update.routes import router as self_update_router
 from .settings.env_seed import seed_auth_from_env
 from .settings.routes import router as settings_router
-from .settings.service import get_global_settings
+from .settings.service import get_global_settings, restore_auto_processing_pause
 from .system.info import router as info_router
 from .system.logs import router as logs_router
 from .system.probe import DefaultSystemProbe, SystemProbe
@@ -131,6 +137,14 @@ def create_app(
     plex_transport: httpx.BaseTransport | None = None,
     system_probe: SystemProbe | None = None,
     ffmpeg_download_transport: httpx.BaseTransport | None = None,
+    self_update_transport: httpx.BaseTransport | None = None,
+    self_update_subprocess_runner: SubprocessRunner | None = None,
+    self_update_reexec_fn: ReexecFn | None = None,
+    self_update_health_check_fn: HealthCheckFn | None = None,
+    self_update_handoff_spawner: HandoffSpawner | None = None,
+    self_update_exit_fn: ExitFn | None = None,
+    self_update_native_swap_fn: NativeSwapFn | None = None,
+    self_update_native_reexec_fn: NativeReexecFn | None = None,
 ) -> FastAPI:
     """Build and return a configured :class:`FastAPI` application.
 
@@ -185,7 +199,48 @@ def create_app(
     is not consumed by any background scheduler -- the download only ever
     runs synchronously inside that one request handler -- so it is stashed
     directly on ``app.state.ffmpeg_download_transport`` for the route to read,
-    rather than threaded into a scheduler constructor.
+    rather than threaded into a scheduler constructor. ``self_update_transport``/
+    ``self_update_subprocess_runner``/``self_update_reexec_fn`` (COL-232) are
+    the same idea for ``POST /api/system/self-update/apply``'s pipx apply
+    flow (:func:`collapsarr.self_update.apply.apply_pipx_update`): the
+    transport stands in for a real network call, and the latter two stand in
+    for a real ``pipx upgrade`` subprocess spawn / a real :func:`os.execv`
+    re-exec, letting tests exercise the whole apply flow with fakes/spies.
+    All three are stashed directly on ``app.state`` (same as
+    ``ffmpeg_download_transport``) and default to ``None``, in which case
+    the route lets :func:`~collapsarr.self_update.apply.apply_pipx_update`'s
+    own production defaults apply. ``self_update_health_check_fn`` (COL-234)
+    is the equivalent seam for the post-re-exec health-check gate
+    (:func:`collapsarr.self_update.health_gate.resolve_awaiting_health`,
+    wired into this lifespan below): tests inject a fake that reports
+    healthy/unhealthy on demand; production leaves it ``None``, in which case
+    the lifespan wires a real one that reruns the Health Check Framework tick
+    just above and reads back its persisted state -- see
+    :mod:`collapsarr.self_update.health_gate`'s module docstring for why that,
+    rather than a real HTTP call to ``/health``, is what "healthy" means here.
+    Unlike the other two self-update seams, this one is consumed once, here in
+    the lifespan (the gate runs at most once per process boot), not stashed on
+    ``app.state`` for a route to read later. ``self_update_handoff_spawner``/
+    ``self_update_exit_fn`` (COL-235) are the native equivalents of the pipx
+    subprocess/re-exec seams: they stand in for a real detached handoff-process
+    spawn and a real process exit in
+    :func:`collapsarr.self_update.native.apply_native_update`, letting tests
+    exercise the native staged-handoff apply flow without spawning a process or
+    terminating this one; both default to ``None`` (the native flow's own
+    production defaults apply). ``self_update_native_swap_fn``/
+    ``self_update_native_reexec_fn`` (COL-236) are the native rollback's own
+    seams, forwarded to :func:`~collapsarr.self_update.health_gate.
+    resolve_awaiting_health` (the same call the ``self_update_health_check_fn``
+    paragraph above describes): they stand in for a real atomic
+    install-directory swap-back
+    (:func:`~collapsarr.self_update.native.swap_install_dir`) and a real
+    ``os.execv`` re-exec into the restored install dir, letting tests exercise
+    the native swap-back-on-unhealthy path without touching real directories
+    or replacing this process. Unlike the native apply seams above, this pair
+    is consumed once, here in the lifespan, not stashed on ``app.state`` --
+    same reasoning as ``self_update_health_check_fn``. Both default to
+    ``None``, in which case :func:`resolve_awaiting_health`'s own production
+    defaults apply.
     """
     resolved_settings = settings or get_settings()
 
@@ -231,6 +286,21 @@ def create_app(
         app.state.engine = engine
         session_factory = create_session_factory(engine)
         app.state.session_factory = session_factory
+
+        # One-shot Auto-Processing Pause restore (COL-233): consume whatever
+        # the self-update apply flow stashed into `GlobalSettings.
+        # auto_processing_pause_restore_value` (collapsarr.self_update.apply,
+        # "Cancel & Restart Now"/"Wait & Restart") before force-pausing
+        # processing for the duration of an apply -- write it back onto
+        # `auto_processing_paused` and clear the restore column to `None`.
+        # Run early, right after the database is available and before the Job
+        # Queue below is even constructed, so a stashed pause never has a
+        # window where a fresh worker could claim a Job against the *forced*
+        # (not yet restored) pause state. A no-op on every ordinary boot (no
+        # self-update has ever run, or the previous boot already consumed
+        # it) -- see `collapsarr.settings.service.restore_auto_processing_pause`.
+        with session_factory() as restore_pause_session:
+            restore_auto_processing_pause(restore_pause_session)
 
         # Runtime log-level control (COL-130): a persisted `GlobalSettings.
         # log_level` override, applied now that the database is available --
@@ -309,6 +379,33 @@ def create_app(
         )
         app.state.health_scheduler = health_scheduler
         health_scheduler.run_once()
+
+        # Self-update health-check gate + pinned-reinstall rollback (COL-234):
+        # a no-op on every ordinary boot -- only the one boot immediately
+        # following COL-232's pipx apply-flow re-exec has
+        # `phase == PHASE_AWAITING_HEALTH` for this to act on. Placed right
+        # after the Health Check Framework's own first tick above so its
+        # default health_check_fn (rerun that tick, then read back
+        # list_failing_checks) reflects this exact boot, not a stale one.
+        # Deliberately before `health_scheduler.start()` below: a rollback
+        # here re-execs this process outright (see
+        # collapsarr.self_update.health_gate's module docstring), so nothing
+        # after it in a real boot ever runs anyway.
+        def _self_update_health_check_fn() -> bool:
+            health_scheduler.run_once()
+            with session_factory() as probe_session:
+                return not list_failing_checks(probe_session)
+
+        with session_factory() as self_update_session:
+            resolve_awaiting_health(
+                self_update_session,
+                health_check_fn=self_update_health_check_fn or _self_update_health_check_fn,
+                subprocess_runner=self_update_subprocess_runner,
+                reexec_fn=self_update_reexec_fn,
+                native_swap_fn=self_update_native_swap_fn,
+                native_reexec_fn=self_update_native_reexec_fn,
+            )
+
         if enable_scheduler:
             health_scheduler.start(run_immediately=False)
 
@@ -397,6 +494,11 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.on_file_ready = on_file_ready or default_on_file_ready_hook
     app.state.ffmpeg_download_transport = ffmpeg_download_transport
+    app.state.self_update_transport = self_update_transport
+    app.state.self_update_subprocess_runner = self_update_subprocess_runner
+    app.state.self_update_reexec_fn = self_update_reexec_fn
+    app.state.self_update_handoff_spawner = self_update_handoff_spawner
+    app.state.self_update_exit_fn = self_update_exit_fn
 
     # Exposed for GET /api/system/tasks (COL-122) to tell whether a Scheduled
     # Task's computed next-run time is actually meaningful: the health/update
@@ -504,6 +606,13 @@ def create_app(
     # health-check banner's opt-in "Download FFmpeg" action; never triggered
     # automatically (ADR 0001/0002).
     app.include_router(ffmpeg_download_router)
+
+    # Self-update status/liveness GET /api/system/self-update/status (COL-230,
+    # Epic COL-224): exposes the singleton self-update state's current phase
+    # and in-progress guard -- foundational for the apply flows (COL-232+)
+    # and the frontend's future polling screen; this ticket only wires up the
+    # read side, there is no start endpoint yet.
+    app.include_router(self_update_router)
 
     # Tail-read GET /api/system/logs (COL-131): the most recent lines of the
     # current rotating log file COL-128's configure_logging() writes to

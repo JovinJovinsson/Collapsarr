@@ -1,7 +1,7 @@
 import { ListOrdered } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { bumpJobToFront, cancelJob, clearQueue, fetchJobQueue } from "../api/activity";
+import { bumpJobToFront, cancelJob, clearQueue, fetchJobQueue, processNow } from "../api/activity";
 import { fetchSettings, updateSettings } from "../api/settings";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { ClearQueueResult, JobHistoryEntry, JobStatus } from "../types/activity";
@@ -44,8 +44,8 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ready"; entries: JobHistoryEntry[] };
 
-/** A per-row action `QueuePage` (COL-180) can run. */
-type RowActionKind = "bump" | "cancel";
+/** A per-row action `QueuePage` (COL-180, COL-229) can run. */
+type RowActionKind = "bump" | "cancel" | "processNow";
 
 /**
  * Which per-row action is currently in flight, keyed by `job_id` (COL-180).
@@ -67,11 +67,28 @@ type PendingActions = Partial<Record<string, RowActionKind>>;
  */
 type ActionNotice = { tone: "hint" | "error"; text: string } | null;
 
-/** Load state for the persisted Auto-Queuing Pause setting (COL-181, COL-174). */
+/**
+ * Load state for the persisted pause settings (COL-181/COL-174's
+ * Auto-Queuing Pause, and COL-226's Auto-Processing Pause) -- both come off
+ * the same `GET /api/settings` fetch, so they share one load state rather
+ * than each toggle managing its own.
+ */
 type SettingsLoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; autoQueuePaused: boolean };
+  | { status: "ready"; autoQueuePaused: boolean; autoProcessingPaused: boolean };
+
+/**
+ * The row currently showing the "Process Now" confirm step (COL-229) --
+ * `null` when none is. `POST /api/jobs/process-now` answers with
+ * `needs_confirmation: true` (and starts nothing) when force-starting this
+ * row's Job would push the number of currently-running Jobs past the
+ * configured Concurrency Limit; this holds the row so a confirm/dismiss
+ * panel can render under it. Only one row's confirm step is ever open at
+ * once -- clicking "Process Now" on a different row replaces it, same as
+ * `pendingActions` only tracking one in-flight action per row.
+ */
+type ProcessNowConfirmState = { entry: JobHistoryEntry } | null;
 
 /**
  * Result notice for the page-level "Clear queue" action (COL-181, COL-173).
@@ -141,10 +158,23 @@ function describeClearQueueResult(result: ClearQueueResult): string {
  * instead. Either way the queue is re-fetched immediately after the action
  * settles, rather than waiting on the next scheduled poll, so the row's
  * fate (moved to front / removed / updated to `failed` / unaffected) is
- * reflected right away. No confirm dialog -- these are single-item,
- * easily-reversible (pending) or immediately-visible (running, via the
- * refreshed row) actions per the plan (only page-level bulk actions,
- * COL-181, get a confirm dialog).
+ * reflected right away. Neither shows a confirm dialog -- these are
+ * single-item, easily-reversible (pending) or immediately-visible (running,
+ * via the refreshed row) actions per the plan (only page-level bulk actions,
+ * COL-181, and COL-229's "Process Now" below, get one).
+ *
+ * COL-229 adds a third per-row action, "Process Now" (`processNow`, `POST
+ * /api/jobs/process-now`), to every `pending` row alongside "Process next"
+ * and "Cancel" -- unlike "Process next" (which only reorders within the
+ * existing pending queue, still subject to Auto-Processing Pause and the
+ * Concurrency Limit once claimed), this force-starts the row's Job
+ * *immediately*, bypassing both. When the response reports
+ * `needs_confirmation: true` -- starting it now would exceed the configured
+ * Concurrency Limit -- nothing is started; an inline confirm panel opens
+ * (mirroring "Clear queue"'s `.view__confirm` pattern) and re-submits the
+ * same request with `confirm: true` on "Process now anyway". Declining
+ * (dismissing the panel) calls nothing further, leaving the file exactly as
+ * it was.
  *
  * COL-181 adds two page-level controls, both in the header next to the
  * title:
@@ -165,6 +195,15 @@ function describeClearQueueResult(result: ClearQueueResult): string {
  *   (`.auto-queue-toggle--active`/`--paused`) so paused vs. active reads
  *   unambiguously at a glance, the same way `TrackedToggleButton`'s
  *   `.tracked-toggle--on`/`--off` does for the Tracked toggle.
+ * - "Pause auto-processing" (`fetchSettings`/`updateSettings`,
+ *   `GET`/`PUT /api/settings`'s `auto_processing_paused`, COL-226): sits
+ *   right next to "Pause auto-queuing", same toggle-button shape/palette
+ *   (`.auto-processing-toggle--active`/`--paused`), but gates a different
+ *   chokepoint -- the Job Queue's worker pool never claims a new `pending`
+ *   Job while set, regardless of how it got there (scan, manual trigger, or
+ *   requeue), whereas "Pause auto-queuing" only stops the scanner from
+ *   adding new pending Jobs in the first place. Already-`running` Jobs are
+ *   unaffected by either toggle.
  */
 export function QueuePage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
@@ -173,9 +212,11 @@ export function QueuePage() {
   const [actionNotice, setActionNotice] = useState<ActionNotice>(null);
   const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
   const [pauseTogglePending, setPauseTogglePending] = useState(false);
+  const [processingPauseTogglePending, setProcessingPauseTogglePending] = useState(false);
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [clearingQueue, setClearingQueue] = useState(false);
   const [clearQueueNotice, setClearQueueNotice] = useState<ClearQueueNotice>(null);
+  const [processNowConfirm, setProcessNowConfirm] = useState<ProcessNowConfirmState>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -210,12 +251,13 @@ export function QueuePage() {
   }, []);
 
   /**
-   * Loads the persisted Auto-Queuing Pause setting once on mount (COL-181,
-   * COL-174) -- a single one-shot `GET /api/settings`, not part of the queue
-   * poll loop above: the setting doesn't change on its own (only this page's
-   * own toggle, or another client, writes it), so there's nothing to poll
-   * for -- {@link handleToggleAutoQueuePause} updates local state directly
-   * from its own `PUT` response instead.
+   * Loads the persisted Auto-Queuing Pause and Auto-Processing Pause
+   * settings once on mount (COL-181/COL-174, COL-226) -- a single one-shot
+   * `GET /api/settings`, not part of the queue poll loop above: neither
+   * setting changes on its own (only this page's own toggles, or another
+   * client, write them), so there's nothing to poll for --
+   * {@link handleToggleAutoQueuePause}/{@link handleToggleAutoProcessingPause}
+   * update local state directly from their own `PUT` response instead.
    */
   useEffect(() => {
     let cancelled = false;
@@ -223,7 +265,11 @@ export function QueuePage() {
       try {
         const settings = await fetchSettings();
         if (cancelled) return;
-        setSettingsState({ status: "ready", autoQueuePaused: settings.auto_queue_paused });
+        setSettingsState({
+          status: "ready",
+          autoQueuePaused: settings.auto_queue_paused,
+          autoProcessingPaused: settings.auto_processing_paused,
+        });
       } catch (error) {
         if (cancelled) return;
         setSettingsState({
@@ -327,6 +373,60 @@ export function QueuePage() {
   }
 
   /**
+   * The per-row "Process Now" action (COL-229): force-starts this row's Job
+   * immediately, bypassing both Auto-Processing Pause and the Concurrency
+   * Limit. Unlike {@link runRowAction}'s shared shape (a single
+   * request, `true`/`false` outcome), this can take a second round-trip: the
+   * first call omits `confirm`, and a `needs_confirmation: true` response
+   * (starting this Job would exceed the configured Concurrency Limit) opens
+   * an inline confirm step ({@link processNowConfirm}) instead of settling
+   * the row immediately. `fromConfirm` marks the second, explicitly-confirmed
+   * call so its outcome always closes the confirm step, success or failure.
+   */
+  async function handleProcessNow(entry: JobHistoryEntry, fromConfirm = false): Promise<void> {
+    setPendingActions((prev) => ({ ...prev, [entry.job_id]: "processNow" }));
+    setActionNotice(null);
+    try {
+      const result = await processNow(entry.file_path, fromConfirm);
+      if (result.needs_confirmation) {
+        setProcessNowConfirm({ entry });
+      } else {
+        if (fromConfirm) setProcessNowConfirm(null);
+        if (!result.enqueued) {
+          setActionNotice({
+            tone: "hint",
+            text: `"${titleFromPath(entry.file_path)}" could not be processed now -- it has no qualifying target, or its audio streams could not be probed.`,
+          });
+        }
+      }
+    } catch (error) {
+      if (fromConfirm) setProcessNowConfirm(null);
+      setActionNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to process job now.",
+      });
+    } finally {
+      setPendingActions((prev) => {
+        const next = { ...prev };
+        delete next[entry.job_id];
+        return next;
+      });
+    }
+    await refreshQueueSoon();
+  }
+
+  /** Re-submits "Process Now" for the confirming row with `confirm: true` (COL-229). */
+  async function handleConfirmProcessNow(): Promise<void> {
+    if (processNowConfirm === null) return;
+    await handleProcessNow(processNowConfirm.entry, true);
+  }
+
+  /** Dismisses the "Process Now" confirm step without calling the endpoint again (COL-229). */
+  function handleDismissProcessNowConfirm(): void {
+    setProcessNowConfirm(null);
+  }
+
+  /**
    * Flips the persisted Auto-Queuing Pause setting (COL-181, COL-174) via
    * `PUT /api/settings`. Unlike the per-row actions' optimistic-free "wait
    * for the server, then refetch" shape, this applies the `PUT` response's
@@ -342,7 +442,11 @@ export function QueuePage() {
     setPauseTogglePending(true);
     try {
       const updated = await updateSettings({ auto_queue_paused: next });
-      setSettingsState({ status: "ready", autoQueuePaused: updated.auto_queue_paused });
+      setSettingsState({
+        status: "ready",
+        autoQueuePaused: updated.auto_queue_paused,
+        autoProcessingPaused: updated.auto_processing_paused,
+      });
     } catch (error) {
       setActionNotice({
         tone: "error",
@@ -350,6 +454,36 @@ export function QueuePage() {
       });
     } finally {
       setPauseTogglePending(false);
+    }
+  }
+
+  /**
+   * Flips the persisted Auto-Processing Pause setting (COL-226) via `PUT
+   * /api/settings` -- mirrors {@link handleToggleAutoQueuePause} exactly,
+   * for the queue's own claim-step gate rather than the scanner's auto-fill
+   * funnel: applies the `PUT` response's own `auto_processing_paused` value
+   * directly, and a failure surfaces through the same shared
+   * {@link ActionNotice} banner, leaving the toggle at its last known-good
+   * state.
+   */
+  async function handleToggleAutoProcessingPause(): Promise<void> {
+    if (settingsState.status !== "ready" || processingPauseTogglePending) return;
+    const next = !settingsState.autoProcessingPaused;
+    setProcessingPauseTogglePending(true);
+    try {
+      const updated = await updateSettings({ auto_processing_paused: next });
+      setSettingsState({
+        status: "ready",
+        autoQueuePaused: updated.auto_queue_paused,
+        autoProcessingPaused: updated.auto_processing_paused,
+      });
+    } catch (error) {
+      setActionNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to update auto-processing setting.",
+      });
+    } finally {
+      setProcessingPauseTogglePending(false);
     }
   }
 
@@ -428,6 +562,25 @@ export function QueuePage() {
                   : "Auto-queuing: Active"}
             </button>
           )}
+          {settingsState.status === "ready" && (
+            <button
+              type="button"
+              className={
+                settingsState.autoProcessingPaused
+                  ? "auto-processing-toggle auto-processing-toggle--paused"
+                  : "auto-processing-toggle auto-processing-toggle--active"
+              }
+              onClick={() => void handleToggleAutoProcessingPause()}
+              disabled={processingPauseTogglePending}
+              aria-pressed={settingsState.autoProcessingPaused}
+            >
+              {processingPauseTogglePending
+                ? "Updating…"
+                : settingsState.autoProcessingPaused
+                  ? "Auto-processing: Paused"
+                  : "Auto-processing: Active"}
+            </button>
+          )}
           {settingsState.status === "error" && (
             <span className="form-hint">
               Couldn&apos;t load auto-queuing setting: {settingsState.message}
@@ -472,6 +625,35 @@ export function QueuePage() {
         <p className={clearQueueNotice.tone === "error" ? "view__error" : "view__notice"} role="status">
           {clearQueueNotice.text}
         </p>
+      )}
+
+      {processNowConfirm && (
+        <div className="panel view__confirm" role="status">
+          <p>
+            Processing &quot;{titleFromPath(processNowConfirm.entry.file_path)}&quot; now would
+            exceed the configured Concurrency Limit. Start it anyway?
+          </p>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="btn btn--secondary"
+              onClick={() => void handleConfirmProcessNow()}
+              disabled={pendingActions[processNowConfirm.entry.job_id] !== undefined}
+            >
+              {pendingActions[processNowConfirm.entry.job_id] === "processNow"
+                ? "Starting…"
+                : "Process now anyway"}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={handleDismissProcessNowConfirm}
+              disabled={pendingActions[processNowConfirm.entry.job_id] !== undefined}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
 
       {hasEntries && (
@@ -578,6 +760,16 @@ export function QueuePage() {
                           disabled={rowAction !== null}
                         >
                           {rowAction === "bump" ? "Processing…" : "Process next"}
+                        </button>
+                      )}
+                      {isPendingRow && (
+                        <button
+                          type="button"
+                          className="btn btn--secondary btn--sm"
+                          onClick={() => void handleProcessNow(entry)}
+                          disabled={rowAction !== null}
+                        >
+                          {rowAction === "processNow" ? "Processing…" : "Process now"}
                         </button>
                       )}
                       {canCancel && (

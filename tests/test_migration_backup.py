@@ -55,7 +55,8 @@ from collapsarr.migrations import (
 #: Preferred Default Audio setting, COL-154's current-default-track snapshot,
 #: COL-155's job-history ``kind``, COL-163's job-history ``priority``, COL-167's
 #: recently-processed dedup window, COL-174's Auto-Queuing Pause toggle,
-#: COL-218's ``ffmpeg_path`` override) --
+#: COL-218's ``ffmpeg_path`` override, COL-226's Auto-Processing Pause toggle,
+#: COL-230's ``auto_processing_pause_restore_value`` self-update scratch flag) --
 #: dropped after ``create_all`` below by :func:`_create_unversioned_db`,
 #: mirroring the same de-evolving idiom in ``test_migration_adoption.py``.
 #: Without this, ``create_all`` (which always builds from the *current*
@@ -75,6 +76,8 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "recently_processed_window_minutes"),
     ("global_settings", "auto_queue_paused"),
     ("global_settings", "ffmpeg_path"),
+    ("global_settings", "auto_processing_paused"),
+    ("global_settings", "auto_processing_pause_restore_value"),
     ("tracked_media_files", "sonarr_episode_id"),
     ("tracked_media_files", "radarr_movie_id"),
     ("tracked_media_files", "current_default_language"),
@@ -99,10 +102,10 @@ _POST_BASELINE_INDEXES: tuple[str, ...] = (
 
 #: Whole tables a post-baseline migration adds (COL-75's ``health_check_state``,
 #: COL-80's ``health_write_probe``, COL-98's ``library_nodes``, COL-209's
-#: ``plex_connection``, COL-210's ``plex_library_items``) -- dropped after
-#: ``create_all`` for the same reason as ``_POST_BASELINE_COLUMNS``, so the
-#: migration that creates them does not collide with a table ``create_all``
-#: already built.
+#: ``plex_connection``, COL-210's ``plex_library_items``, COL-230's
+#: ``self_update_state``) -- dropped after ``create_all`` for the same reason
+#: as ``_POST_BASELINE_COLUMNS``, so the migration that creates them does not
+#: collide with a table ``create_all`` already built.
 _POST_BASELINE_TABLES: tuple[str, ...] = (
     "health_check_state",
     "health_write_probe",
@@ -110,6 +113,7 @@ _POST_BASELINE_TABLES: tuple[str, ...] = (
     "library_nodes",
     "plex_connection",
     "plex_library_items",
+    "self_update_state",
 )
 
 
