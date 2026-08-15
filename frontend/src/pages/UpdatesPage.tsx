@@ -2,19 +2,21 @@ import { Download } from "lucide-react";
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
+import { fetchJobQueue } from "../api/activity";
+import { fetchSettings } from "../api/settings";
 import {
+  applySelfUpdate,
   dismissUpdateStatus,
   fetchUpdateStatus,
   recheckUpdateStatus,
+  SelfUpdateApplyResponseError,
   undismissUpdateStatus,
 } from "../api/updates";
-import type { UpdateCheckState } from "../types/updates";
-
-/** The Docker Hub repository the release pipeline publishes to (`.github/workflows/release.yml`'s `IMAGE_NAME`). */
-const DOCKER_IMAGE = "odxnsson/collapsarr";
-
-/** GitHub Releases page, source of the native (PyInstaller) archives (`StatusPage`'s `SOURCE_URL` origin). */
-const RELEASES_URL = "https://github.com/JovinJovinsson/Collapsarr/releases";
+import { SelfUpdateModal } from "../components/SelfUpdateModal";
+import { SelfUpdateProgress } from "../components/SelfUpdateProgress";
+import { UpdateInstructions } from "../components/UpdateInstructions";
+import type { UpdateChannel } from "../types/settings";
+import type { SelfUpdateFlow, UpdateCheckState } from "../types/updates";
 
 /** Formats an ISO timestamp in the viewer's local time, or an em dash when absent/unparseable. */
 function formatTimestamp(value: string | null): string {
@@ -24,24 +26,77 @@ function formatTimestamp(value: string | null): string {
   return date.toLocaleString();
 }
 
-/**
- * Derives the Docker tag to pull from the latest known release tag.
- *
- * The release pipeline (`.github/workflows/release.yml`) publishes Docker
- * tags *without* the `v` prefix GitHub release tags carry (e.g. release tag
- * `v1.2.3` -> Docker tag `1.2.3`), so this strips a leading `v` rather than
- * passing `latestVersion` through verbatim. Falls back to `latest` when no
- * release has been fetched yet (`latestVersion` is `null`).
- */
-function dockerTagFor(latestVersion: string | null): string {
-  if (!latestVersion) return "latest";
-  return latestVersion.replace(/^v/, "");
-}
-
 type LoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "ready"; state: UpdateCheckState };
+
+/**
+ * Load state for the persisted `update_channel` setting (COL-228) --
+ * `canOfferSelfUpdate` below needs it: Self-Update ships **stable-channel-
+ * only** (`docs/adr/0009-self-update-staged-handoff-with-auto-rollback.md`),
+ * a narrower gate than {@link UpdateCheckState.update_available}, which
+ * reflects whatever channel is *configured* (possibly `beta`). Fetched
+ * independently of the Update Check state above -- same one-shot-on-mount
+ * shape `QueuePage` uses for its own `fetchSettings()` call.
+ */
+type SettingsLoadState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; updateChannel: UpdateChannel };
+
+/**
+ * The confirmation modal's state (COL-228) -- `null` while closed.
+ * `runningJobCount` is resolved from `GET /api/jobs/queue` *before* the
+ * modal opens (see `handleUpdateNowClick`), so `SelfUpdateModal` always
+ * already knows which of its two shapes to render, rather than the modal
+ * itself re-deriving it.
+ */
+type SelfUpdateModalState = { runningJobCount: number } | null;
+
+/**
+ * The dedicated "Updating — please wait" screen's state (COL-231) -- `null`
+ * while not showing it. Set by `handleConfirmSelfUpdate` the moment the
+ * apply call either succeeds or fails at the network layer (see that
+ * function's doc comment for why those two are treated the same), carrying
+ * over `SelfUpdateModalState`'s `runningJobCount` so `SelfUpdateProgress`
+ * can render "Waiting for N jobs to finish" for the `"preparing"` phase
+ * without re-resolving it itself.
+ */
+type SelfUpdateProgressState = { runningJobCount: number } | null;
+
+/**
+ * Page-level notice after an "Update Now" action settles (COL-228) --
+ * mirrors `QueuePage`'s `ActionNotice`/`ClearQueueNotice` named-notice-type
+ * convention rather than an inline object-literal `useState` type.
+ * `"error"` covers a failure to even resolve the running-Job count (the
+ * modal never opened) or an apply-endpoint failure surfaced after the modal
+ * already closed (there isn't one today -- a responded apply failure stays
+ * inside the still-open modal via `applyError` instead, see
+ * `handleConfirmSelfUpdate` -- but the type stays two-toned for symmetry
+ * with every other notice in this codebase). `"success"` no longer fires as
+ * of COL-231: a successfully-triggered apply now transitions into
+ * `SelfUpdateProgress` instead of closing the modal with this notice.
+ */
+type UpdateNowNotice = { tone: "success" | "error"; text: string } | null;
+
+/**
+ * Whether Self-Update (COL-228, `CONTEXT.md`'s **Self-Update** entry) can
+ * offer an "Update Now" action for the current Update Check state --
+ * `native`/`pipx` only (`docker` remains manual-only, an image cannot
+ * self-replace), and only once a **stable**-channel update is available:
+ * `update.update_available` alone isn't sufficient, since it reflects
+ * whatever channel is *configured* (`settings.updateChannel`) -- a `beta`-
+ * channel "update available" is never a valid Self-Update target
+ * (`collapsarr/self_update/apply.py::stable_update_target`), so this page
+ * falls back to {@link UpdateInstructions} in that case exactly as it would
+ * for a `docker` install with nothing else it can offer.
+ */
+function canOfferSelfUpdate(update: UpdateCheckState, settings: SettingsLoadState): boolean {
+  if (!update.update_available) return false;
+  if (update.install_method !== "native" && update.install_method !== "pipx") return false;
+  return settings.status === "ready" && settings.updateChannel === "stable";
+}
 
 /**
  * The System → Updates view (COL-87): the running instance's version against
@@ -56,25 +111,45 @@ type LoadState =
  * (`UpdateIndicator`) deliberately do not reuse `HealthBanner`'s
  * error/warning-oriented styling.
  *
- * Changelog rendering and install-method-specific upgrade instructions
- * (COL-90, three-way switch added in COL-219 for `"native"`): the changelog
- * (raw Markdown from the GitHub Release body, `UpdateCheckState.changelog`)
- * renders via `react-markdown` -- no `dangerouslySetInnerHTML`, and the
- * `rehype-raw` plugin is deliberately not enabled, so raw HTML embedded in a
- * changelog body is never rendered as HTML (that content is externally
- * sourced, from a GitHub Release body). The "How to update" block switches on
- * the API's `install_method` field (`"docker"` | `"pipx"` | `"native"`,
- * formerly the `is_docker` boolean, COL-215): `docker pull`/recreate for
- * `"docker"`, `pipx upgrade`/`pip install --upgrade` for `"pipx"`, and a
- * download-the-archive-and-replace-the-install-folder walkthrough for
- * `"native"` (PyInstaller build, COL-216+) -- the native branch also calls
- * out that the database/config are safe because they live in the OS
- * user-data directory (`platformdirs.user_data_dir("collapsarr")`,
- * `collapsarr/system/info.py`'s `data_dir`), not inside the install folder
- * being replaced. See `docs/adr/0001-update-check-detect-notify-only.md` for
- * why detection is backend-only and why no code path here executes any of
- * these commands itself -- purely informational, same as the docker/pipx
- * branches.
+ * Changelog rendering (COL-90): the changelog (raw Markdown from the GitHub
+ * Release body, `UpdateCheckState.changelog`) renders via `react-markdown`
+ * -- no `dangerouslySetInnerHTML`, and the `rehype-raw` plugin is
+ * deliberately not enabled, so raw HTML embedded in a changelog body is
+ * never rendered as HTML (that content is externally sourced, from a GitHub
+ * Release body).
+ *
+ * The "How to update" block lives in its own `UpdateInstructions`
+ * subcomponent (`components/UpdateInstructions.tsx`, COL-91/COL-228), shown
+ * whenever Self-Update itself has nothing to offer for the current state.
+ *
+ * COL-228 adds the **Self-Update** "Update Now" action (`CONTEXT.md`'s
+ * **Self-Update** entry, `docs/adr/0009-self-update-staged-handoff-with-
+ * auto-rollback.md`): shown instead of `UpdateInstructions` -- see
+ * {@link canOfferSelfUpdate} -- only for a `native`/`pipx` install with a
+ * **stable**-channel update available (Self-Update ships stable-only; a
+ * `docker` install, or a `beta`-channel "update available", falls back to
+ * the static instructions exactly as before). Clicking it resolves the
+ * currently-`running` Job count (`GET /api/jobs/queue`, `handleUpdateNowClick`)
+ * *before* opening `SelfUpdateModal`, so the modal already knows whether to
+ * show the plain confirm, the job-count-aware Cancel & Restart Now / Wait &
+ * Restart choice (`pipx`), or -- for `native` with Jobs running, since the
+ * apply endpoint doesn't support a `flow` on that install method yet -- a
+ * blocked/explanatory state instead of two guaranteed-`409` buttons (see
+ * `SelfUpdateModal`'s doc comment). Confirming calls the apply endpoint
+ * (`applySelfUpdate`, `POST /api/system/self-update/apply`) with the chosen
+ * `flow`; declining (any of the modal's close paths) calls nothing, leaving
+ * the app untouched.
+ *
+ * COL-231 adds the dedicated "Updating — please wait" screen
+ * (`SelfUpdateProgress`): the moment `handleConfirmSelfUpdate` either gets a
+ * response back or the connection drops (a real apply re-execs/exits the
+ * server process -- see `applySelfUpdate`'s doc comment for why a dropped
+ * connection right after calling it is the *expected* shape of success),
+ * this page renders `SelfUpdateProgress` in place of everything below
+ * instead of closing the modal with a notice. Only a **responded** failure
+ * (`SelfUpdateApplyResponseError` -- `403`/`409`/`502`) keeps the modal open
+ * with `applyError` instead, since that means the server is still up and
+ * definitively refused.
  *
  * COL-89 adds Dismiss/Undismiss actions (`POST /api/system/updates/dismiss` /
  * `.../undismiss`, `api/updates.ts`), mirroring `HealthChecksPage`'s per-row
@@ -91,6 +166,13 @@ export function UpdatesPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [rechecking, setRechecking] = useState(false);
   const [dismissing, setDismissing] = useState(false);
+  const [settingsState, setSettingsState] = useState<SettingsLoadState>({ status: "loading" });
+  const [checkingJobs, setCheckingJobs] = useState(false);
+  const [selfUpdateModal, setSelfUpdateModal] = useState<SelfUpdateModalState>(null);
+  const [applying, setApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const [updateNowNotice, setUpdateNowNotice] = useState<UpdateNowNotice>(null);
+  const [selfUpdateProgress, setSelfUpdateProgress] = useState<SelfUpdateProgressState>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -112,6 +194,102 @@ export function UpdatesPage() {
       cancelled = true;
     };
   }, []);
+
+  /**
+   * Loads the persisted `update_channel` setting once on mount (COL-228) --
+   * {@link canOfferSelfUpdate} needs it to gate "Update Now" to a
+   * stable-channel update, same one-shot-on-mount shape `QueuePage` uses for
+   * its own settings fetch (`fetchSettings`, `api/settings.ts`).
+   */
+  useEffect(() => {
+    let cancelled = false;
+    fetchSettings()
+      .then((settings) => {
+        if (!cancelled) {
+          setSettingsState({ status: "ready", updateChannel: settings.update_channel });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setSettingsState({
+            status: "error",
+            message: error instanceof Error ? error.message : "Failed to load settings.",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * "Update Now" (COL-228): resolves the currently-`running` Job count
+   * (`GET /api/jobs/queue`, mirroring `QueuePage`'s own use of
+   * `fetchJobQueue`) *before* opening {@link SelfUpdateModal}, so the modal
+   * always already knows which of its two shapes to render instead of
+   * re-deriving it itself. A failure here surfaces via `updateNowNotice`
+   * and leaves the modal closed -- proceeding without knowing the running
+   * count would risk silently offering the plain-confirm path when Jobs are
+   * in fact running.
+   */
+  async function handleUpdateNowClick() {
+    setCheckingJobs(true);
+    setUpdateNowNotice(null);
+    try {
+      const queue = await fetchJobQueue();
+      const runningJobCount = queue.filter((entry) => entry.status === "running").length;
+      setSelfUpdateModal({ runningJobCount });
+    } catch (error: unknown) {
+      setUpdateNowNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to check running jobs.",
+      });
+    } finally {
+      setCheckingJobs(false);
+    }
+  }
+
+  /**
+   * Confirming the Self-Update modal (COL-228): calls the apply endpoint
+   * with the chosen `flow` (`undefined` for the plain-confirm, no-Jobs-
+   * running case).
+   *
+   * A **responded** failure (`403`/`409`/`502`, surfaced as
+   * `SelfUpdateApplyResponseError`) means the server is still up and
+   * definitively refused -- that stays inside the still-open modal via
+   * `applyError`, so the operator can see why and retry/cancel, unchanged
+   * since COL-228. Anything else -- a resolved call, *or* a network-layer
+   * failure -- transitions into the dedicated polling screen
+   * (`SelfUpdateProgress`, COL-231) instead: a real apply re-execs (pipx) or
+   * exits (native) the server process, so the connection dropping right
+   * after calling this is the *expected* shape of success, not a genuine
+   * error worth surfacing as one (see `applySelfUpdate`'s doc comment).
+   */
+  async function handleConfirmSelfUpdate(flow?: SelfUpdateFlow) {
+    setApplying(true);
+    setApplyError(null);
+    const runningJobCount = selfUpdateModal?.runningJobCount ?? 0;
+    try {
+      await applySelfUpdate(flow);
+      setSelfUpdateModal(null);
+      setSelfUpdateProgress({ runningJobCount });
+    } catch (error: unknown) {
+      if (error instanceof SelfUpdateApplyResponseError) {
+        setApplyError(error.message);
+      } else {
+        setSelfUpdateModal(null);
+        setSelfUpdateProgress({ runningJobCount });
+      }
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  /** Closes the Self-Update modal without calling the apply endpoint (COL-228). */
+  function handleCloseSelfUpdateModal() {
+    setSelfUpdateModal(null);
+    setApplyError(null);
+  }
 
   async function handleRecheck() {
     setRechecking(true);
@@ -152,6 +330,19 @@ export function UpdatesPage() {
     } finally {
       setDismissing(false);
     }
+  }
+
+  // The dedicated "Updating — please wait" screen (COL-231) takes over the
+  // whole view the moment a Self-Update attempt is under way -- the normal
+  // header/actions/panel below have nothing useful to offer while the app
+  // may be mid-restart, so this renders instead of them rather than
+  // alongside.
+  if (selfUpdateProgress) {
+    return (
+      <section className="view">
+        <SelfUpdateProgress runningJobCount={selfUpdateProgress.runningJobCount} />
+      </section>
+    );
   }
 
   return (
@@ -260,68 +451,45 @@ export function UpdatesPage() {
             </div>
           )}
 
-          {state.state.update_available && (
-            <div className="update-panel__instructions">
-              <h2 className="update-panel__instructions-title">How to update</h2>
-              {state.state.install_method === "docker" && (
-                <ol className="update-panel__instructions-steps">
-                  <li>
-                    Pull the new image:
-                    <pre className="update-panel__command">
-                      <code>
-                        docker pull {DOCKER_IMAGE}:{dockerTagFor(state.state.latest_version)}
-                      </code>
-                    </pre>
-                  </li>
-                  <li>
-                    Recreate the container so it picks up the freshly pulled image:
-                    <pre className="update-panel__command">
-                      <code>docker compose up -d</code>
-                    </pre>
-                    (or, without Compose:{" "}
-                    <code>docker stop collapsarr &amp;&amp; docker rm collapsarr</code>, then
-                    re-run your <code>docker run</code> command.)
-                  </li>
-                </ol>
-              )}
-              {state.state.install_method === "pipx" && (
-                <ol className="update-panel__instructions-steps">
-                  <li>
-                    Using pipx:
-                    <pre className="update-panel__command">
-                      <code>pipx upgrade collapsarr</code>
-                    </pre>
-                  </li>
-                  <li>
-                    Or, using pip directly:
-                    <pre className="update-panel__command">
-                      <code>pip install --upgrade collapsarr</code>
-                    </pre>
-                  </li>
-                </ol>
-              )}
-              {state.state.install_method === "native" && (
-                <>
-                  <ol className="update-panel__instructions-steps">
-                    <li>
-                      Download the new archive for your platform from the{" "}
-                      <a href={RELEASES_URL} target="_blank" rel="noreferrer">
-                        release page
-                      </a>
-                      .
-                    </li>
-                    <li>Replace the install folder with the contents of the new archive.</li>
-                    <li>Restart Collapsarr.</li>
-                  </ol>
-                  <p className="update-panel__instructions-note">
-                    Your database and settings are safe: they&apos;re stored in your OS user-data
-                    directory, not inside the install folder you&apos;re replacing.
-                  </p>
-                </>
-              )}
-            </div>
+          {updateNowNotice && (
+            <p
+              className={updateNowNotice.tone === "error" ? "view__error" : "view__notice"}
+              role="status"
+            >
+              {updateNowNotice.text}
+            </p>
           )}
+
+          {state.state.update_available &&
+            (canOfferSelfUpdate(state.state, settingsState) ? (
+              <div className="update-panel__self-update">
+                <button
+                  type="button"
+                  className="btn btn--primary"
+                  onClick={() => void handleUpdateNowClick()}
+                  disabled={checkingJobs}
+                >
+                  {checkingJobs ? "Checking…" : "Update Now"}
+                </button>
+              </div>
+            ) : (
+              <UpdateInstructions
+                installMethod={state.state.install_method}
+                latestVersion={state.state.latest_version}
+              />
+            ))}
         </div>
+      )}
+
+      {selfUpdateModal && state.status === "ready" && (
+        <SelfUpdateModal
+          runningJobCount={selfUpdateModal.runningJobCount}
+          installMethod={state.state.install_method}
+          applying={applying}
+          error={applyError}
+          onConfirm={(flow) => void handleConfirmSelfUpdate(flow)}
+          onClose={handleCloseSelfUpdateModal}
+        />
       )}
     </section>
   );
