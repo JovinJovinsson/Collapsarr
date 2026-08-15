@@ -51,3 +51,44 @@ export interface UpdateCheckState {
    */
   install_method: InstallMethod;
 }
+
+/**
+ * Matches `collapsarr.self_update.routes.SelfUpdateApplyRequest`'s `flow`
+ * literal (COL-233, COL-228). Picks how `POST /api/system/self-update/apply`
+ * handles downmix Jobs currently `RUNNING` at trigger time --
+ * `"cancel_and_restart"` hard-cancels and immediately requeues them
+ * (bypassing the Recently-Processed Window); `"wait_and_restart"` blocks
+ * until they finish naturally, cancelling nothing. See `CONTEXT.md`'s
+ * **Self-Update** entry for the user-facing "Cancel & Restart Now"/"Wait &
+ * Restart" labels these map to.
+ */
+export type SelfUpdateFlow = "cancel_and_restart" | "wait_and_restart";
+
+/**
+ * Request body for `POST /api/system/self-update/apply` (COL-232, COL-233,
+ * COL-228, `collapsarr.self_update.routes.SelfUpdateApplyRequest`).
+ *
+ * `flow` is optional -- omit it (or send `{}`) when no Jobs are currently
+ * running; the endpoint answers `409` if Jobs turn out to be running and no
+ * `flow` was chosen, rather than guessing. `UpdatesPage`'s confirmation
+ * modal (COL-228) always resolves which case applies *before* calling this
+ * endpoint (via a `GET /api/jobs/queue` running-Job count), so it always
+ * sends the correct `flow` up front rather than relying on that `409` retry
+ * path.
+ */
+export interface SelfUpdateApplyRequest {
+  flow?: SelfUpdateFlow;
+}
+
+/**
+ * Response shape for a successful `POST /api/system/self-update/apply`
+ * (COL-228, `collapsarr.self_update.routes.SelfUpdateApplyRead`). `ok` is
+ * only ever actually observed in a test harness that injects a fake
+ * re-exec/exit seam -- a real apply re-execs (pipx) or exits (native,
+ * handing off to the staged-swap process) the running process outright, so
+ * production never actually receives this response before the connection
+ * drops.
+ */
+export interface SelfUpdateApplyResult {
+  ok: boolean;
+}

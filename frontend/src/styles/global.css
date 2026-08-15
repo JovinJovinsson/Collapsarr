@@ -1882,6 +1882,14 @@ a {
   padding-top: var(--sp-4);
 }
 
+/* Self-Update's "Update Now" action (COL-228) -- sits where
+   .update-panel__instructions would, when Self-Update has something to
+   offer for the current state (see UpdatesPage's canOfferSelfUpdate). */
+.update-panel__self-update {
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--sp-4);
+}
+
 .update-panel__instructions-title {
   font-size: var(--fs-base);
   font-weight: 650;

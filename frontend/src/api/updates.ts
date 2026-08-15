@@ -1,5 +1,12 @@
-import type { UpdateCheckState } from "../types/updates";
+import type {
+  SelfUpdateApplyRequest,
+  SelfUpdateApplyResult,
+  SelfUpdateFlow,
+  UpdateCheckState,
+} from "../types/updates";
 import { apiErrorMessage, apiFetch } from "./client";
+
+const JSON_HEADERS = { "Content-Type": "application/json" };
 
 /**
  * Fetches the current Update Check state -- running vs. latest version,
@@ -53,6 +60,39 @@ export async function dismissUpdateStatus(): Promise<UpdateCheckState> {
     );
   }
   return (await response.json()) as UpdateCheckState;
+}
+
+/**
+ * Triggers the Self-Update apply flow for this install
+ * (`POST /api/system/self-update/apply`, COL-232/COL-233/COL-235, COL-228)
+ * -- `UpdatesPage`'s "Update Now" action, called once the confirmation modal
+ * is confirmed. `flow` is omitted for a plain confirm (no Jobs were running
+ * at trigger time); pass `"cancel_and_restart"`/`"wait_and_restart"` when
+ * the modal offered the in-flight-Job choice instead.
+ *
+ * A real apply re-execs (pipx) or exits (native, handing off to the staged
+ * swap) the server process, so a successful call may never actually resolve
+ * with a response before the connection drops -- callers should treat a
+ * network-level failure right after calling this the same as the documented
+ * `{ok: true}` outcome, not necessarily a genuine error. Throws on every
+ * *responded* error status (`403` wrong install method, `409` no stable
+ * update / already in progress / Jobs running with no `flow`, `502`
+ * download/verify/apply failure), same as every other `api/updates.ts`
+ * function.
+ */
+export async function applySelfUpdate(flow?: SelfUpdateFlow): Promise<SelfUpdateApplyResult> {
+  const body: SelfUpdateApplyRequest = flow ? { flow } : {};
+  const response = await apiFetch("/api/system/self-update/apply", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to trigger the update (${response.status})`)
+    );
+  }
+  return (await response.json()) as SelfUpdateApplyResult;
 }
 
 /**
