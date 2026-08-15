@@ -101,17 +101,21 @@ describe("SelfUpdateProgress", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("shows the initial 'preparing' copy with the running Job count before the first poll resolves", async () => {
-    mockStatusFetch([{ in_progress: true, phase: "preparing", previous_version: null }]);
+  it("shows generic 'Starting update…' copy before the first poll resolves (not a phase-specific guess)", async () => {
+    // The common "no Jobs running" apply path starts straight at
+    // `phase="downloading"`, so the pre-first-poll fallback must NOT assume
+    // `"preparing"` (which would flash a wrong "Waiting for N jobs…" message).
+    mockStatusFetch([{ in_progress: true, phase: "downloading", previous_version: null }]);
     render(<SelfUpdateProgress runningJobCount={2} />);
 
-    expect(screen.getByText("Waiting for 2 jobs to finish…")).toBeInTheDocument();
+    expect(screen.getByText("Starting update…")).toBeInTheDocument();
+    expect(screen.queryByText(/waiting for .* jobs? to finish/i)).not.toBeInTheDocument();
 
-    // Flush the first poll's already-queued microtask/state update so it
-    // lands inside `act` rather than after the test body returns.
+    // Once the first poll resolves the real phase takes over.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
+    expect(screen.getByText("Downloading update…")).toBeInTheDocument();
   });
 
   it("keeps showing the last known phase and keeps polling across a network-error gap", async () => {
@@ -152,7 +156,43 @@ describe("SelfUpdateProgress", () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
-  it("reloads the page once the status reports idle and no attempt in progress", async () => {
+  it("does NOT reload when the very first poll reads idle/not-in-progress — it keeps polling", async () => {
+    // `idle`/`!in_progress` on the first successful poll is indistinguishable
+    // from the pre-attempt default row (a `fetch()` that threw for a reason
+    // short of the real re-exec/exit would leave the row here). Treat it as
+    // "not started yet", never as success.
+    const reloadSpy = mockLocationReload();
+    const fetchMock = mockStatusFetch([
+      { in_progress: false, phase: "idle", previous_version: null },
+      { in_progress: false, phase: "idle", previous_version: null },
+      { in_progress: true, phase: "downloading", previous_version: "1.2.3" },
+    ]);
+    render(<SelfUpdateProgress runningJobCount={0} />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // First poll is idle -- must not reload, and must keep the generic
+    // pre-attempt copy rather than "Finishing up…".
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(screen.getByText("Starting update…")).toBeInTheDocument();
+
+    // Second poll is still idle -- still polling, still no reload.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(reloadSpy).not.toHaveBeenCalled();
+
+    // The attempt finally begins.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(screen.getByText("Downloading update…")).toBeInTheDocument();
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("reloads once idle/not-in-progress follows a genuinely in-progress phase", async () => {
     const reloadSpy = mockLocationReload();
     mockStatusFetch([
       { in_progress: true, phase: "awaiting_health", previous_version: "1.2.3" },
@@ -163,6 +203,34 @@ describe("SelfUpdateProgress", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
+    expect(reloadSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("still reaches the idle-success reload when the in-progress phase is only seen after an idle pre-attempt read", async () => {
+    // Guards the full window: idle (not started) -> in-progress -> idle
+    // (finished) must reload, since the middle poll latches "sawInProgress".
+    const reloadSpy = mockLocationReload();
+    mockStatusFetch([
+      { in_progress: false, phase: "idle", previous_version: null },
+      { in_progress: true, phase: "awaiting_health", previous_version: "1.2.3" },
+      { in_progress: false, phase: "idle", previous_version: "1.2.3" },
+    ]);
+    render(<SelfUpdateProgress runningJobCount={0} />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reloadSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(screen.getByText("Restarting…")).toBeInTheDocument();
     expect(reloadSpy).not.toHaveBeenCalled();
 
     await act(async () => {

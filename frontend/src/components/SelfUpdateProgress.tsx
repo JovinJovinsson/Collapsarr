@@ -6,6 +6,25 @@ import { selfUpdatePhaseCopy } from "../utils/selfUpdatePhaseCopy";
 /** How often to re-poll `GET /api/system/self-update/status` (COL-231). */
 const POLL_INTERVAL_MS = 2_000;
 
+/**
+ * The `SelfUpdateStatus.phase` values that mean an attempt is genuinely under
+ * way (`collapsarr.self_update.models.SELF_UPDATE_PHASES`, minus the two
+ * terminal states `idle`/`rolled_back`). We must observe at least one poll in
+ * one of these — or with `in_progress === true` — before a later
+ * `idle`/`!in_progress` read can be trusted as *success* rather than
+ * *not-started-yet*: the backend flips off `idle` only once `begin_self_update`
+ * runs inside the `POST /apply` handler, so a pre-attempt row and a
+ * post-success row are byte-for-byte identical from the status endpoint. See
+ * the `poll()` "success" branch below.
+ */
+const IN_PROGRESS_PHASES = new Set([
+  "preparing",
+  "downloading",
+  "verifying",
+  "applying",
+  "awaiting_health",
+]);
+
 type TerminalState = { previousVersion: string | null };
 
 /**
@@ -35,12 +54,20 @@ type TerminalState = { previousVersion: string | null };
  *   `previous_version`. Polling stops; renders the terminal
  *   "Update failed — rolled back to vX.Y.Z" state instead of reloading, per
  *   this ticket's AC.
- * - `phase === "idle" && !in_progress` -- the update completed and its
- *   health check passed (`idle` is also the pre-attempt default, but by the
- *   time this component is ever mounted an attempt is already under way --
- *   see `handleConfirmSelfUpdate` -- so reading `idle` here always means
- *   "finished", never "never started"). Polling stops; the page reloads
- *   (`window.location.reload()`) to pick up the new build.
+ * - `phase === "idle" && !in_progress` -- terminal *only if* we have already
+ *   observed at least one genuinely in-progress poll ({@link IN_PROGRESS_PHASES}
+ *   or `in_progress === true`). `idle`/`!in_progress` is byte-for-byte
+ *   identical between the pre-attempt default row (`get_self_update_state`'s
+ *   get-or-create) and the post-success terminal row (`clear_self_update`),
+ *   and `begin_self_update` only flips off `idle` *after* the `POST /apply`
+ *   request reaches the handler and clears its checks -- so a `fetch()` that
+ *   threw for any reason short of the real re-exec/exit (a transient blip, a
+ *   proxy timeout, a request that never arrived) leaves the row at `idle`,
+ *   indistinguishable from "finished". So: an `idle` read *before* we have
+ *   ever seen in-progress just means "not started yet" -- keep polling, don't
+ *   reload. Only an `idle` read *after* an in-progress phase is trusted as
+ *   success: polling stops and the page reloads (`window.location.reload()`)
+ *   to pick up the new build.
  * - anything else -- still in progress; the phase-to-copy mapping
  *   (`selfUpdatePhaseCopy`) updates and polling continues.
  */
@@ -52,6 +79,9 @@ export function SelfUpdateProgress({ runningJobCount }: { runningJobCount: numbe
   useEffect(() => {
     let cancelled = false;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    // Latches once we see a genuinely in-progress poll -- gates whether a
+    // later `idle`/`!in_progress` read counts as success (see doc comment).
+    let sawInProgress = false;
 
     async function poll() {
       let status;
@@ -66,13 +96,24 @@ export function SelfUpdateProgress({ runningJobCount }: { runningJobCount: numbe
       if (cancelled) return;
       setReachable(true);
 
+      if (status.in_progress || IN_PROGRESS_PHASES.has(status.phase)) {
+        sawInProgress = true;
+      }
+
       if (status.phase === "rolled_back") {
         setTerminal({ previousVersion: status.previous_version });
         return; // Terminal failure state -- stop polling.
       }
       if (status.phase === "idle" && !status.in_progress) {
-        window.location.reload();
-        return; // Success -- the reload replaces this screen.
+        if (sawInProgress) {
+          window.location.reload();
+          return; // Success -- the reload replaces this screen.
+        }
+        // Not started yet: `idle` here is the pre-attempt row, not success.
+        // Keep polling (and keep the pre-first-poll copy) until we actually
+        // observe the attempt begin.
+        timeoutId = setTimeout(() => void poll(), POLL_INTERVAL_MS);
+        return;
       }
       setPhase(status.phase);
       timeoutId = setTimeout(() => void poll(), POLL_INTERVAL_MS);
@@ -103,7 +144,7 @@ export function SelfUpdateProgress({ runningJobCount }: { runningJobCount: numbe
       <span className="self-update-progress__spinner" aria-hidden />
       <h2 className="self-update-progress__title">Updating — please wait</h2>
       <p className="self-update-progress__message">
-        {selfUpdatePhaseCopy(phase ?? "preparing", runningJobCount)}
+        {phase === null ? "Starting update…" : selfUpdatePhaseCopy(phase, runningJobCount)}
       </p>
       {!reachable && (
         <p className="self-update-progress__footnote">
