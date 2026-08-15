@@ -1,14 +1,43 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getStoredApiKey } from "../api/client";
+import { fetchUpdateStatus, recheckUpdateStatus } from "../api/updates";
 import { GeneralSection } from "../components/settings/GeneralSection";
+import { UpdateIndicator } from "../components/UpdateIndicator";
+import { UpdatesProvider } from "../components/UpdatesProvider";
 import type { GlobalSettings } from "../types/settings";
+import type { UpdateCheckState } from "../types/updates";
+
+// COL-196: `fetchUpdateStatus`/`recheckUpdateStatus` are mocked at the
+// module level rather than via the raw `fetch` mock used elsewhere in this
+// file, so the assertions below are "was the recheck triggered"/"what state
+// did it push", not "which URL got hit" -- keeps the tests decoupled from
+// those endpoints' own request shapes. `fetchUpdateStatus` is mocked too
+// (COL-196 code review) because `GeneralSection` now reads the shared Update
+// Check state via `useUpdates()`, which requires wrapping it in
+// `UpdatesProvider` -- whose own initial-mount fetch needs a resolved value
+// here, same as `UpdateIndicator`'s in `updateIndicator.test.tsx`.
+vi.mock("../api/updates", () => ({
+  fetchUpdateStatus: vi.fn(),
+  recheckUpdateStatus: vi.fn(),
+}));
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status < 400, status, json: () => Promise.resolve(body) };
 }
+
+const baseUpdateCheckState: UpdateCheckState = {
+  running_version: "1.2.3",
+  latest_version: "v1.2.3",
+  latest_version_label: "v1.2.3",
+  changelog: null,
+  checked_at: "2026-08-02T10:00:00Z",
+  update_available: false,
+  dismissed_at: null,
+  install_method: "pipx",
+};
 
 const baseSettings: GlobalSettings = {
   enabled_targets: ["stereo"],
@@ -26,17 +55,32 @@ const baseSettings: GlobalSettings = {
   disk_space_warning_percent: 5,
   disk_space_error_percent: 2,
   update_channel: "stable",
+  default_tracked: true,
+  log_level: null,
+  default_audio_language: null,
+  default_audio_channel_tier: null,
+  auto_set_default_audio: false,
+  recently_processed_window_minutes: 360,
+  auto_queue_paused: false,
+  auto_processing_paused: false,
   api_key: "server-generated-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
 };
 
-/** GeneralSection renders a `Link` to the Updates page (COL-88), so every
- * render needs a Router context -- mirrors `updateIndicator.test.tsx`. */
+/**
+ * GeneralSection renders a `Link` to the Updates page (COL-88), so every
+ * render needs a Router context -- mirrors `updateIndicator.test.tsx`. It
+ * also reads the shared Update Check state via `useUpdates()` (COL-196 code
+ * review), so it needs `UpdatesProvider` too, mirroring
+ * `healthBanner.test.tsx`'s `HealthProvider` wrapping.
+ */
 function renderGeneralSection() {
   return render(
     <MemoryRouter>
-      <GeneralSection />
+      <UpdatesProvider>
+        <GeneralSection />
+      </UpdatesProvider>
     </MemoryRouter>
   );
 }
@@ -44,6 +88,8 @@ function renderGeneralSection() {
 describe("GeneralSection", () => {
   beforeEach(() => {
     localStorage.clear();
+    vi.mocked(fetchUpdateStatus).mockReset().mockResolvedValue(baseUpdateCheckState);
+    vi.mocked(recheckUpdateStatus).mockReset().mockResolvedValue(baseUpdateCheckState);
   });
 
   afterEach(() => {
@@ -64,6 +110,36 @@ describe("GeneralSection", () => {
     expect(screen.getByLabelText(/sign-in method/i)).toHaveValue("forms");
     expect(screen.getByLabelText(/warning threshold/i)).toHaveValue(5);
     expect(screen.getByLabelText(/critical threshold/i)).toHaveValue(2);
+  });
+
+  it("shows a restart-required hint under the concurrency limit field", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    await screen.findByLabelText(/concurrency limit/i);
+    expect(screen.getByText(/restart collapsarr for a change to take effect/i)).toBeInTheDocument();
+  });
+
+  it("lays out the Authentication & concurrency and Update channel fields with the shared full-width grid (COL-188)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    const authRequiredSelect = await screen.findByLabelText(/login requirement/i);
+    const authMethodSelect = screen.getByLabelText(/sign-in method/i);
+    const concurrencyInput = screen.getByLabelText(/concurrency limit/i);
+    const windowInput = screen.getByLabelText(/recently-processed window/i);
+    const channelSelect = screen.getByLabelText(/release channel/i);
+
+    // Same grid pattern as the "Disk space alerts" / "Advanced" panels: each
+    // field lives in a `.form-grid` > `.form-field` wrapper, not the old
+    // fixed-width `.form-field--narrow`, so fields flow across the full
+    // panel width instead of being capped at a narrow column.
+    for (const field of [authRequiredSelect, authMethodSelect, concurrencyInput, windowInput, channelSelect]) {
+      const wrapper = field.closest(".form-field");
+      expect(wrapper).not.toBeNull();
+      expect(wrapper).not.toHaveClass("form-field--narrow");
+      expect(wrapper?.parentElement).toHaveClass("form-grid");
+    }
   });
 
   it("saves the disk-space thresholds via PUT with the edited values", async () => {
@@ -189,6 +265,90 @@ describe("GeneralSection", () => {
     expect(putBody.update_channel).toBe("beta");
   });
 
+  it("triggers an immediate update recheck when a save changes the release channel (COL-196)", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const channelSelect = await screen.findByLabelText(/release channel/i);
+    fireEvent.change(channelSelect, { target: { value: "beta" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    await waitFor(() => expect(recheckUpdateStatus).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not trigger an update recheck when General settings save without a channel change (COL-196)", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const concurrencyInput = await screen.findByLabelText(/concurrency limit/i);
+    fireEvent.change(concurrencyInput, { target: { value: "4" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    expect(recheckUpdateStatus).not.toHaveBeenCalled();
+  });
+
+  it(
+    "reflects a channel-changing save's recheck result in a concurrently mounted UpdateIndicator, " +
+      "with no page reload (COL-196 code review)",
+    async () => {
+      const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+        if ((init?.method ?? "GET") === "PUT") {
+          const body = JSON.parse(String(init?.body));
+          return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+        }
+        return Promise.resolve(jsonResponse(baseSettings));
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const refreshedState: UpdateCheckState = {
+        ...baseUpdateCheckState,
+        latest_version: "v1.3.0-beta.1",
+        update_available: true,
+      };
+      vi.mocked(recheckUpdateStatus).mockReset().mockResolvedValue(refreshedState);
+
+      // UpdateIndicator mounted as a sibling under the same UpdatesProvider,
+      // mirroring how AppShell mounts it once (outside the <Outlet />) for
+      // the whole SPA session, alongside whatever page (here, GeneralSection)
+      // is currently routed into that outlet.
+      render(
+        <MemoryRouter>
+          <UpdatesProvider>
+            <UpdateIndicator />
+            <GeneralSection />
+          </UpdatesProvider>
+        </MemoryRouter>
+      );
+
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+      const channelSelect = await screen.findByLabelText(/release channel/i);
+      fireEvent.change(channelSelect, { target: { value: "beta" } });
+      fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+      expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+      const notice = await screen.findByRole("status");
+      expect(notice).toHaveTextContent(/update available/i);
+      expect(notice).toHaveTextContent("v1.3.0-beta.1");
+    }
+  );
+
   it("saves the browser-stored API key to localStorage", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
     renderGeneralSection();
@@ -265,6 +425,29 @@ describe("GeneralSection", () => {
     expect(putBody.surround_bitrate_kbps).toBeNull();
   });
 
+  it("displays the current default_tracked value and saves changes via PUT", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse({ ...baseSettings, default_tracked: false }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const toggleCheckbox = await screen.findByRole("checkbox", { name: /default tracked for new library items/i });
+    expect(toggleCheckbox).not.toBeChecked();
+
+    fireEvent.click(toggleCheckbox);
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.default_tracked).toBe(true);
+  });
+
   it("surfaces an API error from a failed save", async () => {
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
       if ((init?.method ?? "GET") === "PUT") {
@@ -286,6 +469,66 @@ describe("GeneralSection", () => {
     renderGeneralSection();
 
     expect(await screen.findByText(/couldn't load settings: network down/i)).toBeInTheDocument();
+  });
+
+  it("displays the recently-processed window from a mocked GET", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    expect(await screen.findByLabelText(/recently-processed window/i)).toHaveValue(360);
+  });
+
+  it("saves the recently-processed window via PUT with the edited value", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const windowInput = await screen.findByLabelText(/recently-processed window/i);
+    fireEvent.change(windowInput, { target: { value: "120" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.recently_processed_window_minutes).toBe(120);
+  });
+
+  it("allows 0 as a valid value for the recently-processed window", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const windowInput = await screen.findByLabelText(/recently-processed window/i);
+    fireEvent.change(windowInput, { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.recently_processed_window_minutes).toBe(0);
+  });
+
+  it("validates the recently-processed window before saving", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    renderGeneralSection();
+
+    const windowInput = await screen.findByLabelText(/recently-processed window/i);
+    fireEvent.change(windowInput, { target: { value: "-10" } });
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/recently-processed window must be a whole number of 0 or more/i)).toBeInTheDocument();
   });
 });
 

@@ -22,6 +22,9 @@ from collapsarr.settings.models import (
     AUTH_METHOD_FORMS,
     AUTH_REQUIRED_ENABLED,
     AUTH_REQUIRED_LOCAL_BYPASS,
+    DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES,
+    LOG_LEVEL_DEBUG,
+    LOG_LEVEL_INFO,
     UPDATE_CHANNEL_BETA,
     UPDATE_CHANNEL_STABLE,
     GlobalSettings,
@@ -30,7 +33,9 @@ from collapsarr.settings.service import (
     _default_update_channel,
     as_downmix_settings,
     get_global_settings,
+    restore_auto_processing_pause,
     rotate_session_secret,
+    stash_and_force_pause_processing,
     update_global_settings,
     verify_auth_password,
 )
@@ -553,6 +558,386 @@ def test_update_global_settings_update_channel_persists_across_a_fresh_read(
     reread = get_global_settings(session)
 
     assert reread.update_channel == UPDATE_CHANNEL_BETA
+
+
+# ---------------------------------------------------------------------------
+# Log level (COL-130).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_log_level_to_none(session: Session) -> None:
+    """A fresh row's ``log_level`` is unset -- boot falls back to the env setting."""
+    settings = get_global_settings(session)
+
+    assert settings.log_level is None
+
+
+def test_update_global_settings_sets_the_log_level(session: Session) -> None:
+    updated = update_global_settings(session, log_level=LOG_LEVEL_DEBUG)
+
+    assert updated.log_level == LOG_LEVEL_DEBUG
+
+
+def test_update_global_settings_rejects_an_unknown_log_level(session: Session) -> None:
+    with pytest.raises(ValueError, match="log_level"):
+        update_global_settings(session, log_level="TRACE")
+
+
+def test_update_global_settings_omitting_log_level_leaves_it_untouched(session: Session) -> None:
+    update_global_settings(session, log_level=LOG_LEVEL_DEBUG)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.log_level == LOG_LEVEL_DEBUG
+
+
+def test_update_global_settings_log_level_explicit_none_clears_the_override(
+    session: Session,
+) -> None:
+    update_global_settings(session, log_level=LOG_LEVEL_DEBUG)
+
+    cleared = update_global_settings(session, log_level=None)
+
+    assert cleared.log_level is None
+
+
+def test_update_global_settings_log_level_persists_across_a_fresh_read(session: Session) -> None:
+    update_global_settings(session, log_level=LOG_LEVEL_INFO)
+
+    reread = get_global_settings(session)
+
+    assert reread.log_level == LOG_LEVEL_INFO
+
+
+# ---------------------------------------------------------------------------
+# Preferred Default Audio (COL-151).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_default_audio_preference_to_unset(
+    session: Session,
+) -> None:
+    """A fresh row has no Preferred Default Audio configured, and the
+    auto-set toggle is off."""
+    settings = get_global_settings(session)
+
+    assert settings.default_audio_language is None
+    assert settings.default_audio_channel_tier is None
+    assert settings.auto_set_default_audio is False
+
+
+def test_update_global_settings_sets_the_default_audio_preference(session: Session) -> None:
+    updated = update_global_settings(
+        session,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+        auto_set_default_audio=True,
+    )
+
+    assert updated.default_audio_language == "eng"
+    assert updated.default_audio_channel_tier == "5.1"
+    assert updated.auto_set_default_audio is True
+
+
+def test_update_global_settings_omitting_default_audio_preference_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(
+        session,
+        default_audio_language="jpn",
+        default_audio_channel_tier=DownmixTarget.STEREO,
+        auto_set_default_audio=True,
+    )
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.default_audio_language == "jpn"
+    assert unchanged.default_audio_channel_tier == "stereo"
+    assert unchanged.auto_set_default_audio is True
+
+
+def test_update_global_settings_explicit_none_clears_default_audio_language(
+    session: Session,
+) -> None:
+    update_global_settings(session, default_audio_language="eng")
+
+    cleared = update_global_settings(session, default_audio_language=None)
+
+    assert cleared.default_audio_language is None
+
+
+def test_update_global_settings_explicit_none_clears_default_audio_channel_tier(
+    session: Session,
+) -> None:
+    update_global_settings(session, default_audio_channel_tier=DownmixTarget.TWO_POINT_ONE)
+
+    cleared = update_global_settings(session, default_audio_channel_tier=None)
+
+    assert cleared.default_audio_channel_tier is None
+
+
+def test_update_global_settings_default_audio_preference_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(
+        session,
+        default_audio_language="fre",
+        default_audio_channel_tier=DownmixTarget.STEREO,
+        auto_set_default_audio=True,
+    )
+
+    reread = get_global_settings(session)
+
+    assert reread.default_audio_language == "fre"
+    assert reread.default_audio_channel_tier == "stereo"
+    assert reread.auto_set_default_audio is True
+
+
+def test_update_global_settings_auto_set_default_audio_is_switchable_back_off(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_set_default_audio=True)
+
+    updated = update_global_settings(session, auto_set_default_audio=False)
+
+    assert updated.auto_set_default_audio is False
+
+
+# ---------------------------------------------------------------------------
+# Recently-Processed Window (COL-167).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_recently_processed_window_default(session: Session) -> None:
+    """COL-167: a fresh row defaults to a 360-minute (6h) dedup cooldown."""
+    settings = get_global_settings(session)
+
+    assert settings.recently_processed_window_minutes == DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES
+
+
+def test_update_global_settings_updates_recently_processed_window(session: Session) -> None:
+    updated = update_global_settings(session, recently_processed_window_minutes=90)
+
+    assert updated.recently_processed_window_minutes == 90
+
+
+def test_update_global_settings_recently_processed_window_accepts_zero(session: Session) -> None:
+    """COL-167: 0 is a valid value meaning 'no cooldown', not 'unset'."""
+    updated = update_global_settings(session, recently_processed_window_minutes=0)
+
+    assert updated.recently_processed_window_minutes == 0
+
+
+def test_update_global_settings_rejects_a_negative_recently_processed_window(
+    session: Session,
+) -> None:
+    with pytest.raises(ValueError, match="recently_processed_window_minutes"):
+        update_global_settings(session, recently_processed_window_minutes=-1)
+
+
+def test_update_global_settings_omitting_recently_processed_window_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, recently_processed_window_minutes=45)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.recently_processed_window_minutes == 45
+
+
+def test_update_global_settings_recently_processed_window_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, recently_processed_window_minutes=15)
+
+    reread = get_global_settings(session)
+
+    assert reread.recently_processed_window_minutes == 15
+
+
+# ---------------------------------------------------------------------------
+# Auto-Queuing Pause (COL-174).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_auto_queue_paused_to_false(session: Session) -> None:
+    """AC: the new toggle defaults to off -- auto-fill runs unless paused explicitly."""
+    settings = get_global_settings(session)
+
+    assert settings.auto_queue_paused is False
+
+
+def test_update_global_settings_updates_auto_queue_paused(session: Session) -> None:
+    updated = update_global_settings(session, auto_queue_paused=True)
+
+    assert updated.auto_queue_paused is True
+
+
+def test_update_global_settings_auto_queue_paused_is_switchable_back_off(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    updated = update_global_settings(session, auto_queue_paused=False)
+
+    assert updated.auto_queue_paused is False
+
+
+def test_update_global_settings_omitting_auto_queue_paused_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.auto_queue_paused is True
+
+
+def test_update_global_settings_auto_queue_paused_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_queue_paused=True)
+
+    reread = get_global_settings(session)
+
+    assert reread.auto_queue_paused is True
+
+
+# ---------------------------------------------------------------------------
+# Auto-Processing Pause (COL-226).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_auto_processing_paused_to_false(session: Session) -> None:
+    """AC: the new toggle defaults to off -- pending Jobs are claimed unless paused explicitly."""
+    settings = get_global_settings(session)
+
+    assert settings.auto_processing_paused is False
+
+
+def test_update_global_settings_updates_auto_processing_paused(session: Session) -> None:
+    updated = update_global_settings(session, auto_processing_paused=True)
+
+    assert updated.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_is_switchable_back_off(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    updated = update_global_settings(session, auto_processing_paused=False)
+
+    assert updated.auto_processing_paused is False
+
+
+def test_update_global_settings_omitting_auto_processing_paused_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+
+    reread = get_global_settings(session)
+
+    assert reread.auto_processing_paused is True
+
+
+def test_update_global_settings_auto_processing_paused_is_independent_of_auto_queue_paused(
+    session: Session,
+) -> None:
+    """AC: the two pause toggles are distinct fields -- setting one never touches the other."""
+    update_global_settings(session, auto_processing_paused=True)
+
+    unchanged = get_global_settings(session)
+
+    assert unchanged.auto_processing_paused is True
+    assert unchanged.auto_queue_paused is False
+
+
+# ---------------------------------------------------------------------------
+# auto_processing_pause_restore_value stash/restore (COL-230, COL-233): the
+# self-update apply flow's one-shot "force-pause, then restore whatever it
+# was before" mechanism.
+# ---------------------------------------------------------------------------
+
+
+def test_stash_and_force_pause_processing_snapshots_false_and_forces_true(
+    session: Session,
+) -> None:
+    """Nothing was manually paused beforehand -- the stash records that False."""
+    assert get_global_settings(session).auto_processing_paused is False  # steady-state default
+
+    settings = stash_and_force_pause_processing(session)
+
+    assert settings.auto_processing_paused is True
+    assert settings.auto_processing_pause_restore_value is False
+
+
+def test_stash_and_force_pause_processing_snapshots_a_pre_existing_manual_pause(
+    session: Session,
+) -> None:
+    """An operator had already paused processing -- the stash preserves that fact."""
+    update_global_settings(session, auto_processing_paused=True)
+
+    settings = stash_and_force_pause_processing(session)
+
+    assert settings.auto_processing_paused is True  # unchanged -- already forced/True
+    assert settings.auto_processing_pause_restore_value is True
+
+
+def test_restore_auto_processing_pause_resumes_processing_when_nothing_was_manually_paused(
+    session: Session,
+) -> None:
+    stash_and_force_pause_processing(session)  # stashes False (the pre-update state)
+
+    settings = restore_auto_processing_pause(session)
+
+    assert settings.auto_processing_paused is False
+    assert settings.auto_processing_pause_restore_value is None
+
+
+def test_restore_auto_processing_pause_preserves_a_pre_existing_manual_pause(
+    session: Session,
+) -> None:
+    update_global_settings(session, auto_processing_paused=True)
+    stash_and_force_pause_processing(session)  # stashes True (the pre-update state)
+
+    settings = restore_auto_processing_pause(session)
+
+    assert settings.auto_processing_paused is True
+    assert settings.auto_processing_pause_restore_value is None
+
+
+def test_restore_auto_processing_pause_is_a_noop_when_nothing_was_ever_stashed(
+    session: Session,
+) -> None:
+    """Steady state (e.g. every ordinary boot): no self-update has ever force-paused processing."""
+    assert get_global_settings(session).auto_processing_pause_restore_value is None
+
+    settings = restore_auto_processing_pause(session)
+
+    assert settings.auto_processing_paused is False  # untouched
+    assert settings.auto_processing_pause_restore_value is None
+
+
+def test_restore_auto_processing_pause_is_idempotent(session: Session) -> None:
+    """Callable a second time (e.g. two boots in a row) without side effects."""
+    stash_and_force_pause_processing(session)
+    restore_auto_processing_pause(session)
+
+    settings = restore_auto_processing_pause(session)
+
+    assert settings.auto_processing_paused is False
+    assert settings.auto_processing_pause_restore_value is None
 
 
 # ---------------------------------------------------------------------------

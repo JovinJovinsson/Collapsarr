@@ -76,11 +76,267 @@ failure state (no severity, no Check Code), it is informational.
 
 ## Install Method
 
-How this instance is running — Docker vs. pipx/bare-metal — detected
-server-side via the presence of `/.dockerenv` (the frontend has no
-filesystem access to detect it itself). Surfaced as `is_docker` on
-`GET /api/system/updates`, and used solely to pick which upgrade
-*instructions* the Updates page displays (`docker pull` + recreate-container
-vs. `pipx upgrade`/`pip install --upgrade`) — see
-`docs/adr/0001-update-check-detect-notify-only.md`. No code path executes
-either command; the operator always runs it themselves.
+How this instance is running — Docker vs. pipx vs. native — detected
+server-side (the frontend has no filesystem access to detect it itself):
+Docker via the presence of `/.dockerenv`, checked first; else native
+(a PyInstaller-built binary) via `sys.frozen` being truthy; else pipx —
+the primary documented bare-metal install path. Docker detection always
+wins, even under a frozen build. Surfaced as the three-valued
+`install_method` (`docker`/`pipx`/`native`) on `GET /api/system/updates`,
+superseding the earlier `is_docker` boolean now that a third method
+exists, and used to pick which upgrade path the Updates page offers: for
+`docker`, static `docker pull` + recreate-container instructions only,
+since no code path can execute them (the operator always runs it
+themselves); for `native` and `pipx`, an in-app **Self-Update** ("Update
+Now") action, falling back to the same style of manual instructions (a
+download-and-replace-the-install-folder walkthrough for `native`, `pipx
+upgrade`/`pip install --upgrade` for `pipx`) when Self-Update itself has
+nothing to offer (e.g. no native build published yet for the current
+**Release Channel**). The install-folder-replace path for `native` is safe
+with respect to user data because the database/config live in the OS
+user-data directory, not inside the install folder being replaced — see
+`docs/adr/0001-update-check-detect-notify-only.md` and
+`docs/adr/0009-self-update-staged-handoff-with-auto-rollback.md`.
+
+## Self-Update
+
+The manually-triggered ("Update Now") in-app action that downloads,
+verifies, and installs a new Collapsarr release, then restarts the process
+into it — distinct from the **Update Check**, which only detects and
+notifies. Available only for the `native` and `pipx` **Install Method**s;
+`docker` remains manual, since an image cannot self-replace. Gated by a
+confirmation modal, not a separate settings-level opt-in, and by a
+persisted single-flight guard that rejects a second concurrent trigger.
+
+Two flows depending on in-flight Jobs at trigger time:
+
+- **Cancel & Restart Now** — hard-cancels running Jobs via the existing
+  **Cancel (job)** kill path, then immediately requeues them, bypassing the
+  Recently-Processed Window (this is an operator-forced interruption, not a
+  natural failure).
+- **Wait & Restart** — waits for the currently-running Jobs to finish
+  naturally.
+
+Both engage **Auto-Processing Pause** for the duration. Mechanically,
+`native` stages the new build in a separate directory and hands off to a
+new process that waits for the old one to exit before atomically swapping
+it into the live install dir and re-executing itself; `pipx` upgrades the
+installed package in place, then re-execs the current process — neither
+depends on an external process supervisor. Both auto-rollback to the
+previous version if the post-restart process fails a
+health-check-within-timeout: `native` by swapping the retained old install
+folder back in, `pipx` by reinstalling the previous version pinned by
+number. See `docs/adr/0009-self-update-staged-handoff-with-auto-rollback.md`.
+Scheduled/unattended auto-update and native builds for the `beta`
+**Release Channel** are deferred — see the relevant Stubs.
+
+## Wanted (view)
+
+A tracked media file still missing at least one enabled downmix target
+(Stereo/2.1/5.1). Nothing to do with Sonarr/Radarr's own "wanted" (missing,
+not-yet-downloaded) concept — surfaced by `GET /api/wanted` and the Wanted
+sidebar page, driven entirely by per-`(language, target)` status on a
+tracked media file. Deliberately distinct from **Tracked**: a file can be
+both Tracked and Wanted (eligible for downmixing, and still has a gap), or
+Not Tracked and still technically Wanted (it has a gap Collapsarr will never
+fill automatically, because the user opted it out).
+
+## Tracked
+
+A user-settable boolean on a **Library Node** (Series, Season, Episode, or
+Movie) controlling whether Collapsarr's pipeline should ever act on it
+automatically — queue downmix jobs from a scan/webhook, and list it in
+**Wanted**. Distinct from Sonarr/Radarr's own `monitored` flag (Collapsarr
+never reads or writes it) and from **Wanted** (see above). Setting Tracked
+on a Series or Season cascades immediately to every existing descendant,
+and also becomes that node's stored default for any child discovered later
+— a new episode file landing under a Not-Tracked series defaults to Not
+Tracked itself, even if the instance-wide default is Tracked. A Not-Tracked
+item can still be downmixed via an explicit manual trigger on its detail
+page; Tracked only gates *automatic* behavior. Resolves, in order, from the
+nearest explicit ancestor override down to the global `default_tracked`
+setting (itself defaulting to `true`) when nothing in a node's ancestry has
+been explicitly set. This resolution only applies once a **Catalog
+Identity** has located a real Library Node — an identity that can't be
+resolved to any node at all is **unresolved**, not "resolved, Tracked=false",
+and automatic behavior (enqueue, Wanted-listing) is skipped for it rather
+than falling back to `default_tracked`.
+
+## Catalog Identity
+
+The `(ArrInstance, Sonarr episode id | Radarr movie id)` identity Collapsarr
+uses to bridge an Arr-side file/episode/movie — from a scan, webhook, or API
+request — to its owning **Library Node** and resolved **Tracked** value.
+Always carries an instance; carries at most one leaf id (Sonarr XOR Radarr,
+never both — rejected at construction, since an instance is one Arr type or
+the other, never mixed). A Catalog Identity with no leaf id at all is a
+legitimate state (a file/episode not yet matched to a node) and resolves as
+**unresolved**, not as "resolved, Tracked=false" — see Tracked's resolution
+note below. Resolution itself is a single call,
+`library.service.resolve_tracked_for_source`, replacing what had drifted
+into five independent reimplementations of the same bridge logic.
+
+## Library
+
+A per-`ArrInstance` mirror of that instance's Sonarr/Radarr catalog
+(Series/Season/Episode for Sonarr, Movie for Radarr), persisted in
+Collapsarr's own database and kept in sync via the same scan/webhook
+infrastructure that maintains tracked-media state — never a live proxy to
+the Arr API. Includes items with no file yet, in a distinct "no file"
+state, so their **Tracked** preference can be set ahead of the file
+actually arriving. A Library Node that a later scan no longer sees
+(deleted upstream, in Sonarr/Radarr) is hidden rather than deleted,
+preserving its Tracked value in case it reappears. One Library exists per
+configured `ArrInstance`; the "Libraries" nav item's sidebar sub-items stop
+at this level — deeper navigation (Series > Season > Episode) happens
+inside a Library's own page, not further nested in the sidebar.
+
+## Library Node
+
+A single entry in a **Library**'s tree: a Series, Season, or Episode
+(Sonarr) or a Movie (Radarr), identified by Sonarr/Radarr's own object IDs
+rather than parsed from on-disk folder paths. The unit both **Tracked**
+status and its cascade/inheritance rules apply to.
+
+## Scheduled Task
+
+A named, recurring background activity owned by one of Collapsarr's
+scheduler classes (library scan, health checks, backups, update check),
+surfaced on the `/system/tasks` page with its cadence and next-run time
+plus a manual "Run now" trigger. Distinct from a **Job** (an individual
+downmix work item queued and drained by `JobQueue`/`JobScheduler`) — a
+Scheduled Task is the recurring *activity*, not a unit of work it produces.
+The library-scan Scheduled Task, for example, is what *enqueues* Jobs; it
+is not one itself. Log rotation (P7) is deliberately **not** a Scheduled
+Task despite also being a recurring background mechanism: it triggers
+reactively on write (size-based), has no cadence or next-run time, and
+never appears on `/system/tasks`.
+
+## Default Audio Track
+
+The container-level disposition flag (MKV/MP4 `disposition:default=1`) on
+one audio stream of a media file, marking which stream a player
+auto-selects on playback. Purely a player-behavior concern — distinct from
+a downmix **Target** (which stream tiers exist at all) and from
+**Tracked** (whether Collapsarr acts on the file automatically). Exactly
+one audio stream should carry it at a time.
+
+## Preferred Default Audio
+
+The user's global `(language, channel tier)` preference (the channel tier
+reusing `DownmixTarget` — Stereo/2.1/5.1) for which existing audio stream
+on a file should carry the **Default Audio Track** disposition. Resolved
+per file in strict order: (1) a stream matching both language and tier
+exactly; (2) if no stream matches the tier, the best-available tier
+within the matched language; (3) if the preferred language isn't present
+on the file at all (a foreign-only-audio file), the best-available tier
+in whatever language the file has. Case (3) is expected fallback
+behavior, not a gap — a foreign-only file is never "wrong."
+
+## Job
+
+One enqueued unit of work: a file plus its downmix target/language
+context, run by `JobQueue`'s worker pool and mirrored into the persisted
+`JobHistory` table at each lifecycle stage (`pending` → `running` →
+`succeeded`/`failed`). A `pending` Job survives a process restart by
+rehydrating from its `JobHistory` row — settings are re-derived fresh from
+current global settings at rehydration time, never replayed from an old
+snapshot (`docs/adr/0007-job-queue-priority-pull-rearchitecture.md`).
+
+## Job Priority
+
+The persisted ordering value on a `pending` Job that determines which one
+the worker pool picks up next — lower runs sooner. Only ever moved by
+"Process next" (bump to the front of the queue, ahead of every other
+currently-pending Job); there is no general manual reordering. A newly
+enqueued Job (auto or manual) always joins at the back of the order.
+
+## Process Now
+
+An explicit per-file action that immediately dispatches a downmix Job for
+a **Wanted** file — creating a pending Job first if none exists yet —
+bypassing both **Auto-Processing Pause** and the **Concurrency Limit**
+(prompting for confirmation if starting it would exceed the configured
+limit). Distinct from **Job Priority**'s "Process next," which only
+reorders within the existing pending queue: Process Now starts the Job
+running immediately regardless of queue position or pause state.
+
+## Cancel (job)
+
+Ending a Job on request — never a status a Job reaches; there is no
+distinct `cancelled` state. Both `pending` and `running` Jobs can be
+cancelled (COL-192), but the two cases resolve differently:
+
+- **`pending`** — a clean removal from the queue. Deletes both the live
+  in-memory Job and its `JobHistory` row outright, so a never-started Job
+  leaves no trace and carries no cooldown.
+- **`running`** — a hard kill. `SIGKILL` is sent to the process group of
+  the in-flight `ffmpeg`/`ffprobe` subprocess (each runs in its own process
+  group, so children die with it), which makes the pipeline call return a
+  failure. The worker then transitions the Job to `failed` through the
+  ordinary terminal path — a hard-cancelled run is recorded as `failed`
+  like any other pipeline failure, not a new status, so its `JobHistory`
+  row is kept and it interacts with the Recently-Processed Window's cooldown
+  exactly as a natural failure would.
+
+This supersedes ADR 0007's original stance that a `running` Job could not
+be interrupted (see
+`docs/adr/0007-job-queue-priority-pull-rearchitecture.md`).
+
+**Self-Update**'s Cancel & Restart Now path uses this same hard-cancel
+mechanism, but additionally requeues the cancelled Jobs immediately,
+bypassing the Recently-Processed Window — see **Self-Update**.
+
+## Auto-Queue Limit
+
+The cap (default 5) on how many **Wanted** entries the scanner will
+auto-enqueue at once. Whenever the total pending count (auto **and**
+manually queued combined — origin is never tracked) drops below the
+limit, whether from a Job finishing or being cancelled, the scanner tops
+up with the next not-yet-queued Wanted entry. Manually triggering a Job
+(single or bulk) is never blocked by the limit — it only throttles the
+scanner's own auto-fill, including a manual "Scan now."
+
+## Auto-Queuing Pause
+
+A persisted global toggle that halts only the scanner's Wanted-driven
+auto-fill (both the periodic/manual scan's initial enqueue and the
+**Auto-Queue Limit**'s top-up). Already-`pending`/`running` Jobs keep
+processing, and manual triggers keep working, while paused. Persists
+across restarts, same as **Tracked** — an intentional pause is never
+silently undone by an unrelated restart.
+
+## Auto-Processing Pause
+
+A persisted global toggle halting the `JobQueue` worker pool's own
+automatic pull-next-pending-Job loop — distinct from **Auto-Queuing
+Pause**, which only halts the scanner's auto-fill. Already-`running` Jobs
+are unaffected, and **Process Now** bypasses it entirely for an explicit
+user action. User-settable directly, and persists until manually cleared
+like any other setting — but also force-set by **Self-Update**'s
+job-handling flows for the duration of an update. That usage is one-shot:
+the value in effect immediately before Self-Update force-set it is stashed
+in a restore-point field and written back on the next app boot, so a
+pre-existing manual pause survives the restart but a Self-Update-induced
+one doesn't linger.
+
+## Recently-Processed Window
+
+The configurable cooldown (minutes; default 360; `0` disables it) that
+stops an *automatic* trigger (scan/webhook) from re-enqueuing a file
+whose most recent terminal `JobHistory` row (`succeeded`/`failed`) falls
+inside the window. Live-reloaded from settings on every check — unlike
+**Concurrency Limit**, it has no restart-forcing structural constraint.
+Deliberately decoupled from the scan cadence (`scan_interval_hours`),
+which it used to silently reuse. Every *explicit single-action* trigger
+(the file-detail "Trigger downmix" button, a per-row "Requeue") bypasses
+it outright; only a *batch* requeue action respects it, reporting how
+many of the batch were skipped for falling inside the window.
+
+## Concurrency Limit
+
+The persisted setting (default 1) capping how many Jobs `JobQueue`'s
+worker pool runs simultaneously. Takes effect only after a restart — the
+worker pool is sized once at startup — unlike the **Recently-Processed
+Window**, which live-reloads. The Settings UI surfaces this restart
+requirement as a static hint, not a dynamic post-save notice.

@@ -16,6 +16,7 @@ Two layers, mirroring the rest of the downmix-engine test suite:
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from collections.abc import Mapping
@@ -23,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.pipeline import PipelineOutcome, run_downmix_pipeline
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget, QualifyingTarget
 
@@ -386,3 +388,287 @@ def test_pipeline_passes_ffprobe_ffmpeg_paths_and_timeouts_through(tmp_path: Pat
     assert calls[0][0] == "/opt/homebrew/bin/ffprobe"
     assert calls[1][0] == "/opt/homebrew/bin/ffmpeg"
     assert calls[2][0] == "/opt/homebrew/bin/ffprobe"
+
+
+# ---------------------------------------------------------------------------
+# Automatic in-band Default Audio Track fix during downmix (COL-152).
+# ---------------------------------------------------------------------------
+
+
+def _ffmpeg_command(calls: list[list[str]]) -> list[str]:
+    """Return the single ffmpeg invocation captured by a runner's ``calls`` log."""
+    ffmpeg_calls = [c for c in calls if "ffmpeg" in c[0]]
+    assert len(ffmpeg_calls) == 1, f"expected one ffmpeg call, got {len(ffmpeg_calls)}"
+    return ffmpeg_calls[0]
+
+
+def _disposition_flags(command: list[str]) -> dict[str, str]:
+    """Extract ``{a:N -> flag}`` for every ``-disposition:a:N`` in the command."""
+    return {
+        arg.split(":", 1)[1]: command[i + 1]
+        for i, arg in enumerate(command)
+        if arg.startswith("-disposition:")
+    }
+
+
+# eng 6ch (currently default) + eng 2ch (not default). With 2.1 enabled a new
+# eng 3ch track qualifies, so a real remux runs and the disposition matters.
+_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD = {
+    "streams": [
+        {
+            "index": 0,
+            "codec_type": "audio",
+            "codec_name": "ac3",
+            "channels": 6,
+            "channel_layout": "5.1",
+            "tags": {"language": "eng"},
+            "disposition": {"default": 1},
+        },
+        {
+            "index": 1,
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "channels": 2,
+            "channel_layout": "stereo",
+            "tags": {"language": "eng"},
+            "disposition": {"default": 0},
+        },
+    ]
+}
+
+
+def test_pipeline_applies_default_disposition_in_band_when_toggle_on_and_change_needed(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    calls: list[list[str]] = []
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        original_summary=(10.0, 2),
+        temp_summary=(10.0, 3),  # + one new downmix track
+        calls=calls,
+    )
+
+    result = run_downmix_pipeline(
+        original,
+        DownmixSettings(enabled_targets=ALL_TARGETS),
+        default_audio_preference=DefaultAudioPreference(
+            language="eng", channel_tier=DownmixTarget.STEREO
+        ),
+        auto_set_default_audio=True,
+        runner=runner,  # type: ignore[arg-type]
+    )
+
+    assert result.outcome is PipelineOutcome.SUCCESS
+    # Winner is the existing eng stereo track at output audio index 1; the
+    # wrongly-defaulted 5.1 (a:0) is cleared, and the new 2.1 track (a:2) too.
+    assert _disposition_flags(_ffmpeg_command(calls)) == {
+        "a:0": "0",
+        "a:1": "default",
+        "a:2": "0",
+    }
+
+
+def test_pipeline_adds_no_disposition_flags_when_toggle_on_but_nothing_to_change(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    calls: list[list[str]] = []
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        original_summary=(10.0, 2),
+        temp_summary=(10.0, 3),
+        calls=calls,
+    )
+
+    result = run_downmix_pipeline(
+        original,
+        DownmixSettings(enabled_targets=ALL_TARGETS),
+        # Winner is the eng 5.1 track, which already carries the disposition
+        # and is the only stream that does -> nothing to change.
+        default_audio_preference=DefaultAudioPreference(
+            language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE
+        ),
+        auto_set_default_audio=True,
+        runner=runner,  # type: ignore[arg-type]
+    )
+
+    assert result.outcome is PipelineOutcome.SUCCESS
+    assert _disposition_flags(_ffmpeg_command(calls)) == {}
+
+
+def test_pipeline_remux_command_is_identical_with_toggle_off(tmp_path: Path) -> None:
+    """Toggle off (even with a preference set) is byte-for-byte the baseline command."""
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+
+    baseline_calls: list[list[str]] = []
+    baseline_runner = _fake_runner(
+        original_path=original,
+        audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        original_summary=(10.0, 2),
+        temp_summary=(10.0, 3),
+        calls=baseline_calls,
+    )
+    run_downmix_pipeline(
+        original,
+        DownmixSettings(enabled_targets=ALL_TARGETS),
+        runner=baseline_runner,  # type: ignore[arg-type]
+    )
+
+    toggled_off_calls: list[list[str]] = []
+    toggled_off_runner = _fake_runner(
+        original_path=original,
+        audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        original_summary=(10.0, 2),
+        temp_summary=(10.0, 3),
+        calls=toggled_off_calls,
+    )
+    run_downmix_pipeline(
+        original,
+        DownmixSettings(enabled_targets=ALL_TARGETS),
+        default_audio_preference=DefaultAudioPreference(
+            language="eng", channel_tier=DownmixTarget.STEREO
+        ),
+        auto_set_default_audio=False,
+        runner=toggled_off_runner,  # type: ignore[arg-type]
+    )
+
+    # Compare every argument except the final one (a randomised temp output
+    # path); the rest of the invocation must be byte-for-byte the baseline.
+    toggled_off_command = _ffmpeg_command(toggled_off_calls)
+    assert toggled_off_command[:-1] == _ffmpeg_command(baseline_calls)[:-1]
+    assert not any(arg.startswith("-disposition") for arg in toggled_off_command)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle logging (COL-129): WARNING for skip/degraded, ERROR for failures.
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_logs_a_warning_for_nothing_to_do(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "tags": {"language": "eng"},
+            }
+        ]
+    }
+    runner = _fake_runner(original_path=original, audio_payload=payload)
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.NOTHING_TO_DO
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "nothing to do" in warnings[0].message
+    assert str(original) in warnings[0].message
+
+
+def test_pipeline_logs_an_error_with_truncated_stderr_for_a_remux_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    huge_stderr = "x" * 3000 + "THE_REAL_ERROR_AT_THE_END"
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_STEREO_ENG_PAYLOAD,
+        ffmpeg_returncode=1,
+        ffmpeg_stderr=huge_stderr,
+    )
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.REMUX_FAILED
+    # The untruncated stderr is still carried on the result for job history.
+    assert result.remux_result is not None
+    assert result.remux_result.stderr == huge_stderr
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    logged_message = errors[0].message
+    assert "THE_REAL_ERROR_AT_THE_END" in logged_message
+    # The log line is bounded -- it must not contain the full 3000-char run of
+    # 'x' verbatim (only its last ~2000-char tail), so one bad conversion
+    # can't dominate the rotation window.
+    assert "x" * 3000 not in logged_message
+
+
+def test_pipeline_logs_an_error_for_a_probe_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    runner = _fake_runner(
+        original_path=original, audio_payload=_STEREO_ENG_PAYLOAD, probe_audio_returncode=1
+    )
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.PROBE_FAILED
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert str(original) in errors[0].message
+
+
+def test_pipeline_logs_an_error_for_an_apply_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """APPLY_FAILED still leaves the job with no output produced -- ERROR, like the
+    other ``success=False`` outcomes, not WARNING (only NOTHING_TO_DO gets that)."""
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_STEREO_ENG_PAYLOAD,
+        original_summary=(10.0, 1),
+        temp_summary=(15.0, 2),  # duration drifted far past tolerance
+    )
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.APPLY_FAILED
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "duration mismatch" in errors[0].message
+
+
+def test_pipeline_logs_an_error_when_apply_validation_probing_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other APPLY_FAILED shape: a post-remux ffprobe failure during validation."""
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_STEREO_ENG_PAYLOAD,
+        media_summary_returncode=1,
+    )
+
+    with caplog.at_level(logging.INFO, logger="collapsarr"):
+        result = run_downmix_pipeline(original, DownmixSettings(), runner=runner)  # type: ignore[arg-type]
+
+    assert result.outcome is PipelineOutcome.APPLY_FAILED
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert str(original) in errors[0].message

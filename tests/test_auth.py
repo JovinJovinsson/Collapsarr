@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -43,6 +44,9 @@ PASSWORD = "correct horse battery staple"
 LOOPBACK_HOST = "127.0.0.1"
 PRIVATE_HOST = "192.168.1.50"
 PUBLIC_HOST = "8.8.8.8"  # a real, globally-routable address (Google Public DNS)
+TRUSTED_PROXY_HOST = "10.0.0.1"
+
+URL_BASE = "/collapsarr"
 
 
 @pytest.fixture
@@ -300,6 +304,18 @@ def _client_for_peer(settings: Settings, host: str) -> Iterator[TestClient]:
         yield test_client
 
 
+def _settings_with_trusted_proxies(tmp_path: Path, trusted_proxies: str) -> Settings:
+    """A ``Settings`` instance like the ``settings`` fixture's, but with
+    ``COLLAPSARR_TRUSTED_PROXIES`` set (COL-113) -- for tests that need a
+    peer on the trusted-proxy allowlist. Takes ``tmp_path`` directly (rather
+    than the ``settings`` fixture) since that fixture bakes in an empty
+    allowlist."""
+    db_path = tmp_path / "collapsarr.db"
+    return Settings(
+        database_path=str(db_path), data_dir=str(tmp_path), trusted_proxies=trusted_proxies
+    )
+
+
 def _seed_credential(test_client: TestClient, **auth_kwargs: object) -> None:
     """Persist a credential (and any extra ``update_global_settings`` kwargs,
     e.g. ``auth_required=...``) on ``test_client``'s app, mirroring
@@ -369,6 +385,175 @@ def test_local_bypass_classification_ignores_x_forwarded_for_spoofing(
         redirect = test_client.get(UI_ROUTE, headers={"X-Forwarded-For": LOOPBACK_HOST})
         assert redirect.status_code == 303
         assert redirect.headers["location"] == "/login"
+
+
+# --- local_bypass + trusted-proxy resolution (COL-113) ------------------------
+#
+# ``_client_is_local`` now classifies on ``resolve_client_address``
+# (collapsarr.auth.trust, COL-112) rather than the raw ASGI peer directly.
+# With no ``COLLAPSARR_TRUSTED_PROXIES`` configured -- every test above,
+# including the "ignores spoofing" one -- that resolves to exactly the
+# direct peer, so this module's existing suite passing unmodified already
+# demonstrates the "byte-for-byte identical by default" AC. These tests
+# configure an allowlist to exercise the new trusted-proxy-aware path.
+
+
+def test_local_bypass_classifies_on_forwarded_for_when_peer_is_a_trusted_proxy(
+    tmp_path: Path,
+) -> None:
+    """The proxy's own peer address is irrelevant once it's trusted -- a
+    public rightmost X-Forwarded-For entry is classified non-local and
+    challenged, even though the proxy itself connected from a private
+    address."""
+    settings = _settings_with_trusted_proxies(tmp_path, f"{TRUSTED_PROXY_HOST}/32")
+    with _client_for_peer(settings, TRUSTED_PROXY_HOST) as test_client:
+        _seed_credential(test_client)
+
+        redirect = test_client.get(UI_ROUTE, headers={"X-Forwarded-For": PUBLIC_HOST})
+        assert redirect.status_code == 303
+        assert redirect.headers["location"] == "/login"
+        assert (
+            test_client.post(
+                WEBHOOK_ROUTE, json={}, headers={"X-Forwarded-For": PUBLIC_HOST}
+            ).status_code
+            == 401
+        )
+
+
+@pytest.mark.parametrize("forwarded_host", [LOOPBACK_HOST, PRIVATE_HOST])
+def test_local_bypass_treats_forwarded_loopback_or_private_as_local_when_peer_is_trusted(
+    tmp_path: Path, forwarded_host: str
+) -> None:
+    """A loopback/private rightmost X-Forwarded-For entry from a trusted
+    proxy is classified local and skips auth, same as a direct local peer
+    would."""
+    settings = _settings_with_trusted_proxies(tmp_path, f"{TRUSTED_PROXY_HOST}/32")
+    with _client_for_peer(settings, TRUSTED_PROXY_HOST) as test_client:
+        _seed_credential(test_client)
+
+        assert (
+            test_client.get(UI_ROUTE, headers={"X-Forwarded-For": forwarded_host}).status_code
+            == 404
+        )
+        assert (
+            test_client.post(
+                WEBHOOK_ROUTE, json={}, headers={"X-Forwarded-For": forwarded_host}
+            ).status_code
+            == 404
+        )
+
+
+def test_local_bypass_ignores_forwarded_for_from_a_peer_not_on_the_allowlist(
+    tmp_path: Path,
+) -> None:
+    """A peer that is not a trusted proxy is classified by its own direct
+    address regardless -- a forwarded header claiming loopback from a
+    genuinely public, untrusted peer has no effect."""
+    settings = _settings_with_trusted_proxies(tmp_path, f"{TRUSTED_PROXY_HOST}/32")
+    with _client_for_peer(settings, PUBLIC_HOST) as test_client:
+        _seed_credential(test_client)
+
+        redirect = test_client.get(UI_ROUTE, headers={"X-Forwarded-For": LOOPBACK_HOST})
+        assert redirect.status_code == 303
+        assert redirect.headers["location"] == "/login"
+
+
+def test_local_bypass_ignores_forwarded_for_from_an_untrusted_local_peer(
+    tmp_path: Path,
+) -> None:
+    """The inverse spoof attempt: an untrusted peer that IS local isn't
+    knocked out of the bypass by a forwarded header claiming a public
+    address either -- the header is only ever consulted for an allow-listed
+    peer."""
+    settings = _settings_with_trusted_proxies(tmp_path, f"{TRUSTED_PROXY_HOST}/32")
+    with _client_for_peer(settings, LOOPBACK_HOST) as test_client:
+        _seed_credential(test_client)
+
+        assert (
+            test_client.get(UI_ROUTE, headers={"X-Forwarded-For": PUBLIC_HOST}).status_code == 404
+        )
+
+
+# --- session cookie Secure flag + trusted-proxy resolution (COL-114) ---------
+#
+# ``_is_secure`` (collapsarr.auth.session) now resolves the scheme through
+# ``resolve_scheme`` (collapsarr.auth.trust, COL-112) instead of trusting
+# ``X-Forwarded-Proto`` from any source. With no ``COLLAPSARR_TRUSTED_PROXIES``
+# configured, that header no longer has any effect at all -- only the direct
+# ASGI scheme does. Once the direct peer is on the allowlist, that proxy's
+# ``X-Forwarded-Proto`` is honoured; an untrusted peer's is still ignored,
+# exactly the same forgeability rule COL-113 applied to ``X-Forwarded-For``.
+
+
+@contextmanager
+def _client_for_peer_and_scheme(
+    settings: Settings, host: str, *, scheme: str = "http"
+) -> Iterator[TestClient]:
+    """Like ``_client_for_peer`` but also controls the ASGI scheme TestClient
+    reports: a ``https://testserver`` base URL makes ``request.scope["scheme"]
+    == "https"``, so direct-HTTPS cases can be exercised alongside a chosen
+    peer address."""
+    app = create_app(settings=settings)
+    with TestClient(
+        app,
+        base_url=f"{scheme}://testserver",
+        client=(host, 51234),
+        follow_redirects=False,
+    ) as test_client:
+        yield test_client
+
+
+def _login_set_cookie(test_client: TestClient, **headers: str) -> str:
+    """Seed a credential, log in, and return the ``Set-Cookie`` header value."""
+    _seed_credential(test_client)
+    login = test_client.post(
+        "/api/auth/login",
+        json={"username": USERNAME, "password": PASSWORD},
+        headers=headers,
+    )
+    assert login.status_code == 200
+    return str(login.headers["set-cookie"])
+
+
+def test_secure_flag_absent_over_plain_http_with_no_trusted_proxies(
+    settings: Settings,
+) -> None:
+    with _client_for_peer_and_scheme(settings, PUBLIC_HOST) as test_client:
+        assert "secure" not in _login_set_cookie(test_client).lower()
+
+
+def test_secure_flag_ignores_forwarded_proto_with_no_trusted_proxies(
+    settings: Settings,
+) -> None:
+    """Closes the pre-COL-114 gap: X-Forwarded-Proto from any source used to
+    be trusted unconditionally, regardless of any allowlist."""
+    with _client_for_peer_and_scheme(settings, PUBLIC_HOST) as test_client:
+        cookie = _login_set_cookie(test_client, **{"X-Forwarded-Proto": "https"})
+        assert "secure" not in cookie.lower()
+
+
+def test_secure_flag_set_for_forwarded_proto_from_a_trusted_proxy(tmp_path: Path) -> None:
+    settings = _settings_with_trusted_proxies(tmp_path, f"{TRUSTED_PROXY_HOST}/32")
+    with _client_for_peer_and_scheme(settings, TRUSTED_PROXY_HOST) as test_client:
+        cookie = _login_set_cookie(test_client, **{"X-Forwarded-Proto": "https"})
+        assert "secure" in cookie.lower()
+
+
+def test_secure_flag_absent_for_spoofed_forwarded_proto_from_an_untrusted_peer(
+    tmp_path: Path,
+) -> None:
+    """A peer not on the allowlist cannot force Secure via a forged header,
+    even while the direct connection is plain HTTP."""
+    settings = _settings_with_trusted_proxies(tmp_path, f"{TRUSTED_PROXY_HOST}/32")
+    with _client_for_peer_and_scheme(settings, PUBLIC_HOST) as test_client:
+        cookie = _login_set_cookie(test_client, **{"X-Forwarded-Proto": "https"})
+        assert "secure" not in cookie.lower()
+
+
+def test_secure_flag_set_for_direct_https_regardless_of_allowlist(tmp_path: Path) -> None:
+    settings = _settings_with_trusted_proxies(tmp_path, "")
+    with _client_for_peer_and_scheme(settings, PUBLIC_HOST, scheme="https") as test_client:
+        assert "secure" in _login_set_cookie(test_client).lower()
 
 
 # --- Basic auth method (COL-52) ------------------------------------------------
@@ -622,3 +807,161 @@ def test_logout_everywhere_leaves_the_credential_itself_unchanged(
         "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
     )
     assert relogin.status_code == 200
+
+
+# --- COLLAPSARR_URL_BASE reflected in redirects and cookie path (COL-117) -----
+#
+# UrlBaseMiddleware (COL-116) strips the configured prefix from the request
+# path before enforce_auth_middleware/SessionMiddleware see it, so these
+# tests send the *prefixed* path (as a reverse proxy would forward it) and
+# assert the outbound Location/Set-Cookie headers carry the prefix back --
+# the reverse of that inbound strip. Mirrors the settings-builder +
+# client-builder split used above for the trusted-proxy tests
+# (``_settings_with_trusted_proxies`` / ``_client_for_peer``).
+
+
+def _settings_with_url_base(tmp_path: Path, url_base: str) -> Settings:
+    """A ``Settings`` instance like the ``settings`` fixture's, but with
+    ``COLLAPSARR_URL_BASE`` set (COL-116) -- for tests that need the
+    configured prefix reflected in outbound redirect/cookie headers (COL-117)."""
+    db_path = tmp_path / "collapsarr.db"
+    return Settings(database_path=str(db_path), data_dir=str(tmp_path), url_base=url_base)
+
+
+@contextmanager
+def _url_base_client(settings: Settings) -> Iterator[TestClient]:
+    """A no-follow-redirects TestClient built from ``settings`` (typically from
+    ``_settings_with_url_base``), so the gate's ``303``/``Location`` and
+    ``Set-Cookie`` headers are observable."""
+    app = create_app(settings=settings)
+    with TestClient(app, follow_redirects=False) as test_client:
+        yield test_client
+
+
+def test_first_run_gate_redirect_carries_url_base_prefix(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        response = test_client.get(f"{URL_BASE}{UI_ROUTE}")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"{URL_BASE}/setup"
+
+
+def test_unauthenticated_login_redirect_carries_url_base_prefix(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+
+        response = test_client.get(f"{URL_BASE}{UI_ROUTE}")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"{URL_BASE}/login"
+
+
+def test_post_login_root_redirect_carries_url_base_prefix(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+        login = test_client.post(
+            f"{URL_BASE}/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+        )
+        assert login.status_code == 200
+
+        # Already authenticated: visiting /login itself bounces to the app root.
+        response = test_client.get(f"{URL_BASE}/login")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"{URL_BASE}/"
+
+
+def test_authenticated_setup_root_redirect_carries_url_base_prefix(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+        login = test_client.post(
+            f"{URL_BASE}/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+        )
+        assert login.status_code == 200
+
+        # Already authenticated: visiting /setup itself bounces to the app root.
+        response = test_client.get(f"{URL_BASE}/setup")
+
+        assert response.status_code == 303
+        assert response.headers["location"] == f"{URL_BASE}/"
+
+
+def test_authenticated_setup_root_redirect_is_unprefixed_without_url_base(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    """No ``url_base`` configured: byte-for-byte identical to today."""
+    _set_credential(session)
+    noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+
+    response = noredirect_client.get("/setup")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+
+def test_authenticated_login_root_redirect_is_unprefixed_without_url_base(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    """No ``url_base`` configured: byte-for-byte identical to today."""
+    _set_credential(session)
+    noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+
+    response = noredirect_client.get("/login")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+
+def test_session_cookie_path_scoped_to_url_base_on_login(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+
+        login = test_client.post(
+            f"{URL_BASE}/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+        )
+
+        assert f"path={URL_BASE}/;" in login.headers["set-cookie"]
+
+
+def test_session_cookie_path_scoped_to_url_base_on_logout(tmp_path: Path) -> None:
+    with _url_base_client(_settings_with_url_base(tmp_path, URL_BASE)) as test_client:
+        _seed_credential(test_client)
+        test_client.post(
+            f"{URL_BASE}/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+        )
+
+        logout = test_client.post(f"{URL_BASE}/api/auth/logout")
+
+        assert logout.status_code == 200
+        assert f"path={URL_BASE}/;" in logout.headers["set-cookie"]
+
+
+def test_setup_redirect_is_unprefixed_without_url_base(
+    noredirect_client: TestClient,
+) -> None:
+    """No ``url_base`` configured: byte-for-byte identical to today."""
+    response = noredirect_client.get(UI_ROUTE)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup"
+
+
+def test_session_cookie_path_defaults_to_root_without_url_base(
+    noredirect_client: TestClient, session: Session
+) -> None:
+    """No ``url_base`` configured: cookie path stays the unscoped root."""
+    _set_credential(session)
+
+    login = noredirect_client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}
+    )
+
+    assert "path=/;" in login.headers["set-cookie"]
+
+    logout = noredirect_client.post("/api/auth/logout")
+
+    assert "path=/;" in logout.headers["set-cookie"]

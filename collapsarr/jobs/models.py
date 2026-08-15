@@ -12,7 +12,9 @@ Activity/History view.
 Deliberately reuses :class:`~collapsarr.jobs.queue.JobStatus` for the
 ``status`` column rather than inventing a parallel status vocabulary --
 ``JobStatus.PENDING`` is this ticket's "queued" per the acceptance criteria
-(the job is enqueued and has not started running yet).
+(the job is enqueued and has not started running yet). Likewise reuses
+:class:`~collapsarr.jobs.queue.JobKind` (COL-155) for the ``kind`` column --
+``DOWNMIX`` or ``SET_DEFAULT_AUDIO`` -- rather than a parallel vocabulary.
 
 :mod:`collapsarr.jobs.history` is the service layer (record/list/get) built
 on top of this model; nothing in this module touches a session.
@@ -23,11 +25,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from sqlalchemy import Enum as SAEnum
-from sqlalchemy import Integer, String, Text
+from sqlalchemy import Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from collapsarr.database import Base
-from collapsarr.jobs.queue import JobStatus
+from collapsarr.jobs.queue import JobKind, JobStatus
 
 
 def _utcnow() -> datetime:
@@ -52,11 +54,33 @@ class JobHistory(Base):
 
     ``target``/``language`` capture what the job was configured to do --
     the comma-joined enabled downmix targets and language allow-list from
-    the job's :class:`~collapsarr.downmix.targets.DownmixSettings` -- so
-    they're always present regardless of which stage the run reached
-    (unlike the pipeline's ``tracks_added``, which is only populated on
-    success). ``language`` is ``None`` when the job had no allow-list
-    (evaluates every language present on the file).
+    the job's :class:`~collapsarr.downmix.targets.DownmixSettings` for a
+    ``DOWNMIX`` job, or the resolved channel tier/language from the job's
+    :class:`~collapsarr.downmix.default_audio.DefaultAudioPreference` for a
+    ``SET_DEFAULT_AUDIO`` job (COL-155; see
+    :func:`~collapsarr.jobs.history.record_job_history`) -- so they're always
+    present regardless of which stage the run reached (unlike the pipeline's
+    ``tracks_added``, which is only populated on success). ``language`` is
+    ``None`` when a ``DOWNMIX`` job had no allow-list (evaluates every
+    language present on the file).
+
+    ``kind`` (COL-155) is ``DOWNMIX`` by default -- both for a freshly
+    created row and, via the migration that added this column, for every
+    pre-existing row, so old and new history reads consistently as "this was
+    a downmix job" without a manual backfill step.
+
+    ``priority`` (COL-163) mirrors the originating
+    :attr:`~collapsarr.jobs.queue.Job.priority` -- the join-order sequence
+    number :meth:`~collapsarr.jobs.queue.JobQueue._enqueue` assigns; its
+    Python-side ``default=0`` (like ``status``'s above) only matters for a
+    row built without going through :func:`~collapsarr.jobs.history.
+    record_job_history` (e.g. a test seeding a row directly) -- every real
+    job's row gets its actual priority explicitly. Its migration backfills
+    every pre-existing row from its own ``id`` (this table's insertion
+    order), so an upgrade doesn't scramble whatever ordering was already
+    implied by existing history. This is a pure prefactor -- nothing yet
+    reads this column back to change execution order (that is COL-164's
+    priority-pull worker pool).
     """
 
     __tablename__ = "job_history"
@@ -73,6 +97,22 @@ class JobHistory(Base):
         default=JobStatus.PENDING,
         index=True,
     )
+    kind: Mapped[JobKind] = mapped_column(
+        SAEnum(
+            JobKind,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        default=JobKind.DOWNMIX,
+        # DB-side server_default (matching `GlobalSettings.auto_set_default_audio`'s
+        # treatment) so the COL-155 migration can backfill every pre-existing row to
+        # `'downmix'` in the same additive `ALTER TABLE`, not just new rows going
+        # forward -- see the migration's own docstring for why that backfill value
+        # (rather than nullable/unset) is correct here.
+        server_default=text("'downmix'"),
+        index=True,
+    )
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     ended_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)

@@ -60,6 +60,15 @@ class AudioStreamInfo:
     than being omitted or raising. ``channel_layout`` falls back to
     ``"<channels>ch"`` on the rare stream ffprobe can't name a layout for, so
     it is always populated too.
+
+    ``is_default`` mirrors ffprobe's ``disposition.default`` flag: whether
+    this stream currently carries the container's Default Audio Track
+    disposition. Some encoders omit ``disposition`` (or the ``default`` key
+    within it) entirely rather than writing an explicit ``0``; that is
+    normalized to ``False`` here too, same as an explicit non-default flag,
+    rather than erroring or guessing (COL-150). Pure metadata exposure — the
+    foundation later slices use to know a file's *current* default track
+    before deciding whether it needs to change.
     """
 
     index: int
@@ -67,6 +76,7 @@ class AudioStreamInfo:
     channels: int
     channel_layout: str
     language: str
+    is_default: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,10 +298,24 @@ def _parse_audio_streams(payload: object) -> list[AudioStreamInfo]:
                 channels=channels,
                 channel_layout=_normalize_channel_layout(stream.get("channel_layout"), channels),
                 language=_normalize_language(stream.get("tags")),
+                is_default=_normalize_is_default(stream.get("disposition")),
             )
         )
 
     return results
+
+
+def _normalize_is_default(disposition: object) -> bool:
+    """Read ffprobe's ``disposition.default`` flag, defaulting to ``False``.
+
+    Some encoders omit the ``disposition`` block (or its ``default`` key)
+    entirely rather than writing an explicit ``0`` — that is treated the
+    same as an explicit non-default flag, matching how :func:`_normalize_language`
+    treats an absent tag as ``"unknown"`` rather than raising.
+    """
+    if isinstance(disposition, dict):
+        return bool(disposition.get("default"))
+    return False
 
 
 def _normalize_channel_layout(raw_layout: object, channels: int) -> str:

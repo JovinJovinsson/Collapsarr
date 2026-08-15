@@ -57,6 +57,64 @@ unrecognised value is rejected with a ``422`` before it reaches the service
 layer, which validates it again independently (see
 :func:`collapsarr.settings.service.update_global_settings`) for callers that
 bypass this HTTP layer.
+
+``log_level`` (COL-130) is also read/write here -- ``DEBUG``/``INFO``/
+``WARNING``/``ERROR``, or ``null`` -- the runtime override for the
+``collapsarr`` logger surfaced in Settings -> General's log-level dropdown.
+Like ``language_allow_list``, ``null`` is a meaningful, sendable value (clears
+a persisted override back to deferring to ``COLLAPSARR_LOG_LEVEL``); omitting
+the field leaves it untouched. Unlike every other field here,
+``update_settings_endpoint`` calls
+:func:`collapsarr.logging_setup.apply_log_level` after persisting it, so the
+change is live on the ``collapsarr`` logger immediately, not just on the
+Update Check scheduler's/disk-space check's next tick.
+
+``default_audio_language``/``default_audio_channel_tier``/
+``auto_set_default_audio`` (COL-151) are also read/write here -- the
+Preferred Default Audio setting a later ticket's Targets settings page
+(COL-159) will surface. ``default_audio_channel_tier`` reuses
+:class:`~collapsarr.downmix.targets.DownmixTarget` the same way
+``enabled_targets`` already does, so an unrecognised tier is rejected with a
+``422`` the same way an unrecognised downmix target already is. Like
+``language_allow_list``/``log_level``, ``null`` is a meaningful, sendable
+value for the two nullable fields (clears a configured preference); omitting
+either field leaves it untouched. ``auto_set_default_audio`` is a plain
+boolean, same treatment as ``ui_auth_enabled``/``default_tracked``.
+
+``recently_processed_window_minutes`` (COL-167) is also read/write here --
+the scheduler's "recently processed" dedup cooldown, in minutes, no longer
+silently derived from ``scan_interval_hours``. Constrained to ``>= 0``
+(``Field(ge=0)``, unlike the backup/disk-space knobs above, since ``0`` is a
+valid, meaningful value here -- "no cooldown", not "unset"). No dedicated
+endpoint: it round-trips through this same ``GET``/``PUT /api/settings``
+alongside ``concurrency_limit``. Unlike ``concurrency_limit`` (read once at
+worker-pool construction), :class:`~collapsarr.jobs.scheduler.JobScheduler`
+reads this field live from the settings row on every dedup check, so a
+``PUT`` here changes behavior on the very next check with no restart.
+
+``auto_queue_paused`` (COL-174, "Auto-Queuing Pause") is also read/write
+here -- a plain boolean, same treatment as ``ui_auth_enabled``/
+``default_tracked``/``auto_set_default_audio``, no dedicated endpoint. When
+set, the scanner's Wanted-driven auto-fill (the periodic scan's initial
+enqueue and the Auto-Queue Limit's completion/cancellation-triggered
+top-up) stops running; already-``PENDING``/``RUNNING`` Jobs and every manual
+trigger (single-file trigger, single/bulk requeue) are unaffected -- see
+:class:`~collapsarr.settings.models.GlobalSettings`'s own docstring for the
+full scope. :class:`~collapsarr.jobs.scheduler.JobScheduler` reads it live
+on every top-up attempt, so a ``PUT`` here takes effect immediately with no
+restart.
+
+``auto_processing_paused`` (COL-226, "Auto-Processing Pause") is also
+read/write here -- a plain boolean, same treatment as ``auto_queue_paused``
+above, no dedicated endpoint. When set, :class:`~collapsarr.jobs.queue.
+JobQueue` stops claiming any new ``PENDING`` Job -- already-``RUNNING`` Jobs
+keep running to completion. Deliberately distinct from ``auto_queue_paused``:
+that field only stops the scanner from *adding* new pending Jobs, while this
+one stops already-pending Jobs (however they got there) from ever starting --
+see :class:`~collapsarr.settings.models.GlobalSettings`'s own docstring for
+the full scope. ``JobQueue`` reads it live on every claim attempt via its
+injected ``pause_check`` callable, so a ``PUT`` here takes effect on the very
+next claim with no restart.
 """
 
 from __future__ import annotations
@@ -70,6 +128,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_session
 from ..downmix.targets import DownmixTarget
+from ..logging_setup import apply_log_level
 from .models import GlobalSettings
 from .service import as_downmix_settings, get_global_settings, update_global_settings
 
@@ -91,6 +150,11 @@ UpdateChannelMode = Literal["stable", "beta"]
 :data:`collapsarr.settings.models.UPDATE_CHANNEL_STABLE` /
 :data:`~collapsarr.settings.models.UPDATE_CHANNEL_BETA` -- spelled out as
 literals for the same reason as :data:`AuthRequiredMode`."""
+
+LogLevelMode = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+"""The four levels settable from Settings -> General's log-level dropdown
+(COL-130), matching :data:`collapsarr.settings.models.LOG_LEVELS` -- spelled
+out as literals for the same reason as :data:`AuthRequiredMode`."""
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -120,6 +184,14 @@ class SettingsRead(BaseModel):
     disk_space_warning_percent: float
     disk_space_error_percent: float
     update_channel: UpdateChannelMode
+    default_tracked: bool
+    log_level: LogLevelMode | None
+    default_audio_language: str | None
+    default_audio_channel_tier: DownmixTarget | None
+    auto_set_default_audio: bool
+    recently_processed_window_minutes: int
+    auto_queue_paused: bool
+    auto_processing_paused: bool
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -130,8 +202,8 @@ class SettingsUpdate(BaseModel):
 
     ``enabled_targets`` and ``language_allow_list`` accept JSON arrays. Sending
     an explicit ``null`` for ``language_allow_list``/``stereo_bitrate_kbps``/
-    ``surround_bitrate_kbps`` clears the stored override; omitting the field
-    leaves it untouched.
+    ``surround_bitrate_kbps``/``log_level`` clears the stored override;
+    omitting the field leaves it untouched.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -151,6 +223,14 @@ class SettingsUpdate(BaseModel):
     disk_space_warning_percent: float | None = Field(default=None, gt=0, le=100)
     disk_space_error_percent: float | None = Field(default=None, gt=0, le=100)
     update_channel: UpdateChannelMode | None = None
+    default_tracked: bool | None = None
+    log_level: LogLevelMode | None = None
+    default_audio_language: str | None = None
+    default_audio_channel_tier: DownmixTarget | None = None
+    auto_set_default_audio: bool | None = None
+    recently_processed_window_minutes: int | None = Field(default=None, ge=0)
+    auto_queue_paused: bool | None = None
+    auto_processing_paused: bool | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -181,6 +261,18 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         disk_space_warning_percent=settings.disk_space_warning_percent,
         disk_space_error_percent=settings.disk_space_error_percent,
         update_channel=settings.update_channel,
+        default_tracked=settings.default_tracked,
+        log_level=settings.log_level,
+        default_audio_language=settings.default_audio_language,
+        default_audio_channel_tier=(
+            DownmixTarget(settings.default_audio_channel_tier)
+            if settings.default_audio_channel_tier is not None
+            else None
+        ),
+        auto_set_default_audio=settings.auto_set_default_audio,
+        recently_processed_window_minutes=settings.recently_processed_window_minutes,
+        auto_queue_paused=settings.auto_queue_paused,
+        auto_processing_paused=settings.auto_processing_paused,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -202,8 +294,10 @@ def update_settings_endpoint(
 ) -> SettingsRead:
     """Update the provided settings fields and return the full row.
 
-    Only fields present in the request body are changed; the three
-    nullable-domain fields treat an explicit ``null`` as "clear this override".
+    Only fields present in the request body are changed; the nullable-domain
+    fields treat an explicit ``null`` as "clear this override". A provided
+    ``log_level`` is additionally applied live to the running ``collapsarr``
+    logger (:func:`collapsarr.logging_setup.apply_log_level`) once persisted.
     """
     provided = body.model_fields_set
     kwargs: dict[str, object] = {}
@@ -243,5 +337,24 @@ def update_settings_endpoint(
         kwargs["disk_space_error_percent"] = body.disk_space_error_percent
     if "update_channel" in provided:
         kwargs["update_channel"] = body.update_channel
+    if "default_tracked" in provided:
+        kwargs["default_tracked"] = body.default_tracked
+    if "log_level" in provided:
+        kwargs["log_level"] = body.log_level
+    if "default_audio_language" in provided:
+        kwargs["default_audio_language"] = body.default_audio_language
+    if "default_audio_channel_tier" in provided:
+        kwargs["default_audio_channel_tier"] = body.default_audio_channel_tier
+    if "auto_set_default_audio" in provided:
+        kwargs["auto_set_default_audio"] = body.auto_set_default_audio
+    if "recently_processed_window_minutes" in provided:
+        kwargs["recently_processed_window_minutes"] = body.recently_processed_window_minutes
+    if "auto_queue_paused" in provided:
+        kwargs["auto_queue_paused"] = body.auto_queue_paused
+    if "auto_processing_paused" in provided:
+        kwargs["auto_processing_paused"] = body.auto_processing_paused
 
-    return _to_read(update_global_settings(session, **kwargs))  # type: ignore[arg-type]
+    updated = update_global_settings(session, **kwargs)  # type: ignore[arg-type]
+    if "log_level" in provided:
+        apply_log_level(updated.log_level)
+    return _to_read(updated)

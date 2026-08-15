@@ -168,6 +168,7 @@ class BackupScheduler:
                 self._settings,
                 BACKUP_SCHEDULED,
                 retention_days=self._retention_days(),
+                now=self._now(),
             )
         except BackupUnavailableError:
             # The database stopped being file-based between the support check

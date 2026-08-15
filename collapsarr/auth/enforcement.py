@@ -36,13 +36,18 @@ mode. This makes a LAN/localhost self-hoster's install frictionless (no
 setup, no login, no API key) while any routable-address client -- including
 one pretending to be local -- must still authenticate.
 
-Classification (:func:`_client_is_local`) reads only the literal peer address
-the ASGI server accepted the connection from (``request.client``) -- it never
-parses ``X-Forwarded-For`` or any other client-suppliable header, which any
-caller could forge. The consequence: behind a reverse proxy, the proxy's own
-address is what gets classified, not its upstream client's -- an install
-behind a reverse proxy should set ``auth_required="enabled"`` until a later
-ticket adds trusted-proxy support (see the README's Authentication section).
+Classification (:func:`_client_is_local`) resolves the address via
+:func:`collapsarr.auth.trust.resolve_client_address` (COL-112/COL-113), not
+the raw ASGI peer: by default (no ``COLLAPSARR_TRUSTED_PROXIES`` configured)
+that is exactly the literal peer address the server accepted the connection
+from, same as before -- ``X-Forwarded-For`` is never consulted. Once an
+install lists its reverse proxy's address in ``COLLAPSARR_TRUSTED_PROXIES``,
+a request whose *direct* peer is that trusted proxy is classified on the
+rightmost ``X-Forwarded-For`` entry instead (the proxy's own view of its
+immediate client), so the real upstream client -- not the proxy -- is what
+determines local-vs-routable. A peer that is not on the allowlist is still
+classified by its own direct address, and any ``X-Forwarded-For`` it presents
+is ignored -- exactly as forgeable, and as ignored, as before.
 
 The Basic auth method (COL-52) slots in at the browser-route branch below:
 when ``auth_method="basic"``, an unauthenticated browser request gets a ``401``
@@ -53,6 +58,22 @@ operator credential, shared with Forms) mints a normal session
 (:func:`collapsarr.auth.session.log_in`), so every check *after* that --
 including ``/api``'s session-or-key rule -- is untouched. Only the initial UI
 challenge's transport differs between the two methods.
+
+Registration style (COL-199): this gate is a **raw ASGI middleware class**
+(:class:`EnforceAuthMiddleware`), wired via ``app.add_middleware`` -- *not* the
+older ``app.middleware("http")`` decorator form, which Starlette wraps in a
+:class:`~starlette.middleware.base.BaseHTTPMiddleware`. That wrapper re-buffers
+the wrapped response body through its own ``anyio`` task-group/memory-stream
+machinery instead of handing the ASGI ``send`` callable straight through, which
+is a latent hazard for a large streamed :class:`~fastapi.responses.FileResponse`
+(the backup-download route -- see the stalled-download investigation in
+COL-197/COL-199). On the happy path this class hands ``send`` straight to the
+inner app untouched, so a streamed body is passed through with no re-buffering;
+it only constructs a response itself for a challenge/redirect. The routing
+decisions are unchanged from the decorator-style version it replaced -- it
+matches :class:`collapsarr.auth.session.SessionMiddleware` and
+:class:`collapsarr.url_base.UrlBaseMiddleware`, the app's two other raw-ASGI
+middlewares.
 """
 
 from __future__ import annotations
@@ -60,14 +81,16 @@ from __future__ import annotations
 import base64
 import ipaddress
 import secrets
-from collections.abc import Awaitable, Callable
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..settings.models import AUTH_METHOD_BASIC, AUTH_REQUIRED_LOCAL_BYPASS
 from ..settings.service import get_global_settings, verify_auth_password
+from ..url_base import external_path
 from .session import is_authenticated, log_in
+from .trust import resolve_client_address
 
 API_KEY_HEADER = "X-Api-Key"
 """Request header carrying the API key (Sonarr/Radarr convention)."""
@@ -117,6 +140,17 @@ def _parse_basic_credentials(request: Request) -> tuple[str, str] | None:
     return username, password
 
 
+def _prefixed_redirect(url_base: str, path: str) -> RedirectResponse:
+    """A gate ``RedirectResponse`` to ``path``, with ``url_base`` re-added (COL-117).
+
+    Every gate redirect below goes through this instead of building
+    ``RedirectResponse`` directly, so the ``Location`` header is always the
+    correct external URL for a browser behind a reverse proxy -- see
+    :func:`collapsarr.url_base.external_path`.
+    """
+    return RedirectResponse(url=external_path(url_base, path), status_code=_REDIRECT_STATUS)
+
+
 def _basic_challenge() -> Response:
     """The ``401`` + ``WWW-Authenticate: Basic`` response for an
     unauthenticated request under the Basic auth method (COL-52)."""
@@ -128,22 +162,22 @@ def _basic_challenge() -> Response:
 
 
 def _client_is_local(request: Request) -> bool:
-    """Whether the request's direct TCP peer is loopback or a private-range address.
+    """Whether the request's resolved client address is loopback or private-range.
 
-    Reads ``request.client`` -- the literal address the ASGI server accepted
-    the connection from -- and nothing else. In particular this deliberately
-    does **not** consult ``X-Forwarded-For`` (or any other header): those are
-    supplied by the client and trivially spoofable, so trusting them here
-    would let any external caller claim to be local and bypass auth entirely.
-    The tradeoff (documented in the module docstring and the README) is that
-    an install behind a reverse proxy sees the proxy's own peer address, not
-    its upstream client's -- trusted-proxy support is a later stub.
+    The address comes from :func:`~collapsarr.auth.trust.resolve_client_address`
+    (COL-112), not straight from ``request.client``: with no trusted proxy
+    configured (the default) that is the same literal peer address the ASGI
+    server accepted the connection from, so behavior is unchanged. Only when
+    the *direct* peer is on the ``COLLAPSARR_TRUSTED_PROXIES`` allowlist does
+    the resolved address instead reflect the rightmost ``X-Forwarded-For``
+    entry -- an untrusted peer's forwarded header is never consulted, so it
+    cannot spoof its way into a local classification.
     """
-    client = request.client
-    if client is None:
+    address_str = resolve_client_address(request)
+    if address_str is None:
         return False
     try:
-        address = ipaddress.ip_address(client.host)
+        address = ipaddress.ip_address(address_str)
     except ValueError:
         # Not a literal IP address (seen in some non-network test harnesses) --
         # treat conservatively as not local.
@@ -162,91 +196,137 @@ def _is_static_asset(path: str) -> bool:
     return "." in path.rsplit("/", 1)[-1]
 
 
-async def enforce_auth_middleware(
-    request: Request,
-    call_next: Callable[[Request], Awaitable[Response]],
-) -> Response:
-    """Gate every request per the routing table in the module docstring."""
-    path = request.url.path
+class EnforceAuthMiddleware:
+    """Raw-ASGI request gate; see the module docstring for the routing table
+    and why this is a raw-ASGI class rather than ``app.middleware("http")``
+    (COL-199).
 
-    # The static-asset bypass is for the SPA's public JS/CSS bundle only; it must
-    # never open an ``/api`` route. Without the ``API_PREFIX`` guard, any ``/api``
-    # path whose final segment has a file extension (e.g. a backup id ending in
-    # ``.zip`` -- COL-65's ``DELETE /api/system/backup/{type}/{file}.zip``) would
-    # be misread as a static asset and skip the ``/api`` session/key gate below.
-    if path == HEALTH_PATH or path in OPEN_API_PATHS or (
-        not path.startswith(API_PREFIX) and _is_static_asset(path)
-    ):
-        return await call_next(request)
+    Must be registered as the **innermost** middleware (its ``add_middleware``
+    call comes *before* :class:`~collapsarr.auth.session.SessionMiddleware`'s,
+    so Starlette wraps it inside the session layer) -- it reads the session
+    that :class:`SessionMiddleware` decodes onto the scope. See
+    :func:`collapsarr.main.create_app`.
+    """
 
-    session_factory = request.app.state.session_factory
-    with session_factory() as session:
-        settings = get_global_settings(session)
-        credential_set = settings.auth_username is not None
-        expected_key = settings.api_key
-        auth_required = settings.auth_required
-        auth_method = settings.auth_method
-        auth_username = settings.auth_username
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
 
-    if auth_required == AUTH_REQUIRED_LOCAL_BYPASS and _client_is_local(request):
-        # local_bypass + a loopback/private-range peer: trust the network,
-        # skip every check below (first-run gate, session, API key) same as
-        # /health. A non-local peer falls through to the normal routing.
-        return await call_next(request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            # Only HTTP requests are gated; websocket/lifespan pass straight
+            # through, matching the old BaseHTTPMiddleware wrapper's behaviour.
+            await self.app(scope, receive, send)
+            return
 
-    authed = is_authenticated(request)
+        request = Request(scope, receive)
+        response = await self._authorize(request)
+        if response is None:
+            # Happy path: hand the ASGI ``send`` straight through to the inner
+            # app so a streamed FileResponse body is passed through untouched,
+            # with none of BaseHTTPMiddleware's re-buffering (COL-199). The
+            # *same* ``scope`` is reused (never copied) so a session minted by
+            # the Basic-auth branch in ``_authorize`` -- a mutation of
+            # ``scope["session"]`` -- is visible to the outer SessionMiddleware
+            # when it writes the Set-Cookie header on the response.
+            await self.app(scope, receive, send)
+            return
+        await response(scope, receive, send)
 
-    if path.startswith(API_PREFIX):
-        if authed:
-            return await call_next(request)
-        provided = _extract_key(request)
-        if provided is not None and secrets.compare_digest(provided, expected_key):
-            return await call_next(request)
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Invalid or missing API key."},
-        )
+    async def _authorize(self, request: Request) -> Response | None:
+        """Apply the routing table: return ``None`` to let the request through
+        to the inner app, or a :class:`~fastapi.Response` to short-circuit it
+        (a ``401`` challenge or a ``303`` redirect)."""
+        path = request.url.path
 
-    # --- Browser (SPA navigation) routes -------------------------------------
-    if not credential_set:
-        # First-run gate: only the setup page is reachable.
+        # The static-asset bypass is for the SPA's public JS/CSS bundle only; it
+        # must never open an ``/api`` route. Without the ``API_PREFIX`` guard, any
+        # ``/api`` path whose final segment has a file extension (e.g. a backup id
+        # ending in ``.zip`` -- COL-65's ``DELETE /api/system/backup/{type}/
+        # {file}.zip``) would be misread as a static asset and skip the ``/api``
+        # session/key gate below.
+        if path == HEALTH_PATH or path in OPEN_API_PATHS or (
+            not path.startswith(API_PREFIX) and _is_static_asset(path)
+        ):
+            return None
+
+        # Re-added to any redirect Location header below (COL-117): by the time
+        # this middleware runs, UrlBaseMiddleware (COL-116) has already stripped
+        # the configured prefix from `path`, but a Location header is an
+        # outbound URL sent to the browser, which needs the full external path
+        # -- prefix included. Empty when unconfigured, so redirects stay
+        # unprefixed exactly as before.
+        url_base: str = request.app.state.settings.url_base
+
+        session_factory = request.app.state.session_factory
+        with session_factory() as session:
+            settings = get_global_settings(session)
+            credential_set = settings.auth_username is not None
+            expected_key = settings.api_key
+            auth_required = settings.auth_required
+            auth_method = settings.auth_method
+            auth_username = settings.auth_username
+
+        if auth_required == AUTH_REQUIRED_LOCAL_BYPASS and _client_is_local(request):
+            # local_bypass + a loopback/private-range peer: trust the network,
+            # skip every check below (first-run gate, session, API key) same as
+            # /health. A non-local peer falls through to the normal routing.
+            return None
+
+        authed = is_authenticated(request)
+
+        if path.startswith(API_PREFIX):
+            if authed:
+                return None
+            provided = _extract_key(request)
+            if provided is not None and secrets.compare_digest(provided, expected_key):
+                return None
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API key."},
+            )
+
+        # --- Browser (SPA navigation) routes ---------------------------------
+        if not credential_set:
+            # First-run gate: only the setup page is reachable.
+            if path == SETUP_PATH:
+                return None
+            return _prefixed_redirect(url_base, SETUP_PATH)
+        assert auth_username is not None  # credential_set is True past this point
+
         if path == SETUP_PATH:
-            return await call_next(request)
-        return RedirectResponse(url=SETUP_PATH, status_code=_REDIRECT_STATUS)
-    assert auth_username is not None  # credential_set is True past this point
+            # Credential already exists -- setup is done.
+            if authed:
+                return _prefixed_redirect(url_base, APP_ROOT)
+            if auth_method == AUTH_METHOD_BASIC:
+                return _basic_challenge()
+            return _prefixed_redirect(url_base, LOGIN_PATH)
 
-    if path == SETUP_PATH:
-        # Credential already exists -- setup is done.
-        if authed:
-            return RedirectResponse(url=APP_ROOT, status_code=_REDIRECT_STATUS)
         if auth_method == AUTH_METHOD_BASIC:
+            # No Forms /login page under this method -- every other browser route
+            # (including /login itself, if visited directly) is challenged or
+            # passed the same way.
+            if authed:
+                return None
+            creds = _parse_basic_credentials(request)
+            if creds is not None and creds[0] == auth_username:
+                with session_factory() as session:
+                    password_ok = verify_auth_password(session, creds[1])
+                if password_ok:
+                    # Same credential core as Forms (COL-49) -- mint a session so
+                    # this browser's subsequent /api calls keep working the
+                    # unchanged session-or-key way; only the initial UI challenge
+                    # differs. Mutates ``request.session`` (i.e. scope["session"])
+                    # in place, which the outer SessionMiddleware reads when it
+                    # writes the Set-Cookie header -- see __call__.
+                    log_in(request, auth_username, remember=False)
+                    return None
             return _basic_challenge()
-        return RedirectResponse(url=LOGIN_PATH, status_code=_REDIRECT_STATUS)
 
-    if auth_method == AUTH_METHOD_BASIC:
-        # No Forms /login page under this method -- every other browser route
-        # (including /login itself, if visited directly) is challenged or
-        # passed the same way.
+        if path == LOGIN_PATH:
+            if authed:
+                return _prefixed_redirect(url_base, APP_ROOT)
+            return None
+
         if authed:
-            return await call_next(request)
-        creds = _parse_basic_credentials(request)
-        if creds is not None and creds[0] == auth_username:
-            with session_factory() as session:
-                password_ok = verify_auth_password(session, creds[1])
-            if password_ok:
-                # Same credential core as Forms (COL-49) -- mint a session so
-                # this browser's subsequent /api calls keep working the
-                # unchanged session-or-key way; only the initial UI challenge
-                # differs.
-                log_in(request, auth_username, remember=False)
-                return await call_next(request)
-        return _basic_challenge()
-
-    if path == LOGIN_PATH:
-        if authed:
-            return RedirectResponse(url=APP_ROOT, status_code=_REDIRECT_STATUS)
-        return await call_next(request)
-
-    if authed:
-        return await call_next(request)
-    return RedirectResponse(url=LOGIN_PATH, status_code=_REDIRECT_STATUS)
+            return None
+        return _prefixed_redirect(url_base, LOGIN_PATH)

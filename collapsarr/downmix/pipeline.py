@@ -29,6 +29,23 @@ as a failure.
 Not yet wired into a job queue — that's COL-20's concern. This module is the
 callable, single-file seam a job runner will later invoke per file.
 
+Every non-``SUCCESS`` outcome is also logged (COL-129), via a module logger
+so it lands in the rotating log file COL-128 wires up, split exactly along
+``PipelineResult.success``: the one non-fatal *skip*
+(:attr:`PipelineOutcome.NOTHING_TO_DO` -- ``success=True``, nothing was
+attempted, so it is neither a success nor a failure) logs at ``WARNING``;
+every genuine failure (``success=False`` --
+:attr:`PipelineOutcome.PROBE_FAILED`, :attr:`PipelineOutcome.REMUX_FAILED`,
+:attr:`PipelineOutcome.APPLY_FAILED`) logs at ``ERROR``, since each leaves
+the job with no output produced regardless of how safely it failed.
+:attr:`PipelineOutcome.REMUX_FAILED` additionally includes the last ~2000
+characters of ffmpeg's stderr (the full, untruncated stderr is still carried
+on ``RemuxResult``/``PipelineResult`` for job-history DB storage -- only the
+*log* output is truncated, so one bad conversion can't dominate the rotation
+window). A ``SUCCESS`` is not logged here -- :class:`~collapsarr.jobs.queue.
+JobQueue` logs job completion at ``INFO`` with job-level context (job id)
+this module doesn't have.
+
 Tests mirror the rest of the engine: real committed fixture media under
 ``tests/fixtures/downmix/`` driven through the actual ffmpeg/ffprobe binaries
 end-to-end for the success, nothing-to-do, and real-ffmpeg-failure paths
@@ -39,6 +56,7 @@ flow.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -50,16 +68,50 @@ from collapsarr.downmix.apply import (
     ApplyResult,
     apply_remux_result,
 )
+from collapsarr.downmix.cancellation import CancellationHandle, make_cancellable_runner
+from collapsarr.downmix.default_audio import (
+    DefaultAudioPreference,
+    resolve_default_audio_output_index,
+)
 from collapsarr.downmix.probe import FfprobeError, probe_audio_streams
 from collapsarr.downmix.remux import RemuxResult, run_remux
 from collapsarr.downmix.targets import DownmixSettings, QualifyingTarget, detect_qualifying_targets
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_FFPROBE_PATH = "ffprobe"
 _DEFAULT_FFMPEG_PATH = "ffmpeg"
 _DEFAULT_PROBE_TIMEOUT = 30.0
 _DEFAULT_REMUX_TIMEOUT = 3600.0
 
+#: Cap on how much of ffmpeg's stderr gets written to the log on a remux
+#: failure (COL-129). The full, untruncated stderr is still carried on
+#: ``RemuxResult``/``PipelineResult`` for job-history DB storage -- this only
+#: bounds what lands in the rotating log file, so one bad conversion can't
+#: dominate the rotation window (COL-128).
+_STDERR_LOG_CHARS = 2000
+
 _Runner = Callable[[Sequence[str], float], "subprocess.CompletedProcess[str]"]
+
+
+def _tail_for_log(text: str, limit: int = _STDERR_LOG_CHARS) -> str:
+    """Return the last ``limit`` characters of ``text``, for log output only."""
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _finish(result: PipelineResult, level: int) -> PipelineResult:
+    """Log ``result.detail`` at ``level`` and return ``result`` (COL-129).
+
+    The shared tail end of every non-``SUCCESS`` return in
+    :func:`run_downmix_pipeline`: build the :class:`PipelineResult`, log it,
+    return it. :attr:`PipelineOutcome.REMUX_FAILED` bypasses this -- its log
+    line is bespoke (a truncated ffmpeg-stderr tail rather than ``detail``,
+    which carries the full, untruncated stderr for job-history DB storage).
+    """
+    logger.log(level, result.detail)
+    return result
 
 
 class PipelineOutcome(Enum):
@@ -114,7 +166,10 @@ def run_downmix_pipeline(
     probe_timeout: float = _DEFAULT_PROBE_TIMEOUT,
     remux_timeout: float = _DEFAULT_REMUX_TIMEOUT,
     duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS,
+    default_audio_preference: DefaultAudioPreference | None = None,
+    auto_set_default_audio: bool = False,
     runner: _Runner | None = None,
+    cancel_handle: CancellationHandle | None = None,
 ) -> PipelineResult:
     """Run the full downmix pipeline for a single file, end to end.
 
@@ -156,26 +211,66 @@ def run_downmix_pipeline(
     On success, the original file has been atomically replaced by the
     remuxed version (all original streams intact, plus the newly added
     downmix track(s)), and ``tracks_added`` lists what was added.
+
+    The automatic in-band Default Audio Track fix (COL-152) is opt-in and off
+    by default: only when ``auto_set_default_audio`` is ``True`` *and* a
+    ``default_audio_preference`` is supplied does this resolve the winning
+    stream across the job's final layout (existing streams plus the tracks it is
+    about to encode) via
+    :func:`~collapsarr.downmix.default_audio.resolve_default_audio_output_index`
+    and fold the disposition change into the *same* remux invocation and atomic
+    swap as the downmix — never a second pass. With the toggle off (the
+    default), or when the resolver reports nothing needs changing, no
+    disposition flags are emitted and the remux command is byte-for-byte what it
+    would be without this feature.
+
+    ``cancel_handle`` (COL-192) makes a ``RUNNING`` job hard-killable: when it
+    is supplied and no explicit ``runner`` is given, every subprocess this
+    pipeline spawns is run through :func:`~collapsarr.downmix.cancellation.
+    make_cancellable_runner`, registering each with the handle so a concurrent
+    :meth:`~collapsarr.downmix.cancellation.CancellationHandle.cancel` (driven
+    by :meth:`~collapsarr.jobs.queue.JobQueue.cancel_running`) terminates
+    ffmpeg/ffprobe and its children immediately -- the interrupted subprocess
+    returns a signal exit code, surfacing here as an ordinary
+    :attr:`PipelineOutcome.PROBE_FAILED`/:attr:`PipelineOutcome.REMUX_FAILED`.
+    An explicit ``runner`` always wins (a test injecting its own subprocess
+    stub keeps full control), and with neither supplied the behaviour is
+    byte-for-byte unchanged.
     """
     path = Path(file_path)
+
+    if runner is None and cancel_handle is not None:
+        runner = make_cancellable_runner(cancel_handle)
 
     try:
         streams = probe_audio_streams(
             path, ffprobe_path=ffprobe_path, timeout=probe_timeout, runner=runner
         )
     except FfprobeError as exc:
-        return PipelineResult(
-            outcome=PipelineOutcome.PROBE_FAILED,
-            success=False,
-            detail=f"failed to probe audio streams of {str(path)!r}: {exc}",
+        return _finish(
+            PipelineResult(
+                outcome=PipelineOutcome.PROBE_FAILED,
+                success=False,
+                detail=f"failed to probe audio streams of {str(path)!r}: {exc}",
+            ),
+            logging.ERROR,
         )
 
     targets = detect_qualifying_targets(streams, settings)
     if not targets:
-        return PipelineResult(
-            outcome=PipelineOutcome.NOTHING_TO_DO,
-            success=True,
-            detail=f"no qualifying downmix targets for {str(path)!r}; nothing to do",
+        return _finish(
+            PipelineResult(
+                outcome=PipelineOutcome.NOTHING_TO_DO,
+                success=True,
+                detail=f"no qualifying downmix targets for {str(path)!r}; nothing to do",
+            ),
+            logging.WARNING,
+        )
+
+    default_audio_index: int | None = None
+    if auto_set_default_audio and default_audio_preference is not None:
+        default_audio_index = resolve_default_audio_output_index(
+            streams, targets, default_audio_preference
         )
 
     remux_result = run_remux(
@@ -185,10 +280,11 @@ def run_downmix_pipeline(
         settings,
         ffmpeg_path=ffmpeg_path,
         timeout=remux_timeout,
+        default_audio_index=default_audio_index,
         runner=runner,
     )
     if not remux_result.success:
-        return PipelineResult(
+        result = PipelineResult(
             outcome=PipelineOutcome.REMUX_FAILED,
             success=False,
             detail=(
@@ -197,6 +293,18 @@ def run_downmix_pipeline(
             ),
             remux_result=remux_result,
         )
+        # Deliberately does NOT interpolate `result.detail` here -- it already
+        # carries the *full*, untruncated stderr (kept there for job-history
+        # DB storage). Logging it again in full would defeat the point of
+        # truncating: only the tail below is written to the log line.
+        logger.error(
+            "ffmpeg remux failed for %r (exit code %d) -- stderr (last %d chars): %s",
+            str(path),
+            remux_result.returncode,
+            _STDERR_LOG_CHARS,
+            _tail_for_log(remux_result.stderr),
+        )
+        return result
 
     try:
         apply_result = apply_remux_result(
@@ -209,20 +317,26 @@ def run_downmix_pipeline(
             runner=runner,
         )
     except FfprobeError as exc:
-        return PipelineResult(
-            outcome=PipelineOutcome.APPLY_FAILED,
-            success=False,
-            detail=f"failed to validate remux result for {str(path)!r}: {exc}",
-            remux_result=remux_result,
+        return _finish(
+            PipelineResult(
+                outcome=PipelineOutcome.APPLY_FAILED,
+                success=False,
+                detail=f"failed to validate remux result for {str(path)!r}: {exc}",
+                remux_result=remux_result,
+            ),
+            logging.ERROR,
         )
 
     if not apply_result.success:
-        return PipelineResult(
-            outcome=PipelineOutcome.APPLY_FAILED,
-            success=False,
-            detail=apply_result.detail,
-            remux_result=remux_result,
-            apply_result=apply_result,
+        return _finish(
+            PipelineResult(
+                outcome=PipelineOutcome.APPLY_FAILED,
+                success=False,
+                detail=apply_result.detail,
+                remux_result=remux_result,
+                apply_result=apply_result,
+            ),
+            logging.ERROR,
         )
 
     return PipelineResult(

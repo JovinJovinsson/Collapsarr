@@ -26,6 +26,14 @@ const settings: GlobalSettings = {
   disk_space_warning_percent: 5,
   disk_space_error_percent: 2,
   update_channel: "stable",
+  default_tracked: true,
+  log_level: null,
+  default_audio_language: null,
+  default_audio_channel_tier: null,
+  auto_set_default_audio: false,
+  recently_processed_window_minutes: 360,
+  auto_queue_paused: false,
+  auto_processing_paused: false,
   api_key: "onboarding-server-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
@@ -60,7 +68,8 @@ function renderPanel() {
     <MemoryRouter initialEntries={["/wanted"]}>
       <Routes>
         <Route path="/wanted" element={<OnboardingPanel />} />
-        <Route path="/settings" element={<div>Settings view</div>} />
+        <Route path="/settings/sonarr" element={<div>Sonarr settings view</div>} />
+        <Route path="/settings/radarr" element={<div>Radarr settings view</div>} />
       </Routes>
     </MemoryRouter>,
   );
@@ -70,7 +79,7 @@ function renderPanel() {
  * Covers COL-54's AC: the onboarding panel renders with the auto-generated
  * API key and a working link to instance configuration while the install is
  * unconfigured, is dismissible and stays dismissed, and gets out of the way
- * once an arr instance is configured. Prior art: `settingsPage.test.tsx`
+ * once an arr instance is configured. Prior art: `settingsSonarr.test.tsx`
  * (mocked-fetch render pattern) and `apiClient.test.ts` (localStorage
  * persistence pattern).
  */
@@ -84,18 +93,23 @@ describe("OnboardingPanel", () => {
     localStorage.clear();
   });
 
-  it("renders the auto-generated API key and a working link to instance configuration when unconfigured", async () => {
+  it("renders the auto-generated API key and two separate links to instance configuration when unconfigured", async () => {
     stubFetch([]);
     renderPanel();
 
     expect(await screen.findByText(/welcome to collapsarr/i)).toBeInTheDocument();
     expect(screen.getByText("onboarding-server-key")).toBeInTheDocument();
 
-    const link = screen.getByRole("link", { name: /connect your first sonarr or radarr instance/i });
-    expect(link).toHaveAttribute("href", "/settings");
+    // COL-145: Two separate inline links, one per type.
+    const sonarrLink = screen.getByRole("link", { name: "Sonarr" });
+    expect(sonarrLink).toHaveAttribute("href", "/settings/sonarr");
 
-    fireEvent.click(link);
-    expect(await screen.findByText("Settings view")).toBeInTheDocument();
+    const radarrLink = screen.getByRole("link", { name: "Radarr" });
+    expect(radarrLink).toHaveAttribute("href", "/settings/radarr");
+
+    // Verify navigation works for both.
+    fireEvent.click(sonarrLink);
+    expect(await screen.findByText("Sonarr settings view")).toBeInTheDocument();
   });
 
   it("renders nothing once at least one arr instance is configured", async () => {

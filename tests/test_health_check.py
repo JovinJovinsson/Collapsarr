@@ -33,6 +33,7 @@ from collapsarr.health import (
     reconcile_health_results,
 )
 from collapsarr.notify.service import update_notifier_config
+from collapsarr.settings.service import get_global_settings
 
 _MISSING_BINARY = "collapsarr-test-definitely-not-a-real-binary"
 
@@ -120,6 +121,45 @@ def test_ffmpeg_check_run_adapts_a_missing_binary_to_a_failing_result(session: S
     assert result.code == FFMPEG_MISSING_CODE
     assert result.passing is False
     assert result.message == missing.detail
+
+
+# ---------------------------------------------------------------------------
+# GlobalSettings.ffmpeg_path wiring (COL-218): the real, un-overridden checker
+# reads context.session for a configured override; an injected fake checker
+# (as above) keeps ignoring context entirely -- unchanged pre-COL-218 behaviour.
+# ---------------------------------------------------------------------------
+
+
+def test_ffmpeg_check_run_probes_the_configured_path_when_set(session: Session) -> None:
+    """With no ``checker`` override, a configured ``GlobalSettings.ffmpeg_path``
+    is checked instead of the bare ``"ffmpeg"`` default -- no restart required."""
+    row = get_global_settings(session)
+    row.ffmpeg_path = _MISSING_BINARY
+    session.commit()
+
+    run = make_ffmpeg_check_run()  # real checker, no override
+
+    result = list(run(_context(session)))[0]
+
+    assert result.code == FFMPEG_MISSING_CODE
+    assert result.passing is False
+    assert _MISSING_BINARY in result.message
+
+
+def test_ffmpeg_check_run_falls_back_to_bare_default_when_unset(session: Session) -> None:
+    """Unset (a fresh install's row, and every existing install's after the
+    additive migration): behaviour is byte-for-byte the pre-COL-218 default --
+    the bare ``"ffmpeg"`` command resolved off PATH."""
+    row = get_global_settings(session)
+    assert row.ffmpeg_path is None
+
+    run = make_ffmpeg_check_run()  # real checker, no override
+
+    result = list(run(_context(session)))[0]
+
+    assert result.code == FFMPEG_MISSING_CODE
+    assert result.passing is True
+    assert result.message == check_ffmpeg().detail
 
 
 # ---------------------------------------------------------------------------

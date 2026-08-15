@@ -357,6 +357,7 @@ def create_backup(
     *,
     retention_days: int | None = None,
     snapshot: Callable[[Path, Path], None] | None = None,
+    now: datetime | None = None,
 ) -> BackupInfo:
     """Create one backup archive and return its :class:`BackupInfo`.
 
@@ -381,6 +382,12 @@ def create_backup(
     logged but never fails the create: the backup already succeeded and must not
     be lost.
 
+    ``now`` defaults to :func:`datetime.now(UTC) <datetime.datetime.now>` and is
+    used for both the archive's filename timestamp and (when pruning) the
+    retention cutoff, so a caller with its own injectable clock -- the
+    scheduler's tests, notably -- gets a fully clock-consistent create+prune
+    instead of the prune silently falling back to the real wall clock.
+
     Raises :class:`BackupUnavailableError` when the database isn't a file-based
     SQLite one (see :func:`resolve_sqlite_path`).
     """
@@ -396,7 +403,7 @@ def create_backup(
         target_dir = backup_type_dir(settings, backup_type)
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        now = datetime.now(UTC)
+        now = now or datetime.now(UTC)
         filename = _backup_filename(now)
         final_path = target_dir / filename
         tmp_db = target_dir / f".{filename}.db.part"
@@ -423,6 +430,7 @@ def create_backup(
                     settings,
                     backup_type,
                     retention_days=retention_days,
+                    now=now,
                     protect=final_path,
                 )
             except Exception:  # noqa: BLE001 - a prune failure must not lose the backup

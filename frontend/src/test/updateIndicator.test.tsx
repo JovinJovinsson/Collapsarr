@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { UpdateIndicator } from "../components/UpdateIndicator";
+import { UpdatesProvider } from "../components/UpdatesProvider";
 import type { UpdateCheckState } from "../types/updates";
 
 function jsonResponse(body: unknown, status = 200) {
@@ -17,7 +18,7 @@ const upToDate: UpdateCheckState = {
   checked_at: "2026-08-02T10:00:00Z",
   update_available: false,
   dismissed_at: null,
-  is_docker: false,
+  install_method: "pipx",
 };
 
 const updateAvailable: UpdateCheckState = {
@@ -28,13 +29,22 @@ const updateAvailable: UpdateCheckState = {
   checked_at: "2026-08-02T10:00:00Z",
   update_available: true,
   dismissed_at: null,
-  is_docker: false,
+  install_method: "pipx",
 };
 
+/**
+ * `UpdateIndicator` reads the shared Update Check state via `useUpdates()`
+ * (COL-196 code review), so it must be rendered beneath `UpdatesProvider`
+ * -- mirrors `healthBanner.test.tsx`'s `HealthProvider` wrapping.
+ * `UpdatesProvider` owns the `GET /api/system/updates` fetch these tests'
+ * `fetchMock` assertions target.
+ */
 function renderIndicator() {
   return render(
     <MemoryRouter>
-      <UpdateIndicator />
+      <UpdatesProvider>
+        <UpdateIndicator />
+      </UpdatesProvider>
     </MemoryRouter>
   );
 }

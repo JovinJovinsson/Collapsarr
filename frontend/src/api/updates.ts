@@ -1,5 +1,31 @@
-import type { UpdateCheckState } from "../types/updates";
+import type {
+  SelfUpdateApplyRequest,
+  SelfUpdateApplyResult,
+  SelfUpdateFlow,
+  SelfUpdateStatus,
+  UpdateCheckState,
+} from "../types/updates";
 import { apiErrorMessage, apiFetch } from "./client";
+
+const JSON_HEADERS = { "Content-Type": "application/json" };
+
+/**
+ * Thrown by {@link applySelfUpdate} only when the apply endpoint genuinely
+ * *responded* with a non-ok status (`403`/`409`/`502`) -- as opposed to the
+ * request failing at the network layer (COL-231). The distinction matters to
+ * `UpdatesPage`'s confirm handler: a responded error means the server is
+ * still up and definitively refused the request (keep the modal open so the
+ * operator can see why and retry/cancel, unchanged since COL-228); a
+ * network-layer failure (the connection dropping mid-request) is the
+ * *expected* shape of a real apply that already re-exec'd/exited (see this
+ * function's own doc comment) and should instead route into the dedicated
+ * polling screen (`SelfUpdateProgress`). A plain `instanceof Error` can't
+ * tell these two apart -- a network failure (typically a `TypeError`) and
+ * this class both extend `Error` -- so this dedicated subclass is the seam
+ * callers switch on instead of relying on a particular runtime's own
+ * network-error type.
+ */
+export class SelfUpdateApplyResponseError extends Error {}
 
 /**
  * Fetches the current Update Check state -- running vs. latest version,
@@ -53,6 +79,59 @@ export async function dismissUpdateStatus(): Promise<UpdateCheckState> {
     );
   }
   return (await response.json()) as UpdateCheckState;
+}
+
+/**
+ * Triggers the Self-Update apply flow for this install
+ * (`POST /api/system/self-update/apply`, COL-232/COL-233/COL-235, COL-228)
+ * -- `UpdatesPage`'s "Update Now" action, called once the confirmation modal
+ * is confirmed. `flow` is omitted for a plain confirm (no Jobs were running
+ * at trigger time); pass `"cancel_and_restart"`/`"wait_and_restart"` when
+ * the modal offered the in-flight-Job choice instead.
+ *
+ * A real apply re-execs (pipx) or exits (native, handing off to the staged
+ * swap) the server process, so a successful call may never actually resolve
+ * with a response before the connection drops -- callers should treat a
+ * network-level failure right after calling this the same as the documented
+ * `{ok: true}` outcome, not necessarily a genuine error. Throws on every
+ * *responded* error status (`403` wrong install method, `409` no stable
+ * update / already in progress / Jobs running with no `flow`, `502`
+ * download/verify/apply failure), same as every other `api/updates.ts`
+ * function.
+ */
+export async function applySelfUpdate(flow?: SelfUpdateFlow): Promise<SelfUpdateApplyResult> {
+  const body: SelfUpdateApplyRequest = flow ? { flow } : {};
+  const response = await apiFetch("/api/system/self-update/apply", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new SelfUpdateApplyResponseError(
+      await apiErrorMessage(response, `Failed to trigger the update (${response.status})`)
+    );
+  }
+  return (await response.json()) as SelfUpdateApplyResult;
+}
+
+/**
+ * Fetches the current Self-Update attempt state
+ * (`GET /api/system/self-update/status`, COL-230,
+ * `collapsarr.self_update.routes.SelfUpdateStatusRead`) -- `SelfUpdateProgress`'s
+ * (COL-231) polling target across the app's restart/re-exec downtime window.
+ * Always returns a row (get-or-created server-side, `in_progress=false`,
+ * `phase="idle"` before any attempt has ever run), so there is no "not found"
+ * case to special-case here, only the ordinary responded-error path every
+ * other function in this module already follows.
+ */
+export async function fetchSelfUpdateStatus(): Promise<SelfUpdateStatus> {
+  const response = await apiFetch("/api/system/self-update/status");
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to load the self-update status (${response.status})`)
+    );
+  }
+  return (await response.json()) as SelfUpdateStatus;
 }
 
 /**

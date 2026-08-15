@@ -13,8 +13,8 @@ Sonarr/Radarr-style API key for webhooks and tooling. See the submodules:
 
 from __future__ import annotations
 
-from .enforcement import enforce_auth_middleware
+from .enforcement import EnforceAuthMiddleware
 from .routes import router as auth_router
 from .session import SessionMiddleware
 
-__all__ = ["SessionMiddleware", "auth_router", "enforce_auth_middleware"]
+__all__ = ["EnforceAuthMiddleware", "SessionMiddleware", "auth_router"]

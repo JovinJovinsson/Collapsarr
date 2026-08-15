@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from collapsarr.notify import NotificationEvent, dispatch_notification, get_notifier_config
 
-from .queue import FailureNotifier, Job
+from .queue import FailureNotifier, Job, JobKind
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +56,34 @@ def _error_detail(job: Job) -> str:
 
 
 def _target(job: Job) -> str | None:
-    """Comma-joined enabled downmix targets the job was configured with."""
+    """What the job was configured to do, target-wise (mirrors :mod:`collapsarr.jobs.history`)."""
+    if job.kind is JobKind.SET_DEFAULT_AUDIO:
+        return job.preference.channel_tier.value if job.preference is not None else None
     if not job.settings.enabled_targets:
         return None
     return ",".join(sorted(target.value for target in job.settings.enabled_targets))
 
 
 def _language(job: Job) -> str | None:
-    """Comma-joined language allow-list, or ``None`` when unrestricted."""
+    """What the job was configured to do, language-wise (mirrors :mod:`collapsarr.jobs.history`)."""
+    if job.kind is JobKind.SET_DEFAULT_AUDIO:
+        return job.preference.language if job.preference is not None else None
     if job.settings.language_allow_list is None:
         return None
     return ",".join(sorted(job.settings.language_allow_list))
 
 
 def _build_event(job: Job) -> NotificationEvent:
-    """Build the :class:`NotificationEvent` describing ``job``'s failure."""
+    """Build the :class:`NotificationEvent` describing ``job``'s failure.
+
+    ``event_type`` stays :data:`EVENT_TYPE` (``"downmix_failure"``) for both
+    job kinds -- it is the machine-readable tag downstream consumers key
+    off, and changing it per-kind is a bigger compatibility question than
+    this ticket's queue/scheduler wiring scope (COL-155). ``title``/
+    ``message`` are human copy, though, so those *are* kind-aware -- a
+    ``SET_DEFAULT_AUDIO`` failure saying "Downmix failed" would be simply
+    wrong (that job never downmixes anything).
+    """
     details: dict[str, str] = {"file": str(job.file_path), "error": _error_detail(job)}
     target = _target(job)
     if target is not None:
@@ -79,10 +92,18 @@ def _build_event(job: Job) -> NotificationEvent:
     if language is not None:
         details["language"] = language
 
+    is_default_audio = job.kind is JobKind.SET_DEFAULT_AUDIO
+    title = "Default Audio Track fix failed" if is_default_audio else "Downmix failed"
+    message = (
+        f"Default Audio Track fix failed for {job.file_path}"
+        if is_default_audio
+        else f"Downmix failed for {job.file_path}"
+    )
+
     return NotificationEvent(
         event_type=EVENT_TYPE,
-        title="Downmix failed",
-        message=f"Downmix failed for {job.file_path}",
+        title=title,
+        message=message,
         details=details,
     )
 

@@ -37,6 +37,60 @@ Settings-page write path (:mod:`collapsarr.settings.routes`) also restricts
 the field to a ``Literal`` at the API boundary, but this is the single
 service-layer guard every other caller (env-seeding, scripts, tests) goes
 through too.
+
+``log_level`` (COL-130) follows ``language_allow_list``'s nullable-clearable
+convention (the :data:`_UNSET` sentinel), not ``update_channel``'s: an
+explicit ``None`` clears a persisted override back to "defer to
+``COLLAPSARR_LOG_LEVEL``", while omitting the argument leaves whatever is
+already stored untouched. A non-``None`` value is validated against
+:data:`~collapsarr.settings.models.LOG_LEVELS`, raising :class:`ValueError`
+otherwise -- same guard shape as ``update_channel``. This function only
+*persists* the value; applying it live to the running ``collapsarr`` logger
+is the caller's job (:func:`collapsarr.settings.routes.update_settings_endpoint`
+calls :func:`collapsarr.logging_setup.apply_log_level`), mirroring how
+:func:`rotate_session_secret`'s caller pushes the fresh secret into the
+running process's own cached copy.
+
+``default_audio_language``/``default_audio_channel_tier`` (COL-151) both
+follow ``log_level``'s nullable-clearable convention (the :data:`_UNSET`
+sentinel): an explicit ``None`` clears a configured Preferred Default Audio
+preference, while omitting the argument leaves whatever is already stored
+untouched. ``default_audio_channel_tier`` takes a
+:class:`~collapsarr.downmix.targets.DownmixTarget` (not a bare string,
+matching ``enabled_targets``' own typing) and is stored as its ``.value``.
+``auto_set_default_audio`` follows the plain "only change what's passed"
+rule every other boolean field here follows (``ui_auth_enabled``,
+``default_tracked``) -- there is no clear-to-default sentinel since it
+always holds a concrete ``True``/``False``.
+
+``recently_processed_window_minutes`` (COL-167) follows the same "only
+change what's passed" rule as the backup/disk-space pairs above, with one
+extra guard: a negative value raises :class:`ValueError` (``0`` is valid --
+it means "no cooldown", not "unset"). :class:`~collapsarr.jobs.scheduler.
+JobScheduler` reads this field live from the row on every "recently
+processed" dedup check (see that module's docstring), so a change here is
+live on the *very next* check, no restart or scheduler reconstruction
+needed -- unlike ``concurrency_limit``, whose worker-pool thread count is
+still fixed at construction.
+
+``auto_queue_paused`` (COL-174, "Auto-Queuing Pause") follows the same
+"only change what's passed" rule as every other boolean field here
+(``ui_auth_enabled``, ``default_tracked``, ``auto_set_default_audio``).
+:class:`~collapsarr.jobs.scheduler.JobScheduler` reads it live from the row
+at the top of every :meth:`~collapsarr.jobs.scheduler.JobScheduler.top_up`
+call, so a change here takes effect on the very next auto-fill attempt with
+no restart or scheduler reconstruction -- see that method's docstring for
+exactly what it does and does not gate.
+
+``auto_processing_paused`` (COL-226, "Auto-Processing Pause") follows the
+same "only change what's passed" rule as every other boolean field here.
+:class:`~collapsarr.jobs.queue.JobQueue` reads it live via its injected
+``pause_check`` callable on every claim attempt
+(:meth:`~collapsarr.jobs.queue.JobQueue._claim_next`), so a change here
+takes effect on the next claim with no restart -- see
+:attr:`~collapsarr.settings.models.GlobalSettings.auto_processing_paused`'s
+own docstring for exactly what it does and does not gate, distinct from
+``auto_queue_paused`` above.
 """
 
 from __future__ import annotations
@@ -44,10 +98,12 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from collapsarr import __version__
+from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 
 from .models import (
     BETA_LOCAL_SEGMENT_PREFIX,
+    LOG_LEVELS,
     SETTINGS_ID,
     UPDATE_CHANNEL_BETA,
     UPDATE_CHANNEL_STABLE,
@@ -162,6 +218,14 @@ def update_global_settings(
     disk_space_warning_percent: float | None = None,
     disk_space_error_percent: float | None = None,
     update_channel: str | None = None,
+    default_tracked: bool | None = None,
+    log_level: str | None | _Unset = _UNSET,
+    default_audio_language: str | None | _Unset = _UNSET,
+    default_audio_channel_tier: DownmixTarget | None | _Unset = _UNSET,
+    auto_set_default_audio: bool | None = None,
+    recently_processed_window_minutes: int | None = None,
+    auto_queue_paused: bool | None = None,
+    auto_processing_paused: bool | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -198,6 +262,45 @@ def update_global_settings(
     can persist an invalid channel. The Update Check scheduler reads this
     live from the row on every tick, so a change here takes effect on the
     next tick with no restart.
+
+    ``default_tracked`` (COL-98) follows the same "only change what's passed"
+    rule as every other boolean field here. It is the instance-wide fallback
+    a Library node's Tracked value resolves to when nothing in its ancestry
+    carries an explicit override (see
+    :func:`collapsarr.library.service.resolve_tracked`); the Settings-page
+    toggle exposing it is a later ticket.
+
+    ``log_level`` (COL-130) uses the :data:`_UNSET` sentinel, like
+    ``language_allow_list``: passing ``None`` explicitly clears a persisted
+    override (falling back to ``COLLAPSARR_LOG_LEVEL`` at the next boot, and
+    live immediately -- see :func:`collapsarr.logging_setup.apply_log_level`),
+    while omitting the argument leaves the stored value untouched. A
+    non-``None`` value is validated against
+    :data:`~collapsarr.settings.models.LOG_LEVELS`, raising
+    :class:`ValueError` otherwise. This function only persists the value --
+    it does not itself touch the running logger; see the module docstring.
+
+    ``default_audio_language``/``default_audio_channel_tier`` (COL-151) use
+    the :data:`_UNSET` sentinel, like ``log_level``: passing ``None``
+    explicitly clears a configured Preferred Default Audio preference field,
+    while omitting the argument leaves the stored value untouched.
+    ``default_audio_channel_tier`` is stored as its
+    :class:`~collapsarr.downmix.targets.DownmixTarget` ``.value`` -- there is
+    no separate validation step needed since the parameter is already typed
+    to the enum, so an invalid tier can't reach this function at all (the
+    HTTP boundary, :mod:`collapsarr.settings.routes`, also types the field as
+    the enum for the same reason).
+
+    ``auto_set_default_audio`` (COL-151) follows the same "only change what's
+    passed" rule as every other boolean field here.
+
+    ``auto_processing_paused`` (COL-226, "Auto-Processing Pause") follows the
+    same "only change what's passed" rule as every other boolean field here.
+    Unlike ``auto_queue_paused``, which only gates the scanner's auto-fill
+    funnel, this field gates :class:`~collapsarr.jobs.queue.JobQueue`'s
+    pending -> running claim step directly via an injected ``pause_check``
+    callable -- see :attr:`~collapsarr.settings.models.GlobalSettings.
+    auto_processing_paused`'s own docstring for the full scope.
     """
     settings = get_global_settings(session)
 
@@ -240,7 +343,118 @@ def update_global_settings(
                 f"{UPDATE_CHANNEL_STABLE!r}/{UPDATE_CHANNEL_BETA!r}; got {update_channel!r}"
             )
         settings.update_channel = update_channel
+    if default_tracked is not None:
+        settings.default_tracked = default_tracked
+    if not isinstance(log_level, _Unset):
+        if log_level is not None and log_level not in LOG_LEVELS:
+            raise ValueError(f"log_level must be one of {LOG_LEVELS!r}; got {log_level!r}")
+        settings.log_level = log_level
+    if not isinstance(default_audio_language, _Unset):
+        settings.default_audio_language = default_audio_language
+    if not isinstance(default_audio_channel_tier, _Unset):
+        settings.default_audio_channel_tier = (
+            default_audio_channel_tier.value if default_audio_channel_tier is not None else None
+        )
+    if auto_set_default_audio is not None:
+        settings.auto_set_default_audio = auto_set_default_audio
+    if recently_processed_window_minutes is not None:
+        if recently_processed_window_minutes < 0:
+            raise ValueError(
+                "recently_processed_window_minutes must be >= 0 (0 disables the "
+                f"cooldown); got {recently_processed_window_minutes!r}"
+            )
+        settings.recently_processed_window_minutes = recently_processed_window_minutes
+    if auto_queue_paused is not None:
+        settings.auto_queue_paused = auto_queue_paused
+    if auto_processing_paused is not None:
+        settings.auto_processing_paused = auto_processing_paused
 
+    session.commit()
+    session.refresh(settings)
+    return settings
+
+
+def set_ffmpeg_path(session: Session, ffmpeg_path: str) -> GlobalSettings:
+    """Persist a resolved absolute FFmpeg executable path (COL-218/COL-222).
+
+    A narrow, single-purpose setter -- deliberately **not** folded into
+    :func:`update_global_settings`'s generic kwarg list, unlike every other
+    field there. ``ffmpeg_path`` is not part of the generic Settings form
+    (``GET``/``PUT /api/settings``); it is only ever written by the FFmpeg
+    auto-download flow (:func:`collapsarr.ffmpeg_download.service.
+    download_and_install_ffmpeg`), and only once that flow's download,
+    checksum verification, and archive extraction have *all* already
+    succeeded -- never with a partial or unverified path. The FFmpeg
+    presence health check (:func:`collapsarr.health.ffmpeg.
+    make_ffmpeg_check_run`) and the job queue's pipeline-kwarg resolution
+    (:meth:`collapsarr.jobs.queue.JobQueue._resolve_pipeline_kwargs`) both
+    already read this column live from the row on every use, so a value
+    written here takes effect immediately -- no restart, no separate
+    "apply" step.
+    """
+    settings = get_global_settings(session)
+    settings.ffmpeg_path = ffmpeg_path
+    session.commit()
+    session.refresh(settings)
+    return settings
+
+
+def stash_and_force_pause_processing(session: Session) -> GlobalSettings:
+    """Snapshot ``auto_processing_paused`` then force it ``True`` (COL-230/COL-233).
+
+    The write half of the self-update apply flow's one-shot pause mechanism
+    (:mod:`collapsarr.self_update.apply`'s "Cancel & Restart Now"/"Wait &
+    Restart" flows): stashes whatever ``auto_processing_paused`` currently
+    holds into ``auto_processing_pause_restore_value`` -- see that column's
+    own docstring on :class:`~collapsarr.settings.models.GlobalSettings` --
+    then forces ``auto_processing_paused`` to ``True`` so no *new* Job starts
+    claiming while the apply flow is cancelling/waiting for currently-running
+    ones. Unconditional: always overwrites the restore column with whatever
+    ``auto_processing_paused`` reads as *right now*, mirroring
+    :func:`collapsarr.self_update.service.begin_self_update`'s own
+    unconditional stamp of ``previous_version`` -- this is only ever called
+    once, at the very start of one apply attempt.
+
+    Paired with :func:`restore_auto_processing_pause`, which consumes
+    (writes back, then clears) the stashed value -- either inline, if the
+    apply attempt itself fails before a restart is ever triggered, or at the
+    next process boot (:func:`collapsarr.main.create_app`'s ``lifespan``),
+    which is the only place a *successful* apply's re-exec'd process can run
+    it.
+    """
+    settings = get_global_settings(session)
+    settings.auto_processing_pause_restore_value = settings.auto_processing_paused
+    settings.auto_processing_paused = True
+    session.commit()
+    session.refresh(settings)
+    return settings
+
+
+def restore_auto_processing_pause(session: Session) -> GlobalSettings:
+    """Consume the stashed pre-update ``auto_processing_paused`` value (COL-230/COL-233).
+
+    The read half of :func:`stash_and_force_pause_processing`'s one-shot
+    mechanism: writes ``auto_processing_pause_restore_value`` back onto
+    ``auto_processing_paused`` and clears the restore column to ``None`` --
+    so a pre-existing *manual* pause (the stashed value was ``True``) is
+    still paused after the update, while a pause this apply attempt itself
+    introduced (the stashed value was ``False``) resumes processing.
+
+    A no-op (returns the row unchanged, no write) when
+    ``auto_processing_pause_restore_value`` is already ``None`` -- the
+    steady state: no self-update has ever force-paused processing, or a
+    previous call already consumed it. Idempotent for the same reason
+    :func:`collapsarr.self_update.service.clear_self_update` is: called from
+    two different places (an apply attempt's own failure path, and every
+    process boot -- see :func:`stash_and_force_pause_processing`'s
+    docstring) that can't coordinate with each other about which one gets
+    there first.
+    """
+    settings = get_global_settings(session)
+    if settings.auto_processing_pause_restore_value is None:
+        return settings
+    settings.auto_processing_paused = settings.auto_processing_pause_restore_value
+    settings.auto_processing_pause_restore_value = None
     session.commit()
     session.refresh(settings)
     return settings
@@ -297,4 +511,28 @@ def as_downmix_settings(settings: GlobalSettings) -> DownmixSettings:
         stereo_bitrate_kbps=settings.stereo_bitrate_kbps,
         surround_codec=settings.surround_codec,
         surround_bitrate_kbps=settings.surround_bitrate_kbps,
+    )
+
+
+def as_default_audio_preference(settings: GlobalSettings) -> DefaultAudioPreference | None:
+    """Adapt a persisted :class:`GlobalSettings` row into a :class:`DefaultAudioPreference`.
+
+    The shape the automatic in-band Default Audio Track fix (COL-152) consumes,
+    via :func:`~collapsarr.downmix.default_audio.resolve_default_audio_output_index`
+    and the downmix pipeline -- pairing the row's ``default_audio_language`` with
+    its ``default_audio_channel_tier`` (stored as a
+    :class:`~collapsarr.downmix.targets.DownmixTarget` value, decoded back here).
+
+    Returns ``None`` -- "no actionable preference" -- whenever either half is
+    unset: a preference only means something as a complete
+    ``(language, channel tier)`` pair, the same way
+    :func:`as_downmix_settings` decodes its own columns. Whether to *act* on the
+    returned preference at all is the caller's ``auto_set_default_audio`` gate,
+    not this adapter's concern.
+    """
+    if settings.default_audio_language is None or settings.default_audio_channel_tier is None:
+        return None
+    return DefaultAudioPreference(
+        language=settings.default_audio_language,
+        channel_tier=DownmixTarget(settings.default_audio_channel_tier),
     )

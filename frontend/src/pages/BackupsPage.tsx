@@ -1,3 +1,4 @@
+import { DatabaseBackup } from "lucide-react";
 import type { ChangeEvent } from "react";
 import { useEffect, useState } from "react";
 
@@ -9,28 +10,14 @@ import {
   restoreBackup,
   restoreFromUpload,
 } from "../api/backups";
-import { fetchSettings, updateSettings } from "../api/settings";
-import { BackupIcon } from "../components/icons";
 import type { Backup } from "../types/backups";
+import { formatBytes } from "../utils/format";
 
 /** Formats an ISO timestamp in the viewer's local time, or the raw value if unparseable. */
 function formatTimestamp(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
-}
-
-/** Human-readable byte size (e.g. `1.4 MB`). */
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let size = bytes / 1024;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(1)} ${units[unit]}`;
 }
 
 const TYPE_LABEL: Record<Backup["type"], string> = {
@@ -45,26 +32,6 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ready"; supported: boolean; backups: Backup[] };
 
-type ScheduleLoadState = { status: "loading" } | { status: "error"; message: string } | { status: "ready" };
-
-interface ScheduleFormValues {
-  intervalDays: string;
-  retentionDays: string;
-}
-
-/** Validates the backup-schedule form; returns an error message, or `null` when valid. */
-function validateScheduleForm(form: ScheduleFormValues): string | null {
-  const interval = Number(form.intervalDays);
-  if (form.intervalDays.trim() === "" || !Number.isInteger(interval) || interval < 1) {
-    return "Backup interval must be a whole number of 1 or more.";
-  }
-  const retention = Number(form.retentionDays);
-  if (form.retentionDays.trim() === "" || !Number.isInteger(retention) || retention < 1) {
-    return "Backup retention must be a whole number of 1 or more.";
-  }
-  return null;
-}
-
 /**
  * The System → Backups view (COL-63): lists the database backups on disk and
  * drives the manual "Backup now" action (`POST /api/system/backup`).
@@ -74,12 +41,10 @@ function validateScheduleForm(form: ScheduleFormValues): string | null {
  * configuration" state instead of the controls. Timestamps render in local
  * time.
  *
- * COL-66 adds the inline "Backup schedule" panel: interval/retention days,
- * backed by the same `GET`/`PUT /api/settings` the Settings page's
- * `GeneralSection` uses (Radarr-style -- no dedicated backup-settings
- * endpoint). The values are inert here -- COL-67's scheduler reads the
- * interval and COL-68's pruning reads the retention; this page only persists
- * the knobs.
+ * COL-66 added an inline "Backup schedule" panel here (interval/retention
+ * days via `GET`/`PUT /api/settings`); COL-146 (Phase 2) moved it verbatim
+ * onto its own Settings sub-nav page (`SettingsSchedulerPage` /
+ * `SchedulerSection`) -- this page no longer touches `/api/settings` at all.
  *
  * COL-64 adds a per-row "Download" action, streaming the archive off disk via
  * `GET /api/system/backup/{id}/download` (`downloadBackup`, `api/backups.ts`).
@@ -105,7 +70,6 @@ export function BackupsPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [confirmingRestoreId, setConfirmingRestoreId] = useState<string | null>(null);
@@ -113,64 +77,6 @@ export function BackupsPage() {
   const [restoreStarted, setRestoreStarted] = useState(false);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
-
-  const [scheduleState, setScheduleState] = useState<ScheduleLoadState>({ status: "loading" });
-  const [scheduleForm, setScheduleForm] = useState<ScheduleFormValues>({
-    intervalDays: "7",
-    retentionDays: "28",
-  });
-  const [scheduleSaving, setScheduleSaving] = useState(false);
-  const [scheduleError, setScheduleError] = useState<string | null>(null);
-  const [scheduleSavedAt, setScheduleSavedAt] = useState<number | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetchSettings()
-      .then((settings) => {
-        if (cancelled) return;
-        setScheduleForm({
-          intervalDays: String(settings.backup_interval_days),
-          retentionDays: String(settings.backup_retention_days),
-        });
-        setScheduleState({ status: "ready" });
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setScheduleState({
-          status: "error",
-          message: error instanceof Error ? error.message : "Unknown error.",
-        });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  async function handleSaveSchedule() {
-    const validationError = validateScheduleForm(scheduleForm);
-    if (validationError) {
-      setScheduleError(validationError);
-      return;
-    }
-    setScheduleSaving(true);
-    setScheduleError(null);
-    setScheduleSavedAt(null);
-    try {
-      const updated = await updateSettings({
-        backup_interval_days: Number(scheduleForm.intervalDays),
-        backup_retention_days: Number(scheduleForm.retentionDays),
-      });
-      setScheduleForm({
-        intervalDays: String(updated.backup_interval_days),
-        retentionDays: String(updated.backup_retention_days),
-      });
-      setScheduleSavedAt(Date.now());
-    } catch (error: unknown) {
-      setScheduleError(error instanceof Error ? error.message : "Failed to save the backup schedule.");
-    } finally {
-      setScheduleSaving(false);
-    }
-  }
 
   async function load() {
     try {
@@ -218,15 +124,15 @@ export function BackupsPage() {
     }
   }
 
-  async function handleDownload(backup: Backup) {
-    setDownloadingId(backup.id);
+  function handleDownload(backup: Backup) {
+    // COL-138: downloadBackup triggers a real browser navigation rather than
+    // an awaited fetch, so there's no in-flight state to track here -- the
+    // browser's own download manager now shows progress/failure instead.
     setActionError(null);
     try {
-      await downloadBackup(backup);
+      downloadBackup(backup);
     } catch (error: unknown) {
       setActionError(error instanceof Error ? error.message : "Failed to download backup.");
-    } finally {
-      setDownloadingId(null);
     }
   }
 
@@ -367,63 +273,6 @@ export function BackupsPage() {
         </div>
       )}
 
-      <div className="panel settings-form">
-        <h3 className="settings-form__subtitle">Backup schedule</h3>
-
-        {scheduleState.status === "loading" && (
-          <p className="panel__message">Loading schedule…</p>
-        )}
-
-        {scheduleState.status === "error" && (
-          <p className="form-error">Couldn&apos;t load the backup schedule: {scheduleState.message}</p>
-        )}
-
-        {scheduleState.status === "ready" && (
-          <>
-            <div className="form-grid">
-              <div className="form-field form-field--narrow">
-                <label htmlFor="backup-interval-days">Backup interval (days)</label>
-                <input
-                  id="backup-interval-days"
-                  type="number"
-                  min={1}
-                  value={scheduleForm.intervalDays}
-                  onChange={(event) =>
-                    setScheduleForm({ ...scheduleForm, intervalDays: event.target.value })
-                  }
-                />
-                <p className="form-hint">How often a scheduled backup runs.</p>
-              </div>
-              <div className="form-field form-field--narrow">
-                <label htmlFor="backup-retention-days">Backup retention (days)</label>
-                <input
-                  id="backup-retention-days"
-                  type="number"
-                  min={1}
-                  value={scheduleForm.retentionDays}
-                  onChange={(event) =>
-                    setScheduleForm({ ...scheduleForm, retentionDays: event.target.value })
-                  }
-                />
-                <p className="form-hint">How long a backup is kept before it&apos;s pruned.</p>
-              </div>
-            </div>
-            <div className="form-actions">
-              <button
-                type="button"
-                className="btn btn--primary"
-                onClick={handleSaveSchedule}
-                disabled={scheduleSaving}
-              >
-                {scheduleSaving ? "Saving…" : "Save schedule"}
-              </button>
-              {scheduleSavedAt !== null && !scheduleError && <span className="form-success">Saved.</span>}
-            </div>
-            {scheduleError && <p className="form-error">{scheduleError}</p>}
-          </>
-        )}
-      </div>
-
       {state.status === "loading" && (
         <div className="panel panel--empty">
           <p className="panel__message">Loading backups…</p>
@@ -433,7 +282,7 @@ export function BackupsPage() {
       {state.status === "error" && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <BackupIcon width={28} height={28} />
+            <DatabaseBackup width={28} height={28} />
           </span>
           <p className="panel__message">Couldn&apos;t load backups: {state.message}</p>
         </div>
@@ -442,7 +291,7 @@ export function BackupsPage() {
       {state.status === "ready" && !supported && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <BackupIcon width={28} height={28} />
+            <DatabaseBackup width={28} height={28} />
           </span>
           <p className="panel__message">
             Backups are unavailable for this database configuration. Snapshots are only
@@ -454,7 +303,7 @@ export function BackupsPage() {
       {state.status === "ready" && supported && state.backups.length === 0 && (
         <div className="panel panel--empty">
           <span className="panel__icon" aria-hidden>
-            <BackupIcon width={28} height={28} />
+            <DatabaseBackup width={28} height={28} />
           </span>
           <p className="panel__message">
             No backups yet. Use <strong>Backup now</strong> to create the first one.
@@ -479,16 +328,15 @@ export function BackupsPage() {
                 <tr key={backup.id}>
                   <td>{backup.name}</td>
                   <td>{TYPE_LABEL[backup.type] ?? backup.type}</td>
-                  <td>{formatSize(backup.size)}</td>
+                  <td>{formatBytes(backup.size)}</td>
                   <td>{formatTimestamp(backup.created_at)}</td>
                   <td className="data-table__actions">
                     <button
                       type="button"
                       className="btn btn--secondary btn--sm"
                       onClick={() => handleDownload(backup)}
-                      disabled={downloadingId === backup.id}
                     >
-                      {downloadingId === backup.id ? "Downloading…" : "Download"}
+                      Download
                     </button>
                     {confirmingRestoreId === backup.id ? (
                       <>

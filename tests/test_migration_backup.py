@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 from alembic import command
+from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -50,27 +51,69 @@ from collapsarr.migrations import (
 )
 
 #: Columns a post-baseline migration adds (COL-66's backup schedule knobs,
-#: COL-79's disk-space thresholds) -- dropped after ``create_all`` below by
-#: :func:`_create_unversioned_db`, mirroring the same de-evolving idiom in
-#: ``test_migration_adoption.py``. Without this, ``create_all`` (which always
-#: builds from the *current* ``Base.metadata``) leaves these columns already
-#: present, so the migration that's supposed to add them fails.
+#: COL-79's disk-space thresholds, COL-101's Library-node bridge ids, COL-151's
+#: Preferred Default Audio setting, COL-154's current-default-track snapshot,
+#: COL-155's job-history ``kind``, COL-163's job-history ``priority``, COL-167's
+#: recently-processed dedup window, COL-174's Auto-Queuing Pause toggle,
+#: COL-218's ``ffmpeg_path`` override, COL-226's Auto-Processing Pause toggle,
+#: COL-230's ``auto_processing_pause_restore_value`` self-update scratch flag) --
+#: dropped after ``create_all`` below by :func:`_create_unversioned_db`,
+#: mirroring the same de-evolving idiom in ``test_migration_adoption.py``.
+#: Without this, ``create_all`` (which always builds from the *current*
+#: ``Base.metadata``) leaves these columns already present, so the migration
+#: that's supposed to add them fails.
 _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "backup_interval_days"),
     ("global_settings", "backup_retention_days"),
     ("global_settings", "disk_space_warning_percent"),
     ("global_settings", "disk_space_error_percent"),
     ("global_settings", "update_channel"),
+    ("global_settings", "default_tracked"),
+    ("global_settings", "log_level"),
+    ("global_settings", "default_audio_language"),
+    ("global_settings", "default_audio_channel_tier"),
+    ("global_settings", "auto_set_default_audio"),
+    ("global_settings", "recently_processed_window_minutes"),
+    ("global_settings", "auto_queue_paused"),
+    ("global_settings", "ffmpeg_path"),
+    ("global_settings", "auto_processing_paused"),
+    ("global_settings", "auto_processing_pause_restore_value"),
+    ("tracked_media_files", "sonarr_episode_id"),
+    ("tracked_media_files", "radarr_movie_id"),
+    ("tracked_media_files", "current_default_language"),
+    ("tracked_media_files", "current_default_channel_layout"),
+    ("job_history", "kind"),
+    ("job_history", "priority"),
+)
+
+#: Indexes on the COL-101 ``tracked_media_files`` columns above -- SQLite's
+#: plain ``ALTER TABLE ... DROP COLUMN`` refuses to drop an indexed column,
+#: so these must go first (same reasoning as ``test_migration_adoption.py``'s
+#: ``POST_BASELINE_INDEXES``). ``instance_id`` is handled separately in
+#: :func:`_create_unversioned_db` (it also carries a FK, which needs a batch
+#: table-rebuild rather than plain DDL).
+_POST_BASELINE_INDEXES: tuple[str, ...] = (
+    "ix_tracked_media_files_instance_id",
+    "ix_tracked_media_files_sonarr_episode_id",
+    "ix_tracked_media_files_radarr_movie_id",
+    "ix_job_history_kind",
+    "ix_job_history_priority",
 )
 
 #: Whole tables a post-baseline migration adds (COL-75's ``health_check_state``,
-#: COL-80's ``health_write_probe``) -- dropped after ``create_all`` for the same
-#: reason as ``_POST_BASELINE_COLUMNS``, so the migration that creates them does
-#: not collide with a table ``create_all`` already built.
+#: COL-80's ``health_write_probe``, COL-98's ``library_nodes``, COL-209's
+#: ``plex_connection``, COL-210's ``plex_library_items``, COL-230's
+#: ``self_update_state``) -- dropped after ``create_all`` for the same reason
+#: as ``_POST_BASELINE_COLUMNS``, so the migration that creates them does not
+#: collide with a table ``create_all`` already built.
 _POST_BASELINE_TABLES: tuple[str, ...] = (
     "health_check_state",
     "health_write_probe",
     "update_check_state",
+    "library_nodes",
+    "plex_connection",
+    "plex_library_items",
+    "self_update_state",
 )
 
 
@@ -90,10 +133,25 @@ def _create_unversioned_db(settings: Settings) -> None:
     engine = create_engine_from_settings(settings)
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
+        for index_name in _POST_BASELINE_INDEXES:
+            connection.execute(text(f'DROP INDEX IF EXISTS "{index_name}"'))
         for table_name, column_name in _POST_BASELINE_COLUMNS:
             connection.execute(
                 text(f'ALTER TABLE "{table_name}" DROP COLUMN "{column_name}"')
             )
+        # tracked_media_files.instance_id also carries a FK to arr_instances
+        # (created inline by create_all); SQLite's plain ALTER TABLE ... DROP
+        # COLUMN refuses a column that participates in a FK constraint
+        # defined on the same table, so it needs a batch table-rebuild
+        # instead (same limitation the real migration's downgrade() hits and
+        # works around the same way -- see its module docstring, and
+        # ``test_migration_adoption.py``'s identical fixture fix).
+        batch_ctx = MigrationContext.configure(connection)
+        batch_ops = Operations(batch_ctx)
+        with batch_ops.batch_alter_table(
+            "tracked_media_files", recreate="always"
+        ) as batch_op:
+            batch_op.drop_column("instance_id")
         for table_name in _POST_BASELINE_TABLES:
             connection.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
     engine.dispose()
