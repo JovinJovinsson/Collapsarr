@@ -241,6 +241,73 @@ def test_a_job_enqueued_while_workers_are_busy_is_picked_up_when_one_frees() -> 
     assert runner.order == ["gate", "later"]
 
 
+# ---------------------------------------------------------------------------
+# wait_no_running (COL-233): "Wait & Restart"'s own wait step -- unlike
+# wait_idle, ignores PENDING Jobs entirely (only cares whether anything is
+# currently RUNNING).
+# ---------------------------------------------------------------------------
+
+
+def test_wait_no_running_returns_immediately_when_nothing_is_running() -> None:
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+
+    assert queue.wait_no_running(timeout=1.0) is True
+
+
+def test_wait_no_running_ignores_a_pending_job_that_will_never_be_claimed() -> None:
+    """AC: unlike wait_idle, a PENDING Job blocked by Auto-Processing Pause never matters.
+
+    This is the exact scenario ``apply_with_flow``'s "Wait & Restart" flow
+    creates: it force-pauses claiming *before* calling this, so any Job still
+    sitting PENDING at that point will never be claimed until the pause
+    lifts -- a plain :meth:`wait_idle` call would block forever on it.
+    """
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, pause_check=lambda: True)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    queue.start()
+
+    assert queue.wait_no_running(timeout=1.0) is True  # never blocks on the PENDING job
+    assert job.status is JobStatus.PENDING  # still never claimed
+
+
+def test_wait_no_running_blocks_until_the_running_job_finishes() -> None:
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    queue.enqueue("/media/gate.mkv", DownmixSettings())  # the sole worker claims + blocks
+    assert runner.started.wait(timeout=5)
+
+    result: dict[str, bool] = {}
+
+    def _wait() -> None:
+        result["done"] = queue.wait_no_running(timeout=5)
+
+    thread = threading.Thread(target=_wait)
+    thread.start()
+    time.sleep(0.1)  # give the waiter a moment to actually start blocking
+    assert "done" not in result  # still running -- the wait hasn't returned yet
+
+    runner.release.set()
+    thread.join(timeout=5)
+    assert result.get("done") is True
+
+
+def test_wait_no_running_times_out_while_a_job_is_still_running() -> None:
+    runner = _GatedRunner()  # never released within this test
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    queue.enqueue("/media/gate.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)
+
+    assert queue.wait_no_running(timeout=0.2) is False
+
+    runner.release.set()  # unblock so the pool can shut down cleanly
+    queue.wait_idle(timeout=5)
+
+
 def _write_global_settings(settings: Settings, **fields: object) -> None:
     """Persist arbitrary ``GlobalSettings`` fields into ``settings``' database.
 

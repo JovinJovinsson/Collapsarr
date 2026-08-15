@@ -1242,6 +1242,43 @@ class JobQueue:
             return True
         return any(job.status is JobStatus.PENDING for job in self._jobs.values())
 
+    def wait_no_running(self, timeout: float | None = None) -> bool:
+        """Block until no job is currently ``RUNNING`` -- ignoring ``PENDING`` (COL-233).
+
+        The "Wait & Restart" self-update flow's own wait step
+        (:mod:`collapsarr.self_update.apply`): unlike :meth:`wait_idle`, this
+        deliberately does **not** also wait for every ``PENDING`` job to
+        drain. That distinction matters here specifically because the
+        self-update apply flow force-sets ``auto_processing_paused`` (COL-226)
+        *before* calling this -- while paused, :meth:`_claim_next` never
+        claims a new ``PENDING`` job, so a naive :meth:`wait_idle` call would
+        block forever on a Job that was already sitting ``PENDING`` (or one a
+        concurrent enqueue/top-up added) the moment claiming was paused. This
+        method only ever waits on ``self._active`` (the same counter
+        :meth:`wait_idle` checks, incremented under the lock the instant a
+        worker -- pool or force-started -- claims a Job, decremented only
+        once :meth:`_run_job` has fully finished it, success or failure
+        alike), which is exactly the set of Jobs an operator's browser tab
+        would see as "running" right now.
+
+        Returns ``True`` once no job is ``RUNNING``, or ``False`` if
+        ``timeout`` (seconds) elapsed first. With no ``timeout`` it waits
+        indefinitely. Returns immediately when nothing is currently
+        ``RUNNING``.
+        """
+        with self._cond:
+            if timeout is None:
+                while self._active > 0:
+                    self._cond.wait()
+                return True
+            deadline = time.monotonic() + timeout
+            while self._active > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._active == 0
+                self._cond.wait(remaining)
+            return True
+
     def shutdown(self, *, wait: bool = True, timeout: float | None = None) -> None:
         """Stop the worker pool; any job a worker already claimed still finishes.
 

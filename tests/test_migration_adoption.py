@@ -210,13 +210,14 @@ def test_already_versioned_database_runs_only_pending_deltas(settings: Settings)
 #: Preferred Default Audio setting, COL-154's current-default-track snapshot,
 #: COL-155's job-history ``kind``, COL-163's job-history ``priority``, COL-167's
 #: recently-processed dedup window, COL-174's Auto-Queuing Pause toggle,
-#: COL-218's ``ffmpeg_path`` override, COL-226's Auto-Processing Pause toggle).
+#: COL-218's ``ffmpeg_path`` override, COL-226's Auto-Processing Pause toggle,
+#: COL-230's ``auto_processing_pause_restore_value`` self-update scratch flag).
 #: ``create_all`` below always builds the
 #: table from the live ``Base.metadata`` -- i.e. with these columns already
 #: present -- so they are dropped by raw DDL afterwards to de-evolve the
 #: stand-in back to what a real
 #: pre-COL-66/pre-COL-79/pre-COL-101/pre-COL-151/pre-COL-154/pre-COL-155/
-#: pre-COL-163/pre-COL-167/pre-COL-174/pre-COL-218/pre-COL-226
+#: pre-COL-163/pre-COL-167/pre-COL-174/pre-COL-218/pre-COL-226/pre-COL-230
 #: create_all-era release actually had on disk. This mirrors the ``DROP
 #: INDEX`` idiom just below for the same reason: the unversioned DB this
 #: function fabricates predates every post-baseline delta, not just the
@@ -236,6 +237,7 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "auto_queue_paused"),
     ("global_settings", "ffmpeg_path"),
     ("global_settings", "auto_processing_paused"),
+    ("global_settings", "auto_processing_pause_restore_value"),
     ("tracked_media_files", "instance_id"),
     ("tracked_media_files", "sonarr_episode_id"),
     ("tracked_media_files", "radarr_movie_id"),
@@ -265,9 +267,10 @@ POST_BASELINE_INDEXES: tuple[str, ...] = (
 #: Whole tables a *post-baseline* migration adds (COL-75's
 #: ``health_check_state``, COL-80's ``health_write_probe``, COL-98's
 #: ``library_nodes``, COL-209's ``plex_connection``, COL-210's
-#: ``plex_library_items``). ``create_all`` below builds them from the live
-#: ``Base.metadata``, so they are dropped afterwards to de-evolve the stand-in
-#: back to a real pre-COL-75/pre-COL-80/pre-COL-98/pre-COL-209/pre-COL-210
+#: ``plex_library_items``, COL-230's ``self_update_state``). ``create_all``
+#: below builds them from the live ``Base.metadata``, so they are dropped
+#: afterwards to de-evolve the stand-in back to a real
+#: pre-COL-75/pre-COL-80/pre-COL-98/pre-COL-209/pre-COL-210/pre-COL-230
 #: create_all-era release -- exactly as :data:`POST_BASELINE_COLUMNS` does for
 #: later-added columns -- so the adoption delta (not create_all) is what
 #: creates them.
@@ -278,6 +281,7 @@ POST_BASELINE_TABLES: tuple[str, ...] = (
     "library_nodes",
     "plex_connection",
     "plex_library_items",
+    "self_update_state",
 )
 
 
