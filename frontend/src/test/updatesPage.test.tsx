@@ -89,13 +89,26 @@ function runningJob(id: string): JobHistoryEntry {
 type RouteResult = { ok?: boolean; status?: number; body: unknown };
 
 /**
+ * Default `GET /api/system/self-update/status` body -- an attempt already
+ * under way (COL-231's `SelfUpdateProgress` only ever mounts once
+ * `handleConfirmSelfUpdate` has already called the apply endpoint), so tests
+ * that don't care about its polling behavior still see a stable
+ * `"preparing"` phase rather than immediately reading as complete.
+ */
+const DEFAULT_SELF_UPDATE_STATUS = { in_progress: true, phase: "preparing", previous_version: null };
+
+/**
  * Routes every `fetch` call this page makes by URL/method (COL-228) --
  * `GET /api/system/updates` to `updateBody`, `POST .../recheck`/`.../dismiss`/
  * `.../undismiss` to their own override (default: `updateBody` again, mirroring
  * the endpoint's real "returns the refreshed state" contract), `GET
  * /api/settings` to `settings` (default {@link DEFAULT_SETTINGS_RESPONSE}),
- * `GET /api/jobs/queue` to `queue` (default `[]`), and
- * `POST /api/system/self-update/apply` to `apply` (default `{ok: true}`).
+ * `GET /api/jobs/queue` to `queue` (default `[]`),
+ * `POST /api/system/self-update/apply` to `apply` (default `{ok: true}`,
+ * `"network-error"` rejects the call the way a real re-exec/exit drops the
+ * connection, COL-231), and `GET /api/system/self-update/status` to
+ * `selfUpdateStatus` (default {@link DEFAULT_SELF_UPDATE_STATUS}, COL-231 --
+ * `SelfUpdateProgress`'s polling target).
  *
  * URL-routed rather than call-order-indexed (unlike this file's pre-COL-228
  * `mockResolvedValueOnce` chains) because `UpdatesPage` now fires two
@@ -112,7 +125,8 @@ function mockUpdatesFetch(
     dismiss?: RouteResult;
     undismiss?: RouteResult;
     queue?: unknown;
-    apply?: RouteResult | ((init?: RequestInit) => RouteResult);
+    apply?: RouteResult | "network-error" | ((init?: RequestInit) => RouteResult);
+    selfUpdateStatus?: unknown;
   } = {}
 ) {
   const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
@@ -141,8 +155,14 @@ function mockUpdatesFetch(
     }
     if (url === "/api/system/self-update/apply") {
       const handler = overrides.apply ?? { body: { ok: true } };
+      if (handler === "network-error") {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
       const { status = 200, body } = typeof handler === "function" ? handler(init) : handler;
       return Promise.resolve(jsonResponse(body, status));
+    }
+    if (url === "/api/system/self-update/status" && method === "GET") {
+      return Promise.resolve(jsonResponse(overrides.selfUpdateStatus ?? DEFAULT_SELF_UPDATE_STATUS));
     }
     throw new Error(`updatesPage.test.tsx: unhandled fetch call ${method} ${url}`);
   });
@@ -562,7 +582,7 @@ describe("UpdatesPage", () => {
       expect(within(dialog).queryByText(/not supported yet/i)).not.toBeInTheDocument();
     });
 
-    it("confirming the plain confirm calls the apply endpoint with no flow", async () => {
+    it("confirming the plain confirm calls the apply endpoint with no flow, then shows the updating screen (COL-231)", async () => {
       const fetchMock = mockUpdatesFetch(updateAvailable, {
         settings: { update_channel: "stable" },
         queue: [],
@@ -579,10 +599,37 @@ describe("UpdatesPage", () => {
           expect.objectContaining({ method: "POST", body: JSON.stringify({}) })
         )
       );
+      // A successful apply transitions into the dedicated "Updating — please
+      // wait" screen (COL-231) instead of a page-level notice -- the modal
+      // closes as part of that transition.
       await waitFor(() =>
-        expect(screen.getByText(/update triggered/i)).toBeInTheDocument()
+        expect(screen.getByText(/updating — please wait/i)).toBeInTheDocument()
       );
-      // The modal closes on success.
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.queryByText(/update triggered/i)).not.toBeInTheDocument();
+    });
+
+    it("a network-level failure right after confirming (the connection dropping mid-re-exec) still shows the updating screen, not an error", async () => {
+      const fetchMock = mockUpdatesFetch(updateAvailable, {
+        settings: { update_channel: "stable" },
+        queue: [],
+        apply: "network-error",
+      });
+      render(<UpdatesPage />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Update Now" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Update Now" }));
+
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/api/system/self-update/apply",
+          expect.objectContaining({ method: "POST", body: JSON.stringify({}) })
+        )
+      );
+      await waitFor(() =>
+        expect(screen.getByText(/updating — please wait/i)).toBeInTheDocument()
+      );
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     });
 

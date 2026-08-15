@@ -9,9 +9,11 @@ import {
   dismissUpdateStatus,
   fetchUpdateStatus,
   recheckUpdateStatus,
+  SelfUpdateApplyResponseError,
   undismissUpdateStatus,
 } from "../api/updates";
 import { SelfUpdateModal } from "../components/SelfUpdateModal";
+import { SelfUpdateProgress } from "../components/SelfUpdateProgress";
 import { UpdateInstructions } from "../components/UpdateInstructions";
 import type { UpdateChannel } from "../types/settings";
 import type { SelfUpdateFlow, UpdateCheckState } from "../types/updates";
@@ -53,6 +55,17 @@ type SettingsLoadState =
 type SelfUpdateModalState = { runningJobCount: number } | null;
 
 /**
+ * The dedicated "Updating — please wait" screen's state (COL-231) -- `null`
+ * while not showing it. Set by `handleConfirmSelfUpdate` the moment the
+ * apply call either succeeds or fails at the network layer (see that
+ * function's doc comment for why those two are treated the same), carrying
+ * over `SelfUpdateModalState`'s `runningJobCount` so `SelfUpdateProgress`
+ * can render "Waiting for N jobs to finish" for the `"preparing"` phase
+ * without re-resolving it itself.
+ */
+type SelfUpdateProgressState = { runningJobCount: number } | null;
+
+/**
  * Page-level notice after an "Update Now" action settles (COL-228) --
  * mirrors `QueuePage`'s `ActionNotice`/`ClearQueueNotice` named-notice-type
  * convention rather than an inline object-literal `useState` type.
@@ -61,8 +74,9 @@ type SelfUpdateModalState = { runningJobCount: number } | null;
  * already closed (there isn't one today -- a responded apply failure stays
  * inside the still-open modal via `applyError` instead, see
  * `handleConfirmSelfUpdate` -- but the type stays two-toned for symmetry
- * with every other notice in this codebase). `"success"` is the one case
- * that actually fires today: the apply call was accepted.
+ * with every other notice in this codebase). `"success"` no longer fires as
+ * of COL-231: a successfully-triggered apply now transitions into
+ * `SelfUpdateProgress` instead of closing the modal with this notice.
  */
 type UpdateNowNotice = { tone: "success" | "error"; text: string } | null;
 
@@ -124,10 +138,18 @@ function canOfferSelfUpdate(update: UpdateCheckState, settings: SettingsLoadStat
  * `SelfUpdateModal`'s doc comment). Confirming calls the apply endpoint
  * (`applySelfUpdate`, `POST /api/system/self-update/apply`) with the chosen
  * `flow`; declining (any of the modal's close paths) calls nothing, leaving
- * the app untouched. A successful apply re-execs/exits the server process
- * (see `applySelfUpdate`'s doc comment) -- this page shows a plain "trigger
- * accepted" notice on success rather than trying to track the restart
- * itself; the dedicated polling/restart screen (COL-231) owns that.
+ * the app untouched.
+ *
+ * COL-231 adds the dedicated "Updating — please wait" screen
+ * (`SelfUpdateProgress`): the moment `handleConfirmSelfUpdate` either gets a
+ * response back or the connection drops (a real apply re-execs/exits the
+ * server process -- see `applySelfUpdate`'s doc comment for why a dropped
+ * connection right after calling it is the *expected* shape of success),
+ * this page renders `SelfUpdateProgress` in place of everything below
+ * instead of closing the modal with a notice. Only a **responded** failure
+ * (`SelfUpdateApplyResponseError` -- `403`/`409`/`502`) keeps the modal open
+ * with `applyError` instead, since that means the server is still up and
+ * definitively refused.
  *
  * COL-89 adds Dismiss/Undismiss actions (`POST /api/system/updates/dismiss` /
  * `.../undismiss`, `api/updates.ts`), mirroring `HealthChecksPage`'s per-row
@@ -150,6 +172,7 @@ export function UpdatesPage() {
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState<string | null>(null);
   const [updateNowNotice, setUpdateNowNotice] = useState<UpdateNowNotice>(null);
+  const [selfUpdateProgress, setSelfUpdateProgress] = useState<SelfUpdateProgressState>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -229,24 +252,34 @@ export function UpdatesPage() {
   /**
    * Confirming the Self-Update modal (COL-228): calls the apply endpoint
    * with the chosen `flow` (`undefined` for the plain-confirm, no-Jobs-
-   * running case). A responded failure (`403`/`409`/`502`) surfaces inside
-   * the still-open modal via `applyError`, so the operator can see why and
-   * retry/cancel; success closes the modal and surfaces a page-level notice
-   * instead (see the component doc comment for why this doesn't try to
-   * track the restart itself).
+   * running case).
+   *
+   * A **responded** failure (`403`/`409`/`502`, surfaced as
+   * `SelfUpdateApplyResponseError`) means the server is still up and
+   * definitively refused -- that stays inside the still-open modal via
+   * `applyError`, so the operator can see why and retry/cancel, unchanged
+   * since COL-228. Anything else -- a resolved call, *or* a network-layer
+   * failure -- transitions into the dedicated polling screen
+   * (`SelfUpdateProgress`, COL-231) instead: a real apply re-execs (pipx) or
+   * exits (native) the server process, so the connection dropping right
+   * after calling this is the *expected* shape of success, not a genuine
+   * error worth surfacing as one (see `applySelfUpdate`'s doc comment).
    */
   async function handleConfirmSelfUpdate(flow?: SelfUpdateFlow) {
     setApplying(true);
     setApplyError(null);
+    const runningJobCount = selfUpdateModal?.runningJobCount ?? 0;
     try {
       await applySelfUpdate(flow);
       setSelfUpdateModal(null);
-      setUpdateNowNotice({
-        tone: "success",
-        text: "Update triggered. Collapsarr will restart shortly.",
-      });
+      setSelfUpdateProgress({ runningJobCount });
     } catch (error: unknown) {
-      setApplyError(error instanceof Error ? error.message : "Failed to trigger the update.");
+      if (error instanceof SelfUpdateApplyResponseError) {
+        setApplyError(error.message);
+      } else {
+        setSelfUpdateModal(null);
+        setSelfUpdateProgress({ runningJobCount });
+      }
     } finally {
       setApplying(false);
     }
@@ -297,6 +330,19 @@ export function UpdatesPage() {
     } finally {
       setDismissing(false);
     }
+  }
+
+  // The dedicated "Updating — please wait" screen (COL-231) takes over the
+  // whole view the moment a Self-Update attempt is under way -- the normal
+  // header/actions/panel below have nothing useful to offer while the app
+  // may be mid-restart, so this renders instead of them rather than
+  // alongside.
+  if (selfUpdateProgress) {
+    return (
+      <section className="view">
+        <SelfUpdateProgress runningJobCount={selfUpdateProgress.runningJobCount} />
+      </section>
+    );
   }
 
   return (

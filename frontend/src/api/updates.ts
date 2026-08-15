@@ -2,11 +2,30 @@ import type {
   SelfUpdateApplyRequest,
   SelfUpdateApplyResult,
   SelfUpdateFlow,
+  SelfUpdateStatus,
   UpdateCheckState,
 } from "../types/updates";
 import { apiErrorMessage, apiFetch } from "./client";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
+
+/**
+ * Thrown by {@link applySelfUpdate} only when the apply endpoint genuinely
+ * *responded* with a non-ok status (`403`/`409`/`502`) -- as opposed to the
+ * request failing at the network layer (COL-231). The distinction matters to
+ * `UpdatesPage`'s confirm handler: a responded error means the server is
+ * still up and definitively refused the request (keep the modal open so the
+ * operator can see why and retry/cancel, unchanged since COL-228); a
+ * network-layer failure (the connection dropping mid-request) is the
+ * *expected* shape of a real apply that already re-exec'd/exited (see this
+ * function's own doc comment) and should instead route into the dedicated
+ * polling screen (`SelfUpdateProgress`). A plain `instanceof Error` can't
+ * tell these two apart -- a network failure (typically a `TypeError`) and
+ * this class both extend `Error` -- so this dedicated subclass is the seam
+ * callers switch on instead of relying on a particular runtime's own
+ * network-error type.
+ */
+export class SelfUpdateApplyResponseError extends Error {}
 
 /**
  * Fetches the current Update Check state -- running vs. latest version,
@@ -88,11 +107,31 @@ export async function applySelfUpdate(flow?: SelfUpdateFlow): Promise<SelfUpdate
     body: JSON.stringify(body),
   });
   if (!response.ok) {
-    throw new Error(
+    throw new SelfUpdateApplyResponseError(
       await apiErrorMessage(response, `Failed to trigger the update (${response.status})`)
     );
   }
   return (await response.json()) as SelfUpdateApplyResult;
+}
+
+/**
+ * Fetches the current Self-Update attempt state
+ * (`GET /api/system/self-update/status`, COL-230,
+ * `collapsarr.self_update.routes.SelfUpdateStatusRead`) -- `SelfUpdateProgress`'s
+ * (COL-231) polling target across the app's restart/re-exec downtime window.
+ * Always returns a row (get-or-created server-side, `in_progress=false`,
+ * `phase="idle"` before any attempt has ever run), so there is no "not found"
+ * case to special-case here, only the ordinary responded-error path every
+ * other function in this module already follows.
+ */
+export async function fetchSelfUpdateStatus(): Promise<SelfUpdateStatus> {
+  const response = await apiFetch("/api/system/self-update/status");
+  if (!response.ok) {
+    throw new Error(
+      await apiErrorMessage(response, `Failed to load the self-update status (${response.status})`)
+    );
+  }
+  return (await response.json()) as SelfUpdateStatus;
 }
 
 /**
