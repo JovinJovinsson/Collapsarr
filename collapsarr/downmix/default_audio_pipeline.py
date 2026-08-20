@@ -27,9 +27,13 @@ command is a plain ``-map 0`` / ``-c copy`` stream-copy of every original
 stream, no new encoded audio track, ever) followed by
 :func:`~collapsarr.downmix.apply.apply_remux_result`'s duration/stream-count
 validation and atomic swap (``added_track_count=0``, since nothing new was
-added). If the winner already matches — it already carries the disposition,
-and no other stream wrongly carries it too — this returns a no-op success
-without invoking ffmpeg or touching the file at all, mirroring
+added), which is passed the resolved winner index as
+``expected_default_audio_index`` (COL-241) so it re-probes the swapped-in
+file afterward and confirms that stream — and no other audio stream — really
+does carry ``disposition.default`` before this reports success. If the
+winner already matches — it already carries the disposition, and no other
+stream wrongly carries it too — this returns a no-op success without
+invoking ffmpeg or touching the file at all, mirroring
 :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.NOTHING_TO_DO`'s "nothing
 was attempted, nothing failed" contract.
 
@@ -163,6 +167,11 @@ def run_default_audio_pipeline(
       :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.APPLY_FAILED`; the
       original file is untouched
       (:func:`~collapsarr.downmix.apply.apply_remux_result`'s own guarantee).
+      A post-swap disposition mismatch (COL-241) is also reported as
+      :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.APPLY_FAILED`, but
+      is the one case where the file is *not* left untouched — the swap
+      already happened by the time this check runs, and there is no backup
+      to revert to (see :func:`~collapsarr.downmix.apply.apply_remux_result`).
 
     On success, the original file has been atomically replaced by a remux
     identical to it except for which stream(s) carry the Default Audio Track
@@ -264,6 +273,7 @@ def run_default_audio_pipeline(
             ffprobe_path=ffprobe_path,
             timeout=probe_timeout,
             runner=runner,
+            expected_default_audio_index=winner_index,
         )
     except FfprobeError as exc:
         return _finish(
