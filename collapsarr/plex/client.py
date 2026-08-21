@@ -41,6 +41,24 @@ COL-212 adds one more:
   bytes back to the browser server-side so the ``X-Plex-Token`` never reaches
   the client.
 
+COL-245 adds two more, both feeding the direct-Plex-API-write path for the
+Default Audio Track Job (:mod:`collapsarr.plex.default_audio_write`):
+
+* :func:`get_item_metadata` -- ``GET /library/metadata/{ratingKey}`` (the
+  same "fetch an item" shape :mod:`collapsarr.plex.streams`'s
+  ``parse_audio_streams`` already expects), returning the raw decoded JSON
+  payload rather than anything pre-parsed -- keeping this module's role
+  strictly "make the HTTP call, hand back the payload", with parsing left to
+  :mod:`collapsarr.plex.streams`. Used both to fetch an item's current
+  stream list (before the write) and, called a second time, to verify the
+  write actually took effect.
+* :func:`set_default_audio_stream` -- ``PUT /library/metadata/{ratingKey}``
+  with ``audioStreamID=<streamId>``, Plex's set-default-audio-track write
+  against one already-resolved stream id
+  (:class:`~collapsarr.plex.streams.PlexAudioStream.id`). Like
+  :func:`analyze_item`, Plex responds with an empty body, so success is
+  purely "the request was accepted".
+
 Every call authenticates with the ``X-Plex-Token`` header -- the token is
 supplied by the caller (:mod:`collapsarr.plex.service`, reading it from the
 server-side-only :class:`~collapsarr.plex.models.PlexConnection` row) and
@@ -60,6 +78,7 @@ _SECTION_ITEMS_PATH_TEMPLATE = "/library/sections/{section_key}/all"
 _SEARCH_PATH = "/search"
 _ANALYZE_PATH_TEMPLATE = "/library/metadata/{rating_key}/analyze"
 _POSTER_PATH_TEMPLATE = "/library/metadata/{rating_key}/thumb"
+_METADATA_PATH_TEMPLATE = "/library/metadata/{rating_key}"
 _DEFAULT_TIMEOUT = 10.0
 _ERROR_BODY_LIMIT = 500
 _DEFAULT_POSTER_CONTENT_TYPE = "image/jpeg"
@@ -99,6 +118,29 @@ class ConnectivityResult:
 @dataclass(frozen=True, slots=True)
 class AnalyzeResult:
     """Outcome of triggering Plex's per-item Analyze scan."""
+
+    ok: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ItemMetadataResult:
+    """Outcome of fetching a single item's full metadata (COL-245).
+
+    ``payload`` is the raw decoded ``GET /library/metadata/{ratingKey}``
+    JSON body on success -- the shape :func:`collapsarr.plex.streams.
+    parse_audio_streams` expects -- and ``None`` on any failure. Deliberately
+    not pre-parsed here: this module's job is fetching, not interpreting.
+    """
+
+    ok: bool
+    payload: object | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SetDefaultAudioResult:
+    """Outcome of writing a set-default-audio-track change to a Plex item (COL-245)."""
 
     ok: bool
     error: str | None = None
@@ -261,6 +303,88 @@ def analyze_item(
         return AnalyzeResult(ok=False, error=str(exc))
 
     return AnalyzeResult(ok=True)
+
+
+def get_item_metadata(
+    base_url: str,
+    token: str,
+    rating_key: str,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+    transport: httpx.BaseTransport | None = None,
+) -> ItemMetadataResult:
+    """Fetch a single item's full metadata (``GET /library/metadata/{ratingKey}``, COL-245).
+
+    Returns the raw decoded JSON payload on success -- parsing it into audio
+    streams is :func:`collapsarr.plex.streams.parse_audio_streams`'s job, not
+    this module's. Used twice by the direct-Plex-API-write path
+    (:mod:`collapsarr.plex.default_audio_write`): once to read the item's
+    current stream list before writing, and again afterward to verify the
+    write took effect. Never raises -- see :func:`check_connectivity`'s
+    docstring for the full "never raises" contract, which this mirrors.
+    """
+    if not base_url:
+        return ItemMetadataResult(ok=False, error="No base URL configured")
+
+    path = _METADATA_PATH_TEMPLATE.format(rating_key=rating_key)
+    url = f"{base_url.rstrip('/')}{path}"
+    client = _make_client(timeout, transport)
+
+    try:
+        with client:
+            response = client.get(url, headers=_auth_headers(token, extra=_JSON_HEADERS))
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = f"HTTP {exc.response.status_code}: {exc.response.text}"[:_ERROR_BODY_LIMIT]
+        return ItemMetadataResult(ok=False, error=detail)
+    except (httpx.HTTPError, ValueError) as exc:
+        return ItemMetadataResult(ok=False, error=str(exc))
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return ItemMetadataResult(ok=False, error="Invalid JSON in metadata response")
+
+    return ItemMetadataResult(ok=True, payload=payload)
+
+
+def set_default_audio_stream(
+    base_url: str,
+    token: str,
+    rating_key: str,
+    stream_id: str,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+    transport: httpx.BaseTransport | None = None,
+) -> SetDefaultAudioResult:
+    """Write a set-default-audio-track change against one already-resolved stream (COL-245).
+
+    ``PUT /library/metadata/{ratingKey}?audioStreamID={streamId}`` -- Plex
+    queues the change and responds with an empty body, so success is purely
+    "the request was accepted" (a 2xx status), the same contract
+    :func:`analyze_item` has. Never raises -- see :func:`check_connectivity`'s
+    docstring for the full "never raises" contract, which this mirrors.
+    """
+    if not base_url:
+        return SetDefaultAudioResult(ok=False, error="No base URL configured")
+
+    path = _METADATA_PATH_TEMPLATE.format(rating_key=rating_key)
+    url = f"{base_url.rstrip('/')}{path}"
+    client = _make_client(timeout, transport)
+
+    try:
+        with client:
+            response = client.put(
+                url, headers=_auth_headers(token), params={"audioStreamID": stream_id}
+            )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = f"HTTP {exc.response.status_code}: {exc.response.text}"[:_ERROR_BODY_LIMIT]
+        return SetDefaultAudioResult(ok=False, error=detail)
+    except (httpx.HTTPError, ValueError) as exc:
+        return SetDefaultAudioResult(ok=False, error=str(exc))
+
+    return SetDefaultAudioResult(ok=True)
 
 
 def fetch_poster_image(

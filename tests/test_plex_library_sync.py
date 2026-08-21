@@ -365,6 +365,78 @@ def test_resolve_falls_back_and_matches_episode_by_series_title_season_and_episo
     assert record == ["Game of Thrones"]  # scoped by the *series* title
 
 
+def test_resolve_persists_a_live_query_hit_into_the_mapping_table(session: Session) -> None:
+    """COL-245: a live-query hit is written back immediately, not left for the
+    next Plex Sync to pick up -- so resolving the same path again is a table
+    hit with no further query."""
+    _add_movie(session, file_path="/movies/dune.mkv", title="Dune")
+    record: list[str] = []
+    search = _search(
+        SectionItemsResult(
+            ok=True,
+            items=(PlexMediaItem(rating_key="900", type="movie", title="Dune", section_key="7"),),
+        ),
+        record=record,
+    )
+
+    rating_key = resolve_rating_key(
+        session, "/movies/dune.mkv", base_url=BASE_URL, token=TOKEN, search=search
+    )
+
+    assert rating_key == "900"
+    assert _rows(session) == {"/movies/dune.mkv": ("900", "7")}
+
+    # Resolving again hits the now-populated table -- no second live query.
+    second_rating_key = resolve_rating_key(
+        session, "/movies/dune.mkv", base_url=BASE_URL, token=TOKEN, search=search
+    )
+    assert second_rating_key == "900"
+    assert record == ["Dune"]  # only the first resolution issued a query
+
+
+def test_resolve_persists_a_live_query_hit_with_no_section_key_as_blank(session: Session) -> None:
+    _add_movie(session, file_path="/movies/dune.mkv", title="Dune")
+    search = _search(
+        SectionItemsResult(
+            ok=True, items=(PlexMediaItem(rating_key="900", type="movie", title="Dune"),)
+        )
+    )
+
+    rating_key = resolve_rating_key(
+        session, "/movies/dune.mkv", base_url=BASE_URL, token=TOKEN, search=search
+    )
+
+    assert rating_key == "900"
+    assert _rows(session) == {"/movies/dune.mkv": ("900", "")}
+
+
+def test_resolve_still_returns_a_good_rating_key_even_if_persisting_it_fails(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache-write hiccup during the live-query write-back must never turn an
+    otherwise-successful resolution into a give-up (COL-245) -- `_persist_live_hit`
+    catches its own DB errors internally, distinct from `resolve_rating_key`'s
+    own outer catch-all."""
+    _add_movie(session, file_path="/movies/dune.mkv", title="Dune")
+    search = _search(
+        SectionItemsResult(
+            ok=True, items=(PlexMediaItem(rating_key="900", type="movie", title="Dune"),)
+        )
+    )
+
+    def raising_commit() -> None:
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(session, "commit", raising_commit)
+
+    rating_key = resolve_rating_key(
+        session, "/movies/dune.mkv", base_url=BASE_URL, token=TOKEN, search=search
+    )
+
+    assert rating_key == "900"  # the resolution itself still succeeds...
+    assert _rows(session) == {}  # ...even though nothing was persisted
+
+
 def test_resolve_gives_up_when_file_is_not_tracked(session: Session) -> None:
     record: list[str] = []
 
