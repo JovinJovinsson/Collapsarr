@@ -183,6 +183,7 @@ def _summary_runner(
     *,
     fail_paths: frozenset[str] = frozenset(),
     audio_streams_by_path: dict[str, list[dict[str, object]]] | None = None,
+    audio_probe_fail_paths: frozenset[str] = frozenset(),
 ) -> object:
     """Return a runner that answers ffprobe with canned (duration, stream_count) per path.
 
@@ -192,21 +193,32 @@ def _summary_runner(
     given an ``expected_default_audio_index``) -- distinguished from the
     duration/stream-count probe by ``-select_streams`` being present in the
     command -- with the raw ffprobe stream dicts for that path.
+
+    ``audio_probe_fail_paths`` (COL-241) fails *only* that
+    ``-select_streams`` call for the given path (a non-zero exit), kept
+    separate from ``fail_paths`` (which only ever applies to the duration/
+    stream-count probe) so a test can make the post-swap re-probe itself
+    fail without also failing the pre-swap duration/stream-count probes of
+    the same path.
     """
 
     def runner(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         path = command[-1]
-        if path in fail_paths:
-            return subprocess.CompletedProcess(
-                args=list(command), returncode=1, stdout="", stderr="Invalid data"
-            )
         if "-select_streams" in command:
+            if path in audio_probe_fail_paths:
+                return subprocess.CompletedProcess(
+                    args=list(command), returncode=1, stdout="", stderr="Invalid data"
+                )
             streams = (audio_streams_by_path or {}).get(path, [])
             return subprocess.CompletedProcess(
                 args=list(command),
                 returncode=0,
                 stdout=json.dumps({"streams": streams}),
                 stderr="",
+            )
+        if path in fail_paths:
+            return subprocess.CompletedProcess(
+                args=list(command), returncode=1, stdout="", stderr="Invalid data"
             )
         duration, count = by_path[path]
         payload = {"format": {"duration": str(duration)}, "streams": [{}] * count}
@@ -501,6 +513,42 @@ def test_apply_reports_disposition_mismatch_when_expected_index_is_out_of_range(
     assert result.failure_reason is ApplyFailureReason.DISPOSITION_MISMATCH
     assert "disposition mismatch" in result.detail
     assert "out of range" in result.detail
+
+
+def test_apply_reports_disposition_verification_failed_when_post_swap_reprobe_errors(
+    tmp_path: Path,
+) -> None:
+    """The swap already happened; the *re-probe* itself fails, so verification never ran.
+
+    Distinct from DISPOSITION_MISMATCH (which means the re-probe completed
+    and found the wrong result) and from a pre-swap FfprobeError (which
+    means the original is still untouched) -- this is neither: the swap
+    already happened *and* whether the disposition landed was never
+    actually confirmed.
+    """
+    original, temp, remux = _make_files(tmp_path)
+    runner = _summary_runner(
+        {str(original): (100.0, 2), str(temp): (100.0, 2)},
+        audio_probe_fail_paths=frozenset({str(original)}),
+    )
+
+    result = apply_remux_result(
+        original,
+        remux,
+        added_track_count=0,
+        runner=runner,  # type: ignore[arg-type]
+        expected_default_audio_index=1,
+    )
+
+    assert result.success is False
+    assert result.failure_reason is ApplyFailureReason.DISPOSITION_VERIFICATION_FAILED
+    assert result.applied_path is None
+    assert "disposition verification failed" in result.detail
+    assert "never confirmed" in result.detail
+    # The swap itself already happened (unlike the pre-swap probe-failure
+    # case below, where the rename never occurs at all).
+    assert original.read_bytes() == b"REMUXED-TEMP"
+    assert not temp.exists()
 
 
 def test_apply_skips_disposition_check_when_index_not_supplied(tmp_path: Path) -> None:

@@ -163,15 +163,22 @@ def run_default_audio_pipeline(
       original file is untouched (:func:`~collapsarr.downmix.remux.run_remux`'s
       own guarantee);
     - a failed validate-and-apply (duration/stream-count mismatch, or the
-      temp/original becoming unprobeable) is reported as
-      :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.APPLY_FAILED`; the
-      original file is untouched
+      *pre-swap* probe of the original/temp becoming unprobeable) is reported
+      as :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.APPLY_FAILED`;
+      the original file is untouched
       (:func:`~collapsarr.downmix.apply.apply_remux_result`'s own guarantee).
-      A post-swap disposition mismatch (COL-241) is also reported as
+      A post-swap disposition mismatch, or the post-swap re-probe itself
+      failing (COL-241 — :attr:`~collapsarr.downmix.apply.ApplyFailureReason.
+      DISPOSITION_MISMATCH`/:attr:`~collapsarr.downmix.apply.
+      ApplyFailureReason.DISPOSITION_VERIFICATION_FAILED` respectively), is
+      also reported as
       :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.APPLY_FAILED`, but
       is the one case where the file is *not* left untouched — the swap
-      already happened by the time this check runs, and there is no backup
-      to revert to (see :func:`~collapsarr.downmix.apply.apply_remux_result`).
+      already happened by the time either check runs, and there is no backup
+      to revert to (see :func:`~collapsarr.downmix.apply.apply_remux_result`,
+      whose ``ApplyResult.failure_reason`` keeps the two distinguishable
+      rather than both surfacing as this function's own ``FfprobeError``
+      handling below, which only ever covers the *pre*-swap probes).
 
     On success, the original file has been atomically replaced by a remux
     identical to it except for which stream(s) carry the Default Audio Track
@@ -265,6 +272,14 @@ def run_default_audio_pipeline(
         return result
 
     try:
+        # Only the *pre*-swap probes (of the original/temp, inside
+        # apply_remux_result) can raise FfprobeError here -- the original is
+        # still untouched if either does. The *post*-swap disposition
+        # re-probe apply_remux_result also makes (via
+        # expected_default_audio_index) never raises: its failure comes back
+        # as an ApplyResult(failure_reason=ApplyFailureReason.
+        # DISPOSITION_VERIFICATION_FAILED, ...) below instead, so it can't be
+        # mistaken for this (safe, nothing-changed) pre-swap case.
         apply_result = apply_remux_result(
             path,
             remux_result,

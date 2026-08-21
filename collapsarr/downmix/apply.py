@@ -49,14 +49,22 @@ default_audio_pipeline` — is currently the only caller that does), the
 now-swapped-in file at ``original_path`` is re-probed via
 :func:`~collapsarr.downmix.probe.probe_audio_streams` and the resolved
 target output audio index is confirmed to be the *only* audio stream
-carrying ``disposition.default``. Unlike the two pre-swap checks, a
-disposition mismatch here **cannot** be healed by discarding the temp file —
-the swap has already happened and no backup of the original is ever kept
-(see above) — so this check cannot preserve the "original left untouched"
-guarantee the way the duration/stream-count checks do. It exists purely so a
-disposition bug is reported as a distinct, loud Job failure
-(:attr:`ApplyFailureReason.DISPOSITION_MISMATCH`) instead of silently
-reporting success, which is the gap COL-241 closes.
+carrying ``disposition.default``. Unlike the two pre-swap checks, neither a
+disposition mismatch nor a failure of the re-probe itself can be healed by
+discarding the temp file — the swap has already happened and no backup of
+the original is ever kept (see above) — so this check cannot preserve the
+"original left untouched" guarantee the way the duration/stream-count
+checks do. It exists purely so a disposition bug is reported as a distinct,
+loud Job failure instead of silently reporting success, which is the gap
+COL-241 closes — and the two ways it can fail are themselves kept distinct:
+a completed-but-wrong re-probe is :attr:`ApplyFailureReason.
+DISPOSITION_MISMATCH`; the re-probe itself erroring (so verification never
+actually completed) is :attr:`ApplyFailureReason.
+DISPOSITION_VERIFICATION_FAILED`. Collapsing those two into one generic
+"couldn't validate" error would silently re-introduce the exact ambiguity
+this ticket exists to close: an operator couldn't tell "the swap happened
+and disposition is confirmed wrong" from "the swap happened and disposition
+was never actually checked".
 
 Mirrors the testing pattern of :mod:`collapsarr.downmix.remux`: real committed
 fixture media under ``tests/fixtures/downmix/`` driven through the actual
@@ -75,6 +83,7 @@ from pathlib import Path
 
 from collapsarr.downmix.probe import (
     AudioStreamInfo,
+    FfprobeError,
     MediaSummary,
     probe_audio_streams,
     probe_media_summary,
@@ -99,6 +108,7 @@ class ApplyFailureReason(Enum):
     DURATION_MISMATCH = "duration_mismatch"
     STREAM_COUNT_MISMATCH = "stream_count_mismatch"
     DISPOSITION_MISMATCH = "disposition_mismatch"
+    DISPOSITION_VERIFICATION_FAILED = "disposition_verification_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,13 +121,19 @@ class ApplyResult:
     that failed, and — guaranteed for :attr:`ApplyFailureReason.
     DURATION_MISMATCH`/:attr:`ApplyFailureReason.STREAM_COUNT_MISMATCH` — the
     original file is unchanged and the temp file has been deleted.
-    :attr:`ApplyFailureReason.DISPOSITION_MISMATCH` is the one exception: it
-    is only ever raised *after* the atomic swap already happened (see the
-    module docstring), so on that specific failure the swapped-in file is
-    what's left on disk at ``original_path`` — not reverted, since no backup
-    of the pre-swap original is ever kept. ``detail`` is always a
-    human-readable summary (the concrete durations/counts/streams involved)
-    suitable for logging.
+    :attr:`ApplyFailureReason.DISPOSITION_MISMATCH` and :attr:`ApplyFailureReason.
+    DISPOSITION_VERIFICATION_FAILED` are the two exceptions: both are only
+    ever produced *after* the atomic swap already happened (see the module
+    docstring), so on either failure the swapped-in file is what's left on
+    disk at ``original_path`` — not reverted, since no backup of the
+    pre-swap original is ever kept. The two are distinct so a caller/operator
+    can tell them apart: ``DISPOSITION_MISMATCH`` means verification *ran*
+    and found the wrong (or no) stream flagged default; ``DISPOSITION_
+    VERIFICATION_FAILED`` means verification itself could not complete (the
+    post-swap re-probe errored) — the swap happened but whether the
+    disposition landed correctly was never actually confirmed either way.
+    ``detail`` is always a human-readable summary (the concrete
+    durations/counts/streams involved) suitable for logging.
     """
 
     success: bool
@@ -163,11 +179,21 @@ def apply_remux_result(
     make the Default Audio Track. When supplied, **after** the atomic rename
     this re-probes the swapped-in file's audio streams via
     :func:`~collapsarr.downmix.probe.probe_audio_streams` and confirms that
-    stream — and no other audio stream — carries ``disposition.default``. A
-    mismatch (wrong stream, no stream, or more than one stream flagged
-    default) returns ``ApplyResult(success=False, failure_reason=
-    ApplyFailureReason.DISPOSITION_MISMATCH, ...)`` instead of reporting
-    success — but, unlike the duration/stream-count checks, cannot undo the
+    stream — and no other audio stream — carries ``disposition.default``,
+    returning one of two distinct failures instead of reporting success when
+    it can't confirm that:
+
+    - the re-probe **completes** but finds the wrong stream (or no stream, or
+      more than one stream) flagged default: ``ApplyResult(success=False,
+      failure_reason=ApplyFailureReason.DISPOSITION_MISMATCH, ...)``;
+    - the re-probe **itself fails** to complete (missing binary, timeout,
+      non-zero exit, unparseable output) — so verification was never actually
+      performed at all: ``ApplyResult(success=False, failure_reason=
+      ApplyFailureReason.DISPOSITION_VERIFICATION_FAILED, ...)``, distinct
+      from the first so a caller/operator can't mistake "confirmed wrong" for
+      "never confirmed".
+
+    Either way, unlike the duration/stream-count checks, neither can undo the
     swap that already happened (see the module docstring). Leaving this
     ``None`` (the default) skips the check entirely, preserving prior
     behaviour byte-for-byte for every caller that doesn't pass it.
@@ -178,15 +204,19 @@ def apply_remux_result(
             caller/programmer errors, mirroring
             :func:`~collapsarr.downmix.remux.run_remux`'s use of ``ValueError``
             for bad inputs.
-        collapsarr.downmix.probe.FfprobeError: any probe (original, temp, or
-            — when ``expected_default_audio_index`` is supplied — the
-            post-swap re-probe) could not be completed (missing binary,
-            timeout, non-zero exit, unparseable/incomplete output). For the
-            pre-swap probes (original/temp) the temp file is deleted and the
-            original left untouched before the error propagates, so no
-            orphan is left and no unvalidated swap ever happens. The
-            post-swap probe has no such cleanup to do — the swap already
-            succeeded — so its failure just propagates as-is.
+        collapsarr.downmix.probe.FfprobeError: the *pre-swap* probe of the
+            original or the temp file could not be completed (missing
+            binary, timeout, non-zero exit, unparseable/incomplete output).
+            The temp file is deleted and the original left untouched before
+            the error propagates, so no orphan is left and no unvalidated
+            swap ever happens. The *post-swap* re-probe (when
+            ``expected_default_audio_index`` is supplied) never raises this
+            — it has no cleanup left to do, the swap already succeeded — its
+            failure is instead reported as ``ApplyResult(failure_reason=
+            ApplyFailureReason.DISPOSITION_VERIFICATION_FAILED, ...)`` above,
+            precisely so it can't be conflated with (or silently swallowed
+            alongside) a pre-swap probe failure by a caller's blanket
+            ``except FfprobeError``.
     """
     if not remux_result.success or remux_result.temp_file_path is None:
         raise ValueError(
@@ -246,9 +276,33 @@ def apply_remux_result(
         # and no original left to protect -- the swap already happened. A
         # mismatch here is reported as a distinct Job failure (COL-241), not
         # silently treated as success, but it cannot be reverted.
-        post_swap_streams = probe_audio_streams(
-            original, ffprobe_path=ffprobe_path, timeout=timeout, runner=runner
-        )
+        #
+        # The re-probe's own failure is caught here -- deliberately *not*
+        # left to propagate as FfprobeError like the pre-swap probes above.
+        # A caller with one blanket `except FfprobeError` around the whole
+        # apply_remux_result() call (e.g. run_default_audio_pipeline) would
+        # otherwise report this identically to a pre-swap probe failure, even
+        # though the safety implications are opposite: pre-swap, the original
+        # is untouched; here, the swap already happened and disposition was
+        # never actually confirmed either way. Reporting it as a distinct
+        # ApplyResult keeps that "verification never completed" case
+        # separate from both "confirmed wrong" (DISPOSITION_MISMATCH) and any
+        # pre-swap failure.
+        try:
+            post_swap_streams = probe_audio_streams(
+                original, ffprobe_path=ffprobe_path, timeout=timeout, runner=runner
+            )
+        except FfprobeError as exc:
+            return ApplyResult(
+                success=False,
+                applied_path=None,
+                failure_reason=ApplyFailureReason.DISPOSITION_VERIFICATION_FAILED,
+                detail=(
+                    "disposition verification failed: could not re-probe "
+                    f"{str(original)!r} after the atomic swap ({exc}); swap "
+                    "already applied, disposition never confirmed either way"
+                ),
+            )
         mismatch_detail = _disposition_mismatch_detail(
             post_swap_streams, expected_default_audio_index
         )
