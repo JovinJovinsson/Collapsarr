@@ -205,3 +205,42 @@ def test_matches_local_resolver_outcome_given_equivalent_stream_data() -> None:
     assert local_result.channels == plex_result.channels
     assert local_result.language == plex_result.language
     assert plex_result is plex_streams[2]
+
+
+def test_matches_local_resolver_tie_break_given_equivalent_stream_data() -> None:
+    """Parity through the *tie-break* path: no exact match, two same-language streams
+    tied on channel count, so both resolvers must fall back to
+    ``_best_available``/``_best_available`` and land on the equivalent (earliest-
+    in-list / lowest-index) stream -- not just whichever happens to satisfy the
+    exact-match short-circuit, which is all the sibling parity test above
+    exercises.
+    """
+    from collapsarr.downmix.default_audio import (
+        resolve_default_audio_stream as resolve_local,
+    )
+    from collapsarr.downmix.probe import AudioStreamInfo
+
+    # No eng stream at the preferred stereo (2ch) tier -> falls back to
+    # best-available within eng, where the two eng streams are tied at 6ch.
+    local_streams = [
+        AudioStreamInfo(index=0, codec="flac", channels=6, channel_layout="6ch", language="eng"),
+        AudioStreamInfo(index=1, codec="flac", channels=6, channel_layout="6ch", language="eng"),
+        AudioStreamInfo(index=2, codec="flac", channels=2, channel_layout="2ch", language="jpn"),
+    ]
+    plex_streams = [
+        _stream(stream_id="1", channels=6, language="eng"),
+        _stream(stream_id="2", channels=6, language="eng"),
+        _stream(stream_id="3", channels=2, language="jpn"),
+    ]
+    preference = DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.STEREO)
+
+    local_result = resolve_local(local_streams, preference)
+    plex_result = resolve_default_audio_stream(plex_streams, preference)
+
+    assert local_result is not None and plex_result is not None
+    # Both resolvers break the 6ch/6ch tie toward the earliest entry: the
+    # local resolver via `stream.index`, the Plex resolver via input position.
+    assert local_result is local_streams[0]
+    assert plex_result is plex_streams[0]
+    assert local_result.channels == plex_result.channels
+    assert local_result.language == plex_result.language

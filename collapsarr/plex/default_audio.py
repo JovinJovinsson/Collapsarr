@@ -94,6 +94,4 @@ def _find_exact_match(
 
 def _best_available(streams: Sequence[PlexAudioStream]) -> PlexAudioStream:
     """Return the highest-channel-count stream, ties broken toward the earliest in the input."""
-    return min(
-        enumerate(streams), key=lambda pair: (-pair[1].channels, pair[0])
-    )[1]
+    return min(enumerate(streams), key=lambda pair: (-pair[1].channels, pair[0]))[1]
