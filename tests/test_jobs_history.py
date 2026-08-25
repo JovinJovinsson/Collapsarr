@@ -87,6 +87,7 @@ def test_record_job_history_persists_a_queued_job(session: Session) -> None:
     assert history.exit_code is None
     assert history.error_text is None
     assert history.scheduled_at is None
+    assert history.expected_stream_count is None
 
 
 def test_record_job_history_persists_a_jobs_scheduled_at(session: Session) -> None:
@@ -104,6 +105,18 @@ def test_record_job_history_persists_a_jobs_scheduled_at(session: Session) -> No
     history = record_job_history(session, job)
 
     assert history.scheduled_at == due
+
+
+def test_record_job_history_persists_a_jobs_expected_stream_count(session: Session) -> None:
+    """COL-251: a downmix-triggered Job's expected_stream_count round-trips onto its history
+    row, so the "stream not yet ingested" check survives a restart while still pending."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.expected_stream_count = 3
+
+    history = record_job_history(session, job)
+
+    assert history.expected_stream_count == 3
 
 
 def test_record_job_history_persists_a_succeeded_run(session: Session) -> None:

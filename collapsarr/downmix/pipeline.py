@@ -147,6 +147,17 @@ class PipelineResult:
 
     ``detail`` is always a human-readable one-line summary suitable for
     logging, regardless of outcome.
+
+    ``final_stream_count`` (COL-251) is the file's total audio-stream count
+    immediately after this run, set only on :attr:`PipelineOutcome.SUCCESS`
+    (``None`` otherwise) -- the existing probed streams plus ``tracks_added``.
+    A caller that schedules a follow-up Default Audio Track Job for a
+    downmix-triggered fix (:meth:`~collapsarr.jobs.queue.JobQueue.
+    enqueue_default_audio`'s ``expected_stream_count``) threads this value
+    through so that Job can tell "Plex hasn't finished re-ingesting the new
+    stream yet" apart from a genuine resolution failure -- see
+    :mod:`collapsarr.plex.default_audio_write`'s
+    ``PlexDefaultAudioOutcome.STREAM_NOT_YET_INGESTED``.
     """
 
     outcome: PipelineOutcome
@@ -155,6 +166,7 @@ class PipelineResult:
     tracks_added: tuple[QualifyingTarget, ...] = ()
     remux_result: RemuxResult | None = None
     apply_result: ApplyResult | None = None
+    final_stream_count: int | None = None
 
 
 def run_downmix_pipeline(
@@ -346,4 +358,5 @@ def run_downmix_pipeline(
         tracks_added=tuple(targets),
         remux_result=remux_result,
         apply_result=apply_result,
+        final_stream_count=len(streams) + len(targets),
     )

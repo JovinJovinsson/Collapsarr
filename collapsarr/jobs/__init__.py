@@ -25,6 +25,7 @@ from .models import JobHistory
 from .plex_analyze import make_plex_analyzer, trigger_plex_analyze
 from .queue import (
     DEFAULT_MAX_CONCURRENCY,
+    DefaultAudioAutoSchedule,
     DefaultAudioPipelineRunner,
     FailureNotifier,
     HistoryRecorder,
@@ -40,6 +41,7 @@ from .tracked_media import make_tracked_media_recorder, record_tracked_media
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
+    "DefaultAudioAutoSchedule",
     "DefaultAudioPipelineRunner",
     "FailureNotifier",
     "HistoryRecorder",

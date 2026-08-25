@@ -134,6 +134,22 @@ def test_pipeline_is_a_noop_with_a_single_audio_stream(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == [original]
 
 
+def test_pipeline_accepts_and_ignores_expected_stream_count(tmp_path: Path) -> None:
+    """COL-251: call-signature parity with apply_default_audio_via_plex -- unused here since
+    this pipeline always re-probes the actual local file (see the parameter's own docstring)."""
+    original = tmp_path / "movie.mkv"
+    shutil.copy(FIXTURES_DIR / "stereo_eng.mkv", original)
+
+    result = run_default_audio_pipeline(
+        original,
+        DefaultAudioPreference(language="jpn", channel_tier=DownmixTarget.FIVE_POINT_ONE),
+        expected_stream_count=99,  # deliberately absurd -- must not affect the outcome
+    )
+
+    assert result.outcome is PipelineOutcome.NOTHING_TO_DO
+    assert result.success is True
+
+
 @requires_ffmpeg
 def test_pipeline_reports_apply_failure_and_leaves_original_untouched(tmp_path: Path) -> None:
     """A real (successful) remux that's still rejected by an impossibly tight tolerance."""
