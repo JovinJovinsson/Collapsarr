@@ -116,7 +116,14 @@ which matches purely on file path, also spans both kinds transparently --
 see its module docstring). :meth:`enqueue` creates a ``DOWNMIX`` job (as it
 always has); :meth:`enqueue_default_audio` (COL-155) creates a
 ``SET_DEFAULT_AUDIO`` one. :meth:`_run_job` dispatches to whichever runner
-matches ``job.kind``.
+matches ``job.kind`` -- for ``SET_DEFAULT_AUDIO`` that is always exactly one
+call to ``default_audio_pipeline_runner``, regardless of what it does
+internally: :meth:`from_settings` wires that runner, by default, to
+:func:`~collapsarr.jobs.default_audio_dispatch.make_default_audio_pipeline_runner`'s
+mechanism-selection gate (COL-247), which itself picks exactly one of the
+ffmpeg remux fallback or a direct Plex API write per Job based on whether a
+Plex Connection is configured -- never both. This queue has no knowledge of
+that choice; it only ever sees one runner and one result.
 
 Threads, not asyncio: every stage of the downmix pipeline shells out to
 ``ffprobe``/``ffmpeg`` via blocking :mod:`subprocess` calls, so a small pool
@@ -622,7 +629,7 @@ class JobQueue:
         *,
         pipeline_runner: PipelineRunner = run_downmix_pipeline,
         pipeline_kwargs: Mapping[str, Any] | None = None,
-        default_audio_pipeline_runner: DefaultAudioPipelineRunner = run_default_audio_pipeline,
+        default_audio_pipeline_runner: DefaultAudioPipelineRunner | None = None,
         history_recorder: HistoryRecorder | None = None,
         failure_notifier: FailureNotifier | None = None,
         tracked_media_recorder: TrackedMediaRecorder | None = None,
@@ -682,12 +689,22 @@ class JobQueue:
         explicit ``pipeline_kwargs`` key from the caller always wins. See
         :meth:`_resolve_pipeline_kwargs`.
 
-        ``default_audio_pipeline_runner`` (COL-155) defaults to the real
+        ``default_audio_pipeline_runner`` (COL-155), when not passed
+        explicitly (``None``, the default here -- unlike the raw
+        :meth:`__init__`, where it defaults directly to the real
         :func:`~collapsarr.downmix.default_audio_pipeline.
-        run_default_audio_pipeline`, mirroring how ``pipeline_runner``
-        already defaults to the real downmix pipeline -- unlike the
-        automatic in-band fix above, the manual/bulk ``SET_DEFAULT_AUDIO``
-        preference isn't read from Settings here: :meth:`JobScheduler.
+        run_default_audio_pipeline` for lightweight unit construction),
+        resolves to the real COL-247 mechanism-selection gate
+        (:func:`~collapsarr.jobs.default_audio_dispatch.
+        make_default_audio_pipeline_runner`, bound to this same
+        ``session_factory``): a ``SET_DEFAULT_AUDIO`` job dispatched through a
+        real queue routes to a direct Plex API write when a Plex Connection
+        is configured, and to the ffmpeg remux fallback otherwise -- never
+        both for the same file. Pass an explicit ``default_audio_pipeline_runner``
+        (e.g. :func:`run_default_audio_pipeline` itself, or a test fake) to
+        bypass the gate entirely, the same opt-out every other ``None``-defaulted
+        hook on this factory gives. The manual/bulk ``SET_DEFAULT_AUDIO``
+        preference itself still isn't read from Settings here: :meth:`JobScheduler.
         trigger_set_default_audio` resolves it live, per call, and passes it
         straight to :meth:`enqueue_default_audio`.
 
@@ -766,6 +783,14 @@ class JobQueue:
 
             resolved_plex_analyzer = make_plex_analyzer(session_factory)
 
+        resolved_default_audio_pipeline_runner = default_audio_pipeline_runner
+        if resolved_default_audio_pipeline_runner is None:
+            from collapsarr.jobs.default_audio_dispatch import make_default_audio_pipeline_runner
+
+            resolved_default_audio_pipeline_runner = make_default_audio_pipeline_runner(
+                session_factory
+            )
+
         resolved_pause_check = pause_check
         if resolved_pause_check is None:
             resolved_pause_check = _make_live_pause_check(session_factory)
@@ -774,7 +799,7 @@ class JobQueue:
             max_concurrency=global_settings.concurrency_limit,
             pipeline_runner=pipeline_runner,
             pipeline_kwargs=cls._resolve_pipeline_kwargs(pipeline_kwargs, global_settings),
-            default_audio_pipeline_runner=default_audio_pipeline_runner,
+            default_audio_pipeline_runner=resolved_default_audio_pipeline_runner,
             history_recorder=resolved_history_recorder,
             failure_notifier=resolved_failure_notifier,
             tracked_media_recorder=resolved_tracked_media_recorder,
