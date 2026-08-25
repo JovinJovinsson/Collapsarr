@@ -22,6 +22,7 @@ from collapsarr.settings.models import (
     AUTH_METHOD_FORMS,
     AUTH_REQUIRED_ENABLED,
     AUTH_REQUIRED_LOCAL_BYPASS,
+    DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES,
     DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES,
     LOG_LEVEL_DEBUG,
     LOG_LEVEL_INFO,
@@ -701,6 +702,57 @@ def test_update_global_settings_auto_set_default_audio_is_switchable_back_off(
     updated = update_global_settings(session, auto_set_default_audio=False)
 
     assert updated.auto_set_default_audio is False
+
+
+# ---------------------------------------------------------------------------
+# Default Audio Delay (COL-243).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_default_audio_delay_default(session: Session) -> None:
+    """COL-243: a fresh row defaults to a 30-minute Default Audio Track delay."""
+    settings = get_global_settings(session)
+
+    assert settings.default_audio_delay_minutes == DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES
+
+
+def test_update_global_settings_updates_default_audio_delay(session: Session) -> None:
+    updated = update_global_settings(session, default_audio_delay_minutes=45)
+
+    assert updated.default_audio_delay_minutes == 45
+
+
+def test_update_global_settings_default_audio_delay_accepts_zero(session: Session) -> None:
+    updated = update_global_settings(session, default_audio_delay_minutes=0)
+
+    assert updated.default_audio_delay_minutes == 0
+
+
+def test_update_global_settings_rejects_a_negative_default_audio_delay(
+    session: Session,
+) -> None:
+    with pytest.raises(ValueError, match="default_audio_delay_minutes"):
+        update_global_settings(session, default_audio_delay_minutes=-1)
+
+
+def test_update_global_settings_omitting_default_audio_delay_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, default_audio_delay_minutes=90)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.default_audio_delay_minutes == 90
+
+
+def test_update_global_settings_default_audio_delay_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, default_audio_delay_minutes=15)
+
+    reread = get_global_settings(session)
+
+    assert reread.default_audio_delay_minutes == 15
 
 
 # ---------------------------------------------------------------------------
