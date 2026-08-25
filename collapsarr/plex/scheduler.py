@@ -11,7 +11,13 @@ into the app lifespan behind the same ``enable_scheduler`` flag.
 
 Each tick rebuilds the Plex Library Item mapping table wholesale
 (:func:`collapsarr.plex.library_sync.rebuild_library_items`) from the persisted
-:class:`~collapsarr.plex.models.PlexConnection`. It runs:
+:class:`~collapsarr.plex.models.PlexConnection`, then -- reading that
+freshly-rebuilt mapping -- refreshes every tracked, Plex-resolved file's
+Default Audio Track display snapshot from Plex's current state
+(:func:`collapsarr.plex.default_audio_snapshot.refresh_default_audio_snapshots`,
+COL-248), so a default track changed directly in Plex's own UI (outside
+Collapsarr) is picked up on the very next sync, with no Collapsarr Job
+required. It runs:
 
 - **weekly** -- the fixed :data:`INTERVAL_SECONDS` cadence (unlike the library
   scan's operator-tunable interval, a full Plex walk is heavy and its output
@@ -45,7 +51,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from collapsarr.config import Settings
 
-from .client import list_library_sections, list_section_items
+from .client import get_item_metadata, list_library_sections, list_section_items
+from .default_audio_snapshot import GetMetadataFn, refresh_default_audio_snapshots
 from .library_sync import ListItemsFn, ListSectionsFn, rebuild_library_items
 from .service import get_plex_connection
 
@@ -74,11 +81,13 @@ class PlexSyncScheduler:
     ``now`` is an injectable clock (defaults to real UTC now); tests pass a
     fixed one to assert :attr:`last_sync_at` without real wall-clock time.
     ``transport`` is forwarded to the Plex client calls (tests inject an
-    ``httpx.MockTransport``). ``list_sections``/``list_items`` are the
-    injectable client-call seams (defaulting to the real
-    :mod:`collapsarr.plex.client` functions), so the sync can be driven with
-    in-memory fakes. ``interval_seconds`` is overridable for tests but defaults
-    to the fixed weekly cadence.
+    ``httpx.MockTransport``). ``list_sections``/``list_items``/``get_metadata``
+    are the injectable client-call seams (defaulting to the real
+    :mod:`collapsarr.plex.client` functions) -- ``get_metadata`` feeds the
+    Default Audio Track snapshot refresh (COL-248) the same way
+    ``list_sections``/``list_items`` feed the mapping-table rebuild -- so the
+    sync can be driven with in-memory fakes. ``interval_seconds`` is
+    overridable for tests but defaults to the fixed weekly cadence.
     """
 
     def __init__(
@@ -90,6 +99,7 @@ class PlexSyncScheduler:
         transport: object | None = None,
         list_sections: ListSectionsFn = list_library_sections,
         list_items: ListItemsFn = list_section_items,
+        get_metadata: GetMetadataFn = get_item_metadata,
         interval_seconds: float = INTERVAL_SECONDS,
     ) -> None:
         self._settings = settings
@@ -98,6 +108,7 @@ class PlexSyncScheduler:
         self._transport = transport
         self._list_sections = list_sections
         self._list_items = list_items
+        self._get_metadata = get_metadata
         self._interval_seconds = interval_seconds
         self._last_sync_at: datetime | None = None
         self._stop = threading.Event()
@@ -122,7 +133,7 @@ class PlexSyncScheduler:
         return self._last_sync_at
 
     def run_once(self) -> int:
-        """Rebuild the mapping table from the persisted connection; return its row count.
+        """Rebuild the mapping table, refresh the Default Audio Track snapshot, return its count.
 
         The unit the loop calls each iteration and the seam the tests drive
         directly. Stamps :attr:`last_sync_at` at the very start -- before any
@@ -130,11 +141,20 @@ class PlexSyncScheduler:
         no-op tick (an unconfigured connection: :func:`~collapsarr.plex.
         library_sync.rebuild_library_items` no-ops on a blank ``base_url``,
         returning ``0`` and leaving any existing map untouched).
+
+        After the mapping table is rebuilt, :func:`~collapsarr.plex.
+        default_audio_snapshot.refresh_default_audio_snapshots` (COL-248) reads
+        that freshly-rebuilt table and refreshes every tracked, Plex-resolved
+        file's ``current_default_language``/``current_default_channel_layout``
+        columns from Plex's current state, in the same session. The returned
+        count is still the mapping table's row count (matching this method's
+        existing contract, e.g. ``POST /api/plex/sync``'s response) -- the
+        snapshot refresh's own count is not surfaced here.
         """
         self._last_sync_at = self._now()
         with self._session_factory() as session:
             connection = get_plex_connection(session)
-            return rebuild_library_items(
+            item_count = rebuild_library_items(
                 session,
                 base_url=connection.base_url,
                 token=connection.token,
@@ -142,6 +162,14 @@ class PlexSyncScheduler:
                 list_sections=self._list_sections,
                 list_items=self._list_items,
             )
+            refresh_default_audio_snapshots(
+                session,
+                base_url=connection.base_url,
+                token=connection.token,
+                transport=self._transport,
+                get_metadata=self._get_metadata,
+            )
+            return item_count
 
     def request_sync(self) -> None:
         """Ask the background loop to take an off-cycle sync as soon as possible (COL-210).
