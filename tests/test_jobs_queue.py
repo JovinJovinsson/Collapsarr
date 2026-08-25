@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -27,6 +28,11 @@ from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.jobs.queue import DEFAULT_MAX_CONCURRENCY, Job, JobKind, JobQueue, JobStatus
 from collapsarr.migrations import upgrade_to_head
 from collapsarr.settings.service import update_global_settings
+
+_FIXED_NOW = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
+"""A fixed "now" for injecting into ``JobQueue(now=...)`` (COL-242) -- mirrors
+the ``_FIXED_NOW`` pattern already used by ``test_jobs_scheduler.py``/
+``test_health_failed_jobs.py`` for their own injected clocks."""
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
 _NOTHING_TO_DO = PipelineResult(
@@ -1689,3 +1695,158 @@ def test_count_running_counts_only_running_jobs() -> None:
     assert queue.wait_idle(timeout=5) is True
     assert queue.count_running() == 0
     assert gate_job.status is JobStatus.SUCCEEDED
+
+
+# ---------------------------------------------------------------------------
+# Scheduled Job due-time gate (COL-242): an injectable ``now`` clock plus a
+# nullable ``Job.scheduled_at`` -- a still-PENDING Job isn't claimed by the
+# ordinary worker-pool claim path until its scheduled_at has passed (or is
+# unset, the default -- every existing Job kind/trigger is unaffected).
+# ---------------------------------------------------------------------------
+
+
+def test_job_scheduled_at_defaults_to_none() -> None:
+    """AC: every existing Job kind/trigger is unaffected -- scheduled_at is unset by default."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    assert job.scheduled_at is None
+
+
+def test_pending_job_with_future_scheduled_at_is_not_claimed_by_the_worker_pool() -> None:
+    """AC: a pending Job whose scheduled_at is still in the future is not claimed."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW + timedelta(hours=1)
+
+    queue.start()
+    time.sleep(0.2)
+
+    assert job.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+def test_pending_job_with_past_scheduled_at_is_claimed_as_today() -> None:
+    """AC: a pending Job whose scheduled_at has already passed is claimed as today."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW - timedelta(hours=1)
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+    assert len(runner.calls) == 1
+
+
+def test_pending_job_with_scheduled_at_exactly_now_is_claimed() -> None:
+    """The due-time comparison is inclusive: scheduled_at == now is already due."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_a_future_scheduled_job_never_blocks_an_earlier_priority_claimable_job() -> None:
+    """A future-scheduled Job is skipped entirely -- an unrelated claimable Job still runs.
+
+    Doesn't use ``wait_idle`` here: with ``now`` fixed, ``scheduled_job`` stays
+    genuinely ``PENDING`` forever (correctly -- it hasn't run), so a queue
+    that's fully idle in the ordinary sense never actually happens. Polls
+    ``claimable_job`` directly instead.
+    """
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    scheduled_job = queue.enqueue("/media/later.mkv", DownmixSettings())
+    scheduled_job.scheduled_at = _FIXED_NOW + timedelta(hours=1)
+    claimable_job = queue.enqueue("/media/now.mkv", DownmixSettings())
+
+    queue.start()
+    deadline = time.monotonic() + 5
+    while claimable_job.status is JobStatus.PENDING and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    assert claimable_job.status is JobStatus.SUCCEEDED
+    assert scheduled_job.status is JobStatus.PENDING
+
+
+def test_worker_pool_claims_a_scheduled_job_once_its_due_time_passes() -> None:
+    """AC: the gate is live, not just checked once -- toggling the clock forward wakes a worker.
+
+    Mirrors ``test_pause_check_toggling_off_lets_a_previously_pending_job_be_claimed``:
+    nothing explicitly wakes a worker blocked purely on a future scheduled_at
+    (see ``_SCHEDULE_POLL_INTERVAL_SECONDS``), so this proves the bounded poll
+    actually notices the due time passing, not just the gate's initial check.
+    """
+    current_now = {"value": _FIXED_NOW}
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: current_now["value"])
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW + timedelta(seconds=1)
+
+    queue.start()
+    time.sleep(0.2)
+    assert job.status is JobStatus.PENDING  # not due yet
+
+    current_now["value"] = _FIXED_NOW + timedelta(hours=1)  # advance past the due time
+    # No event to wait on -- the worker only notices via its bounded poll
+    # (_SCHEDULE_POLL_INTERVAL_SECONDS), so wait_idle's own timeout comfortably
+    # covers the worst case.
+    assert queue.wait_idle(timeout=5) is True
+
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_force_start_bypasses_the_scheduled_at_gate() -> None:
+    """AC: Process Now still claims a pending Job regardless of scheduled_at."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW + timedelta(days=1)
+
+    queue.start()
+    time.sleep(0.2)
+    assert job.status is JobStatus.PENDING  # the pool never claims it
+
+    assert queue.force_start(job.id) is True
+    assert queue.wait_idle(timeout=5) is True
+
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_from_settings_defaults_now_to_a_real_clock(tmp_path: Path) -> None:
+    """The production factory's default `now` genuinely reflects wall-clock time."""
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    runner = _stub_runner(_SUCCESS)
+
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = datetime.now(UTC) - timedelta(minutes=1)  # already due
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_from_settings_accepts_an_injected_now_clock(tmp_path: Path) -> None:
+    """AC-adjacent: `from_settings` threads an explicit `now` through, same as the raw ctor."""
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    runner = _stub_runner(_SUCCESS)
+
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW + timedelta(hours=1)
+
+    queue.start()
+    time.sleep(0.2)
+
+    assert job.status is JobStatus.PENDING
+    assert runner.calls == []

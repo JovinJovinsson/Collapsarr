@@ -75,6 +75,7 @@ function runningJob(id: string): JobHistoryEntry {
     status: "running",
     kind: "downmix",
     priority: 1,
+    scheduled_at: null,
     started_at: "2026-08-15T10:00:00Z",
     ended_at: null,
     exit_code: null,

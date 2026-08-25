@@ -112,6 +112,7 @@ def record_job_history(session: Session, job: Job) -> JobHistory:
     history.status = job.status
     history.kind = job.kind
     history.priority = job.priority
+    history.scheduled_at = job.scheduled_at
     history.started_at = job.started_at
     history.ended_at = job.ended_at
     history.exit_code = _exit_code(job)

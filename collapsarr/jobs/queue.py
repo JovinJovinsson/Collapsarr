@@ -180,6 +180,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CONCURRENCY = 1
 
+
+def _utcnow() -> datetime:
+    """Real UTC-now -- :class:`JobQueue`'s default injectable clock (COL-242).
+
+    Mirrors :func:`collapsarr.jobs.scheduler._utcnow` exactly (same signature,
+    same body): a plain zero-arg callable a test can swap out via ``JobQueue``'s
+    ``now`` constructor parameter, the same seam :class:`~collapsarr.jobs.
+    scheduler.JobScheduler` already exposes for its own ``now``.
+    """
+    return datetime.now(UTC)
+
+
 _PAUSE_POLL_INTERVAL_SECONDS = 1.0
 """How often a worker blocked purely because :data:`AutoProcessingPauseCheck`
 currently returns ``True`` re-checks it (COL-226). Toggling the persisted
@@ -192,6 +204,20 @@ bounded latency" shape :class:`~collapsarr.jobs.scheduler.JobScheduler`'s
 ``recently_processed_window_minutes`` dedup cooldown already uses for a live
 Settings read. 1 second keeps the worst-case "un-pause to first claim"
 latency low without spinning the CPU or hammering the database."""
+
+_SCHEDULE_POLL_INTERVAL_SECONDS = 1.0
+"""How often a worker blocked purely because every still-``PENDING`` Job's
+``scheduled_at`` (COL-242) is in the future re-checks whether one has come
+due. Mirrors :data:`_PAUSE_POLL_INTERVAL_SECONDS`'s reasoning exactly: nothing
+calls ``notify_all`` on the condition a blocked worker waits on merely because
+wall-clock time passed, so a worker that would otherwise wait indefinitely
+(the ordinary "nothing claimable, not paused" case) instead polls at this
+cadence whenever the *reason* nothing is claimable is a future
+``scheduled_at`` rather than a genuinely empty/paused queue -- see
+:meth:`JobQueue._has_future_scheduled_pending_locked`. In production this
+never fires today: nothing yet enqueues a Job with a non-``None``
+``scheduled_at`` (a later ticket adds that), so every existing Job kind/
+trigger keeps waiting indefinitely exactly as before this constant existed."""
 
 #: Signature the ``DOWNMIX`` pipeline runner (real or injected-for-tests) must
 #: match: ``(file_path, settings, **pipeline_kwargs) -> PipelineResult``.
@@ -351,6 +377,21 @@ class Job:
     subprocess and terminate it on an explicit user cancel. Not mutated
     directly by anyone else; ``None`` again reads simply as "never ran / not
     running."
+
+    ``scheduled_at`` (COL-242) is an optional due-time gate on an otherwise
+    ordinary ``PENDING`` job: ``None`` (the default -- every existing Job
+    kind/trigger) means "claimable as soon as a worker is free", exactly the
+    behaviour before this field existed. A non-``None`` value means a worker's
+    ordinary claim path (:meth:`JobQueue._claim_next`) skips this Job until
+    ``scheduled_at`` has passed (compared against the queue's injectable
+    :attr:`JobQueue._now` clock) -- it still reads as ``status is
+    JobStatus.PENDING`` the whole time (there is no new status), it simply
+    isn't *claimable* yet. :meth:`JobQueue.force_start` ("Process Now")
+    bypasses this gate entirely, the same way it already bypasses Auto-
+    Processing Pause and the Concurrency Limit -- see that method's own
+    docstring. This ticket only builds and exposes the mechanism: nothing yet
+    constructs a Job with a non-``None`` ``scheduled_at`` (a later ticket
+    wires an actual enqueue-with-a-future-due-time caller).
     """
 
     file_path: Path
@@ -365,6 +406,7 @@ class Job:
     started_at: datetime | None = None
     ended_at: datetime | None = None
     cancellation: CancellationHandle | None = None
+    scheduled_at: datetime | None = None
 
 
 def _run_context_for_log(job: Job) -> str:
@@ -528,6 +570,16 @@ class JobQueue:
     ``GlobalSettings.auto_processing_paused`` live, so a ``PUT
     /api/settings`` change takes effect on the very next claim attempt with
     no restart.
+
+    ``now`` (COL-242) is the injectable clock :meth:`_claim_next` compares a
+    still-``PENDING`` Job's :attr:`Job.scheduled_at` against -- mirroring the
+    pattern :class:`~collapsarr.jobs.scheduler.JobScheduler` already uses for
+    its own ``now`` constructor parameter (same signature, same real default,
+    see that class's docstring). Defaults directly to :func:`_utcnow` (not the
+    ``None``-defers-to-real-implementation pattern ``history_recorder``/
+    ``failure_notifier``/etc. use above) because, like ``JobScheduler.now``,
+    it needs no DB/session wiring to be real -- there is nothing lightweight
+    unit construction needs to opt out of.
     """
 
     def __init__(
@@ -542,6 +594,7 @@ class JobQueue:
         tracked_media_recorder: TrackedMediaRecorder | None = None,
         plex_analyzer: PlexAnalyzer | None = None,
         pause_check: AutoProcessingPauseCheck | None = None,
+        now: Callable[[], datetime] = _utcnow,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
@@ -556,6 +609,10 @@ class JobQueue:
         #: The Auto-Processing Pause gate (COL-226) -- see the class
         #: docstring's ``pause_check`` paragraph and :data:`AutoProcessingPauseCheck`.
         self._pause_check = pause_check
+        #: The injectable clock (COL-242) -- see the class docstring's ``now``
+        #: paragraph. Compared against a still-``PENDING`` Job's
+        #: ``scheduled_at`` in :meth:`_claim_next`/:meth:`_lowest_priority_pending_locked`.
+        self._now = now
         self._lock = threading.Lock()
         #: Guards every access to ``_jobs``/``_next_priority``/``_shutdown``
         #: and coordinates the worker pool. Workers ``wait`` on it for a
@@ -635,6 +692,7 @@ class JobQueue:
         tracked_media_recorder: TrackedMediaRecorder | None = None,
         plex_analyzer: PlexAnalyzer | None = None,
         pause_check: AutoProcessingPauseCheck | None = None,
+        now: Callable[[], datetime] = _utcnow,
     ) -> JobQueue:
         """Build a :class:`JobQueue` whose concurrency cap comes from persisted Settings.
 
@@ -738,6 +796,11 @@ class JobQueue:
         genuinely honours a persisted Auto-Processing Pause, mirroring how
         ``history_recorder``/``failure_notifier``/``tracked_media_recorder``/
         ``plex_analyzer`` above all resolve to real ones here too.
+
+        ``now`` (COL-242) passes straight through to :meth:`__init__` --
+        unlike the four hooks above, it needs no ``session_factory`` to be
+        real (:func:`_utcnow` touches nothing), so there is no separate
+        ``resolved_now``/``None``-defers-to-real step here.
         """
         resolved = settings or get_settings()
 
@@ -805,6 +868,7 @@ class JobQueue:
             tracked_media_recorder=resolved_tracked_media_recorder,
             plex_analyzer=resolved_plex_analyzer,
             pause_check=resolved_pause_check,
+            now=now,
         )
 
     @staticmethod
@@ -1082,7 +1146,7 @@ class JobQueue:
         and then runs it (:meth:`_run_job`) on a brand-new, dedicated thread
         rather than waiting for one of the pool's own threads to free up.
 
-        That is what makes this a genuine bypass of both gates "Process Now"
+        That is what makes this a genuine bypass of every gate "Process Now"
         must clear:
 
         * **Auto-Processing Pause** (COL-226) -- ``self._pause_check`` is
@@ -1093,6 +1157,12 @@ class JobQueue:
           fixed at construction); spinning up one more thread outside that
           fixed pool genuinely runs this job *alongside* however many pool
           workers are already busy, rather than waiting for one to free up.
+        * **Scheduled Job due-time gate** (COL-242) -- ``job.scheduled_at`` is
+          likewise consulted only inside :meth:`_lowest_priority_pending_locked`
+          (called from :meth:`_claim_next`), never here, so a Job scheduled
+          for the future still force-starts immediately through this method --
+          "Process Now" always means *now*, not "now, unless it was scheduled
+          for later."
 
         Every other side effect of a normal run is unaffected: the new
         thread calls :meth:`_run_job` exactly as a pool worker would, so
@@ -1373,6 +1443,17 @@ class JobQueue:
         docstring for why) -- once claimable, the ordinary indefinite wait
         (woken by :meth:`_enqueue`/:meth:`bump_to_front`/:meth:`shutdown`)
         applies as before.
+
+        **Scheduled Job due-time gate (COL-242).** :meth:`_lowest_priority_pending_locked`
+        already excludes a still-``PENDING`` Job whose :attr:`Job.scheduled_at`
+        is in the future (compared against ``self._now()``), so this method
+        never sees it as claimable either way -- it simply isn't returned.
+        When that is the *only* reason nothing is claimable (not paused, but
+        every ``PENDING`` Job is scheduled for later), the wait below uses
+        :data:`_SCHEDULE_POLL_INTERVAL_SECONDS` instead of blocking forever,
+        for the identical reason the pause case above does: nothing wakes a
+        blocked worker merely because wall-clock time passed a Job's due
+        time. See :meth:`_has_future_scheduled_pending_locked`.
         """
         with self._cond:
             while True:
@@ -1392,21 +1473,61 @@ class JobQueue:
                         job.cancellation = CancellationHandle()
                         self._active += 1  # stays counted until _run_job fully finishes
                         return job
-                self._cond.wait(_PAUSE_POLL_INTERVAL_SECONDS if paused else None)
+                if paused:
+                    wait_seconds: float | None = _PAUSE_POLL_INTERVAL_SECONDS
+                elif self._has_future_scheduled_pending_locked():
+                    wait_seconds = _SCHEDULE_POLL_INTERVAL_SECONDS
+                else:
+                    wait_seconds = None
+                self._cond.wait(wait_seconds)
 
     def _lowest_priority_pending_locked(self) -> Job | None:
         """The pending job a free worker should claim next (call with the lock held).
 
-        A linear scan for the minimum ``priority`` among ``PENDING`` jobs --
-        the queue holds media-library-scale job counts, so an O(n) pick per
-        claim is simpler and less error-prone than a heap that would also have
-        to support :meth:`cancel`'s arbitrary removal and
-        :meth:`bump_to_front`'s key decrease.
+        A linear scan for the minimum ``priority`` among ``PENDING`` jobs
+        that are also currently *claimable* -- ``scheduled_at`` unset, or set
+        to a moment that has already passed ``self._now()`` (COL-242). A
+        ``PENDING`` Job whose ``scheduled_at`` is still in the future is
+        excluded from consideration entirely, exactly as if it weren't
+        pending yet -- it stays ``PENDING`` and reappears in this scan on the
+        next claim attempt once its due time passes. The queue holds
+        media-library-scale job counts, so an O(n) pick per claim is simpler
+        and less error-prone than a heap that would also have to support
+        :meth:`cancel`'s arbitrary removal and :meth:`bump_to_front`'s key
+        decrease.
         """
-        pending = [job for job in self._jobs.values() if job.status is JobStatus.PENDING]
-        if not pending:
+        now = self._now()
+        claimable = [
+            job
+            for job in self._jobs.values()
+            if job.status is JobStatus.PENDING
+            and (job.scheduled_at is None or job.scheduled_at <= now)
+        ]
+        if not claimable:
             return None
-        return min(pending, key=lambda job: job.priority)
+        return min(claimable, key=lambda job: job.priority)
+
+    def _has_future_scheduled_pending_locked(self) -> bool:
+        """Whether some ``PENDING`` Job is blocked purely by a future ``scheduled_at`` (COL-242).
+
+        Called with the lock held, only once :meth:`_lowest_priority_pending_locked`
+        has already reported nothing claimable and the queue isn't paused --
+        distinguishes "genuinely nothing pending" (the ordinary indefinite
+        wait applies, woken only by :meth:`_enqueue`/:meth:`bump_to_front`/
+        :meth:`shutdown`) from "something is pending but not due yet" (the
+        bounded :data:`_SCHEDULE_POLL_INTERVAL_SECONDS` wait applies instead,
+        so a worker notices the due time passing without needing an explicit
+        wake). In production this is always ``False`` today -- nothing yet
+        enqueues a Job with a non-``None`` ``scheduled_at`` -- so every
+        existing trigger keeps using the ordinary indefinite wait unchanged.
+        """
+        now = self._now()
+        return any(
+            job.status is JobStatus.PENDING
+            and job.scheduled_at is not None
+            and job.scheduled_at > now
+            for job in self._jobs.values()
+        )
 
     def _run_job(self, job: Job) -> None:
         """Execute one already-claimed job's pipeline run, record its outcome, and persist/notify.
