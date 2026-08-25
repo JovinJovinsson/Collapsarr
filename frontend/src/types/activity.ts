@@ -45,7 +45,7 @@ export interface JobHistoryEntry {
    * row that is still in the future, the UI derives a `SCHEDULED` label (and
    * shows this due date/time) in place of `PENDING` -- the backend `status`
    * itself never changes to a new value for this. See
-   * `deriveDisplayStatus` in `pages/QueuePage.tsx`.
+   * `displayStatus` in `pages/QueuePage.tsx`.
    */
   scheduled_at: string | null;
   started_at: string | null;
