@@ -21,7 +21,14 @@ table (one row per known on-disk file path -> Plex ``ratingKey`` + section):
   **give up silently** if that also fails. This is a soft-fail path by design:
   it never raises and never logs at a level that would alarm an operator -- a
   file with no Plex counterpart is an ordinary, expected outcome (e.g. media
-  Plex hasn't scanned yet), not an error.
+  Plex hasn't scanned yet), not an error. A live-query **hit** is written back
+  into the mapping table immediately (COL-245) -- rather than left for the next
+  scheduled/on-demand Plex Sync (:func:`rebuild_library_items`) to pick up --
+  so a caller resolving the same path again (e.g. a retried Job) gets a table
+  hit next time. That write-back runs in its own inner try/except
+  (:func:`_persist_live_hit`): a persistence hiccup must never turn an
+  otherwise-successful resolution into a give-up, so the caller still gets
+  the resolved ``ratingKey`` back even if the cache write itself fails.
 
 The client calls are injectable seams (``list_sections``/``list_items``/
 ``search``), defaulting to the real client functions -- mirroring
@@ -45,6 +52,7 @@ from collapsarr.media.service import get_tracked_media
 
 from .client import (
     PLEX_EPISODE_TYPE,
+    PlexMediaItem,
     SectionItemsResult,
     SectionsResult,
     list_library_sections,
@@ -199,6 +207,11 @@ def resolve_rating_key(
        start to finish, is soft-fail by design, so a DB hiccup on the cheap
        indexed lookup gives up exactly like a failed live query would, rather
        than propagating.
+
+    A live-query **hit** (step 2 succeeding) is written back into the mapping
+    table immediately, via :func:`_persist_live_hit` -- see the module
+    docstring for why that write is isolated from this function's own
+    give-up-on-any-exception behaviour.
     """
     path_str = str(file_path)
 
@@ -218,10 +231,54 @@ def resolve_rating_key(
         result = search(base_url, token, scope.title, transport=transport)
         if not result.ok:
             return None
-        return _match_rating_key(result, scope)
+        matched = _match_item(result, scope)
+        if matched is None:
+            return None
+
+        _persist_live_hit(session, path_str, matched)
+        return matched.rating_key
     except Exception:  # noqa: BLE001 - soft-fail path: never propagate, never alarm
         logger.debug("Plex ratingKey resolution failed for %s; giving up", path_str, exc_info=True)
         return None
+
+
+def _persist_live_hit(session: Session, file_path: str, item: PlexMediaItem) -> None:
+    """Write a live-query ratingKey hit into the mapping table immediately (COL-245).
+
+    Runs inside its own try/except, deliberately separate from
+    :func:`resolve_rating_key`'s own outer one: a persistence hiccup here (a
+    DB error, a race with a concurrent Plex Sync) must never turn an
+    otherwise-successful live resolution into a give-up -- the caller already
+    has a good ``ratingKey`` to return regardless of whether this write lands,
+    so any failure here is logged at debug and swallowed, not propagated.
+
+    Upserts by ``file_path``: :func:`resolve_rating_key` only reaches this
+    point once it has already confirmed no row exists for the path, so a
+    plain insert is the expected case; the fallback update path covers the
+    narrow race where a concurrent write (e.g. a Plex Sync run) landed a row
+    for the same path in between.
+    """
+    try:
+        existing = session.scalars(
+            select(PlexLibraryItem).where(PlexLibraryItem.file_path == file_path)
+        ).one_or_none()
+        if existing is not None:
+            existing.rating_key = item.rating_key
+            existing.section_key = item.section_key or existing.section_key
+        else:
+            session.add(
+                PlexLibraryItem(
+                    file_path=file_path,
+                    rating_key=item.rating_key,
+                    section_key=item.section_key or "",
+                )
+            )
+        session.commit()
+    except Exception:  # noqa: BLE001 - never let a cache-write hiccup lose a good resolution
+        session.rollback()
+        logger.debug(
+            "Plex ratingKey live-query hit for %s could not be cached", file_path, exc_info=True
+        )
 
 
 def _resolve_scope(session: Session, file_path: str) -> _LiveQueryScope | None:
@@ -275,13 +332,16 @@ def _series_title(session: Session, instance_id: int, episode_node: LibraryNode)
     return series_node.title if series_node is not None else None
 
 
-def _match_rating_key(result: SectionItemsResult, scope: _LiveQueryScope) -> str | None:
-    """Pick the ``ratingKey`` from a search result that matches ``scope``.
+def _match_item(result: SectionItemsResult, scope: _LiveQueryScope) -> PlexMediaItem | None:
+    """Pick the item from a search result that matches ``scope``.
 
     For an episode, the candidate must be a Plex ``episode`` whose
     ``season_number``/``episode_number`` both match the scope. For a movie, the
     first ``movie`` candidate wins (the query was already scoped by its title);
     if none is explicitly typed ``movie``, the first candidate is taken.
+    Returns the full :class:`~collapsarr.plex.client.PlexMediaItem` (not just
+    its ``rating_key``) -- :func:`_persist_live_hit` also needs its
+    ``section_key`` for the mapping-table write-back.
     """
     if scope.is_episode:
         for item in result.items:
@@ -290,9 +350,9 @@ def _match_rating_key(result: SectionItemsResult, scope: _LiveQueryScope) -> str
                 and item.season_number == scope.season_number
                 and item.episode_number == scope.episode_number
             ):
-                return item.rating_key
+                return item
         return None
     for item in result.items:
         if item.type == "movie":
-            return item.rating_key
-    return result.items[0].rating_key if result.items else None
+            return item
+    return result.items[0] if result.items else None

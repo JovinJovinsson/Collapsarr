@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from collapsarr.downmix.apply import ApplyFailureReason
 from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.default_audio_pipeline import run_default_audio_pipeline
 from collapsarr.downmix.pipeline import PipelineOutcome
@@ -166,17 +167,32 @@ def _fake_runner(
     *,
     original_path: Path,
     audio_payload: Mapping[str, object],
+    post_swap_audio_payload: Mapping[str, object] | None = None,
     original_summary: tuple[float, int] = (10.0, 2),
     temp_summary: tuple[float, int] = (10.0, 2),
     probe_audio_returncode: int = 0,
+    post_swap_probe_audio_returncode: int = 0,
     ffmpeg_returncode: int = 0,
     ffmpeg_stderr: str = "",
     media_summary_returncode: int = 0,
     calls: list[list[str]] | None = None,
 ) -> object:
-    """A stub subprocess runner dispatching on binary + flags, like a fake ffmpeg/ffprobe."""
+    """A stub subprocess runner dispatching on binary + flags, like a fake ffmpeg/ffprobe.
+
+    ``post_swap_audio_payload``/``post_swap_probe_audio_returncode`` (COL-241)
+    answer the pipeline's *second* ``probe_audio_streams``-shaped call -- the
+    post-swap disposition re-probe :func:`~collapsarr.downmix.apply.
+    apply_remux_result` makes when given an ``expected_default_audio_index``
+    -- separately from the first (pre-remux) one, which always gets
+    ``audio_payload``/``probe_audio_returncode``. Both default to mirroring
+    the first call's values, so tests that don't care about the disposition
+    check (or want it to trivially pass with an unchanged stream list) don't
+    need to pass either.
+    """
+    audio_probe_calls = 0
 
     def runner(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal audio_probe_calls
         if calls is not None:
             calls.append(list(command))
         binary = command[0]
@@ -190,8 +206,19 @@ def _fake_runner(
             payload = {"format": {"duration": str(duration)}, "streams": [{}] * count}
             return subprocess.CompletedProcess(list(command), 0, json.dumps(payload), "")
         if "ffprobe" in binary:
+            audio_probe_calls += 1
+            is_first_call = audio_probe_calls == 1
+            audio_probe_payload = (
+                audio_payload
+                if is_first_call or post_swap_audio_payload is None
+                else post_swap_audio_payload
+            )
+            returncode = (
+                probe_audio_returncode if is_first_call else post_swap_probe_audio_returncode
+            )
+            stderr = "Invalid data found" if returncode != 0 else ""
             return subprocess.CompletedProcess(
-                list(command), probe_audio_returncode, json.dumps(audio_payload), ""
+                list(command), returncode, json.dumps(audio_probe_payload), stderr
             )
         if "ffmpeg" in binary:
             return subprocess.CompletedProcess(list(command), ffmpeg_returncode, "", ffmpeg_stderr)
@@ -225,6 +252,39 @@ _ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD = {
     ]
 }
 
+# Same two streams as `_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD`, but with the
+# disposition flipped onto the stereo track (a:1) -- the post-swap state a
+# genuine, correct remux produces when the preference picks eng Stereo. Used
+# to answer `_fake_runner`'s post-swap re-probe (COL-241) on the success path.
+_ENG_STEREO_DEFAULT_PLUS_5_1_PAYLOAD = {
+    "streams": [
+        {
+            "index": 0,
+            "codec_type": "audio",
+            "codec_name": "ac3",
+            "channels": 6,
+            "channel_layout": "5.1",
+            "tags": {"language": "eng"},
+            "disposition": {"default": 0},
+        },
+        {
+            "index": 1,
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "channels": 2,
+            "channel_layout": "stereo",
+            "tags": {"language": "eng"},
+            "disposition": {"default": 1},
+        },
+    ]
+}
+
+# A *broken* remux: the disposition never actually moved (both post-swap
+# streams still read exactly as they did pre-remux -- a:0 still default,
+# a:1 still not) even though the preference picked eng Stereo (a:1). Used to
+# drive the disposition-mismatch failure path (COL-241).
+_UNCHANGED_DISPOSITION_PAYLOAD = _ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD
+
 _SINGLE_STREAM_PAYLOAD = {
     "streams": [
         {
@@ -253,6 +313,7 @@ def test_pipeline_succeeds_with_injected_runner_and_wires_all_stages(tmp_path: P
     runner = _fake_runner(
         original_path=original,
         audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        post_swap_audio_payload=_ENG_STEREO_DEFAULT_PLUS_5_1_PAYLOAD,
         calls=calls,
     )
 
@@ -267,8 +328,10 @@ def test_pipeline_succeeds_with_injected_runner_and_wires_all_stages(tmp_path: P
     assert result.tracks_added == ()
     assert result.remux_result is not None and result.remux_result.success is True
     assert result.apply_result is not None and result.apply_result.success is True
+    # COL-241: the post-swap re-probe confirmed the disposition really moved.
+    assert "disposition verified" in result.apply_result.detail
     binaries = [c[0] for c in calls]
-    assert binaries == ["ffprobe", "ffmpeg", "ffprobe", "ffprobe"]
+    assert binaries == ["ffprobe", "ffmpeg", "ffprobe", "ffprobe", "ffprobe"]
     assert original.exists()
 
     # The disposition moved onto the eng stereo stream (a:1); the wrongly
@@ -280,6 +343,79 @@ def test_pipeline_succeeds_with_injected_runner_and_wires_all_stages(tmp_path: P
     assert not any(arg.startswith("-c:a:") for arg in command)
     assert command[command.index("-disposition:a:0") + 1] == "0"
     assert command[command.index("-disposition:a:1") + 1] == "default"
+
+
+def test_pipeline_reports_apply_failure_on_disposition_mismatch(tmp_path: Path) -> None:
+    """The swap happened, but the resulting file's disposition never actually moved."""
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    calls: list[list[str]] = []
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        # A buggy/no-op remux: post-swap disposition is unchanged from
+        # pre-swap -- a:0 (5.1) is still (wrongly) default, a:1 (stereo,
+        # the expected winner) still isn't.
+        post_swap_audio_payload=_UNCHANGED_DISPOSITION_PAYLOAD,
+        calls=calls,
+    )
+
+    result = run_default_audio_pipeline(
+        original,
+        DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.STEREO),
+        runner=runner,  # type: ignore[arg-type]
+    )
+
+    assert result.outcome is PipelineOutcome.APPLY_FAILED
+    assert result.success is False
+    assert result.remux_result is not None and result.remux_result.success is True
+    assert result.apply_result is not None
+    assert result.apply_result.success is False
+    assert result.apply_result.failure_reason is ApplyFailureReason.DISPOSITION_MISMATCH
+    assert "disposition mismatch" in result.detail
+    # All five probes/ffmpeg calls still ran -- the mismatch is only caught
+    # by the final, post-swap re-probe.
+    binaries = [c[0] for c in calls]
+    assert binaries == ["ffprobe", "ffmpeg", "ffprobe", "ffprobe", "ffprobe"]
+
+
+def test_pipeline_reports_apply_failure_when_post_swap_reprobe_itself_errors(
+    tmp_path: Path,
+) -> None:
+    """The swap already happened; the post-swap re-probe fails outright (not a mismatch).
+
+    Distinct from `test_pipeline_reports_apply_failure_on_disposition_mismatch`
+    above (re-probe *completes* and finds the wrong result) and from
+    `test_pipeline_reports_apply_failure_when_validation_probing_fails` below
+    (a *pre*-swap probe failure, where the original is untouched) -- this is
+    the third, previously-conflated case: the swap happened and verification
+    itself never completed.
+    """
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    calls: list[list[str]] = []
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        post_swap_probe_audio_returncode=1,
+        calls=calls,
+    )
+
+    result = run_default_audio_pipeline(
+        original,
+        DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.STEREO),
+        runner=runner,  # type: ignore[arg-type]
+    )
+
+    assert result.outcome is PipelineOutcome.APPLY_FAILED
+    assert result.success is False
+    assert result.remux_result is not None and result.remux_result.success is True
+    assert result.apply_result is not None
+    assert result.apply_result.success is False
+    assert result.apply_result.failure_reason is ApplyFailureReason.DISPOSITION_VERIFICATION_FAILED
+    assert "disposition verification failed" in result.detail
+    binaries = [c[0] for c in calls]
+    assert binaries == ["ffprobe", "ffmpeg", "ffprobe", "ffprobe", "ffprobe"]
 
 
 def test_pipeline_is_a_noop_when_disposition_already_matches_with_injected_runner(

@@ -17,17 +17,21 @@ from collapsarr.plex.client import (
     PLEX_EPISODE_TYPE,
     AnalyzeResult,
     ConnectivityResult,
+    ItemMetadataResult,
     LibrarySection,
     PlexMediaItem,
     PosterImageResult,
     SectionItemsResult,
     SectionsResult,
+    SetDefaultAudioResult,
     analyze_item,
     check_connectivity,
     fetch_poster_image,
+    get_item_metadata,
     list_library_sections,
     list_section_items,
     search_items,
+    set_default_audio_stream,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "plex"
@@ -216,6 +220,152 @@ def test_analyze_item_connection_error_is_reported_as_failure() -> None:
 
     assert result.ok is False
     assert result.error is not None
+
+
+# ---------------------------------------------------------------------------
+# get_item_metadata
+# ---------------------------------------------------------------------------
+
+
+def test_get_item_metadata_success_returns_raw_payload() -> None:
+    payload = {"MediaContainer": {"size": 1, "Metadata": [{"ratingKey": "123"}]}}
+    transport = _transport_returning(200, payload)
+
+    result = get_item_metadata("http://plex.local:32400", "plex-token", "123", transport=transport)
+
+    assert result == ItemMetadataResult(ok=True, payload=payload, error=None)
+
+
+def test_get_item_metadata_request_carries_token_header_json_accept_and_rating_key_path() -> None:
+    seen: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = request
+        return httpx.Response(200, json={"MediaContainer": {}})
+
+    transport = httpx.MockTransport(handler)
+
+    get_item_metadata("http://plex.local:32400", "plex-token", "999", transport=transport)
+
+    request = seen["request"]
+    assert request.method == "GET"
+    assert request.url.path == "/library/metadata/999"
+    assert request.headers["X-Plex-Token"] == "plex-token"
+    assert request.headers["Accept"] == "application/json"
+
+
+def test_get_item_metadata_unauthorized_is_reported_as_failure() -> None:
+    payload = _load_fixture("unauthorized.json")
+    transport = _transport_returning(401, payload)
+
+    result = get_item_metadata(
+        "http://plex.local:32400", "wrong-token", "1", transport=transport
+    )
+
+    assert result.ok is False
+    assert result.payload is None
+    assert result.error is not None
+    assert "401" in result.error
+
+
+def test_get_item_metadata_connection_error_is_reported_as_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    result = get_item_metadata(
+        "http://unreachable.local:32400", "plex-token", "1", transport=transport
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_get_item_metadata_malformed_json_is_reported_as_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not json")
+
+    transport = httpx.MockTransport(handler)
+
+    result = get_item_metadata(
+        "http://plex.local:32400", "plex-token", "1", transport=transport
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_get_item_metadata_blank_base_url_is_reported_as_failure() -> None:
+    result = get_item_metadata("", "plex-token", "1")
+
+    assert result == ItemMetadataResult(ok=False, error="No base URL configured")
+
+
+# ---------------------------------------------------------------------------
+# set_default_audio_stream
+# ---------------------------------------------------------------------------
+
+
+def test_set_default_audio_stream_success() -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(200))
+
+    result = set_default_audio_stream(
+        "http://plex.local:32400", "plex-token", "12345", "101", transport=transport
+    )
+
+    assert result == SetDefaultAudioResult(ok=True, error=None)
+
+
+def test_set_default_audio_stream_request_carries_method_path_token_and_stream_id_param() -> None:
+    seen: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = request
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+
+    set_default_audio_stream(
+        "http://plex.local:32400", "plex-token", "999", "42", transport=transport
+    )
+
+    request = seen["request"]
+    assert request.method == "PUT"
+    assert request.url.path == "/library/metadata/999"
+    assert request.url.params["audioStreamID"] == "42"
+    assert request.headers["X-Plex-Token"] == "plex-token"
+
+
+def test_set_default_audio_stream_error_response_is_reported_as_failure() -> None:
+    transport = _transport_returning(404, {"errors": [{"code": 404, "message": "Not Found"}]})
+
+    result = set_default_audio_stream(
+        "http://plex.local:32400", "plex-token", "does-not-exist", "1", transport=transport
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_set_default_audio_stream_connection_error_is_reported_as_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    result = set_default_audio_stream(
+        "http://unreachable.local:32400", "plex-token", "1", "1", transport=transport
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_set_default_audio_stream_blank_base_url_is_reported_as_failure() -> None:
+    result = set_default_audio_stream("", "plex-token", "1", "1")
+
+    assert result == SetDefaultAudioResult(ok=False, error="No base URL configured")
 
 
 # ---------------------------------------------------------------------------
