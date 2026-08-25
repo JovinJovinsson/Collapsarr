@@ -1,7 +1,7 @@
 """default audio delay minutes
 
 Revision ID: d2aa7dc1a72d
-Revises: 42f6e2c6c70b
+Revises: a3f9c1d8e207
 Create Date: 2026-08-25 00:00:00.000000
 
 Additive migration for COL-243: a new ``default_audio_delay_minutes`` NOT
@@ -24,7 +24,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'd2aa7dc1a72d'
-down_revision: str | None = '42f6e2c6c70b'
+down_revision: str | None = 'a3f9c1d8e207'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
