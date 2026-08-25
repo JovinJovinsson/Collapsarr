@@ -162,7 +162,11 @@ def _reconstruct_job(
     ``row.job_id`` so the rehydrated Job keeps the same identity its history
     row already carries: the next :func:`~collapsarr.jobs.history.
     record_job_history` call (once this Job actually runs) updates that same
-    row in place rather than creating a duplicate.
+    row in place rather than creating a duplicate. ``scheduled_at`` (COL-242)
+    is carried over verbatim from the row so a due-time gate survives a
+    restart -- ``None`` for every row written before this field existed (and
+    every kind/trigger that still doesn't set it today), so this is a no-op
+    in production for now.
 
     Returns a ``(job, None)`` pair on success. Returns ``(None, reason)`` --
     ``reason`` a short, human-readable explanation the caller
@@ -213,6 +217,7 @@ def _reconstruct_job(
                 preference=preference,
                 priority=row.priority,
                 status=JobStatus.PENDING,
+                scheduled_at=row.scheduled_at,
             ),
             None,
         )
@@ -226,6 +231,7 @@ def _reconstruct_job(
                 kind=JobKind.DOWNMIX,
                 priority=row.priority,
                 status=JobStatus.PENDING,
+                scheduled_at=row.scheduled_at,
             ),
             None,
         )

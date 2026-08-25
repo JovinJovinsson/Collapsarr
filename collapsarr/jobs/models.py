@@ -81,6 +81,18 @@ class JobHistory(Base):
     implied by existing history. This is a pure prefactor -- nothing yet
     reads this column back to change execution order (that is COL-164's
     priority-pull worker pool).
+
+    ``scheduled_at`` (COL-242) mirrors the originating
+    :attr:`~collapsarr.jobs.queue.Job.scheduled_at`: ``None`` for every
+    existing Job kind/trigger (and every pre-existing row, via this column's
+    additive nullable migration), or a due-time gate a still-``pending`` Job
+    isn't claimed before (see :meth:`~collapsarr.jobs.queue.JobQueue._claim_next`).
+    No new backend status is introduced by this -- ``status`` stays
+    ``JobStatus.PENDING`` throughout; a client derives a "Scheduled" display
+    label from ``status is pending`` plus ``scheduled_at`` being in the
+    future rather than reading a distinct status value. This ticket only
+    persists the column; nothing yet writes a non-``None`` value (a later
+    ticket wires an actual enqueue-with-a-future-due-time caller).
     """
 
     __tablename__ = "job_history"
@@ -113,6 +125,7 @@ class JobHistory(Base):
         index=True,
     )
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     ended_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)

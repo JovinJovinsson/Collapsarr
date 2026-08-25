@@ -19,6 +19,7 @@ factory (via the ``settings`` fixture) rather than the single shared
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -85,6 +86,24 @@ def test_record_job_history_persists_a_queued_job(session: Session) -> None:
     assert history.ended_at is None
     assert history.exit_code is None
     assert history.error_text is None
+    assert history.scheduled_at is None
+
+
+def test_record_job_history_persists_a_jobs_scheduled_at(session: Session) -> None:
+    """COL-242: a Job's scheduled_at (the due-time gate) round-trips onto its history row."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    # Naive -- SQLite's DateTime column round-trips a value without tzinfo
+    # regardless of what was assigned, matching started_at/ended_at's own
+    # storage (both stamped from datetime.now(UTC) but likewise read back
+    # naive); comparing tz-aware to tz-aware here would be an apples-to-
+    # oranges mismatch against what the DB actually returns.
+    due = datetime(2026, 8, 25, 12, 0, 0)
+    job.scheduled_at = due
+
+    history = record_job_history(session, job)
+
+    assert history.scheduled_at == due
 
 
 def test_record_job_history_persists_a_succeeded_run(session: Session) -> None:

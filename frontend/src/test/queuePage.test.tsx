@@ -11,6 +11,7 @@ const runningJob: JobHistoryEntry = {
   status: "running",
   kind: "downmix",
   priority: 3,
+  scheduled_at: null,
   started_at: "2026-08-11T10:00:00Z",
   ended_at: null,
   exit_code: null,
@@ -28,6 +29,7 @@ const pendingJobLowerPriority: JobHistoryEntry = {
   status: "pending",
   kind: "set_default_audio",
   priority: 1,
+  scheduled_at: null,
   started_at: null,
   ended_at: null,
   exit_code: null,
@@ -45,6 +47,7 @@ const pendingJobHigherPriority: JobHistoryEntry = {
   status: "pending",
   kind: "downmix",
   priority: 2,
+  scheduled_at: null,
   started_at: null,
   ended_at: null,
   exit_code: null,
@@ -181,6 +184,41 @@ describe("QueuePage", () => {
     expect(within(pendingRow).getByText("Pending")).toBeInTheDocument();
     expect(within(pendingRow).getByText("stereo")).toBeInTheDocument();
     expect(within(pendingRow).getByText("fr")).toBeInTheDocument();
+  });
+
+  it("shows SCHEDULED with the due date/time instead of PENDING for a job scheduled in the future (COL-242)", async () => {
+    const scheduledJob: JobHistoryEntry = {
+      ...pendingJobLowerPriority,
+      id: 4,
+      job_id: "44444444-4444-4444-4444-444444444444",
+      file_path: "/media/tv/Later/Later.S01E03.mkv",
+      scheduled_at: "2099-01-01T00:00:00Z",
+    };
+    mockFetchQueue([[scheduledJob]]);
+    render(<QueuePage />);
+
+    const row = (await screen.findByText("Later.S01E03")).closest("tr") as HTMLElement;
+    expect(within(row).getByText("Scheduled")).toBeInTheDocument();
+    expect(within(row).queryByText("Pending")).not.toBeInTheDocument();
+    expect(within(row).getByText(/due/i)).toHaveTextContent(
+      new Date("2099-01-01T00:00:00Z").toLocaleString(),
+    );
+  });
+
+  it("still shows PENDING (not SCHEDULED) for a pending job whose scheduled_at has already passed (COL-242)", async () => {
+    const dueJob: JobHistoryEntry = {
+      ...pendingJobLowerPriority,
+      id: 5,
+      job_id: "55555555-5555-5555-5555-555555555555",
+      file_path: "/media/tv/Due/Due.S01E04.mkv",
+      scheduled_at: "2020-01-01T00:00:00Z",
+    };
+    mockFetchQueue([[dueJob]]);
+    render(<QueuePage />);
+
+    const row = (await screen.findByText("Due.S01E04")).closest("tr") as HTMLElement;
+    expect(within(row).getByText("Pending")).toBeInTheDocument();
+    expect(within(row).queryByText("Scheduled")).not.toBeInTheDocument();
   });
 
   it("shows each row's job kind", async () => {

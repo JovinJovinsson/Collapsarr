@@ -216,6 +216,14 @@ class JobHistoryRead(BaseModel):
     :attr:`~collapsarr.jobs.queue.Job.priority` -- the join-order sequence
     number a lower value means "earlier"/"next in line". It's what
     ``GET /api/jobs/queue`` (COL-175) orders pending Jobs by.
+
+    ``scheduled_at`` (COL-242) is ``null`` for every existing Job kind/
+    trigger -- nothing yet enqueues one with a due-time gate. When set on a
+    row whose ``status`` is still ``pending``, the frontend derives a
+    ``SCHEDULED`` display label (and shows the due date/time) in place of
+    ``PENDING`` if ``scheduled_at`` is still in the future; the backend
+    ``status`` itself never changes to a new value for this -- see
+    :class:`~collapsarr.jobs.models.JobHistory`'s own docstring.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -226,6 +234,7 @@ class JobHistoryRead(BaseModel):
     status: JobStatus
     kind: JobKind
     priority: int
+    scheduled_at: datetime | None
     started_at: datetime | None
     ended_at: datetime | None
     exit_code: int | None

@@ -29,6 +29,7 @@ const historyResponse: JobHistoryEntry[] = [
     status: "succeeded",
     kind: "downmix",
     priority: 0,
+    scheduled_at: null,
     started_at: "2026-07-10T10:00:00Z",
     ended_at: "2026-07-10T10:05:00Z",
     exit_code: 0,

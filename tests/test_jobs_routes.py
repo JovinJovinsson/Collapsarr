@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -275,8 +276,10 @@ def test_history_lists_rows_with_full_shape(client: TestClient, session: Session
     assert row["status"] == "succeeded"
     assert row["kind"] == "downmix"  # COL-155: a bare JobHistory() row defaults to DOWNMIX
     assert row["priority"] == 7  # COL-175: priority is exposed in the response shape
+    assert row["scheduled_at"] is None  # COL-242: exposed in the response shape
     for key in (
         "id",
+        "scheduled_at",
         "started_at",
         "ended_at",
         "exit_code",
@@ -287,6 +290,27 @@ def test_history_lists_rows_with_full_shape(client: TestClient, session: Session
         "updated_at",
     ):
         assert key in row
+
+
+def test_history_row_exposes_a_non_null_scheduled_at(client: TestClient, session: Session) -> None:
+    """COL-242: a row with a due-time gate reports it verbatim, not just null."""
+    session.add(
+        JobHistory(
+            job_id="job-scheduled",
+            file_path="/media/a.mkv",
+            status=JobStatus.PENDING,
+            kind=JobKind.DOWNMIX,
+            priority=0,
+            scheduled_at=datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+    session.commit()
+
+    response = client.get("/api/jobs/history", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    row = response.json()[0]
+    assert row["scheduled_at"] == "2026-08-25T12:00:00"
 
 
 def test_history_filters_by_file(client: TestClient, session: Session) -> None:
