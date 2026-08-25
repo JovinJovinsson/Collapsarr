@@ -102,6 +102,14 @@ export interface GlobalSettings {
    */
   auto_set_default_audio: boolean;
   /**
+   * Minimum age (in minutes) a remuxed file's new audio streams must have
+   * before Collapsarr trusts Plex to have already processed them for a
+   * Default Audio Track write/verify (COL-243). Default 30. Not yet
+   * consumed by any Job-scheduling logic -- COL-251 is the follow-up
+   * ticket that will read it.
+   */
+  default_audio_delay_minutes: number;
+  /**
    * Recently-processed window for the scheduler's dedup cooldown (COL-167).
    * In minutes; `0` disables the cooldown entirely (always eligible for
    * retry). Default 360 (6 hours). Read live on every dedup check -- no
@@ -161,6 +169,7 @@ export interface GlobalSettingsUpdateInput {
   default_audio_language?: string | null;
   default_audio_channel_tier?: DownmixTarget | null;
   auto_set_default_audio?: boolean;
+  default_audio_delay_minutes?: number;
   recently_processed_window_minutes?: number;
   auto_queue_paused?: boolean;
   auto_processing_paused?: boolean;

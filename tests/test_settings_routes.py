@@ -53,6 +53,7 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["default_audio_language"] is None  # COL-151 default
     assert body["default_audio_channel_tier"] is None  # COL-151 default
     assert body["auto_set_default_audio"] is False  # COL-151 default
+    assert body["default_audio_delay_minutes"] == 30  # COL-243 default
     assert body["recently_processed_window_minutes"] == 360  # COL-167 default
     assert body["auto_queue_paused"] is False  # COL-174 default
     assert body["auto_processing_paused"] is False  # COL-226 default
@@ -277,6 +278,65 @@ def test_put_settings_rejects_a_disk_space_error_percent_above_100(client: TestC
     response = client.put(
         "/api/settings",
         json={"disk_space_error_percent": 101},
+        headers=_auth_headers(client),
+    )
+    assert response.status_code == 422
+
+
+# --- default audio delay (COL-243) -----------------------------------------------
+
+
+def test_put_settings_updates_default_audio_delay(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"default_audio_delay_minutes": 45},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["default_audio_delay_minutes"] == 45
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["default_audio_delay_minutes"] == 45
+
+
+def test_put_settings_default_audio_delay_accepts_zero(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"default_audio_delay_minutes": 0},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["default_audio_delay_minutes"] == 0
+
+
+def test_put_settings_leaves_default_audio_delay_untouched_when_omitted(
+    client: TestClient,
+) -> None:
+    client.put(
+        "/api/settings",
+        json={"default_audio_delay_minutes": 60},
+        headers=_auth_headers(client),
+    )
+
+    client.put(
+        "/api/settings",
+        json={"concurrency_limit": 3},
+        headers=_auth_headers(client),
+    )
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["default_audio_delay_minutes"] == 60
+    assert body["concurrency_limit"] == 3
+
+
+def test_put_settings_rejects_a_negative_default_audio_delay(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"default_audio_delay_minutes": -1},
         headers=_auth_headers(client),
     )
     assert response.status_code == 422

@@ -63,6 +63,12 @@ rule every other boolean field here follows (``ui_auth_enabled``,
 ``default_tracked``) -- there is no clear-to-default sentinel since it
 always holds a concrete ``True``/``False``.
 
+``default_audio_delay_minutes`` (COL-243) follows the same "only change
+what's passed" rule as ``recently_processed_window_minutes`` below, with
+the same negative-value guard (:class:`ValueError`). Not yet read by any
+caller in this codebase -- COL-251 is the follow-up ticket that will
+consume it from the downmix pipeline.
+
 ``recently_processed_window_minutes`` (COL-167) follows the same "only
 change what's passed" rule as the backup/disk-space pairs above, with one
 extra guard: a negative value raises :class:`ValueError` (``0`` is valid --
@@ -223,6 +229,7 @@ def update_global_settings(
     default_audio_language: str | None | _Unset = _UNSET,
     default_audio_channel_tier: DownmixTarget | None | _Unset = _UNSET,
     auto_set_default_audio: bool | None = None,
+    default_audio_delay_minutes: int | None = None,
     recently_processed_window_minutes: int | None = None,
     auto_queue_paused: bool | None = None,
     auto_processing_paused: bool | None = None,
@@ -301,6 +308,13 @@ def update_global_settings(
     pending -> running claim step directly via an injected ``pause_check``
     callable -- see :attr:`~collapsarr.settings.models.GlobalSettings.
     auto_processing_paused`'s own docstring for the full scope.
+
+    ``default_audio_delay_minutes`` (COL-243) follows the same "only change
+    what's passed" rule as every other non-nullable integer field here, with
+    the same negative-value guard as ``recently_processed_window_minutes``
+    below (:class:`ValueError` on a negative value; ``0`` is valid). Not yet
+    read by any caller -- see :attr:`~collapsarr.settings.models.
+    GlobalSettings.default_audio_delay_minutes`'s own docstring.
     """
     settings = get_global_settings(session)
 
@@ -357,6 +371,13 @@ def update_global_settings(
         )
     if auto_set_default_audio is not None:
         settings.auto_set_default_audio = auto_set_default_audio
+    if default_audio_delay_minutes is not None:
+        if default_audio_delay_minutes < 0:
+            raise ValueError(
+                "default_audio_delay_minutes must be >= 0; got "
+                f"{default_audio_delay_minutes!r}"
+            )
+        settings.default_audio_delay_minutes = default_audio_delay_minutes
     if recently_processed_window_minutes is not None:
         if recently_processed_window_minutes < 0:
             raise ValueError(

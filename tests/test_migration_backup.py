@@ -73,6 +73,7 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "default_audio_language"),
     ("global_settings", "default_audio_channel_tier"),
     ("global_settings", "auto_set_default_audio"),
+    ("global_settings", "default_audio_delay_minutes"),
     ("global_settings", "recently_processed_window_minutes"),
     ("global_settings", "auto_queue_paused"),
     ("global_settings", "ffmpeg_path"),

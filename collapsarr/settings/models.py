@@ -119,6 +119,16 @@ fresh install should do without the operator first configuring
 ``default_audio_language``/``default_audio_channel_tier`` and turning it on
 deliberately."""
 
+DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES = 30
+"""Default :attr:`GlobalSettings.default_audio_delay_minutes` for a fresh
+install / an existing row backfilled by the additive migration (COL-243).
+In minutes; modeled on :data:`DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES`'s
+column shape (a plain ``NOT NULL`` integer with a matching DB-side
+``server_default``). Not yet consumed by any Job-scheduling logic -- this
+ticket only adds the knob and its Settings UI field; COL-251 is the
+downmix pipeline's delayed Default Audio Track Job enqueue that will read
+it."""
+
 DEFAULT_AUTO_QUEUE_PAUSED = False
 """Default :attr:`GlobalSettings.auto_queue_paused` for a fresh install / an
 existing row backfilled by the additive migration (COL-174). Off by default,
@@ -323,6 +333,17 @@ class GlobalSettings(Base):
     the additive migration backfills existing installs to ``False`` rather
     than leaving the column ``NULL``.
 
+    ``default_audio_delay_minutes`` (COL-243) is the minimum age (in
+    minutes) a remuxed file's new audio streams must have before Collapsarr
+    trusts Plex to have already processed them for a Default Audio Track
+    write/verify -- see :data:`DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES`. Modeled
+    directly on ``recently_processed_window_minutes`` below: a plain
+    ``NOT NULL`` integer with a matching DB-side ``server_default`` so the
+    additive migration backfills existing installs to the documented
+    default rather than leaving the column ``NULL``. Not yet read by any
+    Job-scheduling logic -- this ticket only persists the knob and exposes
+    it in Settings; COL-251 is the follow-up ticket that consumes it.
+
     ``recently_processed_window_minutes`` (COL-167) is the scheduler's
     "recently processed" dedup cooldown, in minutes -- see
     :data:`DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES` and
@@ -508,6 +529,13 @@ class GlobalSettings(Base):
         nullable=False,
         default=DEFAULT_AUTO_SET_DEFAULT_AUDIO,
         server_default=text("0"),
+    )
+
+    default_audio_delay_minutes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES,
+        server_default=text(str(DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES)),
     )
 
     recently_processed_window_minutes: Mapped[int] = mapped_column(
