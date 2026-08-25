@@ -213,6 +213,101 @@ def test_rating_key_miss_and_verification_mismatch_errors_are_distinguishable(
 
 
 # ---------------------------------------------------------------------------
+# Stream not yet ingested (COL-251): a downmix-triggered call passes
+# expected_stream_count; Plex reporting fewer streams than that is a distinct
+# hard failure, not a fall-through to resolution against a stale list.
+# ---------------------------------------------------------------------------
+
+
+def test_stream_not_yet_ingested_fails_distinctly_when_plex_reports_fewer_streams(
+    session: Session,
+) -> None:
+    """Plex still reports only the pre-downmix streams -- the new one hasn't landed yet."""
+    _mapped(session)
+    pre_payload = _metadata_payload(_PRE_WRITE_STREAMS)  # 2 streams
+    transport, seen = _sequenced_get_transport(get_payloads=[pre_payload])
+
+    result = apply_default_audio_via_plex(
+        session,
+        FILE_PATH,
+        PREFERENCE,
+        base_url=BASE_URL,
+        token=TOKEN,
+        transport=transport,
+        expected_stream_count=3,
+    )
+
+    assert result.outcome is PlexDefaultAudioOutcome.STREAM_NOT_YET_INGESTED
+    assert result.success is False
+    assert result.rating_key == RATING_KEY
+    assert result.stream_id is None
+    assert "hasn't finished ingesting" in result.detail
+    assert [r.method for r in seen] == ["GET"]  # no resolution, no PUT, no verify attempted
+
+
+def test_stream_not_yet_ingested_is_distinct_from_rating_key_unresolved(
+    session: Session,
+) -> None:
+    """AC: a distinct, specific error -- not the generic ratingKey-resolution-failure message."""
+    _mapped(session)
+    pre_payload = _metadata_payload(_PRE_WRITE_STREAMS)
+    transport, _ = _sequenced_get_transport(get_payloads=[pre_payload])
+
+    result = apply_default_audio_via_plex(
+        session,
+        FILE_PATH,
+        PREFERENCE,
+        base_url=BASE_URL,
+        token=TOKEN,
+        transport=transport,
+        expected_stream_count=3,
+    )
+
+    assert result.outcome is not PlexDefaultAudioOutcome.RATING_KEY_UNRESOLVED
+    assert "Could not resolve a Plex ratingKey" not in result.detail
+
+
+def test_expected_stream_count_met_proceeds_to_resolution_as_normal(session: Session) -> None:
+    """Plex already reports at least as many streams as expected: no special-casing."""
+    _mapped(session)
+    pre_payload = _metadata_payload(_PRE_WRITE_STREAMS)  # 2 streams
+    verify_payload = _metadata_payload(
+        [
+            _stream_entry(stream_id="1", channels=2, selected=False),
+            _stream_entry(stream_id="2", channels=6, selected=True),
+        ]
+    )
+    transport, seen = _sequenced_get_transport(get_payloads=[pre_payload, verify_payload])
+
+    result = apply_default_audio_via_plex(
+        session,
+        FILE_PATH,
+        PREFERENCE,
+        base_url=BASE_URL,
+        token=TOKEN,
+        transport=transport,
+        expected_stream_count=2,
+    )
+
+    assert result.outcome is PlexDefaultAudioOutcome.SUCCESS
+    assert [r.method for r in seen] == ["GET", "PUT", "GET"]
+
+
+def test_expected_stream_count_unset_never_checks_the_count(session: Session) -> None:
+    """An immediate trigger (no expected_stream_count) never hits this check at all."""
+    _mapped(session)
+    single_stream_payload = _metadata_payload([_stream_entry(stream_id="1", selected=True)])
+    transport, seen = _sequenced_get_transport(get_payloads=[single_stream_payload])
+
+    result = apply_default_audio_via_plex(
+        session, FILE_PATH, PREFERENCE, base_url=BASE_URL, token=TOKEN, transport=transport
+    )
+
+    assert result.outcome is PlexDefaultAudioOutcome.NOTHING_TO_DO
+    assert [r.method for r in seen] == ["GET"]
+
+
+# ---------------------------------------------------------------------------
 # Additional failure modes, for completeness alongside the three AC-mandated cases.
 # ---------------------------------------------------------------------------
 

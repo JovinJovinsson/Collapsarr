@@ -61,6 +61,10 @@ class _StubPlexRunner:
     def __init__(self, result: PlexDefaultAudioResult) -> None:
         self._result = result
         self.calls: list[tuple[Session, str, DefaultAudioPreference, str, str]] = []
+        #: ``expected_stream_count`` (COL-251) recorded separately from
+        #: ``calls`` rather than added to that tuple, so every existing
+        #: 5-tuple unpack at each call site keeps working unchanged.
+        self.expected_stream_count_calls: list[int | None] = []
 
     def __call__(
         self,
@@ -71,8 +75,10 @@ class _StubPlexRunner:
         base_url: str,
         token: str,
         transport: httpx.BaseTransport | None = None,
+        expected_stream_count: int | None = None,
     ) -> PlexDefaultAudioResult:
         self.calls.append((session, str(file_path), preference, base_url, token))
+        self.expected_stream_count_calls.append(expected_stream_count)
         return self._result
 
 
@@ -152,6 +158,32 @@ def test_remux_runner_kwargs_are_forwarded_unchanged(
     assert remux_runner.calls == [
         (FILE_PATH, _PREFERENCE, {"cancel_handle": None, "ffmpeg_path": "/opt/ffmpeg/ffmpeg"})
     ]
+
+
+def test_expected_stream_count_is_forwarded_to_the_plex_runner(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """COL-251: a downmix-triggered Job's expected_stream_count reaches the Plex mechanism."""
+    _configure_plex(session_factory)
+    plex_runner = _StubPlexRunner(_PLEX_SUCCESS)
+    runner = make_default_audio_pipeline_runner(session_factory, plex_runner=plex_runner)
+
+    runner(FILE_PATH, _PREFERENCE, expected_stream_count=3)
+
+    assert plex_runner.expected_stream_count_calls == [3]
+
+
+def test_expected_stream_count_defaults_to_none_for_an_immediate_trigger(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """A manual/bulk or plain-webhook trigger never sets expected_stream_count (COL-251)."""
+    _configure_plex(session_factory)
+    plex_runner = _StubPlexRunner(_PLEX_SUCCESS)
+    runner = make_default_audio_pipeline_runner(session_factory, plex_runner=plex_runner)
+
+    runner(FILE_PATH, _PREFERENCE)
+
+    assert plex_runner.expected_stream_count_calls == [None]
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +298,13 @@ def test_worker_pool_routes_a_set_default_audio_job_to_the_remux_mechanism_when_
     queue.wait_idle()
 
     assert job.status is JobStatus.SUCCEEDED
-    assert remux_runner.calls == [(FILE_PATH, _PREFERENCE, {"cancel_handle": job.cancellation})]
+    assert remux_runner.calls == [
+        (
+            FILE_PATH,
+            _PREFERENCE,
+            {"cancel_handle": job.cancellation, "expected_stream_count": None},
+        )
+    ]
     assert plex_runner.calls == []
 
 

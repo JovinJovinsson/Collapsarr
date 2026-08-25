@@ -248,6 +248,7 @@ POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("job_history", "kind"),
     ("job_history", "priority"),
     ("job_history", "scheduled_at"),
+    ("job_history", "expected_stream_count"),
 )
 
 #: Indexes a *post-baseline* migration adds on an *indexed* post-baseline

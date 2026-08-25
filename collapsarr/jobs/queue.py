@@ -158,7 +158,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -215,9 +215,10 @@ wall-clock time passed, so a worker that would otherwise wait indefinitely
 cadence whenever the *reason* nothing is claimable is a future
 ``scheduled_at`` rather than a genuinely empty/paused queue -- see
 :meth:`JobQueue._has_future_scheduled_pending_locked`. In production this
-never fires today: nothing yet enqueues a Job with a non-``None``
-``scheduled_at`` (a later ticket adds that), so every existing Job kind/
-trigger keeps waiting indefinitely exactly as before this constant existed."""
+fires for a downmix-triggered ``SET_DEFAULT_AUDIO`` Job (COL-251, via
+:meth:`JobQueue._schedule_default_audio_job`) while it waits out its
+``default_audio_delay_minutes`` due time; every other Job kind/trigger still
+leaves ``scheduled_at`` unset and so is never affected by this poll at all."""
 
 #: Signature the ``DOWNMIX`` pipeline runner (real or injected-for-tests) must
 #: match: ``(file_path, settings, **pipeline_kwargs) -> PipelineResult``.
@@ -233,14 +234,17 @@ DefaultAudioPipelineRunner = Callable[..., PipelineResult]
 #: :func:`~collapsarr.downmix.default_audio_pipeline.run_default_audio_pipeline`
 #: also accepts, so :meth:`JobQueue._run_job` can forward them to a
 #: ``SET_DEFAULT_AUDIO`` job's runner too. **Not** every key: ``pipeline_kwargs``
-#: can also carry ``auto_set_default_audio``/``default_audio_preference``
-#: (COL-152), which are :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`
-#: -only parameters -- :func:`run_default_audio_pipeline` has no matching
-#: parameters (nor a catch-all ``**kwargs``) for those, so passing the whole
-#: dict through unfiltered would raise ``TypeError`` on a real
-#: ``SET_DEFAULT_AUDIO`` job the moment the Default Audio Track auto-fix
-#: toggle is also on. ``ffmpeg_path`` is the only key both pipelines share
-#: today.
+#: is a ``DOWNMIX``-job-only dict (e.g. it carried
+#: ``auto_set_default_audio``/``default_audio_preference`` before COL-251
+#: replaced that in-band fold with :meth:`JobQueue._schedule_default_audio_job`
+#: below), and :func:`run_default_audio_pipeline` has no catch-all ``**kwargs``
+#: for arbitrary ``DOWNMIX``-only keys, so passing the whole dict through
+#: unfiltered would raise ``TypeError``. ``ffmpeg_path`` is the only key both
+#: pipelines share today. This is unrelated to ``expected_stream_count``
+#: (COL-251), which is per-*Job* (``job.expected_stream_count``), not part of
+#: this constructor-level ``pipeline_kwargs`` dict -- see
+#: :meth:`JobQueue._run_job`'s ``SET_DEFAULT_AUDIO`` branch, which passes it
+#: as its own explicit keyword alongside ``cancel_handle``.
 _SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS = frozenset({"ffmpeg_path"})
 
 #: Signature the Auto-Processing Pause gate (COL-226, "Auto-Processing
@@ -262,6 +266,38 @@ _SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS = frozenset({"ffmpeg_path"})
 #: ``GlobalSettings.auto_processing_paused`` live (see
 #: :func:`_make_live_pause_check`).
 AutoProcessingPauseCheck = Callable[[], bool]
+
+
+@dataclass(frozen=True, slots=True)
+class DefaultAudioAutoSchedule:
+    """Config for auto-scheduling a delayed Default Audio Track Job after a downmix (COL-251).
+
+    Replaces COL-152's in-band fold (``run_downmix_pipeline``'s
+    ``auto_set_default_audio``/``default_audio_preference`` parameters, still
+    present on that function for direct/test callers, but no longer wired
+    into it by :meth:`JobQueue.from_settings`): rather than folding the
+    disposition change into the *same* remux, a downmix that adds a new
+    stream now enqueues a *separate*, delayed ``SET_DEFAULT_AUDIO`` Job --
+    see :meth:`JobQueue._schedule_default_audio_job`. Doing it this way lets
+    the Job apply the fix through the COL-247 mechanism-selection gate (a
+    verified direct Plex API write when Plex is configured, so the decision
+    is based on what Plex itself reports rather than local ffprobe output),
+    with ``delay`` giving Plex's own asynchronous ingestion of the new stream
+    time to catch up before the write is attempted.
+
+    Built by :meth:`JobQueue.from_settings` from
+    ``GlobalSettings.auto_set_default_audio``/``default_audio_language``/
+    ``default_audio_channel_tier``/``default_audio_delay_minutes`` -- only
+    when the opt-in toggle is on *and* a complete ``(language, channel tier)``
+    preference is configured (mirroring :func:`~collapsarr.settings.service.
+    as_default_audio_preference`'s own "no actionable preference" contract).
+    ``None`` (the :meth:`JobQueue.__init__` default) means the feature is
+    off: a downmix Job's success schedules nothing, matching pre-COL-251
+    behaviour for every install that hasn't opted in.
+    """
+
+    preference: DefaultAudioPreference
+    delay: timedelta
 
 
 def _make_live_pause_check(
@@ -379,9 +415,10 @@ class Job:
     running."
 
     ``scheduled_at`` (COL-242) is an optional due-time gate on an otherwise
-    ordinary ``PENDING`` job: ``None`` (the default -- every existing Job
-    kind/trigger) means "claimable as soon as a worker is free", exactly the
-    behaviour before this field existed. A non-``None`` value means a worker's
+    ordinary ``PENDING`` job: ``None`` (the default -- every immediate
+    trigger: manual/bulk, the plain webhook, and every ``DOWNMIX`` job)
+    means "claimable as soon as a worker is free", exactly the behaviour
+    before this field existed. A non-``None`` value means a worker's
     ordinary claim path (:meth:`JobQueue._claim_next`) skips this Job until
     ``scheduled_at`` has passed (compared against the queue's injectable
     :attr:`JobQueue._now` clock) -- it still reads as ``status is
@@ -389,9 +426,20 @@ class Job:
     isn't *claimable* yet. :meth:`JobQueue.force_start` ("Process Now")
     bypasses this gate entirely, the same way it already bypasses Auto-
     Processing Pause and the Concurrency Limit -- see that method's own
-    docstring. This ticket only builds and exposes the mechanism: nothing yet
-    constructs a Job with a non-``None`` ``scheduled_at`` (a later ticket
-    wires an actual enqueue-with-a-future-due-time caller).
+    docstring. COL-251's :meth:`JobQueue._schedule_default_audio_job` is the
+    one production caller that constructs a ``SET_DEFAULT_AUDIO`` Job with a
+    non-``None`` ``scheduled_at`` -- the downmix-triggered case.
+
+    ``expected_stream_count`` (COL-251) is set alongside ``scheduled_at`` by
+    that same caller: the file's total audio-stream count immediately after
+    the downmix remux that triggered this Job (:attr:`~collapsarr.downmix.
+    pipeline.PipelineResult.final_stream_count`). ``None`` for every other
+    trigger. :meth:`JobQueue._run_job` forwards it to
+    ``default_audio_pipeline_runner`` so the COL-247 mechanism-selection
+    gate's Plex-write path can detect "Plex hasn't finished re-ingesting the
+    new stream yet" as a distinct failure rather than silently resolving
+    against a stale stream list -- see :mod:`collapsarr.plex.
+    default_audio_write`'s ``PlexDefaultAudioOutcome.STREAM_NOT_YET_INGESTED``.
     """
 
     file_path: Path
@@ -407,6 +455,7 @@ class Job:
     ended_at: datetime | None = None
     cancellation: CancellationHandle | None = None
     scheduled_at: datetime | None = None
+    expected_stream_count: int | None = None
 
 
 def _run_context_for_log(job: Job) -> str:
@@ -579,7 +628,20 @@ class JobQueue:
     ``None``-defers-to-real-implementation pattern ``history_recorder``/
     ``failure_notifier``/etc. use above) because, like ``JobScheduler.now``,
     it needs no DB/session wiring to be real -- there is nothing lightweight
-    unit construction needs to opt out of.
+    unit construction needs to opt out of. It also computes
+    ``default_audio_auto_schedule``'s ``scheduled_at`` below (``now() + delay``).
+
+    ``default_audio_auto_schedule`` (COL-251), when set, arms
+    :meth:`_schedule_default_audio_job`: a ``DOWNMIX`` Job that reaches
+    ``SUCCEEDED`` having actually added a track (:attr:`~collapsarr.downmix.
+    pipeline.PipelineResult.tracks_added` non-empty) enqueues a follow-up
+    ``SET_DEFAULT_AUDIO`` Job for the same file, via :meth:`enqueue_default_audio`,
+    with ``scheduled_at`` set to ``now() + default_audio_auto_schedule.delay``
+    and ``expected_stream_count`` set to the just-finished Job's
+    ``result.final_stream_count``. ``None`` (the default) means the feature
+    is off -- a ``DOWNMIX`` Job's success schedules nothing, matching every
+    Job kind/trigger's behaviour before this field existed. See
+    :class:`DefaultAudioAutoSchedule`.
     """
 
     def __init__(
@@ -595,6 +657,7 @@ class JobQueue:
         plex_analyzer: PlexAnalyzer | None = None,
         pause_check: AutoProcessingPauseCheck | None = None,
         now: Callable[[], datetime] = _utcnow,
+        default_audio_auto_schedule: DefaultAudioAutoSchedule | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
@@ -613,6 +676,10 @@ class JobQueue:
         #: paragraph. Compared against a still-``PENDING`` Job's
         #: ``scheduled_at`` in :meth:`_claim_next`/:meth:`_lowest_priority_pending_locked`.
         self._now = now
+        #: The downmix-triggered delayed Default Audio Track Job feature
+        #: (COL-251) -- see the class docstring's ``default_audio_auto_schedule``
+        #: paragraph and :meth:`_schedule_default_audio_job`.
+        self._default_audio_auto_schedule = default_audio_auto_schedule
         self._lock = threading.Lock()
         #: Guards every access to ``_jobs``/``_next_priority``/``_shutdown``
         #: and coordinates the worker pool. Workers ``wait`` on it for a
@@ -733,19 +800,27 @@ class JobQueue:
         via :meth:`__init__` directly instead) to opt out.
 
         This factory is also where the persisted **Preferred Default Audio**
-        settings reach a real downmix job (COL-152): it reads
-        ``GlobalSettings.auto_set_default_audio`` and, when that opt-in toggle
-        is on, folds ``auto_set_default_audio=True`` plus the adapted
-        ``default_audio_preference`` (from
-        ``GlobalSettings.default_audio_language``/``default_audio_channel_tier``)
-        into the ``pipeline_kwargs`` every enqueued job passes to
-        :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline` -- so the
-        automatic in-band Default Audio Track fix is genuinely reachable from a
-        real job dispatched through this queue, not only from the pipeline
-        function's parameter surface. With the toggle off (the default) nothing
-        is added and a job runs byte-for-byte as it did before the feature; an
-        explicit ``pipeline_kwargs`` key from the caller always wins. See
-        :meth:`_resolve_pipeline_kwargs`.
+        settings reach a real downmix job. Through COL-247's Phase 1, that
+        meant folding ``auto_set_default_audio``/``default_audio_preference``
+        into ``pipeline_kwargs`` (COL-152's in-band fix, still available on
+        :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline` itself for
+        direct/test callers, but no longer wired in here). COL-251 replaces
+        that wiring: it reads ``GlobalSettings.auto_set_default_audio``,
+        ``default_audio_language``/``default_audio_channel_tier`` (adapted via
+        :func:`~collapsarr.settings.service.as_default_audio_preference`), and
+        ``default_audio_delay_minutes``, and -- only when the toggle is on and
+        a complete preference is configured -- builds a
+        :class:`DefaultAudioAutoSchedule` and passes it as
+        ``default_audio_auto_schedule`` below. A real ``DOWNMIX`` job that adds
+        a new stream then schedules a separate, delayed ``SET_DEFAULT_AUDIO``
+        Job for the same file (:meth:`JobQueue._schedule_default_audio_job`)
+        rather than fixing the disposition in the same remux -- see that
+        method's docstring for why (Plex needs time to ingest the new stream
+        before a direct-write mechanism can see it). With the toggle off (the
+        default), ``default_audio_auto_schedule`` stays ``None`` and a
+        ``DOWNMIX`` job's success schedules nothing, matching pre-COL-251
+        behaviour. See :meth:`_resolve_pipeline_kwargs` (now ``ffmpeg_path``
+        only) and :meth:`_resolve_default_audio_auto_schedule`.
 
         ``default_audio_pipeline_runner`` (COL-155), when not passed
         explicitly (``None``, the default here -- unlike the raw
@@ -816,9 +891,10 @@ class JobQueue:
         session_factory = create_session_factory(engine)
 
         # Read once here, at construction time: concurrency_limit (COL-165)
-        # sizes the pool below, and auto_set_default_audio (COL-152) feeds
-        # _resolve_pipeline_kwargs -- both come off this same singleton row,
-        # so one read serves both rather than opening a second session.
+        # sizes the pool below, and auto_set_default_audio/default_audio_delay_minutes
+        # (COL-251) feed _resolve_default_audio_auto_schedule -- both come off
+        # this same singleton row, so one read serves both rather than opening
+        # a second session.
         with session_factory() as session:
             global_settings = get_global_settings(session)
 
@@ -869,6 +945,7 @@ class JobQueue:
             plex_analyzer=resolved_plex_analyzer,
             pause_check=resolved_pause_check,
             now=now,
+            default_audio_auto_schedule=cls._resolve_default_audio_auto_schedule(global_settings),
         )
 
     @staticmethod
@@ -883,14 +960,6 @@ class JobQueue:
         :meth:`from_settings` already reads once for ``concurrency_limit``
         (COL-165), reused here rather than opening a second session.
 
-        **Only** when its opt-in ``auto_set_default_audio`` toggle is on
-        (COL-152), threads ``auto_set_default_audio=True`` plus the adapted
-        ``default_audio_preference`` (:func:`~collapsarr.settings.service.
-        as_default_audio_preference`) into the kwargs every enqueued downmix job
-        passes to :func:`~collapsarr.downmix.pipeline.run_downmix_pipeline`. This
-        is the production wiring that makes the automatic in-band fix reachable:
-        a real downmix job dispatched through this queue now actually applies it.
-
         **Only** when ``ffmpeg_path`` is set (COL-218 -- e.g. an operator has
         pointed Collapsarr at a runtime-free native FFmpeg build, Epic COL-214),
         threads it into the kwargs both
@@ -901,29 +970,62 @@ class JobQueue:
         invokes that FFmpeg binary instead of the bare ``"ffmpeg"`` resolved off
         ``PATH``.
 
-        With both toggles at their default (unset/off -- every fresh install's
-        state, and every existing install's row after the additive migrations)
-        nothing is added, so a job's pipeline call is byte-for-byte what it was
-        before either feature. An explicit ``pipeline_kwargs`` from the caller
-        always wins -- keys already present are never overwritten -- so a test
-        (or a future alternate wiring) can still pin its own values.
+        Until COL-251, this also folded ``auto_set_default_audio``/
+        ``default_audio_preference`` in when that toggle was on (COL-152's
+        in-band fix) -- that wiring moved to
+        :meth:`_resolve_default_audio_auto_schedule` (see :meth:`from_settings`'s
+        docstring for why); this method now only ever adds ``ffmpeg_path``.
 
-        The import below is deferred, matching the surrounding factory: the
-        settings service pulls in the ORM/adapters, which don't need to load for
-        a lightweight :meth:`__init__` construction that never touches Settings.
+        With the toggle at its default (unset -- every fresh install's state,
+        and every existing install's row after the additive migration)
+        nothing is added, so a job's pipeline call is byte-for-byte what it
+        was before the feature. An explicit ``pipeline_kwargs`` from the
+        caller always wins -- a key already present is never overwritten --
+        so a test (or a future alternate wiring) can still pin its own value.
         """
-        from collapsarr.settings.service import as_default_audio_preference
-
         resolved = dict(pipeline_kwargs or {})
-        if global_settings.auto_set_default_audio:
-            resolved.setdefault("auto_set_default_audio", True)
-            resolved.setdefault(
-                "default_audio_preference",
-                as_default_audio_preference(global_settings),
-            )
         if global_settings.ffmpeg_path:
             resolved.setdefault("ffmpeg_path", global_settings.ffmpeg_path)
         return resolved
+
+    @staticmethod
+    def _resolve_default_audio_auto_schedule(
+        global_settings: GlobalSettings,
+    ) -> DefaultAudioAutoSchedule | None:
+        """Build the downmix-triggered auto-schedule config from Settings, if armed (COL-251).
+
+        Takes ``global_settings`` -- the same singleton row :meth:`from_settings`
+        already reads once, reused here rather than opening a second session.
+
+        Returns ``None`` -- "feature off" -- unless *both*:
+
+        - ``global_settings.auto_set_default_audio`` (COL-151) is ``True``; and
+        - :func:`~collapsarr.settings.service.as_default_audio_preference`
+          resolves an actual preference (``None`` when either
+          ``default_audio_language``/``default_audio_channel_tier`` is unset
+          -- "no actionable preference", the same guard COL-152's in-band fix
+          used).
+
+        Otherwise returns a :class:`DefaultAudioAutoSchedule` pairing that
+        preference with ``timedelta(minutes=global_settings.
+        default_audio_delay_minutes)`` (COL-243's setting).
+
+        The import below is deferred, matching the surrounding factory: the
+        settings service pulls in the ORM/adapters, which don't need to load
+        for a lightweight :meth:`__init__` construction that never touches
+        Settings.
+        """
+        if not global_settings.auto_set_default_audio:
+            return None
+        from collapsarr.settings.service import as_default_audio_preference
+
+        preference = as_default_audio_preference(global_settings)
+        if preference is None:
+            return None
+        return DefaultAudioAutoSchedule(
+            preference=preference,
+            delay=timedelta(minutes=global_settings.default_audio_delay_minutes),
+        )
 
     @property
     def max_concurrency(self) -> int:
@@ -958,30 +1060,48 @@ class JobQueue:
         return self._enqueue(job)
 
     def enqueue_default_audio(
-        self, file_path: str | Path, preference: DefaultAudioPreference
+        self,
+        file_path: str | Path,
+        preference: DefaultAudioPreference,
+        *,
+        scheduled_at: datetime | None = None,
+        expected_stream_count: int | None = None,
     ) -> Job:
         """Add a file + its Default Audio Track preference as a ``SET_DEFAULT_AUDIO`` job (COL-155).
 
         Mirrors :meth:`enqueue` exactly, for the disposition-only fix: same
-        immediate ``PENDING`` job, same worker pool runs it, same
-        ``history_recorder`` visibility. The job's ``settings`` is a
-        placeholder :class:`~collapsarr.downmix.targets.DownmixSettings`
-        with an empty ``enabled_targets`` -- unused by :meth:`_run_job` for
-        this kind, but keeping it well-formed means job-history's
-        target/language columns correctly read as "no downmix target" for
-        this job rather than the ``DownmixSettings`` default (Stereo).
+        ``PENDING`` job, same worker pool runs it, same ``history_recorder``
+        visibility. The job's ``settings`` is a placeholder
+        :class:`~collapsarr.downmix.targets.DownmixSettings` with an empty
+        ``enabled_targets`` -- unused by :meth:`_run_job` for this kind, but
+        keeping it well-formed means job-history's target/language columns
+        correctly read as "no downmix target" for this job rather than the
+        ``DownmixSettings`` default (Stereo).
 
         Shares this queue's ``_jobs`` dict (and so its ``max_concurrency``
         cap and, via :class:`~collapsarr.jobs.scheduler.JobScheduler`'s
         file-path-only dedup guard, its de-duplication) with every
         ``DOWNMIX`` job already on it -- the two kinds are not run through
         separate pools.
+
+        ``scheduled_at``/``expected_stream_count`` (COL-251) default to
+        ``None`` -- an immediate, claimable-right-away Job with no
+        ingestion-wait check, exactly :meth:`enqueue_default_audio`'s
+        pre-COL-251 behaviour. Every caller of this method today except
+        :meth:`_schedule_default_audio_job` (:class:`~collapsarr.jobs.
+        scheduler.JobScheduler`'s manual/bulk ``trigger_set_default_audio``
+        trigger) leaves both unset, since a manual/bulk trigger acts on
+        streams that already exist in the file -- there is nothing to wait
+        on. See :attr:`Job.scheduled_at`/:attr:`Job.expected_stream_count`
+        for what each does once the Job runs.
         """
         job = Job(
             file_path=Path(file_path),
             settings=DownmixSettings(enabled_targets=frozenset()),
             kind=JobKind.SET_DEFAULT_AUDIO,
             preference=preference,
+            scheduled_at=scheduled_at,
+            expected_stream_count=expected_stream_count,
         )
         return self._enqueue(job)
 
@@ -1542,10 +1662,13 @@ class JobQueue:
         ``self._record_tracked_media`` (a no-op unless the job actually
         ``SUCCEEDED`` and a ``tracked_media_recorder`` is configured, COL-95)
         ``self._notify_failure`` (a no-op unless the job actually
-        ``FAILED`` and a ``failure_notifier`` is configured), and
+        ``FAILED`` and a ``failure_notifier`` is configured),
         ``self._trigger_plex_analyze`` (a no-op unless the job actually
-        ``SUCCEEDED`` and a ``plex_analyzer`` is configured, COL-211) run --
-        all outside ``self._lock``, since by that point only this thread ever
+        ``SUCCEEDED`` and a ``plex_analyzer`` is configured, COL-211), and
+        ``self._schedule_default_audio_job`` (a no-op unless the job actually
+        ``SUCCEEDED`` as a ``DOWNMIX`` job that added a track and
+        ``default_audio_auto_schedule`` is configured, COL-251) run -- all
+        outside ``self._lock``, since by that point only this thread ever
         touches this particular ``job`` (each job is claimed by exactly one
         worker), so there is nothing left to race against.
 
@@ -1553,8 +1676,8 @@ class JobQueue:
         executes the pipeline: ``DOWNMIX`` calls ``self._pipeline_runner``
         with ``job.settings`` and the full ``self._pipeline_kwargs``,
         ``SET_DEFAULT_AUDIO`` calls ``self._default_audio_pipeline_runner``
-        with ``job.preference`` and only the
-        :data:`_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS` subset of
+        with ``job.preference``, ``job.expected_stream_count`` (COL-251), and
+        only the :data:`_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS` subset of
         ``self._pipeline_kwargs`` (COL-218 -- today, just ``ffmpeg_path``; see
         that constant's docstring for why the *whole* dict can't be forwarded)
         -- everything else below (history/tracked-media/failure handling) is
@@ -1587,6 +1710,9 @@ class JobQueue:
                         job.file_path,
                         job.preference,
                         cancel_handle=job.cancellation,
+                        # COL-251: per-Job, not part of `_pipeline_kwargs` --
+                        # see `_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS`'s docstring.
+                        expected_stream_count=job.expected_stream_count,
                         **shared_kwargs,
                     )
                 else:
@@ -1619,6 +1745,7 @@ class JobQueue:
             self._record_tracked_media(job)
             self._notify_failure(job)
             self._trigger_plex_analyze(job)
+            self._schedule_default_audio_job(job)
             self._call_job_terminal_hook(job)
         finally:
             # Only now -- after every side effect -- is the job fully done, so
@@ -1691,6 +1818,59 @@ class JobQueue:
             self._plex_analyzer(job)
         except Exception:  # noqa: BLE001 - a Plex problem must never fail the job
             pass
+
+    def _schedule_default_audio_job(self, job: Job) -> None:
+        """Enqueue a delayed follow-up ``SET_DEFAULT_AUDIO`` Job for a downmix, if armed (COL-251).
+
+        A no-op unless every one of these holds:
+
+        - :attr:`_default_audio_auto_schedule` is configured (the opt-in
+          ``auto_set_default_audio`` toggle is on and a complete preference is
+          set -- see :class:`DefaultAudioAutoSchedule`);
+        - ``job.kind is JobKind.DOWNMIX`` (a ``SET_DEFAULT_AUDIO`` job never
+          schedules another one -- there is no chaining);
+        - ``job.status is JobStatus.SUCCEEDED``; and
+        - ``job.result.tracks_added`` is non-empty -- the downmix actually
+          added a new stream. A ``NOTHING_TO_DO`` downmix (every enabled
+          target already present) has nothing new for Plex to ingest, so
+          nothing is scheduled for it.
+
+        When armed, calls :meth:`enqueue_default_audio` for the same file with
+        the configured preference, ``scheduled_at=self._now() +
+        default_audio_auto_schedule.delay``, and ``expected_stream_count`` set
+        to ``job.result.final_stream_count`` (the file's total audio-stream
+        count immediately after this downmix) -- the input the COL-247
+        mechanism-selection gate's Plex-write path (:func:`~collapsarr.plex.
+        default_audio_write.apply_default_audio_via_plex`) uses to detect a
+        not-yet-ingested stream distinctly. Called from the same worker thread
+        as :meth:`_trigger_plex_analyze`, right after it, outside ``self._lock``
+        -- safe to call back into :meth:`enqueue_default_audio` (which takes
+        the lock itself) for the same reason documented on
+        :meth:`_call_job_terminal_hook`. Wrapped in a defensive
+        ``try``/``except``, mirroring :meth:`_trigger_plex_analyze`: a problem
+        scheduling the follow-up Job must never be able to fail the ``DOWNMIX``
+        job that just succeeded.
+        """
+        if self._default_audio_auto_schedule is None:
+            return
+        if job.kind is not JobKind.DOWNMIX or job.status is not JobStatus.SUCCEEDED:
+            return
+        if job.result is None or not job.result.tracks_added:
+            return
+        try:
+            scheduled_at = self._now() + self._default_audio_auto_schedule.delay
+            self.enqueue_default_audio(
+                job.file_path,
+                self._default_audio_auto_schedule.preference,
+                scheduled_at=scheduled_at,
+                expected_stream_count=job.result.final_stream_count,
+            )
+        except Exception:  # noqa: BLE001 - must never fail the job it's reporting on
+            logger.exception(
+                "failed to schedule a follow-up Default Audio Track Job for %s (job %s)",
+                job.file_path,
+                job.id,
+            )
 
     def _call_job_terminal_hook(self, job: Job) -> None:
         """Invoke the job-terminal hook for ``job``, if one is configured (COL-171).

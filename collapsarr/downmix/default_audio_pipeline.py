@@ -131,8 +131,19 @@ def run_default_audio_pipeline(
     duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS,
     runner: _Runner | None = None,
     cancel_handle: CancellationHandle | None = None,
+    expected_stream_count: int | None = None,
 ) -> PipelineResult:
     """Fix a single file's Default Audio Track disposition, on demand, no downmixing.
+
+    ``expected_stream_count`` (COL-251) is accepted for call-signature parity
+    with :func:`~collapsarr.plex.default_audio_write.apply_default_audio_via_plex`
+    -- :class:`~collapsarr.jobs.queue.JobQueue` forwards a ``SET_DEFAULT_AUDIO``
+    job's ``expected_stream_count`` to whichever mechanism the COL-247
+    mechanism-selection gate routes to, and this pipeline is one of the two.
+    It is unused here: this pipeline always re-probes the *actual* local
+    file, which already reflects the downmix's real output the instant the
+    remux completed -- there is no Plex-ingestion race to guard against on
+    this (no-Plex) path, unlike the direct Plex API write.
 
     In order: :func:`~collapsarr.downmix.probe.probe_audio_streams`,
     :func:`~collapsarr.downmix.default_audio.resolve_default_audio_stream`,

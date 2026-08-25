@@ -23,7 +23,14 @@ In order, for one file:
    its fix to, and that must be visible as a Job failure, not swallowed.
 2. **GET** the item's current stream list
    (:func:`~collapsarr.plex.client.get_item_metadata`, parsed by
-   :func:`~collapsarr.plex.streams.parse_audio_streams`).
+   :func:`~collapsarr.plex.streams.parse_audio_streams`). When the caller
+   passes ``expected_stream_count`` (COL-251 -- a downmix-triggered Job
+   only; see below), fewer reported streams than that is a distinct hard
+   failure (:attr:`PlexDefaultAudioOutcome.STREAM_NOT_YET_INGESTED`) rather
+   than falling through to resolution: Plex's asynchronous ingestion of the
+   remux's newly-added stream(s) hasn't caught up yet, so resolving against
+   this stale list could otherwise silently apply the fix to the *wrong*
+   (pre-existing) stream instead of failing loudly.
 3. **Resolve** the preferred stream over that list
    (:func:`~collapsarr.plex.default_audio.resolve_default_audio_stream`,
    COL-240). Fewer than two streams to compare resolves to ``None`` --
@@ -48,10 +55,11 @@ resolve_rating_key` may make.
 This module intentionally does not decide *when* it runs -- gating on
 whether a Plex Connection is configured, and choosing between this mechanism
 and the ffmpeg-remux fallback, is a separate mechanism-selection concern
-(COL-247) layered on top; this module only implements the mechanism itself
-for the immediate-trigger cases (manual/bulk trigger, plain new-file-ready
-webhook trigger). The downmix-triggered delayed case is a separate ticket
-(COL-251).
+(COL-247) layered on top. This module implements the mechanism itself for
+every trigger: the immediate ones (manual/bulk trigger, plain new-file-ready
+webhook trigger) call it with no ``expected_stream_count``; the
+downmix-triggered, delayed case (COL-251) passes one, arming the
+stream-not-yet-ingested check in step 2 above.
 """
 
 from __future__ import annotations
@@ -81,6 +89,7 @@ class PlexDefaultAudioOutcome(Enum):
     NOTHING_TO_DO = "nothing_to_do"
     RATING_KEY_UNRESOLVED = "rating_key_unresolved"
     STREAM_FETCH_FAILED = "stream_fetch_failed"
+    STREAM_NOT_YET_INGESTED = "stream_not_yet_ingested"
     WRITE_FAILED = "write_failed"
     VERIFY_FETCH_FAILED = "verify_fetch_failed"
     VERIFY_MISMATCH = "verify_mismatch"
@@ -124,6 +133,7 @@ def apply_default_audio_via_plex(
     base_url: str,
     token: str,
     transport: httpx.BaseTransport | None = None,
+    expected_stream_count: int | None = None,
 ) -> PlexDefaultAudioResult:
     """Fix a single file's Default Audio Track disposition via a direct Plex API write.
 
@@ -133,6 +143,16 @@ def apply_default_audio_via_plex(
     "capture, don't raise" contract every other Plex-facing module in this
     package (:mod:`collapsarr.plex.client`, :mod:`collapsarr.plex.
     library_sync`) already follows.
+
+    ``expected_stream_count`` (COL-251) is the file's total audio-stream
+    count as of the downmix remux that triggered this Job (see
+    :attr:`~collapsarr.downmix.pipeline.PipelineResult.final_stream_count`),
+    passed only for a downmix-triggered ``SET_DEFAULT_AUDIO`` Job -- ``None``
+    (the default) for every immediate trigger, which acts on streams that
+    already exist and so has nothing to wait on. When set, and Plex currently
+    reports *fewer* audio streams than this for the item, the write is
+    aborted with :attr:`PlexDefaultAudioOutcome.STREAM_NOT_YET_INGESTED`
+    before any resolution or write is attempted.
     """
     path_str = str(file_path)
 
@@ -169,6 +189,22 @@ def apply_default_audio_via_plex(
         )
 
     streams = parse_audio_streams(metadata_result.payload)
+    if expected_stream_count is not None and len(streams) < expected_stream_count:
+        return _finish(
+            PlexDefaultAudioResult(
+                outcome=PlexDefaultAudioOutcome.STREAM_NOT_YET_INGESTED,
+                success=False,
+                detail=(
+                    f"Plex reports {len(streams)} audio stream(s) for ratingKey {rating_key} "
+                    f"(file {path_str!r}), fewer than the {expected_stream_count} expected "
+                    "after the downmix remux; Plex likely hasn't finished ingesting the new "
+                    "stream yet -- no Plex API write attempted"
+                ),
+                rating_key=rating_key,
+            ),
+            logging.ERROR,
+        )
+
     winner = resolve_default_audio_stream(streams, preference)
     if winner is None:
         return _finish(

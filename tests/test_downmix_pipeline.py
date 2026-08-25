@@ -106,6 +106,7 @@ def test_pipeline_is_a_noop_when_no_targets_qualify(tmp_path: Path) -> None:
     assert result.tracks_added == ()
     assert result.remux_result is None
     assert result.apply_result is None
+    assert result.final_stream_count is None  # COL-251: only set on SUCCESS
     assert "nothing to do" in result.detail
     # Nothing was ever invoked against the file -- byte-for-byte untouched,
     # no temp file created.
@@ -238,6 +239,8 @@ def test_pipeline_succeeds_with_injected_runner_and_wires_all_stages(tmp_path: P
     assert result.outcome is PipelineOutcome.SUCCESS
     assert result.success is True
     assert result.tracks_added == (QualifyingTarget(language="eng", target=DownmixTarget.STEREO),)
+    # COL-251: 1 existing (5.1 eng) stream + 1 newly-added (Stereo eng) track.
+    assert result.final_stream_count == 2
     assert result.remux_result is not None and result.remux_result.success is True
     assert result.apply_result is not None and result.apply_result.success is True
     # All three stages actually ran, in order: ffprobe (audio), ffmpeg, ffprobe x2 (summaries).

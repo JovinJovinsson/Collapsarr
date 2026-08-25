@@ -163,10 +163,11 @@ def _reconstruct_job(
     row already carries: the next :func:`~collapsarr.jobs.history.
     record_job_history` call (once this Job actually runs) updates that same
     row in place rather than creating a duplicate. ``scheduled_at`` (COL-242)
-    is carried over verbatim from the row so a due-time gate survives a
-    restart -- ``None`` for every row written before this field existed (and
-    every kind/trigger that still doesn't set it today), so this is a no-op
-    in production for now.
+    and ``expected_stream_count`` (COL-251) are both carried over verbatim
+    from the row -- so a downmix-triggered ``SET_DEFAULT_AUDIO`` row's
+    due-time gate *and* its "stream not yet ingested" check both survive a
+    restart intact. ``None`` for every immediate-trigger row (and every row
+    written before either field existed).
 
     Returns a ``(job, None)`` pair on success. Returns ``(None, reason)`` --
     ``reason`` a short, human-readable explanation the caller
@@ -218,6 +219,7 @@ def _reconstruct_job(
                 priority=row.priority,
                 status=JobStatus.PENDING,
                 scheduled_at=row.scheduled_at,
+                expected_stream_count=row.expected_stream_count,
             ),
             None,
         )
