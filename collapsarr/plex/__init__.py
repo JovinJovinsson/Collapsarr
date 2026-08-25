@@ -38,6 +38,7 @@ from .client import (
     search_items,
     set_default_audio_stream,
 )
+from .default_audio_snapshot import refresh_default_audio_snapshots
 from .default_audio_write import (
     PlexDefaultAudioOutcome,
     PlexDefaultAudioResult,
@@ -78,6 +79,7 @@ __all__ = [
     "list_library_sections",
     "list_section_items",
     "rebuild_library_items",
+    "refresh_default_audio_snapshots",
     "resolve_rating_key",
     "search_items",
     "set_default_audio_stream",

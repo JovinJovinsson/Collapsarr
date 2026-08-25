@@ -31,6 +31,7 @@ const settings: GlobalSettings = {
   default_audio_language: null,
   default_audio_channel_tier: null,
   auto_set_default_audio: false,
+  default_audio_delay_minutes: 30,
   recently_processed_window_minutes: 360,
   auto_queue_paused: false,
   auto_processing_paused: false,

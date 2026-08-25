@@ -14,12 +14,14 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from collapsarr.config import Settings
 from collapsarr.database import create_engine_from_settings, create_session_factory
+from collapsarr.media.models import TrackedMediaFile
 from collapsarr.migrations import upgrade_to_head
 from collapsarr.plex.client import LibrarySection, PlexMediaItem, SectionItemsResult, SectionsResult
 from collapsarr.plex.models import PlexLibraryItem
@@ -75,6 +77,7 @@ def _make_scheduler(
     now: datetime = _FIXED_NOW,
     list_sections: Callable[..., SectionsResult] | None = None,
     list_items: Callable[..., SectionItemsResult] | None = None,
+    transport: httpx.BaseTransport | None = None,
     interval_seconds: float = INTERVAL_SECONDS,
 ) -> PlexSyncScheduler:
     return PlexSyncScheduler(
@@ -83,6 +86,7 @@ def _make_scheduler(
         now=lambda: now,
         list_sections=list_sections or _sections(),
         list_items=list_items or _items({}),
+        transport=transport,
         interval_seconds=interval_seconds,
     )
 
@@ -195,6 +199,87 @@ def test_start_ticks_immediately_request_sync_retriggers_then_stops_cleanly(
 
     assert scheduler._thread is None  # joined + cleared on stop
     assert scheduler.last_sync_at is not None
+
+
+# --------------------------------------------------------------------------- #
+# run_once also refreshes the Default Audio Track display snapshot (COL-248)
+# --------------------------------------------------------------------------- #
+def test_run_once_refreshes_default_audio_track_snapshot_from_plex(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A default changed directly in Plex's UI (not via a Collapsarr Job) is
+    reflected in the tracked file's snapshot columns after one sync run --
+    driven end to end through ``run_once`` with an ``httpx.MockTransport``
+    standing in for the real Plex metadata GET (COL-248 AC)."""
+    _configure_connection(session_factory, base_url=_BASE_URL)
+    file_path = "/movies/a.mkv"
+    rating_key = "101"
+    with session_factory() as session:
+        session.add(
+            TrackedMediaFile(
+                file_path=file_path,
+                current_default_language="fra",
+                current_default_channel_layout="stereo",
+            )
+        )
+        session.commit()
+
+    def metadata_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "Metadata": [
+                        {
+                            "ratingKey": rating_key,
+                            "Media": [
+                                {
+                                    "Part": [
+                                        {
+                                            "Stream": [
+                                                {
+                                                    "id": "1",
+                                                    "streamType": 2,
+                                                    "channels": 2,
+                                                    "languageCode": "fra",
+                                                    "selected": False,
+                                                },
+                                                {
+                                                    "id": "2",
+                                                    "streamType": 2,
+                                                    "channels": 6,
+                                                    "languageCode": "eng",
+                                                    "selected": True,
+                                                },
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        )
+
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        list_sections=_sections(LibrarySection(key="1", title="Movies", type="movie")),
+        list_items=_items(
+            {"1": [PlexMediaItem(rating_key=rating_key, file_paths=(file_path,), type="movie")]}
+        ),
+        transport=httpx.MockTransport(metadata_handler),
+    )
+
+    scheduler.run_once()
+
+    with session_factory() as session:
+        media = session.scalars(
+            select(TrackedMediaFile).where(TrackedMediaFile.file_path == file_path)
+        ).one()
+        assert media.current_default_language == "eng"
+        assert media.current_default_channel_layout == "5.1"
 
 
 def _wait_until(predicate: Callable[[], bool], *, timeout: float) -> None:

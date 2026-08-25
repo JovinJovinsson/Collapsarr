@@ -157,6 +157,12 @@ def make_default_audio_pipeline_runner(
     def runner(
         file_path: str | Path, preference: DefaultAudioPreference, **kwargs: object
     ) -> PipelineResult:
+        # COL-251: a downmix-triggered SET_DEFAULT_AUDIO job carries this via
+        # `JobQueue._run_job`; every other trigger leaves it unset (None).
+        # Read via .get() rather than popped -- remux_runner below still
+        # receives it in **kwargs (run_default_audio_pipeline accepts and
+        # ignores it, for call-signature parity; see its own docstring).
+        expected_stream_count = kwargs.get("expected_stream_count")
         with session_factory() as session:
             connection = get_plex_connection(session)
             if connection.is_configured:
@@ -167,6 +173,7 @@ def make_default_audio_pipeline_runner(
                     base_url=connection.base_url,
                     token=connection.token,
                     transport=transport,
+                    expected_stream_count=expected_stream_count,
                 )
                 return _pipeline_result_from_plex(plex_result)
         # Not configured: the session above is already closed -- a remux can

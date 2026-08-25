@@ -11,6 +11,7 @@ PENDING rows at different priorities" shape the acceptance criteria ask for.
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -37,6 +38,8 @@ def _seed_history(
     job_id: str | None = None,
     target: str | None = "stereo",
     language: str | None = None,
+    scheduled_at: datetime | None = None,
+    expected_stream_count: int | None = None,
 ) -> JobHistory:
     """Write one ``JobHistory`` row directly, bypassing ``record_job_history``.
 
@@ -54,6 +57,8 @@ def _seed_history(
         priority=priority,
         target=target,
         language=language,
+        scheduled_at=scheduled_at,
+        expected_stream_count=expected_stream_count,
     )
     session.add(row)
     session.commit()
@@ -92,6 +97,60 @@ def test_rehydrate_reconstructs_every_pending_row_as_a_live_pending_job(
     assert {job.file_path for job in jobs} == {Path("/media/a.mkv"), Path("/media/b.mkv")}
     assert all(job.status is JobStatus.PENDING for job in jobs)
     assert {job.id for job in jobs} == {job.id for job in queue.list_jobs()}
+
+
+def test_rehydrate_carries_over_a_rows_scheduled_at(session: Session) -> None:
+    """COL-242: a due-time gate survives a restart -- rehydration doesn't drop it."""
+    due = datetime(2026, 8, 25, 12, 0, 0)
+    _seed_history(session, file_path="/media/a.mkv", priority=0, scheduled_at=due)
+    queue = JobQueue(pipeline_runner=_RecordingRunner())
+
+    jobs = rehydrate_pending_jobs(session, queue)
+
+    assert len(jobs) == 1
+    assert jobs[0].scheduled_at == due
+
+
+def test_rehydrate_leaves_scheduled_at_none_when_the_row_never_set_one(session: Session) -> None:
+    _seed_history(session, file_path="/media/a.mkv", priority=0)
+    queue = JobQueue(pipeline_runner=_RecordingRunner())
+
+    jobs = rehydrate_pending_jobs(session, queue)
+
+    assert jobs[0].scheduled_at is None
+
+
+def test_rehydrate_carries_over_a_rows_expected_stream_count(session: Session) -> None:
+    """COL-251: the "stream not yet ingested" check's input survives a restart, too."""
+    _seed_history(
+        session,
+        file_path="/media/a.mkv",
+        priority=0,
+        kind=JobKind.SET_DEFAULT_AUDIO,
+        expected_stream_count=3,
+    )
+    update_global_settings(
+        session,
+        default_audio_language="en",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+    )
+    queue = JobQueue(pipeline_runner=_RecordingRunner())
+
+    jobs = rehydrate_pending_jobs(session, queue)
+
+    assert len(jobs) == 1
+    assert jobs[0].expected_stream_count == 3
+
+
+def test_rehydrate_leaves_expected_stream_count_none_when_the_row_never_set_one(
+    session: Session,
+) -> None:
+    _seed_history(session, file_path="/media/a.mkv", priority=0)
+    queue = JobQueue(pipeline_runner=_RecordingRunner())
+
+    jobs = rehydrate_pending_jobs(session, queue)
+
+    assert jobs[0].expected_stream_count is None
 
 
 def test_rehydrate_ignores_terminal_rows_and_orphans_running_ones(session: Session) -> None:

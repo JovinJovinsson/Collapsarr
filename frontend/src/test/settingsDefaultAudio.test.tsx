@@ -29,6 +29,7 @@ const baseSettings: GlobalSettings = {
   default_audio_language: null,
   default_audio_channel_tier: null,
   auto_set_default_audio: false,
+  default_audio_delay_minutes: 30,
   recently_processed_window_minutes: 360,
   auto_queue_paused: false,
   auto_processing_paused: false,
@@ -149,6 +150,7 @@ describe("DefaultAudioSection", () => {
       default_audio_language: "eng",
       default_audio_channel_tier: "5.1",
       auto_set_default_audio: true,
+      default_audio_delay_minutes: 30,
     });
 
     expect(screen.getByLabelText(/preferred language/i)).toHaveValue("eng");
@@ -199,6 +201,73 @@ describe("DefaultAudioSection", () => {
     const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
     expect(putBody.default_audio_language).toBeNull();
     expect(putBody.auto_set_default_audio).toBe(false);
+  });
+
+  // --- default audio delay (COL-243) -----------------------------------------
+
+  it("renders the default audio delay from a mocked GET, with its inline warning note", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse({ ...baseSettings, default_audio_delay_minutes: 45 })),
+    );
+    render(<DefaultAudioSection />);
+
+    expect(await screen.findByLabelText(/default audio delay \(minutes\)/i)).toHaveValue(45);
+    expect(
+      screen.getByText(
+        /durations shorter than 30 minutes may fail if your plex has not processed the new audio streams in the media file yet\./i,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("defaults the default audio delay to 30 minutes", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(baseSettings)));
+    render(<DefaultAudioSection />);
+
+    expect(await screen.findByLabelText(/default audio delay \(minutes\)/i)).toHaveValue(30);
+  });
+
+  it("saves an edited default audio delay via PUT and round-trips the response", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(
+          jsonResponse({ ...baseSettings, default_audio_delay_minutes: body.default_audio_delay_minutes }),
+        );
+      }
+      return Promise.resolve(jsonResponse(baseSettings));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<DefaultAudioSection />);
+    const delayInput = await screen.findByLabelText(/default audio delay \(minutes\)/i);
+
+    fireEvent.change(delayInput, { target: { value: "90" } });
+    fireEvent.click(screen.getByRole("button", { name: /save preferred default audio/i }));
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.default_audio_delay_minutes).toBe(90);
+    expect(delayInput).toHaveValue(90);
+  });
+
+  it("rejects a negative default audio delay client-side without sending a PUT", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(baseSettings));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<DefaultAudioSection />);
+    const delayInput = await screen.findByLabelText(/default audio delay \(minutes\)/i);
+
+    fireEvent.change(delayInput, { target: { value: "-1" } });
+    fireEvent.click(screen.getByRole("button", { name: /save preferred default audio/i }));
+
+    expect(
+      await screen.findByText(/default audio delay must be a whole number of 0 or more\./i),
+    ).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "PUT")).toBe(
+      false,
+    );
   });
 
   it("surfaces an API error from a failed save", async () => {

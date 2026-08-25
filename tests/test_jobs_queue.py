@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -23,10 +24,22 @@ from collapsarr.downmix.cancellation import CancellationHandle
 from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.default_audio_pipeline import run_default_audio_pipeline
 from collapsarr.downmix.pipeline import PipelineOutcome, PipelineResult
-from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
-from collapsarr.jobs.queue import DEFAULT_MAX_CONCURRENCY, Job, JobKind, JobQueue, JobStatus
+from collapsarr.downmix.targets import DownmixSettings, DownmixTarget, QualifyingTarget
+from collapsarr.jobs.queue import (
+    DEFAULT_MAX_CONCURRENCY,
+    DefaultAudioAutoSchedule,
+    Job,
+    JobKind,
+    JobQueue,
+    JobStatus,
+)
 from collapsarr.migrations import upgrade_to_head
 from collapsarr.settings.service import update_global_settings
+
+_FIXED_NOW = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
+"""A fixed "now" for injecting into ``JobQueue(now=...)`` (COL-242) -- mirrors
+the ``_FIXED_NOW`` pattern already used by ``test_jobs_scheduler.py``/
+``test_health_failed_jobs.py`` for their own injected clocks."""
 
 _SUCCESS = PipelineResult(outcome=PipelineOutcome.SUCCESS, success=True, detail="ok")
 _NOTHING_TO_DO = PipelineResult(
@@ -888,9 +901,13 @@ def test_run_job_logs_error_when_the_runner_raises_unexpectedly(
 
 
 # ---------------------------------------------------------------------------
-# Default Audio Track preference wiring (COL-152): the persisted opt-in toggle
-# and (language, tier) preference must actually reach run_downmix_pipeline's
-# kwargs for a real job dispatched through a JobQueue built via from_settings.
+# Default Audio Track preference wiring: the persisted opt-in toggle and
+# (language, tier) preference must actually reach a real job dispatched
+# through a JobQueue built via from_settings. Through COL-152, that meant
+# run_downmix_pipeline's own kwargs (folded into the *same* remux); COL-251
+# replaces that in-band fold with a separate, delayed SET_DEFAULT_AUDIO Job
+# scheduled after a DOWNMIX job succeeds -- see the "Downmix-triggered
+# delayed Default Audio Track Job" section further below for those tests.
 # ---------------------------------------------------------------------------
 
 
@@ -914,22 +931,27 @@ def _write_default_audio_settings(
     auto_set_default_audio: bool,
     default_audio_language: str | None = None,
     default_audio_channel_tier: DownmixTarget | None = None,
+    default_audio_delay_minutes: int | None = None,
 ) -> None:
     """Persist the Default Audio Track settings into ``settings``' database.
 
     A thin, named wrapper around :func:`_write_global_settings` for this
-    module's Default Audio Track tests (COL-152).
+    module's Default Audio Track tests (COL-152/COL-243/COL-251).
     """
-    _write_global_settings(
-        settings,
-        default_audio_language=default_audio_language,
-        default_audio_channel_tier=default_audio_channel_tier,
-        auto_set_default_audio=auto_set_default_audio,
-    )
+    fields: dict[str, object] = {
+        "default_audio_language": default_audio_language,
+        "default_audio_channel_tier": default_audio_channel_tier,
+        "auto_set_default_audio": auto_set_default_audio,
+    }
+    if default_audio_delay_minutes is not None:
+        fields["default_audio_delay_minutes"] = default_audio_delay_minutes
+    _write_global_settings(settings, **fields)
 
 
-def test_from_settings_threads_default_audio_preference_when_toggle_on(tmp_path: Path) -> None:
-    """Toggle on: a job dispatched through the queue reaches the pipeline with the fix armed."""
+def test_from_settings_passes_no_default_audio_kwargs_to_downmix_jobs(tmp_path: Path) -> None:
+    """A DOWNMIX job's pipeline_kwargs never carries a Default Audio Track key (COL-251):
+    that fix is no longer folded in-band regardless of the toggle -- see
+    ``_resolve_default_audio_auto_schedule`` instead."""
     settings = Settings(
         _env_file=None,
         database_path=str(tmp_path / "collapsarr.db"),
@@ -949,42 +971,10 @@ def test_from_settings_threads_default_audio_preference_when_toggle_on(tmp_path:
     queue.wait_idle()
 
     assert len(runner.kwargs_calls) == 1
-    kwargs = runner.kwargs_calls[0]
-    assert kwargs["auto_set_default_audio"] is True
-    assert kwargs["default_audio_preference"] == DefaultAudioPreference(
-        language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE
-    )
-
-
-def test_from_settings_passes_no_default_audio_kwargs_when_toggle_off(tmp_path: Path) -> None:
-    """Toggle off (the default): no Default Audio fix kwargs -- only COL-192's cancel_handle."""
-    settings = Settings(
-        _env_file=None,
-        database_path=str(tmp_path / "collapsarr.db"),
-        data_dir=str(tmp_path),
-    )
-    # Even with a language/tier persisted, the off toggle must gate them out.
-    _write_default_audio_settings(
-        settings,
-        auto_set_default_audio=False,
-        default_audio_language="eng",
-        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
-    )
-
-    runner = _KwargsCapturingRunner(_SUCCESS)
-    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
-    queue.enqueue("/media/movie.mkv", DownmixSettings())
-    queue.start()
-    queue.wait_idle()
-
-    assert len(runner.kwargs_calls) == 1
-    kwargs = runner.kwargs_calls[0]
-    assert "auto_set_default_audio" not in kwargs
-    assert "default_audio_preference" not in kwargs
-    # The only per-call kwarg the queue now threads is COL-192's hard-kill
-    # handle (created per RUNNING job); the Default Audio fix stays gated out.
-    assert set(kwargs) == {"cancel_handle"}
-    assert isinstance(kwargs["cancel_handle"], CancellationHandle)
+    # The only per-call kwarg the queue threads to a DOWNMIX job is COL-192's
+    # hard-kill handle (created per RUNNING job).
+    assert set(runner.kwargs_calls[0]) == {"cancel_handle"}
+    assert isinstance(runner.kwargs_calls[0]["cancel_handle"], CancellationHandle)
 
 
 # ---------------------------------------------------------------------------
@@ -1174,11 +1164,11 @@ def test_from_settings_threads_ffmpeg_path_to_set_default_audio_jobs_too(tmp_pat
 
 class _StrictDefaultAudioRunner:
     """A default_audio_pipeline_runner stub matching run_default_audio_pipeline's
-    exact kwarg surface -- ``ffmpeg_path`` only, no catch-all ``**kwargs`` -- so a
-    call with any other keyword (e.g. ``auto_set_default_audio``) raises
+    exact kwarg surface -- ``ffmpeg_path``/``expected_stream_count`` only, no
+    catch-all ``**kwargs`` -- so a call with any other keyword raises
     ``TypeError`` just like the real function would. Guards against a regression
     where :meth:`JobQueue._run_job` forwards an unsupported ``pipeline_kwargs``
-    key to it (COL-218)."""
+    key to it (COL-218), or an unsupported per-Job kwarg (COL-251)."""
 
     def __init__(self, result: PipelineResult) -> None:
         self._result = result
@@ -1191,6 +1181,7 @@ class _StrictDefaultAudioRunner:
         *,
         cancel_handle: object = None,
         ffmpeg_path: str | None = None,
+        expected_stream_count: int | None = None,
     ) -> PipelineResult:
         self.calls.append((file_path, preference, ffmpeg_path))
         return self._result
@@ -1199,12 +1190,11 @@ class _StrictDefaultAudioRunner:
 def test_from_settings_does_not_forward_downmix_only_kwargs_to_set_default_audio_jobs(
     tmp_path: Path,
 ) -> None:
-    """``auto_set_default_audio``/``default_audio_preference`` are
-    run_downmix_pipeline-*only* kwargs (COL-152); run_default_audio_pipeline has
-    no matching parameters or catch-all **kwargs for them, so forwarding the
-    whole pipeline_kwargs dict unfiltered would raise TypeError on a real
-    SET_DEFAULT_AUDIO job the moment both features are configured together.
-    ffmpeg_path, the one key both pipelines share, must still get through."""
+    """``pipeline_kwargs`` is a ``DOWNMIX``-job-only dict (COL-152's in-band fold moved
+    out of it entirely -- COL-251); run_default_audio_pipeline has no catch-all
+    **kwargs for arbitrary keys in it, so forwarding the whole dict unfiltered
+    would raise TypeError on a real SET_DEFAULT_AUDIO job. ffmpeg_path, the one
+    key both pipelines share, must still get through."""
     settings = Settings(
         _env_file=None,
         database_path=str(tmp_path / "collapsarr.db"),
@@ -1689,3 +1679,384 @@ def test_count_running_counts_only_running_jobs() -> None:
     assert queue.wait_idle(timeout=5) is True
     assert queue.count_running() == 0
     assert gate_job.status is JobStatus.SUCCEEDED
+
+
+# ---------------------------------------------------------------------------
+# Scheduled Job due-time gate (COL-242): an injectable ``now`` clock plus a
+# nullable ``Job.scheduled_at`` -- a still-PENDING Job isn't claimed by the
+# ordinary worker-pool claim path until its scheduled_at has passed (or is
+# unset, the default -- every existing Job kind/trigger is unaffected).
+# ---------------------------------------------------------------------------
+
+
+def test_job_scheduled_at_defaults_to_none() -> None:
+    """AC: every existing Job kind/trigger is unaffected -- scheduled_at is unset by default."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    assert job.scheduled_at is None
+
+
+def test_pending_job_with_future_scheduled_at_is_not_claimed_by_the_worker_pool() -> None:
+    """AC: a pending Job whose scheduled_at is still in the future is not claimed."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW + timedelta(hours=1)
+
+    queue.start()
+    time.sleep(0.2)
+
+    assert job.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+def test_pending_job_with_past_scheduled_at_is_claimed_as_today() -> None:
+    """AC: a pending Job whose scheduled_at has already passed is claimed as today."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW - timedelta(hours=1)
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+    assert len(runner.calls) == 1
+
+
+def test_pending_job_with_scheduled_at_exactly_now_is_claimed() -> None:
+    """The due-time comparison is inclusive: scheduled_at == now is already due."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_a_future_scheduled_job_never_blocks_an_earlier_priority_claimable_job() -> None:
+    """A future-scheduled Job is skipped entirely -- an unrelated claimable Job still runs.
+
+    Doesn't use ``wait_idle`` here: with ``now`` fixed, ``scheduled_job`` stays
+    genuinely ``PENDING`` forever (correctly -- it hasn't run), so a queue
+    that's fully idle in the ordinary sense never actually happens. Polls
+    ``claimable_job`` directly instead.
+    """
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    scheduled_job = queue.enqueue("/media/later.mkv", DownmixSettings())
+    scheduled_job.scheduled_at = _FIXED_NOW + timedelta(hours=1)
+    claimable_job = queue.enqueue("/media/now.mkv", DownmixSettings())
+
+    queue.start()
+    deadline = time.monotonic() + 5
+    while claimable_job.status is JobStatus.PENDING and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    assert claimable_job.status is JobStatus.SUCCEEDED
+    assert scheduled_job.status is JobStatus.PENDING
+
+
+def test_worker_pool_claims_a_scheduled_job_once_its_due_time_passes() -> None:
+    """AC: the gate is live, not just checked once -- toggling the clock forward wakes a worker.
+
+    Mirrors ``test_pause_check_toggling_off_lets_a_previously_pending_job_be_claimed``:
+    nothing explicitly wakes a worker blocked purely on a future scheduled_at
+    (see ``_SCHEDULE_POLL_INTERVAL_SECONDS``), so this proves the bounded poll
+    actually notices the due time passing, not just the gate's initial check.
+    """
+    current_now = {"value": _FIXED_NOW}
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: current_now["value"])
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW + timedelta(seconds=1)
+
+    queue.start()
+    time.sleep(0.2)
+    assert job.status is JobStatus.PENDING  # not due yet
+
+    current_now["value"] = _FIXED_NOW + timedelta(hours=1)  # advance past the due time
+    # No event to wait on -- the worker only notices via its bounded poll
+    # (_SCHEDULE_POLL_INTERVAL_SECONDS), so wait_idle's own timeout comfortably
+    # covers the worst case.
+    assert queue.wait_idle(timeout=5) is True
+
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_force_start_bypasses_the_scheduled_at_gate() -> None:
+    """AC: Process Now still claims a pending Job regardless of scheduled_at."""
+    runner = _stub_runner(_SUCCESS)
+    queue = JobQueue(pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW + timedelta(days=1)
+
+    queue.start()
+    time.sleep(0.2)
+    assert job.status is JobStatus.PENDING  # the pool never claims it
+
+    assert queue.force_start(job.id) is True
+    assert queue.wait_idle(timeout=5) is True
+
+    assert queue.get_job(job.id) is not None
+    assert queue.get_job(job.id).status is JobStatus.SUCCEEDED  # type: ignore[union-attr]
+
+
+def test_from_settings_defaults_now_to_a_real_clock(tmp_path: Path) -> None:
+    """The production factory's default `now` genuinely reflects wall-clock time."""
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    runner = _stub_runner(_SUCCESS)
+
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = datetime.now(UTC) - timedelta(minutes=1)  # already due
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+
+
+def test_from_settings_accepts_an_injected_now_clock(tmp_path: Path) -> None:
+    """AC-adjacent: `from_settings` threads an explicit `now` through, same as the raw ctor."""
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "collapsarr.db"))
+    runner = _stub_runner(_SUCCESS)
+
+    queue = JobQueue.from_settings(settings, pipeline_runner=runner, now=lambda: _FIXED_NOW)
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    job.scheduled_at = _FIXED_NOW + timedelta(hours=1)
+
+    queue.start()
+    time.sleep(0.2)
+
+    assert job.status is JobStatus.PENDING
+    assert runner.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Downmix-triggered delayed Default Audio Track Job (COL-251): a DOWNMIX job
+# that actually adds a track schedules a follow-up SET_DEFAULT_AUDIO Job,
+# using COL-242's due-time gate/injectable clock and COL-243's delay setting.
+# ---------------------------------------------------------------------------
+
+_DOWNMIX_TARGET = QualifyingTarget(language="eng", target=DownmixTarget.FIVE_POINT_ONE)
+_SUCCESS_WITH_NEW_STREAM = PipelineResult(
+    outcome=PipelineOutcome.SUCCESS,
+    success=True,
+    detail="ok",
+    tracks_added=(_DOWNMIX_TARGET,),
+    final_stream_count=3,
+)
+_DEFAULT_AUDIO_PREFERENCE = DefaultAudioPreference(
+    language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE
+)
+
+
+def _wait_for_job_count(queue: JobQueue, count: int, *, timeout: float = 5) -> None:
+    """Poll until ``queue`` has enqueued ``count`` Jobs, or ``timeout`` elapses.
+
+    Deliberately not :meth:`JobQueue.wait_idle`: a downmix-triggered Job's
+    ``scheduled_at`` may never come due against a fixed injected ``now``, so
+    the queue never becomes idle in the ordinary sense -- mirroring
+    ``test_a_future_scheduled_job_never_blocks_an_earlier_priority_claimable_job``
+    above.
+    """
+    deadline = time.monotonic() + timeout
+    while len(queue.list_jobs()) < count and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+
+def test_downmix_job_that_adds_a_track_schedules_a_default_audio_job() -> None:
+    """AC: scheduled_at = now + delay, expected_stream_count = the downmix's final count."""
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(_SUCCESS_WITH_NEW_STREAM),
+        now=lambda: _FIXED_NOW,
+        default_audio_auto_schedule=DefaultAudioAutoSchedule(
+            preference=_DEFAULT_AUDIO_PREFERENCE, delay=timedelta(minutes=45)
+        ),
+    )
+    downmix_job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    _wait_for_job_count(queue, 2)
+
+    assert downmix_job.status is JobStatus.SUCCEEDED
+    jobs = queue.list_jobs()
+    assert len(jobs) == 2
+    scheduled_job = next(job for job in jobs if job.kind is JobKind.SET_DEFAULT_AUDIO)
+    assert scheduled_job.file_path == downmix_job.file_path
+    assert scheduled_job.preference == _DEFAULT_AUDIO_PREFERENCE
+    assert scheduled_job.scheduled_at == _FIXED_NOW + timedelta(minutes=45)
+    assert scheduled_job.expected_stream_count == 3
+    # now is fixed at _FIXED_NOW, so the due time never arrives in this test.
+    assert scheduled_job.status is JobStatus.PENDING
+
+
+def test_downmix_job_with_nothing_to_do_schedules_nothing() -> None:
+    """A downmix that adds no track (NOTHING_TO_DO) has nothing new for Plex to ingest."""
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(_NOTHING_TO_DO),
+        now=lambda: _FIXED_NOW,
+        default_audio_auto_schedule=DefaultAudioAutoSchedule(
+            preference=_DEFAULT_AUDIO_PREFERENCE, delay=timedelta(minutes=45)
+        ),
+    )
+    downmix_job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert downmix_job.status is JobStatus.SUCCEEDED
+    assert len(queue.list_jobs()) == 1
+
+
+def test_downmix_job_that_fails_schedules_nothing() -> None:
+    """A FAILED downmix never schedules a follow-up -- nothing succeeded to fix disposition on."""
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(_FAILED),
+        now=lambda: _FIXED_NOW,
+        default_audio_auto_schedule=DefaultAudioAutoSchedule(
+            preference=_DEFAULT_AUDIO_PREFERENCE, delay=timedelta(minutes=45)
+        ),
+    )
+    downmix_job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert downmix_job.status is JobStatus.FAILED
+    assert len(queue.list_jobs()) == 1
+
+
+def test_default_audio_auto_schedule_none_schedules_nothing() -> None:
+    """The default (``default_audio_auto_schedule=None``): pre-COL-251 behaviour, unaffected."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS_WITH_NEW_STREAM), now=lambda: _FIXED_NOW)
+    downmix_job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert downmix_job.status is JobStatus.SUCCEEDED
+    assert len(queue.list_jobs()) == 1
+
+
+def test_set_default_audio_job_never_chains_another_schedule() -> None:
+    """A SET_DEFAULT_AUDIO job's own success never schedules a further Job -- no chaining."""
+    queue = JobQueue(
+        default_audio_pipeline_runner=_StubDefaultAudioRunner(_SUCCESS),
+        now=lambda: _FIXED_NOW,
+        default_audio_auto_schedule=DefaultAudioAutoSchedule(
+            preference=_DEFAULT_AUDIO_PREFERENCE, delay=timedelta(minutes=45)
+        ),
+    )
+    job = queue.enqueue_default_audio("/media/movie.mkv", _DEFAULT_AUDIO_PREFERENCE)
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+    assert len(queue.list_jobs()) == 1
+
+
+def test_from_settings_schedules_a_default_audio_job_when_toggle_on(tmp_path: Path) -> None:
+    """AC: wired end-to-end through the real production factory."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_default_audio_settings(
+        settings,
+        auto_set_default_audio=True,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+        default_audio_delay_minutes=45,
+    )
+
+    queue = JobQueue.from_settings(
+        settings,
+        pipeline_runner=_stub_runner(_SUCCESS_WITH_NEW_STREAM),
+        now=lambda: _FIXED_NOW,
+    )
+    downmix_job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    _wait_for_job_count(queue, 2)
+
+    assert downmix_job.status is JobStatus.SUCCEEDED
+    jobs = queue.list_jobs()
+    assert len(jobs) == 2
+    scheduled_job = next(job for job in jobs if job.kind is JobKind.SET_DEFAULT_AUDIO)
+    assert scheduled_job.scheduled_at == _FIXED_NOW + timedelta(minutes=45)
+    assert scheduled_job.expected_stream_count == 3
+    assert scheduled_job.preference == _DEFAULT_AUDIO_PREFERENCE
+
+
+def test_from_settings_schedules_nothing_when_toggle_off(tmp_path: Path) -> None:
+    """AC: the manual/bulk trigger and plain webhook trigger are unaffected by the toggle being
+    off -- and so is a downmix, which schedules nothing at all in that case."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_default_audio_settings(
+        settings,
+        auto_set_default_audio=False,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.FIVE_POINT_ONE,
+    )
+
+    queue = JobQueue.from_settings(
+        settings,
+        pipeline_runner=_stub_runner(_SUCCESS_WITH_NEW_STREAM),
+        now=lambda: _FIXED_NOW,
+    )
+    downmix_job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert downmix_job.status is JobStatus.SUCCEEDED
+    assert len(queue.list_jobs()) == 1
+
+
+def test_from_settings_schedules_nothing_with_an_incomplete_preference(tmp_path: Path) -> None:
+    """Toggle on but only the language half configured: no actionable preference, no schedule."""
+    settings = Settings(
+        _env_file=None,
+        database_path=str(tmp_path / "collapsarr.db"),
+        data_dir=str(tmp_path),
+    )
+    _write_default_audio_settings(
+        settings,
+        auto_set_default_audio=True,
+        default_audio_language="eng",
+        default_audio_channel_tier=None,
+    )
+
+    queue = JobQueue.from_settings(
+        settings,
+        pipeline_runner=_stub_runner(_SUCCESS_WITH_NEW_STREAM),
+        now=lambda: _FIXED_NOW,
+    )
+    downmix_job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+
+    queue.start()
+    assert queue.wait_idle(timeout=5) is True
+
+    assert downmix_job.status is JobStatus.SUCCEEDED
+    assert len(queue.list_jobs()) == 1
+
+
+def test_manual_trigger_enqueue_default_audio_still_enqueues_immediately() -> None:
+    """AC: the manual/bulk trigger (enqueue_default_audio with no scheduled_at) is unaffected --
+    still enqueues immediately, with no due-time gate."""
+    queue = JobQueue(default_audio_pipeline_runner=_StubDefaultAudioRunner(_SUCCESS))
+    job = queue.enqueue_default_audio("/media/movie.mkv", _DEFAULT_AUDIO_PREFERENCE)
+
+    assert job.scheduled_at is None
+    assert job.expected_stream_count is None

@@ -56,7 +56,8 @@ from collapsarr.migrations import (
 #: COL-155's job-history ``kind``, COL-163's job-history ``priority``, COL-167's
 #: recently-processed dedup window, COL-174's Auto-Queuing Pause toggle,
 #: COL-218's ``ffmpeg_path`` override, COL-226's Auto-Processing Pause toggle,
-#: COL-230's ``auto_processing_pause_restore_value`` self-update scratch flag) --
+#: COL-230's ``auto_processing_pause_restore_value`` self-update scratch flag,
+#: COL-242's job-history ``scheduled_at`` due-time gate) --
 #: dropped after ``create_all`` below by :func:`_create_unversioned_db`,
 #: mirroring the same de-evolving idiom in ``test_migration_adoption.py``.
 #: Without this, ``create_all`` (which always builds from the *current*
@@ -73,6 +74,7 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("global_settings", "default_audio_language"),
     ("global_settings", "default_audio_channel_tier"),
     ("global_settings", "auto_set_default_audio"),
+    ("global_settings", "default_audio_delay_minutes"),
     ("global_settings", "recently_processed_window_minutes"),
     ("global_settings", "auto_queue_paused"),
     ("global_settings", "ffmpeg_path"),
@@ -84,6 +86,8 @@ _POST_BASELINE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("tracked_media_files", "current_default_channel_layout"),
     ("job_history", "kind"),
     ("job_history", "priority"),
+    ("job_history", "scheduled_at"),
+    ("job_history", "expected_stream_count"),
 )
 
 #: Indexes on the COL-101 ``tracked_media_files`` columns above -- SQLite's

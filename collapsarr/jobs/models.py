@@ -81,6 +81,30 @@ class JobHistory(Base):
     implied by existing history. This is a pure prefactor -- nothing yet
     reads this column back to change execution order (that is COL-164's
     priority-pull worker pool).
+
+    ``scheduled_at`` (COL-242) mirrors the originating
+    :attr:`~collapsarr.jobs.queue.Job.scheduled_at`: ``None`` for every
+    existing Job kind/trigger (and every pre-existing row, via this column's
+    additive nullable migration), or a due-time gate a still-``pending`` Job
+    isn't claimed before (see :meth:`~collapsarr.jobs.queue.JobQueue._claim_next`).
+    No new backend status is introduced by this -- ``status`` stays
+    ``JobStatus.PENDING`` throughout; a client derives a "Scheduled" display
+    label from ``status is pending`` plus ``scheduled_at`` being in the
+    future rather than reading a distinct status value.
+
+    ``expected_stream_count`` (COL-251) mirrors the originating
+    :attr:`~collapsarr.jobs.queue.Job.expected_stream_count`: ``None`` for
+    every immediate trigger (manual/bulk, plain webhook), or the file's
+    total audio-stream count as of the downmix remux that scheduled this
+    row, for a downmix-triggered ``SET_DEFAULT_AUDIO`` row. Persisted
+    (rather than kept in-memory only, unlike e.g. ``Job.error``) for the same
+    reason ``scheduled_at`` is: a downmix-triggered row can sit ``pending``
+    for a real, possibly long (default 30 minute) delay, so it must survive
+    a restart with the "stream not yet ingested" check still armed when it
+    is rehydrated (:func:`~collapsarr.jobs.rehydrate._reconstruct_job`) --
+    losing this value on restart would silently disable that safety check
+    for any row that happened to be scheduled, not yet due, at the moment
+    the process restarted.
     """
 
     __tablename__ = "job_history"
@@ -113,6 +137,10 @@ class JobHistory(Base):
         index=True,
     )
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
+    expected_stream_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
     started_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     ended_at: Mapped[datetime | None] = mapped_column(nullable=True, default=None)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)

@@ -81,6 +81,15 @@ value for the two nullable fields (clears a configured preference); omitting
 either field leaves it untouched. ``auto_set_default_audio`` is a plain
 boolean, same treatment as ``ui_auth_enabled``/``default_tracked``.
 
+``default_audio_delay_minutes`` (COL-243) is also read/write here -- the
+minimum age (in minutes) a remuxed file's new audio streams must have
+before Collapsarr trusts Plex to have already processed them for a Default
+Audio Track write/verify. Constrained to ``>= 0`` (``Field(ge=0)``), same
+treatment as ``recently_processed_window_minutes`` below. No dedicated
+endpoint: it round-trips through this same ``GET``/``PUT /api/settings``.
+Not yet read by any Job-scheduling logic -- COL-251 is the follow-up
+ticket that will consume it.
+
 ``recently_processed_window_minutes`` (COL-167) is also read/write here --
 the scheduler's "recently processed" dedup cooldown, in minutes, no longer
 silently derived from ``scan_interval_hours``. Constrained to ``>= 0``
@@ -189,6 +198,7 @@ class SettingsRead(BaseModel):
     default_audio_language: str | None
     default_audio_channel_tier: DownmixTarget | None
     auto_set_default_audio: bool
+    default_audio_delay_minutes: int
     recently_processed_window_minutes: int
     auto_queue_paused: bool
     auto_processing_paused: bool
@@ -228,6 +238,7 @@ class SettingsUpdate(BaseModel):
     default_audio_language: str | None = None
     default_audio_channel_tier: DownmixTarget | None = None
     auto_set_default_audio: bool | None = None
+    default_audio_delay_minutes: int | None = Field(default=None, ge=0)
     recently_processed_window_minutes: int | None = Field(default=None, ge=0)
     auto_queue_paused: bool | None = None
     auto_processing_paused: bool | None = None
@@ -270,6 +281,7 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
             else None
         ),
         auto_set_default_audio=settings.auto_set_default_audio,
+        default_audio_delay_minutes=settings.default_audio_delay_minutes,
         recently_processed_window_minutes=settings.recently_processed_window_minutes,
         auto_queue_paused=settings.auto_queue_paused,
         auto_processing_paused=settings.auto_processing_paused,
@@ -347,6 +359,8 @@ def update_settings_endpoint(
         kwargs["default_audio_channel_tier"] = body.default_audio_channel_tier
     if "auto_set_default_audio" in provided:
         kwargs["auto_set_default_audio"] = body.auto_set_default_audio
+    if "default_audio_delay_minutes" in provided:
+        kwargs["default_audio_delay_minutes"] = body.default_audio_delay_minutes
     if "recently_processed_window_minutes" in provided:
         kwargs["recently_processed_window_minutes"] = body.recently_processed_window_minutes
     if "auto_queue_paused" in provided:
