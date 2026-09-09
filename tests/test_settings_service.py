@@ -23,6 +23,7 @@ from collapsarr.settings.models import (
     AUTH_REQUIRED_ENABLED,
     AUTH_REQUIRED_LOCAL_BYPASS,
     DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES,
+    DEFAULT_IGNORE_COMMENTARY_TRACKS,
     DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES,
     LOG_LEVEL_DEBUG,
     LOG_LEVEL_INFO,
@@ -990,6 +991,55 @@ def test_restore_auto_processing_pause_is_idempotent(session: Session) -> None:
 
     assert settings.auto_processing_paused is False
     assert settings.auto_processing_pause_restore_value is None
+
+
+# ---------------------------------------------------------------------------
+# Ignore Commentary Tracks (COL-244).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_ignore_commentary_tracks_to_true(session: Session) -> None:
+    """AC: the new toggle defaults to on -- commentary tracks are ignored unless opted out."""
+    settings = get_global_settings(session)
+
+    assert settings.ignore_commentary_tracks is DEFAULT_IGNORE_COMMENTARY_TRACKS
+    assert settings.ignore_commentary_tracks is True
+
+
+def test_update_global_settings_updates_ignore_commentary_tracks(session: Session) -> None:
+    updated = update_global_settings(session, ignore_commentary_tracks=False)
+
+    assert updated.ignore_commentary_tracks is False
+
+
+def test_update_global_settings_ignore_commentary_tracks_is_switchable_back_on(
+    session: Session,
+) -> None:
+    update_global_settings(session, ignore_commentary_tracks=False)
+
+    updated = update_global_settings(session, ignore_commentary_tracks=True)
+
+    assert updated.ignore_commentary_tracks is True
+
+
+def test_update_global_settings_omitting_ignore_commentary_tracks_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, ignore_commentary_tracks=False)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.ignore_commentary_tracks is False
+
+
+def test_update_global_settings_ignore_commentary_tracks_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, ignore_commentary_tracks=False)
+
+    reread = get_global_settings(session)
+
+    assert reread.ignore_commentary_tracks is False
 
 
 # ---------------------------------------------------------------------------
