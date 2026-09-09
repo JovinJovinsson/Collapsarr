@@ -69,6 +69,19 @@ class AudioStreamInfo:
     rather than erroring or guessing (COL-150). Pure metadata exposure — the
     foundation later slices use to know a file's *current* default track
     before deciding whether it needs to change.
+
+    ``title`` is ffprobe's ``tags.title`` free-text stream tag (e.g. "Director's
+    Commentary"), or ``None`` when the stream carries no title tag at all —
+    unlike ``language``, there is no "unknown" bucket to fall back to here,
+    since an absent title is a perfectly ordinary, common case rather than
+    something worth normalizing away. ``is_commentary`` mirrors
+    ``is_default``'s treatment of ``disposition`` but reads the ``comment``
+    key instead of ``default``: whether ffprobe reports this stream as
+    carrying the container's Commentary disposition flag, normalized to
+    ``False`` when ``disposition`` (or its ``comment`` key) is missing
+    entirely (COL-246). Neither field alone is authoritative for "is this a
+    commentary track" — see :func:`is_commentary_track`, which combines this
+    flag with the title text.
     """
 
     index: int
@@ -77,6 +90,8 @@ class AudioStreamInfo:
     channel_layout: str
     language: str
     is_default: bool = False
+    title: str | None = None
+    is_commentary: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,10 +314,28 @@ def _parse_audio_streams(payload: object) -> list[AudioStreamInfo]:
                 channel_layout=_normalize_channel_layout(stream.get("channel_layout"), channels),
                 language=_normalize_language(stream.get("tags")),
                 is_default=_normalize_is_default(stream.get("disposition")),
+                title=_normalize_title(stream.get("tags")),
+                is_commentary=_normalize_is_commentary(stream.get("disposition")),
             )
         )
 
     return results
+
+
+def is_commentary_track(stream: AudioStreamInfo) -> bool:
+    """Whether ``stream`` looks like a commentary track, from either of two signals.
+
+    ``True`` when ffprobe's ``disposition.comment`` flag is set (exposed as
+    :attr:`AudioStreamInfo.is_commentary`) **or** the stream's tag title
+    contains "comment", case-insensitively (e.g. "Director's Commentary") —
+    whichever an encoder happens to have used to convey it, since real-world
+    rips are inconsistent about setting the disposition flag versus just
+    labeling the title (COL-246). A stream with neither signal returns
+    ``False``.
+    """
+    if stream.is_commentary:
+        return True
+    return stream.title is not None and "comment" in stream.title.lower()
 
 
 def _normalize_is_default(disposition: object) -> bool:
@@ -315,6 +348,17 @@ def _normalize_is_default(disposition: object) -> bool:
     """
     if isinstance(disposition, dict):
         return bool(disposition.get("default"))
+    return False
+
+
+def _normalize_is_commentary(disposition: object) -> bool:
+    """Read ffprobe's ``disposition.comment`` flag, defaulting to ``False``.
+
+    Same missing-block/missing-key-safe treatment as :func:`_normalize_is_default`,
+    just reading the ``comment`` key instead of ``default``.
+    """
+    if isinstance(disposition, dict):
+        return bool(disposition.get("comment"))
     return False
 
 
@@ -332,3 +376,18 @@ def _normalize_language(tags: object) -> str:
             if language not in _UNDETERMINED_LANGUAGE_CODES:
                 return language
     return _UNKNOWN_LANGUAGE
+
+
+def _normalize_title(tags: object) -> str | None:
+    """Read ffprobe's ``tags.title`` free-text stream tag, or ``None`` when absent.
+
+    Missing-key-safe the same way :func:`_normalize_language` is safe against
+    an absent/non-dict ``tags`` block, but unlike language there is no
+    "unknown" bucket to fall back to — a stream with no title tag is simply
+    untitled.
+    """
+    if isinstance(tags, dict):
+        raw_title = tags.get("title")
+        if isinstance(raw_title, str) and raw_title.strip():
+            return raw_title.strip()
+    return None

@@ -233,6 +233,22 @@ on the file at all (a foreign-only-audio file), the best-available tier
 in whatever language the file has. Case (3) is expected fallback
 behavior, not a gap — a foreign-only file is never "wrong."
 
+## Commentary Track
+
+An audio stream carrying director/cast/crew commentary rather than a
+normal program mix, detected — as a signal only, not yet acted on — from
+two independent sources (COL-246). Locally, `ffprobe`'s
+`disposition.comment` flag OR'd with a case-insensitive "comment"
+substring match on the stream's tag `title`
+(`collapsarr.downmix.probe.is_commentary_track`); via Plex, the same
+case-insensitive "comment" substring match against `title` and/or
+`extended_display_title` (`collapsarr.plex.streams.is_commentary_track`) —
+Plex exposes no disposition-flag equivalent, so its check is title-only.
+Local ffprobe and Plex metadata are independent signals; either can flag a
+stream regardless of what the other reports. Detection-only for now: not
+yet wired into downmix eligibility or **Preferred Default Audio**
+resolution (that's COL-249/COL-250).
+
 ## Job
 
 One enqueued unit of work: a file plus its downmix target/language

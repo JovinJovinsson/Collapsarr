@@ -142,3 +142,20 @@ def _normalize_language(raw_language_code: object) -> str:
         if language not in _UNDETERMINED_LANGUAGE_CODES:
             return language
     return _UNKNOWN_LANGUAGE
+
+
+def is_commentary_track(stream: PlexAudioStream) -> bool:
+    """Whether ``stream`` looks like a commentary track, from title alone (COL-246).
+
+    ``True`` when either ``title`` or ``extended_display_title`` contains
+    "comment", case-insensitively. Plex exposes no native commentary
+    disposition the way ffprobe's ``disposition.comment`` flag does for a
+    locally-probed stream (see
+    :func:`collapsarr.downmix.probe.is_commentary_track`'s other signal), so
+    this is title-only — a single-signal check across the two free-text
+    fields rather than the local side's two-signal OR.
+    """
+    for candidate in (stream.title, stream.extended_display_title):
+        if candidate is not None and "comment" in candidate.lower():
+            return True
+    return False
