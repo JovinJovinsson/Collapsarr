@@ -153,10 +153,10 @@ DEFAULT_IGNORE_COMMENTARY_TRACKS = True
 / an existing row backfilled by the additive migration (COL-244). On by
 default -- commentary tracks are noise for both channel-layout detection and
 Default Audio Track resolution, so the common case is to skip them without
-requiring an operator to opt in. Not yet consumed by any detection/
-eligibility/resolution logic -- this ticket only persists the knob and
-exposes it in Settings; COL-249/COL-250 are the follow-up tickets that read
-it."""
+requiring an operator to opt in. Consumed by the downmix-eligibility check
+(:func:`~collapsarr.downmix.targets.detect_qualifying_targets`, COL-249);
+COL-250 (Default Audio Track resolution) is the remaining follow-up ticket
+that reads it."""
 
 DEFAULT_AUTO_PROCESSING_PAUSE_RESTORE_VALUE = None
 """Default :attr:`GlobalSettings.auto_processing_pause_restore_value` for a
@@ -434,10 +434,11 @@ class GlobalSettings(Base):
     Preferred Default Audio resolution above. Carries a DB-side
     ``server_default`` (matching ``auto_set_default_audio`` above) so the
     additive migration backfills existing installs to ``True`` rather than
-    leaving the column ``NULL``. Not yet read by any caller -- COL-249
-    (detection/eligibility) and COL-250 (resolution) are the follow-up
-    tickets that will consume it; this ticket only persists the knob and
-    exposes it in Settings.
+    leaving the column ``NULL``. Read via :func:`~collapsarr.settings.
+    service.as_downmix_settings` by :func:`~collapsarr.downmix.targets.
+    detect_qualifying_targets` (COL-249, detection/eligibility); COL-250
+    (Default Audio Track resolution) is the remaining follow-up ticket that
+    will consume it.
 
     ``auto_processing_pause_restore_value`` (COL-230, consumed by COL-233) is
     a nullable *scratch* boolean backing the self-update apply flow's
