@@ -1074,6 +1074,15 @@ def test_as_downmix_settings_adapts_customised_values(session: Session) -> None:
     assert downmix_settings.surround_bitrate_kbps == 640
 
 
+def test_as_downmix_settings_adapts_ignore_commentary_tracks(session: Session) -> None:
+    """COL-249: the toggle round-trips into DownmixSettings, in both directions."""
+    settings = update_global_settings(session, ignore_commentary_tracks=False)
+
+    downmix_settings = as_downmix_settings(settings)
+
+    assert downmix_settings.ignore_commentary_tracks is False
+
+
 # ---------------------------------------------------------------------------
 # Public re-exports.
 # ---------------------------------------------------------------------------

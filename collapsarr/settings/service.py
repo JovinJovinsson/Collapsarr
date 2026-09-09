@@ -100,10 +100,12 @@ own docstring for exactly what it does and does not gate, distinct from
 
 ``ignore_commentary_tracks`` (COL-244) follows the same "only change what's
 passed" rule as every other boolean field here (``ui_auth_enabled``,
-``default_tracked``, ``auto_set_default_audio``). Not yet read by any
-caller -- see :attr:`~collapsarr.settings.models.GlobalSettings.
-ignore_commentary_tracks`'s own docstring for the tickets that will
-eventually consume it.
+``default_tracked``, ``auto_set_default_audio``). Read via
+:func:`as_downmix_settings` by :func:`~collapsarr.downmix.targets.
+detect_qualifying_targets` (COL-249) for the downmix-eligibility check;
+see :attr:`~collapsarr.settings.models.GlobalSettings.
+ignore_commentary_tracks`'s own docstring for the remaining follow-up
+ticket (COL-250, Default Audio Track resolution) that has yet to consume it.
 """
 
 from __future__ import annotations
@@ -539,6 +541,11 @@ def as_downmix_settings(settings: GlobalSettings) -> DownmixSettings:
     queue) consumes -- decoding the comma-joined ``enabled_targets``/
     ``language_allow_list`` columns back into the ``frozenset`` forms
     :class:`~collapsarr.downmix.targets.DownmixSettings` expects.
+
+    ``ignore_commentary_tracks`` (COL-244) is passed straight through --
+    :func:`~collapsarr.downmix.targets.detect_qualifying_targets` (COL-249)
+    is the first caller to actually read it, excluding commentary streams
+    from its channel-layout eligibility check when set.
     """
     return DownmixSettings(
         enabled_targets=_decode_targets(settings.enabled_targets),
@@ -547,6 +554,7 @@ def as_downmix_settings(settings: GlobalSettings) -> DownmixSettings:
         stereo_bitrate_kbps=settings.stereo_bitrate_kbps,
         surround_codec=settings.surround_codec,
         surround_bitrate_kbps=settings.surround_bitrate_kbps,
+        ignore_commentary_tracks=settings.ignore_commentary_tracks,
     )
 
 
