@@ -26,6 +26,7 @@ interface GeneralFormValues {
   diskSpaceErrorPercent: string;
   recentlyProcessedWindowMinutes: string;
   defaultTracked: boolean;
+  ignoreCommentaryTracks: boolean;
 }
 
 /** Validates the general-settings form; returns an error message, or `null` when valid. */
@@ -86,6 +87,7 @@ export function GeneralSection() {
     diskSpaceErrorPercent: "2",
     recentlyProcessedWindowMinutes: "360",
     defaultTracked: true,
+    ignoreCommentaryTracks: true,
   });
 
   const [saving, setSaving] = useState(false);
@@ -141,6 +143,7 @@ export function GeneralSection() {
           diskSpaceErrorPercent: String(settings.disk_space_error_percent),
           recentlyProcessedWindowMinutes: String(settings.recently_processed_window_minutes),
           defaultTracked: settings.default_tracked,
+          ignoreCommentaryTracks: settings.ignore_commentary_tracks,
         });
         setState({ status: "ready" });
       })
@@ -174,6 +177,7 @@ export function GeneralSection() {
         disk_space_error_percent: Number(form.diskSpaceErrorPercent),
         recently_processed_window_minutes: Number(form.recentlyProcessedWindowMinutes),
         default_tracked: form.defaultTracked,
+        ignore_commentary_tracks: form.ignoreCommentaryTracks,
       });
       setServerApiKey(updated.api_key);
       setForm({
@@ -191,6 +195,7 @@ export function GeneralSection() {
         diskSpaceErrorPercent: String(updated.disk_space_error_percent),
         recentlyProcessedWindowMinutes: String(updated.recently_processed_window_minutes),
         defaultTracked: updated.default_tracked,
+        ignoreCommentaryTracks: updated.ignore_commentary_tracks,
       });
       setSavedAt(Date.now());
 
@@ -395,6 +400,15 @@ export function GeneralSection() {
                 onChange={(event) => setForm({ ...form, defaultTracked: event.target.checked })}
               />
               Default Tracked for new library items
+            </label>
+
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={form.ignoreCommentaryTracks}
+                onChange={(event) => setForm({ ...form, ignoreCommentaryTracks: event.target.checked })}
+              />
+              Ignore commentary tracks
             </label>
 
             <div className="form-grid">

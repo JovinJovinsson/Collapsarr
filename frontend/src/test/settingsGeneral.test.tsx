@@ -60,9 +60,11 @@ const baseSettings: GlobalSettings = {
   default_audio_language: null,
   default_audio_channel_tier: null,
   auto_set_default_audio: false,
+  default_audio_delay_minutes: 30,
   recently_processed_window_minutes: 360,
   auto_queue_paused: false,
   auto_processing_paused: false,
+  ignore_commentary_tracks: true,
   api_key: "server-generated-key",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
@@ -446,6 +448,29 @@ describe("GeneralSection", () => {
     const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
     const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
     expect(putBody.default_tracked).toBe(true);
+  });
+
+  it("displays the current ignore_commentary_tracks value and saves changes via PUT", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        return Promise.resolve(jsonResponse({ ...baseSettings, ...body }));
+      }
+      return Promise.resolve(jsonResponse({ ...baseSettings, ignore_commentary_tracks: false }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderGeneralSection();
+    const toggleCheckbox = await screen.findByRole("checkbox", { name: /ignore commentary tracks/i });
+    expect(toggleCheckbox).not.toBeChecked();
+
+    fireEvent.click(toggleCheckbox);
+    fireEvent.click(screen.getByRole("button", { name: /save general settings/i }));
+
+    expect(await screen.findByText(/saved\./i)).toBeInTheDocument();
+    const putCall = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const putBody = JSON.parse(String((putCall?.[1] as RequestInit).body));
+    expect(putBody.ignore_commentary_tracks).toBe(true);
   });
 
   it("surfaces an API error from a failed save", async () => {

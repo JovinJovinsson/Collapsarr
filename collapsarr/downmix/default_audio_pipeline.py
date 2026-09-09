@@ -27,9 +27,13 @@ command is a plain ``-map 0`` / ``-c copy`` stream-copy of every original
 stream, no new encoded audio track, ever) followed by
 :func:`~collapsarr.downmix.apply.apply_remux_result`'s duration/stream-count
 validation and atomic swap (``added_track_count=0``, since nothing new was
-added). If the winner already matches — it already carries the disposition,
-and no other stream wrongly carries it too — this returns a no-op success
-without invoking ffmpeg or touching the file at all, mirroring
+added), which is passed the resolved winner index as
+``expected_default_audio_index`` (COL-241) so it re-probes the swapped-in
+file afterward and confirms that stream — and no other audio stream — really
+does carry ``disposition.default`` before this reports success. If the
+winner already matches — it already carries the disposition, and no other
+stream wrongly carries it too — this returns a no-op success without
+invoking ffmpeg or touching the file at all, mirroring
 :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.NOTHING_TO_DO`'s "nothing
 was attempted, nothing failed" contract.
 
@@ -127,8 +131,19 @@ def run_default_audio_pipeline(
     duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS,
     runner: _Runner | None = None,
     cancel_handle: CancellationHandle | None = None,
+    expected_stream_count: int | None = None,
 ) -> PipelineResult:
     """Fix a single file's Default Audio Track disposition, on demand, no downmixing.
+
+    ``expected_stream_count`` (COL-251) is accepted for call-signature parity
+    with :func:`~collapsarr.plex.default_audio_write.apply_default_audio_via_plex`
+    -- :class:`~collapsarr.jobs.queue.JobQueue` forwards a ``SET_DEFAULT_AUDIO``
+    job's ``expected_stream_count`` to whichever mechanism the COL-247
+    mechanism-selection gate routes to, and this pipeline is one of the two.
+    It is unused here: this pipeline always re-probes the *actual* local
+    file, which already reflects the downmix's real output the instant the
+    remux completed -- there is no Plex-ingestion race to guard against on
+    this (no-Plex) path, unlike the direct Plex API write.
 
     In order: :func:`~collapsarr.downmix.probe.probe_audio_streams`,
     :func:`~collapsarr.downmix.default_audio.resolve_default_audio_stream`,
@@ -159,10 +174,22 @@ def run_default_audio_pipeline(
       original file is untouched (:func:`~collapsarr.downmix.remux.run_remux`'s
       own guarantee);
     - a failed validate-and-apply (duration/stream-count mismatch, or the
-      temp/original becoming unprobeable) is reported as
-      :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.APPLY_FAILED`; the
-      original file is untouched
+      *pre-swap* probe of the original/temp becoming unprobeable) is reported
+      as :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.APPLY_FAILED`;
+      the original file is untouched
       (:func:`~collapsarr.downmix.apply.apply_remux_result`'s own guarantee).
+      A post-swap disposition mismatch, or the post-swap re-probe itself
+      failing (COL-241 — :attr:`~collapsarr.downmix.apply.ApplyFailureReason.
+      DISPOSITION_MISMATCH`/:attr:`~collapsarr.downmix.apply.
+      ApplyFailureReason.DISPOSITION_VERIFICATION_FAILED` respectively), is
+      also reported as
+      :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.APPLY_FAILED`, but
+      is the one case where the file is *not* left untouched — the swap
+      already happened by the time either check runs, and there is no backup
+      to revert to (see :func:`~collapsarr.downmix.apply.apply_remux_result`,
+      whose ``ApplyResult.failure_reason`` keeps the two distinguishable
+      rather than both surfacing as this function's own ``FfprobeError``
+      handling below, which only ever covers the *pre*-swap probes).
 
     On success, the original file has been atomically replaced by a remux
     identical to it except for which stream(s) carry the Default Audio Track
@@ -256,6 +283,14 @@ def run_default_audio_pipeline(
         return result
 
     try:
+        # Only the *pre*-swap probes (of the original/temp, inside
+        # apply_remux_result) can raise FfprobeError here -- the original is
+        # still untouched if either does. The *post*-swap disposition
+        # re-probe apply_remux_result also makes (via
+        # expected_default_audio_index) never raises: its failure comes back
+        # as an ApplyResult(failure_reason=ApplyFailureReason.
+        # DISPOSITION_VERIFICATION_FAILED, ...) below instead, so it can't be
+        # mistaken for this (safe, nothing-changed) pre-swap case.
         apply_result = apply_remux_result(
             path,
             remux_result,
@@ -264,6 +299,7 @@ def run_default_audio_pipeline(
             ffprobe_path=ffprobe_path,
             timeout=probe_timeout,
             runner=runner,
+            expected_default_audio_index=winner_index,
         )
     except FfprobeError as exc:
         return _finish(

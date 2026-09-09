@@ -119,6 +119,16 @@ fresh install should do without the operator first configuring
 ``default_audio_language``/``default_audio_channel_tier`` and turning it on
 deliberately."""
 
+DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES = 30
+"""Default :attr:`GlobalSettings.default_audio_delay_minutes` for a fresh
+install / an existing row backfilled by the additive migration (COL-243).
+In minutes; modeled on :data:`DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES`'s
+column shape (a plain ``NOT NULL`` integer with a matching DB-side
+``server_default``). Not yet consumed by any Job-scheduling logic -- this
+ticket only adds the knob and its Settings UI field; COL-251 is the
+downmix pipeline's delayed Default Audio Track Job enqueue that will read
+it."""
+
 DEFAULT_AUTO_QUEUE_PAUSED = False
 """Default :attr:`GlobalSettings.auto_queue_paused` for a fresh install / an
 existing row backfilled by the additive migration (COL-174). Off by default,
@@ -137,6 +147,16 @@ auto_processing_paused`'s own docstring for exactly what it does and does not
 gate -- distinct from :data:`DEFAULT_AUTO_QUEUE_PAUSED`'s "Auto-Queuing
 Pause", which only gates the scanner's enqueue/top-up funnel and never
 touches an already-``PENDING``/``RUNNING`` Job."""
+
+DEFAULT_IGNORE_COMMENTARY_TRACKS = True
+"""Default :attr:`GlobalSettings.ignore_commentary_tracks` for a fresh install
+/ an existing row backfilled by the additive migration (COL-244). On by
+default -- commentary tracks are noise for both channel-layout detection and
+Default Audio Track resolution, so the common case is to skip them without
+requiring an operator to opt in. Consumed by the downmix-eligibility check
+(:func:`~collapsarr.downmix.targets.detect_qualifying_targets`, COL-249);
+COL-250 (Default Audio Track resolution) is the remaining follow-up ticket
+that reads it."""
 
 DEFAULT_AUTO_PROCESSING_PAUSE_RESTORE_VALUE = None
 """Default :attr:`GlobalSettings.auto_processing_pause_restore_value` for a
@@ -323,6 +343,17 @@ class GlobalSettings(Base):
     the additive migration backfills existing installs to ``False`` rather
     than leaving the column ``NULL``.
 
+    ``default_audio_delay_minutes`` (COL-243) is the minimum age (in
+    minutes) a remuxed file's new audio streams must have before Collapsarr
+    trusts Plex to have already processed them for a Default Audio Track
+    write/verify -- see :data:`DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES`. Modeled
+    directly on ``recently_processed_window_minutes`` below: a plain
+    ``NOT NULL`` integer with a matching DB-side ``server_default`` so the
+    additive migration backfills existing installs to the documented
+    default rather than leaving the column ``NULL``. Not yet read by any
+    Job-scheduling logic -- this ticket only persists the knob and exposes
+    it in Settings; COL-251 is the follow-up ticket that consumes it.
+
     ``recently_processed_window_minutes`` (COL-167) is the scheduler's
     "recently processed" dedup cooldown, in minutes -- see
     :data:`DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES` and
@@ -396,6 +427,18 @@ class GlobalSettings(Base):
     kwarg when set) and by :func:`collapsarr.health.ffmpeg.
     make_ffmpeg_check_run`'s ``run`` callable (probes this path instead of
     the bare default when set).
+
+    ``ignore_commentary_tracks`` (COL-244) is the global toggle deciding
+    whether commentary audio tracks are excluded from consideration -- both
+    the downmix pipeline's channel-layout detection/target selection and the
+    Preferred Default Audio resolution above. Carries a DB-side
+    ``server_default`` (matching ``auto_set_default_audio`` above) so the
+    additive migration backfills existing installs to ``True`` rather than
+    leaving the column ``NULL``. Read via :func:`~collapsarr.settings.
+    service.as_downmix_settings` by :func:`~collapsarr.downmix.targets.
+    detect_qualifying_targets` (COL-249, detection/eligibility); COL-250
+    (Default Audio Track resolution) is the remaining follow-up ticket that
+    will consume it.
 
     ``auto_processing_pause_restore_value`` (COL-230, consumed by COL-233) is
     a nullable *scratch* boolean backing the self-update apply flow's
@@ -510,6 +553,13 @@ class GlobalSettings(Base):
         server_default=text("0"),
     )
 
+    default_audio_delay_minutes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES,
+        server_default=text(str(DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES)),
+    )
+
     recently_processed_window_minutes: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -532,6 +582,13 @@ class GlobalSettings(Base):
     )
 
     ffmpeg_path: Mapped[str | None] = mapped_column(String(500), nullable=True, default=None)
+
+    ignore_commentary_tracks: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=DEFAULT_IGNORE_COMMENTARY_TRACKS,
+        server_default=text("1"),
+    )
 
     auto_processing_pause_restore_value: Mapped[bool | None] = mapped_column(
         Boolean, nullable=True, default=DEFAULT_AUTO_PROCESSING_PAUSE_RESTORE_VALUE

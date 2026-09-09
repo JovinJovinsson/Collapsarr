@@ -97,10 +97,10 @@ def record_job_history(session: Session, job: Job) -> JobHistory:
 
     Looks up an existing :class:`JobHistory` row by ``str(job.id)``; if none
     exists yet, creates one. Every persisted field (status, priority,
-    started/ended timestamps, exit code, error text, target/language) is
-    (re)computed from ``job``'s current state and written, so calling this
-    again later (e.g. once a pending job has finished running) updates the
-    same row rather than creating a duplicate.
+    scheduled_at, expected_stream_count, started/ended timestamps, exit code,
+    error text, target/language) is (re)computed from ``job``'s current state
+    and written, so calling this again later (e.g. once a pending job has
+    finished running) updates the same row rather than creating a duplicate.
     """
     job_id = str(job.id)
     history = session.scalars(select(JobHistory).where(JobHistory.job_id == job_id)).one_or_none()
@@ -112,6 +112,8 @@ def record_job_history(session: Session, job: Job) -> JobHistory:
     history.status = job.status
     history.kind = job.kind
     history.priority = job.priority
+    history.scheduled_at = job.scheduled_at
+    history.expected_stream_count = job.expected_stream_count
     history.started_at = job.started_at
     history.ended_at = job.ended_at
     history.exit_code = _exit_code(job)

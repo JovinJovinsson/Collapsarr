@@ -22,6 +22,8 @@ from collapsarr.settings.models import (
     AUTH_METHOD_FORMS,
     AUTH_REQUIRED_ENABLED,
     AUTH_REQUIRED_LOCAL_BYPASS,
+    DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES,
+    DEFAULT_IGNORE_COMMENTARY_TRACKS,
     DEFAULT_RECENTLY_PROCESSED_WINDOW_MINUTES,
     LOG_LEVEL_DEBUG,
     LOG_LEVEL_INFO,
@@ -31,6 +33,7 @@ from collapsarr.settings.models import (
 )
 from collapsarr.settings.service import (
     _default_update_channel,
+    as_default_audio_preference,
     as_downmix_settings,
     get_global_settings,
     restore_auto_processing_pause,
@@ -704,6 +707,57 @@ def test_update_global_settings_auto_set_default_audio_is_switchable_back_off(
 
 
 # ---------------------------------------------------------------------------
+# Default Audio Delay (COL-243).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_default_audio_delay_default(session: Session) -> None:
+    """COL-243: a fresh row defaults to a 30-minute Default Audio Track delay."""
+    settings = get_global_settings(session)
+
+    assert settings.default_audio_delay_minutes == DEFAULT_DEFAULT_AUDIO_DELAY_MINUTES
+
+
+def test_update_global_settings_updates_default_audio_delay(session: Session) -> None:
+    updated = update_global_settings(session, default_audio_delay_minutes=45)
+
+    assert updated.default_audio_delay_minutes == 45
+
+
+def test_update_global_settings_default_audio_delay_accepts_zero(session: Session) -> None:
+    updated = update_global_settings(session, default_audio_delay_minutes=0)
+
+    assert updated.default_audio_delay_minutes == 0
+
+
+def test_update_global_settings_rejects_a_negative_default_audio_delay(
+    session: Session,
+) -> None:
+    with pytest.raises(ValueError, match="default_audio_delay_minutes"):
+        update_global_settings(session, default_audio_delay_minutes=-1)
+
+
+def test_update_global_settings_omitting_default_audio_delay_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, default_audio_delay_minutes=90)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.default_audio_delay_minutes == 90
+
+
+def test_update_global_settings_default_audio_delay_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, default_audio_delay_minutes=15)
+
+    reread = get_global_settings(session)
+
+    assert reread.default_audio_delay_minutes == 15
+
+
+# ---------------------------------------------------------------------------
 # Recently-Processed Window (COL-167).
 # ---------------------------------------------------------------------------
 
@@ -941,6 +995,55 @@ def test_restore_auto_processing_pause_is_idempotent(session: Session) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ignore Commentary Tracks (COL-244).
+# ---------------------------------------------------------------------------
+
+
+def test_get_global_settings_defaults_ignore_commentary_tracks_to_true(session: Session) -> None:
+    """AC: the new toggle defaults to on -- commentary tracks are ignored unless opted out."""
+    settings = get_global_settings(session)
+
+    assert settings.ignore_commentary_tracks is DEFAULT_IGNORE_COMMENTARY_TRACKS
+    assert settings.ignore_commentary_tracks is True
+
+
+def test_update_global_settings_updates_ignore_commentary_tracks(session: Session) -> None:
+    updated = update_global_settings(session, ignore_commentary_tracks=False)
+
+    assert updated.ignore_commentary_tracks is False
+
+
+def test_update_global_settings_ignore_commentary_tracks_is_switchable_back_on(
+    session: Session,
+) -> None:
+    update_global_settings(session, ignore_commentary_tracks=False)
+
+    updated = update_global_settings(session, ignore_commentary_tracks=True)
+
+    assert updated.ignore_commentary_tracks is True
+
+
+def test_update_global_settings_omitting_ignore_commentary_tracks_leaves_it_untouched(
+    session: Session,
+) -> None:
+    update_global_settings(session, ignore_commentary_tracks=False)
+
+    unchanged = update_global_settings(session, concurrency_limit=3)
+
+    assert unchanged.ignore_commentary_tracks is False
+
+
+def test_update_global_settings_ignore_commentary_tracks_persists_across_a_fresh_read(
+    session: Session,
+) -> None:
+    update_global_settings(session, ignore_commentary_tracks=False)
+
+    reread = get_global_settings(session)
+
+    assert reread.ignore_commentary_tracks is False
+
+
+# ---------------------------------------------------------------------------
 # Adapting to DownmixSettings.
 # ---------------------------------------------------------------------------
 
@@ -970,6 +1073,58 @@ def test_as_downmix_settings_adapts_customised_values(session: Session) -> None:
     assert downmix_settings.language_allow_list == frozenset({"eng"})
     assert downmix_settings.stereo_bitrate_kbps == 192
     assert downmix_settings.surround_bitrate_kbps == 640
+
+
+def test_as_downmix_settings_adapts_ignore_commentary_tracks(session: Session) -> None:
+    """COL-249: the toggle round-trips into DownmixSettings, in both directions."""
+    settings = update_global_settings(session, ignore_commentary_tracks=False)
+
+    downmix_settings = as_downmix_settings(settings)
+
+    assert downmix_settings.ignore_commentary_tracks is False
+
+
+# ---------------------------------------------------------------------------
+# Adapting to DefaultAudioPreference (COL-250).
+# ---------------------------------------------------------------------------
+
+
+def test_as_default_audio_preference_is_none_when_unset(session: Session) -> None:
+    settings = get_global_settings(session)
+
+    assert as_default_audio_preference(settings) is None
+
+
+def test_as_default_audio_preference_carries_ignore_commentary_tracks_default(
+    session: Session,
+) -> None:
+    """The column's own default (``True``) flows through untouched."""
+    settings = update_global_settings(
+        session, default_audio_language="eng", default_audio_channel_tier=DownmixTarget.STEREO
+    )
+
+    preference = as_default_audio_preference(settings)
+
+    assert preference is not None
+    assert preference.language == "eng"
+    assert preference.channel_tier == DownmixTarget.STEREO
+    assert preference.ignore_commentary_tracks == DEFAULT_IGNORE_COMMENTARY_TRACKS
+
+
+def test_as_default_audio_preference_carries_ignore_commentary_tracks_when_disabled(
+    session: Session,
+) -> None:
+    settings = update_global_settings(
+        session,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.STEREO,
+        ignore_commentary_tracks=False,
+    )
+
+    preference = as_default_audio_preference(settings)
+
+    assert preference is not None
+    assert preference.ignore_commentary_tracks is False
 
 
 # ---------------------------------------------------------------------------

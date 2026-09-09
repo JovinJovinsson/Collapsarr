@@ -797,6 +797,21 @@ a {
   background: var(--c-surface-raised);
 }
 
+/* COL-242: a pending Job whose scheduled_at is still in the future renders
+   as "Scheduled" instead of "Pending" -- same muted treatment as pending,
+   distinguished by the due-date/time line below it. */
+.activity-table__status--scheduled {
+  color: var(--c-text-muted);
+  background: var(--c-surface-raised);
+}
+
+.activity-table__scheduled-due {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+  color: var(--c-text-muted);
+  white-space: nowrap;
+}
+
 .activity-table__status--missing {
   color: var(--c-text-muted);
   background: var(--c-surface-raised);

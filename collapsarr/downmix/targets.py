@@ -21,6 +21,17 @@ qualifies for a given language only when all of the following hold:
 Multiple qualifying targets stack: a 7.1 source with every target enabled
 qualifies for Stereo, 2.1, *and* 5.1, none replacing the original 7.1 track.
 
+When :attr:`DownmixSettings.ignore_commentary_tracks` is on (the default —
+see :data:`~collapsarr.settings.models.DEFAULT_IGNORE_COMMENTARY_TRACKS`),
+streams :func:`~collapsarr.downmix.probe.is_commentary_track` flags are
+dropped before the per-language channel-count bookkeeping above runs (COL-249).
+A commentary track therefore never counts as "already present" for a tier
+(a 5.1 main track plus a 2.0 commentary track still qualifies for a *real*
+Stereo downmix) and never contributes to a language's highest existing
+channel count. A language whose *only* streams are commentary tracks drops
+out of consideration entirely, the same as a language excluded by
+``language_allow_list`` — there is no non-commentary source to downmix from.
+
 This is intentionally a pure function over plain data — no I/O, no DB. A
 persisted, DB-backed ``Settings`` model is out of scope for this ticket;
 :class:`DownmixSettings` is a settings-*shaped* plain dataclass that a real
@@ -34,7 +45,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from collapsarr.downmix.probe import AudioStreamInfo
+from collapsarr.downmix.probe import AudioStreamInfo, is_commentary_track
 
 
 class DownmixTarget(Enum):
@@ -80,6 +91,15 @@ class DownmixSettings:
     ``None`` (no explicit ``-b:a``, letting the AAC encoder pick its own
     default quality) since the design only calls out a fixed bitrate for
     the surround targets.
+
+    ``ignore_commentary_tracks`` (COL-244/COL-249) mirrors the global
+    :attr:`~collapsarr.settings.models.GlobalSettings.ignore_commentary_tracks`
+    setting it is adapted from (:func:`~collapsarr.settings.service.
+    as_downmix_settings`); defaults to ``True`` to match that column's
+    server default. When ``True``, :func:`detect_qualifying_targets` drops
+    every stream :func:`~collapsarr.downmix.probe.is_commentary_track`
+    flags before doing its per-language channel-count bookkeeping, so a
+    commentary track never counts as satisfying a tier.
     """
 
     enabled_targets: frozenset[DownmixTarget] = frozenset({DownmixTarget.STEREO})
@@ -88,6 +108,7 @@ class DownmixSettings:
     stereo_bitrate_kbps: int | None = None
     surround_codec: str = "ac3"
     surround_bitrate_kbps: int | None = 448
+    ignore_commentary_tracks: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +138,15 @@ def detect_qualifying_targets(
     When ``settings.language_allow_list`` is set, streams whose language
     isn't in it are excluded from consideration entirely — that language
     simply doesn't appear in the result, no error is raised.
+
+    When ``settings.ignore_commentary_tracks`` is ``True`` (COL-249),
+    streams :func:`~collapsarr.downmix.probe.is_commentary_track` flags are
+    excluded from the per-language bookkeeping the same way allow-list-excluded
+    streams are: a commentary track's channel count never counts as "already
+    present" for a tier and never raises a language's highest existing
+    channel count, so it can no longer mask a still-missing real downmix
+    track. A language left with no non-commentary streams simply doesn't
+    appear in the result, same as one excluded entirely by the allow-list.
     """
     channels_by_language: dict[str, set[int]] = defaultdict(set)
     for stream in streams:
@@ -124,6 +154,8 @@ def detect_qualifying_targets(
             settings.language_allow_list is not None
             and stream.language not in settings.language_allow_list
         ):
+            continue
+        if settings.ignore_commentary_tracks and is_commentary_track(stream):
             continue
         channels_by_language[stream.language].add(stream.channels)
 

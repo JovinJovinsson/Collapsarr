@@ -162,7 +162,12 @@ def _reconstruct_job(
     ``row.job_id`` so the rehydrated Job keeps the same identity its history
     row already carries: the next :func:`~collapsarr.jobs.history.
     record_job_history` call (once this Job actually runs) updates that same
-    row in place rather than creating a duplicate.
+    row in place rather than creating a duplicate. ``scheduled_at`` (COL-242)
+    and ``expected_stream_count`` (COL-251) are both carried over verbatim
+    from the row -- so a downmix-triggered ``SET_DEFAULT_AUDIO`` row's
+    due-time gate *and* its "stream not yet ingested" check both survive a
+    restart intact. ``None`` for every immediate-trigger row (and every row
+    written before either field existed).
 
     Returns a ``(job, None)`` pair on success. Returns ``(None, reason)`` --
     ``reason`` a short, human-readable explanation the caller
@@ -213,6 +218,8 @@ def _reconstruct_job(
                 preference=preference,
                 priority=row.priority,
                 status=JobStatus.PENDING,
+                scheduled_at=row.scheduled_at,
+                expected_stream_count=row.expected_stream_count,
             ),
             None,
         )
@@ -226,6 +233,7 @@ def _reconstruct_job(
                 kind=JobKind.DOWNMIX,
                 priority=row.priority,
                 status=JobStatus.PENDING,
+                scheduled_at=row.scheduled_at,
             ),
             None,
         )

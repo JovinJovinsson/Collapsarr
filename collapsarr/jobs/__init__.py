@@ -13,6 +13,7 @@ the Alembic migration environment (:mod:`collapsarr.migrations`).
 
 from __future__ import annotations
 
+from .default_audio_dispatch import make_default_audio_pipeline_runner
 from .failure_notify import make_failure_notifier, notify_job_failure
 from .history import (
     get_job_history,
@@ -24,6 +25,7 @@ from .models import JobHistory
 from .plex_analyze import make_plex_analyzer, trigger_plex_analyze
 from .queue import (
     DEFAULT_MAX_CONCURRENCY,
+    DefaultAudioAutoSchedule,
     DefaultAudioPipelineRunner,
     FailureNotifier,
     HistoryRecorder,
@@ -39,6 +41,7 @@ from .tracked_media import make_tracked_media_recorder, record_tracked_media
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
+    "DefaultAudioAutoSchedule",
     "DefaultAudioPipelineRunner",
     "FailureNotifier",
     "HistoryRecorder",
@@ -52,6 +55,7 @@ __all__ = [
     "TrackedMediaRecorder",
     "get_job_history",
     "list_job_history",
+    "make_default_audio_pipeline_runner",
     "make_failure_notifier",
     "make_history_recorder",
     "make_plex_analyzer",

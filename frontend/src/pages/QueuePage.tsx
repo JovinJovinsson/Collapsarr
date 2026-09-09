@@ -13,6 +13,35 @@ const STATUS_LABEL: Record<JobStatus, string> = {
   failed: "Failed",
 };
 
+/**
+ * A row's status as displayed -- {@link JobStatus} plus one purely-client-side
+ * derived value, `"scheduled"` (COL-242). There is no backend `"scheduled"`
+ * `JobStatus`: a scheduled row's `status` stays `"pending"` the whole time
+ * (see `JobHistoryEntry.scheduled_at`'s own doc comment) -- this type only
+ * exists to drive the label/badge this page renders.
+ */
+type DisplayStatus = JobStatus | "scheduled";
+
+const DISPLAY_STATUS_LABEL: Record<DisplayStatus, string> = {
+  ...STATUS_LABEL,
+  scheduled: "Scheduled",
+};
+
+/**
+ * The status to actually display for `entry` (COL-242): `"scheduled"` in
+ * place of `"pending"` when `scheduled_at` is set and still in the future
+ * (matching the worker pool's own claim gate,
+ * `JobQueue._lowest_priority_pending_locked`) -- every other row's own
+ * `status` is shown unchanged. An unparseable `scheduled_at` is treated as
+ * "not scheduled" (falls back to the plain `status`) rather than throwing.
+ */
+function displayStatus(entry: JobHistoryEntry): DisplayStatus {
+  if (entry.status !== "pending" || !entry.scheduled_at) return entry.status;
+  const due = new Date(entry.scheduled_at).getTime();
+  if (Number.isNaN(due) || due <= Date.now()) return entry.status;
+  return "scheduled";
+}
+
 /** How often to re-poll `GET /api/jobs/queue` while the queue has running/pending content. */
 const POLL_INTERVAL_ACTIVE_MS = 5_000;
 
@@ -730,6 +759,7 @@ export function QueuePage() {
                 // COL-192/COL-193) -- Bump stays pending-only, above.
                 const canCancel = isPendingRow || entry.status === "running";
                 const rowAction = pendingActions[entry.job_id] ?? null;
+                const shownStatus = displayStatus(entry);
                 return (
                   <tr key={entry.id}>
                     <td>
@@ -743,10 +773,15 @@ export function QueuePage() {
                     </td>
                     <td>
                       <span
-                        className={`activity-table__status activity-table__status--${entry.status}`}
+                        className={`activity-table__status activity-table__status--${shownStatus}`}
                       >
-                        {STATUS_LABEL[entry.status]}
+                        {DISPLAY_STATUS_LABEL[shownStatus]}
                       </span>
+                      {shownStatus === "scheduled" && (
+                        <div className="activity-table__scheduled-due">
+                          Due {formatTimestamp(entry.scheduled_at)}
+                        </div>
+                      )}
                     </td>
                     <td>{formatTimestamp(entry.started_at)}</td>
                     <td>{entry.target ?? "—"}</td>

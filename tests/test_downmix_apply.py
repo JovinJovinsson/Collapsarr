@@ -182,11 +182,40 @@ def _summary_runner(
     by_path: dict[str, tuple[float, int]],
     *,
     fail_paths: frozenset[str] = frozenset(),
+    audio_streams_by_path: dict[str, list[dict[str, object]]] | None = None,
+    audio_probe_fail_paths: frozenset[str] = frozenset(),
 ) -> object:
-    """Return a runner that answers ffprobe with canned (duration, stream_count) per path."""
+    """Return a runner that answers ffprobe with canned (duration, stream_count) per path.
+
+    ``audio_streams_by_path`` (COL-241) additionally answers
+    :func:`~collapsarr.downmix.probe.probe_audio_streams`-shaped calls (the
+    post-swap disposition re-probe :func:`apply_remux_result` makes when
+    given an ``expected_default_audio_index``) -- distinguished from the
+    duration/stream-count probe by ``-select_streams`` being present in the
+    command -- with the raw ffprobe stream dicts for that path.
+
+    ``audio_probe_fail_paths`` (COL-241) fails *only* that
+    ``-select_streams`` call for the given path (a non-zero exit), kept
+    separate from ``fail_paths`` (which only ever applies to the duration/
+    stream-count probe) so a test can make the post-swap re-probe itself
+    fail without also failing the pre-swap duration/stream-count probes of
+    the same path.
+    """
 
     def runner(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         path = command[-1]
+        if "-select_streams" in command:
+            if path in audio_probe_fail_paths:
+                return subprocess.CompletedProcess(
+                    args=list(command), returncode=1, stdout="", stderr="Invalid data"
+                )
+            streams = (audio_streams_by_path or {}).get(path, [])
+            return subprocess.CompletedProcess(
+                args=list(command),
+                returncode=0,
+                stdout=json.dumps({"streams": streams}),
+                stderr="",
+            )
         if path in fail_paths:
             return subprocess.CompletedProcess(
                 args=list(command), returncode=1, stdout="", stderr="Invalid data"
@@ -276,6 +305,264 @@ def test_apply_rejects_stream_count_mismatch_deletes_temp_keeps_original(
     assert original.read_bytes() == b"ORIGINAL"
     assert not temp.exists()
     assert list(tmp_path.iterdir()) == [original]
+
+
+# ---------------------------------------------------------------------------
+# Post-swap disposition verification (COL-241): `expected_default_audio_index`.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_verifies_disposition_and_succeeds_when_expected_stream_is_sole_default(
+    tmp_path: Path,
+) -> None:
+    original, temp, remux = _make_files(tmp_path)
+    runner = _summary_runner(
+        {str(original): (100.0, 2), str(temp): (100.0, 2)},
+        audio_streams_by_path={
+            str(original): [
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "channels": 2,
+                    "disposition": {"default": 0},
+                },
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "ac3",
+                    "channels": 6,
+                    "disposition": {"default": 1},
+                },
+            ]
+        },
+    )
+
+    result = apply_remux_result(
+        original,
+        remux,
+        added_track_count=0,
+        runner=runner,  # type: ignore[arg-type]
+        expected_default_audio_index=1,
+    )
+
+    assert result.success is True
+    assert result.failure_reason is None
+    assert result.applied_path == original
+    assert "disposition verified" in result.detail
+    assert original.read_bytes() == b"REMUXED-TEMP"
+    assert not temp.exists()
+
+
+def test_apply_rejects_disposition_mismatch_but_cannot_revert_the_already_applied_swap(
+    tmp_path: Path,
+) -> None:
+    """The swap happens before the post-swap disposition check -- a mismatch can't undo it."""
+    original, temp, remux = _make_files(tmp_path)
+    runner = _summary_runner(
+        {str(original): (100.0, 2), str(temp): (100.0, 2)},
+        audio_streams_by_path={
+            str(original): [
+                # Wrong stream ended up flagged default (a:0, not the
+                # expected a:1) -- e.g. a stale/incorrect disposition index.
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "channels": 2,
+                    "disposition": {"default": 1},
+                },
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "ac3",
+                    "channels": 6,
+                    "disposition": {"default": 0},
+                },
+            ]
+        },
+    )
+
+    result = apply_remux_result(
+        original,
+        remux,
+        added_track_count=0,
+        runner=runner,  # type: ignore[arg-type]
+        expected_default_audio_index=1,
+    )
+
+    assert result.success is False
+    assert result.failure_reason is ApplyFailureReason.DISPOSITION_MISMATCH
+    assert result.applied_path is None
+    assert "disposition mismatch" in result.detail
+    # Unlike DURATION_MISMATCH/STREAM_COUNT_MISMATCH (both checked *before*
+    # the rename), the swap already happened by the time this check runs and
+    # there's no backup to revert to: the original path now holds the temp's
+    # bytes, not the pre-swap original's.
+    assert original.read_bytes() == b"REMUXED-TEMP"
+    assert not temp.exists()
+    assert list(tmp_path.iterdir()) == [original]
+
+
+def test_apply_reports_disposition_mismatch_when_no_stream_is_default(tmp_path: Path) -> None:
+    original, temp, remux = _make_files(tmp_path)
+    runner = _summary_runner(
+        {str(original): (100.0, 2), str(temp): (100.0, 2)},
+        audio_streams_by_path={
+            str(original): [
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "channels": 2,
+                    "disposition": {"default": 0},
+                },
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "ac3",
+                    "channels": 6,
+                    "disposition": {"default": 0},
+                },
+            ]
+        },
+    )
+
+    result = apply_remux_result(
+        original,
+        remux,
+        added_track_count=0,
+        runner=runner,  # type: ignore[arg-type]
+        expected_default_audio_index=1,
+    )
+
+    assert result.success is False
+    assert result.failure_reason is ApplyFailureReason.DISPOSITION_MISMATCH
+    assert "disposition mismatch" in result.detail
+
+
+def test_apply_reports_disposition_mismatch_when_an_extra_stream_is_also_default(
+    tmp_path: Path,
+) -> None:
+    """The expected stream IS flagged default, but so -- wrongly -- is another one."""
+    original, temp, remux = _make_files(tmp_path)
+    runner = _summary_runner(
+        {str(original): (100.0, 2), str(temp): (100.0, 2)},
+        audio_streams_by_path={
+            str(original): [
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "channels": 2,
+                    "disposition": {"default": 1},
+                },
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "ac3",
+                    "channels": 6,
+                    "disposition": {"default": 1},
+                },
+            ]
+        },
+    )
+
+    result = apply_remux_result(
+        original,
+        remux,
+        added_track_count=0,
+        runner=runner,  # type: ignore[arg-type]
+        expected_default_audio_index=1,
+    )
+
+    assert result.success is False
+    assert result.failure_reason is ApplyFailureReason.DISPOSITION_MISMATCH
+    assert "disposition mismatch" in result.detail
+
+
+def test_apply_reports_disposition_mismatch_when_expected_index_is_out_of_range(
+    tmp_path: Path,
+) -> None:
+    """A defensive guard: an `expected_default_audio_index` beyond the post-swap layout."""
+    original, temp, remux = _make_files(tmp_path)
+    runner = _summary_runner(
+        {str(original): (100.0, 1), str(temp): (100.0, 1)},
+        audio_streams_by_path={
+            str(original): [
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "channels": 2,
+                    "disposition": {"default": 0},
+                },
+            ]
+        },
+    )
+
+    result = apply_remux_result(
+        original,
+        remux,
+        added_track_count=0,
+        runner=runner,  # type: ignore[arg-type]
+        expected_default_audio_index=1,  # only index 0 exists post-swap
+    )
+
+    assert result.success is False
+    assert result.failure_reason is ApplyFailureReason.DISPOSITION_MISMATCH
+    assert "disposition mismatch" in result.detail
+    assert "out of range" in result.detail
+
+
+def test_apply_reports_disposition_verification_failed_when_post_swap_reprobe_errors(
+    tmp_path: Path,
+) -> None:
+    """The swap already happened; the *re-probe* itself fails, so verification never ran.
+
+    Distinct from DISPOSITION_MISMATCH (which means the re-probe completed
+    and found the wrong result) and from a pre-swap FfprobeError (which
+    means the original is still untouched) -- this is neither: the swap
+    already happened *and* whether the disposition landed was never
+    actually confirmed.
+    """
+    original, temp, remux = _make_files(tmp_path)
+    runner = _summary_runner(
+        {str(original): (100.0, 2), str(temp): (100.0, 2)},
+        audio_probe_fail_paths=frozenset({str(original)}),
+    )
+
+    result = apply_remux_result(
+        original,
+        remux,
+        added_track_count=0,
+        runner=runner,  # type: ignore[arg-type]
+        expected_default_audio_index=1,
+    )
+
+    assert result.success is False
+    assert result.failure_reason is ApplyFailureReason.DISPOSITION_VERIFICATION_FAILED
+    assert result.applied_path is None
+    assert "disposition verification failed" in result.detail
+    assert "never confirmed" in result.detail
+    # The swap itself already happened (unlike the pre-swap probe-failure
+    # case below, where the rename never occurs at all).
+    assert original.read_bytes() == b"REMUXED-TEMP"
+    assert not temp.exists()
+
+
+def test_apply_skips_disposition_check_when_index_not_supplied(tmp_path: Path) -> None:
+    """Every existing caller that omits `expected_default_audio_index` is unaffected."""
+    original, temp, remux = _make_files(tmp_path)
+    # No `audio_streams_by_path` entries at all -- if the disposition check
+    # ran, `probe_audio_streams` would see an empty streams list and this
+    # would fail. It must not run at all when the parameter is omitted.
+    runner = _summary_runner({str(original): (100.0, 2), str(temp): (100.0, 2)})
+
+    result = apply_remux_result(original, remux, added_track_count=0, runner=runner)  # type: ignore[arg-type]
+
+    assert result.success is True
+    assert "disposition verified" not in result.detail
 
 
 def test_apply_uses_default_tolerance_when_unspecified(tmp_path: Path) -> None:
