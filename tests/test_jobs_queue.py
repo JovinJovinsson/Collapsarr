@@ -1992,7 +1992,13 @@ def test_from_settings_schedules_a_default_audio_job_when_toggle_on(tmp_path: Pa
     scheduled_job = next(job for job in jobs if job.kind is JobKind.SET_DEFAULT_AUDIO)
     assert scheduled_job.scheduled_at == _FIXED_NOW + timedelta(minutes=45)
     assert scheduled_job.expected_stream_count == 3
-    assert scheduled_job.preference == _DEFAULT_AUDIO_PREFERENCE
+    # Built via the real `as_default_audio_preference` adapter (COL-250), so it
+    # also carries the persisted `ignore_commentary_tracks` column's own
+    # default (True) -- unlike `_DEFAULT_AUDIO_PREFERENCE`, which every other
+    # test in this module constructs directly and passes straight back in.
+    assert scheduled_job.preference == DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE, ignore_commentary_tracks=True
+    )
 
 
 def test_from_settings_schedules_nothing_when_toggle_off(tmp_path: Path) -> None:

@@ -33,6 +33,7 @@ from collapsarr.settings.models import (
 )
 from collapsarr.settings.service import (
     _default_update_channel,
+    as_default_audio_preference,
     as_downmix_settings,
     get_global_settings,
     restore_auto_processing_pause,
@@ -1072,6 +1073,49 @@ def test_as_downmix_settings_adapts_customised_values(session: Session) -> None:
     assert downmix_settings.language_allow_list == frozenset({"eng"})
     assert downmix_settings.stereo_bitrate_kbps == 192
     assert downmix_settings.surround_bitrate_kbps == 640
+
+
+# ---------------------------------------------------------------------------
+# Adapting to DefaultAudioPreference (COL-250).
+# ---------------------------------------------------------------------------
+
+
+def test_as_default_audio_preference_is_none_when_unset(session: Session) -> None:
+    settings = get_global_settings(session)
+
+    assert as_default_audio_preference(settings) is None
+
+
+def test_as_default_audio_preference_carries_ignore_commentary_tracks_default(
+    session: Session,
+) -> None:
+    """The column's own default (``True``) flows through untouched."""
+    settings = update_global_settings(
+        session, default_audio_language="eng", default_audio_channel_tier=DownmixTarget.STEREO
+    )
+
+    preference = as_default_audio_preference(settings)
+
+    assert preference is not None
+    assert preference.language == "eng"
+    assert preference.channel_tier == DownmixTarget.STEREO
+    assert preference.ignore_commentary_tracks == DEFAULT_IGNORE_COMMENTARY_TRACKS
+
+
+def test_as_default_audio_preference_carries_ignore_commentary_tracks_when_disabled(
+    session: Session,
+) -> None:
+    settings = update_global_settings(
+        session,
+        default_audio_language="eng",
+        default_audio_channel_tier=DownmixTarget.STEREO,
+        ignore_commentary_tracks=False,
+    )
+
+    preference = as_default_audio_preference(settings)
+
+    assert preference is not None
+    assert preference.ignore_commentary_tracks is False
 
 
 # ---------------------------------------------------------------------------
