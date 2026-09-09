@@ -232,6 +232,22 @@ def test_ignore_commentary_tracks_detects_via_extended_display_title() -> None:
     assert result == streams[0]
 
 
+def test_ignore_commentary_tracks_excludes_from_language_fallback() -> None:
+    streams = [
+        _stream(stream_id="1", channels=2, language="jpn"),
+        _stream(stream_id="2", channels=6, language="fre", title="Commentary"),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    # eng isn't present at all; fre's only track is commentary and excluded,
+    # so the best-available *non-commentary* stream overall wins: jpn.
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[0]
+
+
 def test_ignore_commentary_tracks_falls_back_to_commentary_when_all_streams_are_commentary() -> (
     None
 ):
