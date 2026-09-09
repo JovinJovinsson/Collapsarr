@@ -57,6 +57,7 @@ def test_get_settings_returns_documented_defaults(client: TestClient) -> None:
     assert body["recently_processed_window_minutes"] == 360  # COL-167 default
     assert body["auto_queue_paused"] is False  # COL-174 default
     assert body["auto_processing_paused"] is False  # COL-226 default
+    assert body["ignore_commentary_tracks"] is True  # COL-244 default
     assert body["api_key"]  # auto-generated, surfaced read-only
     assert "created_at" in body
     assert "updated_at" in body
@@ -714,6 +715,53 @@ def test_put_settings_auto_processing_paused_does_not_affect_auto_queue_paused(
     body = response.json()
     assert body["auto_processing_paused"] is True
     assert body["auto_queue_paused"] is False
+
+
+# --- Ignore Commentary Tracks (COL-244) -----------------------------------------
+
+
+def test_put_settings_sets_ignore_commentary_tracks(client: TestClient) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"ignore_commentary_tracks": False},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["ignore_commentary_tracks"] is False
+
+    # Persisted -- a fresh GET reflects it.
+    follow_up = client.get("/api/settings", headers=_auth_headers(client))
+    assert follow_up.json()["ignore_commentary_tracks"] is False
+
+
+def test_put_settings_ignore_commentary_tracks_is_switchable_back_on(client: TestClient) -> None:
+    client.put(
+        "/api/settings", json={"ignore_commentary_tracks": False}, headers=_auth_headers(client)
+    )
+
+    response = client.put(
+        "/api/settings",
+        json={"ignore_commentary_tracks": True},
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["ignore_commentary_tracks"] is True
+
+
+def test_put_settings_leaves_ignore_commentary_tracks_untouched_when_omitted(
+    client: TestClient,
+) -> None:
+    client.put(
+        "/api/settings", json={"ignore_commentary_tracks": False}, headers=_auth_headers(client)
+    )
+
+    client.put("/api/settings", json={"concurrency_limit": 3}, headers=_auth_headers(client))
+
+    body = client.get("/api/settings", headers=_auth_headers(client)).json()
+    assert body["ignore_commentary_tracks"] is False
+    assert body["concurrency_limit"] == 3
 
 
 # --- auth-required behaviour ---------------------------------------------------

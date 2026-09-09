@@ -97,6 +97,13 @@ takes effect on the next claim with no restart -- see
 :attr:`~collapsarr.settings.models.GlobalSettings.auto_processing_paused`'s
 own docstring for exactly what it does and does not gate, distinct from
 ``auto_queue_paused`` above.
+
+``ignore_commentary_tracks`` (COL-244) follows the same "only change what's
+passed" rule as every other boolean field here (``ui_auth_enabled``,
+``default_tracked``, ``auto_set_default_audio``). Not yet read by any
+caller -- see :attr:`~collapsarr.settings.models.GlobalSettings.
+ignore_commentary_tracks`'s own docstring for the tickets that will
+eventually consume it.
 """
 
 from __future__ import annotations
@@ -233,6 +240,7 @@ def update_global_settings(
     recently_processed_window_minutes: int | None = None,
     auto_queue_paused: bool | None = None,
     auto_processing_paused: bool | None = None,
+    ignore_commentary_tracks: bool | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -315,6 +323,11 @@ def update_global_settings(
     below (:class:`ValueError` on a negative value; ``0`` is valid). Not yet
     read by any caller -- see :attr:`~collapsarr.settings.models.
     GlobalSettings.default_audio_delay_minutes`'s own docstring.
+
+    ``ignore_commentary_tracks`` (COL-244) follows the same "only change
+    what's passed" rule as every other boolean field here. Not yet read by
+    any caller -- see :attr:`~collapsarr.settings.models.GlobalSettings.
+    ignore_commentary_tracks`'s own docstring.
     """
     settings = get_global_settings(session)
 
@@ -389,6 +402,8 @@ def update_global_settings(
         settings.auto_queue_paused = auto_queue_paused
     if auto_processing_paused is not None:
         settings.auto_processing_paused = auto_processing_paused
+    if ignore_commentary_tracks is not None:
+        settings.ignore_commentary_tracks = ignore_commentary_tracks
 
     session.commit()
     session.refresh(settings)

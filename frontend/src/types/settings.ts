@@ -135,6 +135,14 @@ export interface GlobalSettings {
    * Default `false`.
    */
   auto_processing_paused: boolean;
+  /**
+   * Ignore Commentary Tracks (COL-244). When `true`, commentary audio
+   * tracks are excluded from consideration by both channel-layout
+   * detection/target selection and Preferred Default Audio resolution.
+   * Default `true`. Not yet consumed by any detection/eligibility/
+   * resolution logic -- that wiring lands in COL-249/COL-250.
+   */
+  ignore_commentary_tracks: boolean;
   /** Auto-generated, read-only -- never set through this body. */
   api_key: string;
   created_at: string;
@@ -173,4 +181,5 @@ export interface GlobalSettingsUpdateInput {
   recently_processed_window_minutes?: number;
   auto_queue_paused?: boolean;
   auto_processing_paused?: boolean;
+  ignore_commentary_tracks?: boolean;
 }

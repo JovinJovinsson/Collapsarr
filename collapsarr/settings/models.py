@@ -148,6 +148,16 @@ gate -- distinct from :data:`DEFAULT_AUTO_QUEUE_PAUSED`'s "Auto-Queuing
 Pause", which only gates the scanner's enqueue/top-up funnel and never
 touches an already-``PENDING``/``RUNNING`` Job."""
 
+DEFAULT_IGNORE_COMMENTARY_TRACKS = True
+"""Default :attr:`GlobalSettings.ignore_commentary_tracks` for a fresh install
+/ an existing row backfilled by the additive migration (COL-244). On by
+default -- commentary tracks are noise for both channel-layout detection and
+Default Audio Track resolution, so the common case is to skip them without
+requiring an operator to opt in. Not yet consumed by any detection/
+eligibility/resolution logic -- this ticket only persists the knob and
+exposes it in Settings; COL-249/COL-250 are the follow-up tickets that read
+it."""
+
 DEFAULT_AUTO_PROCESSING_PAUSE_RESTORE_VALUE = None
 """Default :attr:`GlobalSettings.auto_processing_pause_restore_value` for a
 fresh install / an existing row backfilled by the additive migration
@@ -418,6 +428,17 @@ class GlobalSettings(Base):
     make_ffmpeg_check_run`'s ``run`` callable (probes this path instead of
     the bare default when set).
 
+    ``ignore_commentary_tracks`` (COL-244) is the global toggle deciding
+    whether commentary audio tracks are excluded from consideration -- both
+    the downmix pipeline's channel-layout detection/target selection and the
+    Preferred Default Audio resolution above. Carries a DB-side
+    ``server_default`` (matching ``auto_set_default_audio`` above) so the
+    additive migration backfills existing installs to ``True`` rather than
+    leaving the column ``NULL``. Not yet read by any caller -- COL-249
+    (detection/eligibility) and COL-250 (resolution) are the follow-up
+    tickets that will consume it; this ticket only persists the knob and
+    exposes it in Settings.
+
     ``auto_processing_pause_restore_value`` (COL-230, consumed by COL-233) is
     a nullable *scratch* boolean backing the self-update apply flow's
     one-shot "pause processing, apply the update, then restore whatever the
@@ -560,6 +581,13 @@ class GlobalSettings(Base):
     )
 
     ffmpeg_path: Mapped[str | None] = mapped_column(String(500), nullable=True, default=None)
+
+    ignore_commentary_tracks: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=DEFAULT_IGNORE_COMMENTARY_TRACKS,
+        server_default=text("1"),
+    )
 
     auto_processing_pause_restore_value: Mapped[bool | None] = mapped_column(
         Boolean, nullable=True, default=DEFAULT_AUTO_PROCESSING_PAUSE_RESTORE_VALUE

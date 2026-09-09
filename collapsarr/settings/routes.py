@@ -124,6 +124,12 @@ see :class:`~collapsarr.settings.models.GlobalSettings`'s own docstring for
 the full scope. ``JobQueue`` reads it live on every claim attempt via its
 injected ``pause_check`` callable, so a ``PUT`` here takes effect on the very
 next claim with no restart.
+
+``ignore_commentary_tracks`` (COL-244) is also read/write here -- a plain
+boolean, same treatment as ``ui_auth_enabled``/``default_tracked``/
+``auto_set_default_audio``, no dedicated endpoint. Not yet consumed by any
+detection/eligibility/resolution logic -- COL-249/COL-250 are the follow-up
+tickets that will read it.
 """
 
 from __future__ import annotations
@@ -202,6 +208,7 @@ class SettingsRead(BaseModel):
     recently_processed_window_minutes: int
     auto_queue_paused: bool
     auto_processing_paused: bool
+    ignore_commentary_tracks: bool
     api_key: str
     created_at: datetime
     updated_at: datetime
@@ -242,6 +249,7 @@ class SettingsUpdate(BaseModel):
     recently_processed_window_minutes: int | None = Field(default=None, ge=0)
     auto_queue_paused: bool | None = None
     auto_processing_paused: bool | None = None
+    ignore_commentary_tracks: bool | None = None
 
 
 def _to_read(settings: GlobalSettings) -> SettingsRead:
@@ -285,6 +293,7 @@ def _to_read(settings: GlobalSettings) -> SettingsRead:
         recently_processed_window_minutes=settings.recently_processed_window_minutes,
         auto_queue_paused=settings.auto_queue_paused,
         auto_processing_paused=settings.auto_processing_paused,
+        ignore_commentary_tracks=settings.ignore_commentary_tracks,
         api_key=settings.api_key,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
@@ -367,6 +376,8 @@ def update_settings_endpoint(
         kwargs["auto_queue_paused"] = body.auto_queue_paused
     if "auto_processing_paused" in provided:
         kwargs["auto_processing_paused"] = body.auto_processing_paused
+    if "ignore_commentary_tracks" in provided:
+        kwargs["ignore_commentary_tracks"] = body.ignore_commentary_tracks
 
     updated = update_global_settings(session, **kwargs)  # type: ignore[arg-type]
     if "log_level" in provided:

@@ -34,6 +34,7 @@ const sampleSettings: GlobalSettings = {
   recently_processed_window_minutes: 360,
   auto_queue_paused: false,
   auto_processing_paused: false,
+  ignore_commentary_tracks: true,
   api_key: "abc123",
   created_at: "2026-07-27T00:00:00Z",
   updated_at: "2026-07-27T00:00:00Z",
