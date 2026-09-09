@@ -1988,7 +1988,14 @@ _SURROUND_TWO_LANGUAGES_NEEDS_DEFAULT_AUDIO_FIX: list[AudioStreamInfo] = [
     ),
 ]
 
-_PREFERENCE = DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE)
+# `ignore_commentary_tracks=True` matches the persisted column's own default
+# (COL-244) -- `_configure_preference` below only ever writes
+# language/channel_tier, so `job.preference` (re-derived via the real
+# `as_default_audio_preference` adapter, COL-250) always carries that default
+# too.
+_PREFERENCE = DefaultAudioPreference(
+    language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE, ignore_commentary_tracks=True
+)
 
 
 def _configure_preference(session_factory: sessionmaker[Session]) -> None:

@@ -26,6 +26,7 @@ from collapsarr.downmix.probe import (
     FfprobeError,
     FfprobeNotFoundError,
     MediaSummary,
+    is_commentary_track,
     probe_audio_streams,
     probe_media_summary,
 )
@@ -400,6 +401,154 @@ def test_stream_with_no_disposition_metadata_reports_is_default_false() -> None:
             is_default=False,
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# title / is_commentary parsing + is_commentary_track (COL-246).
+# ---------------------------------------------------------------------------
+
+
+def test_stream_title_tag_is_parsed() -> None:
+    """A stream's ``tags.title`` free-text tag is surfaced on ``title``."""
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_name": "ac3",
+                "codec_type": "audio",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "tags": {"language": "eng", "title": "Director's Commentary"},
+            }
+        ]
+    }
+    _, runner = _stub_runner(stdout=json.dumps(payload))
+
+    streams = probe_audio_streams("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert streams == [
+        AudioStreamInfo(
+            index=0,
+            codec="ac3",
+            channels=2,
+            channel_layout="stereo",
+            language="eng",
+            title="Director's Commentary",
+        )
+    ]
+
+
+def test_stream_with_no_title_tag_reports_title_none() -> None:
+    """A stream with no ``tags.title`` (or no ``tags`` at all) reports ``title=None``."""
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_name": "aac",
+                "codec_type": "audio",
+                "channels": 2,
+                "channel_layout": "stereo",
+            }
+        ]
+    }
+    _, runner = _stub_runner(stdout=json.dumps(payload))
+
+    streams = probe_audio_streams("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert streams == [
+        AudioStreamInfo(
+            index=0, codec="aac", channels=2, channel_layout="stereo", language="unknown"
+        )
+    ]
+    assert streams[0].title is None
+
+
+def test_stream_explicitly_flagged_comment_reports_is_commentary_true() -> None:
+    """A stream with ``disposition.comment = 1`` is reported via ``is_commentary``."""
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_name": "aac",
+                "codec_type": "audio",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "tags": {"language": "eng"},
+                "disposition": {"comment": 1},
+            }
+        ]
+    }
+    _, runner = _stub_runner(stdout=json.dumps(payload))
+
+    streams = probe_audio_streams("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert streams == [
+        AudioStreamInfo(
+            index=0,
+            codec="aac",
+            channels=2,
+            channel_layout="stereo",
+            language="eng",
+            is_commentary=True,
+        )
+    ]
+
+
+def test_stream_with_no_disposition_metadata_reports_is_commentary_false() -> None:
+    """A stream missing the disposition block entirely probes ``is_commentary=False``."""
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_name": "aac",
+                "codec_type": "audio",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "tags": {"language": "eng"},
+            }
+        ]
+    }
+    _, runner = _stub_runner(stdout=json.dumps(payload))
+
+    streams = probe_audio_streams("/media/movie.mkv", runner=runner)  # type: ignore[arg-type]
+
+    assert streams[0].is_commentary is False
+
+
+def _stream(*, title: str | None = None, is_commentary: bool = False) -> AudioStreamInfo:
+    return AudioStreamInfo(
+        index=0,
+        codec="ac3",
+        channels=2,
+        channel_layout="stereo",
+        language="eng",
+        title=title,
+        is_commentary=is_commentary,
+    )
+
+
+def test_is_commentary_track_true_for_disposition_flag_alone() -> None:
+    """``disposition.comment`` set, with no telling title, is enough on its own."""
+    assert is_commentary_track(_stream(title=None, is_commentary=True)) is True
+
+
+def test_is_commentary_track_true_for_title_alone() -> None:
+    """A title containing "comment", with the disposition flag unset, is enough on its own."""
+    assert is_commentary_track(_stream(title="Commentary Track", is_commentary=False)) is True
+
+
+def test_is_commentary_track_title_match_is_case_insensitive() -> None:
+    assert is_commentary_track(_stream(title="DIRECTOR'S COMMENTARY", is_commentary=False)) is True
+    assert is_commentary_track(_stream(title="director's commentary", is_commentary=False)) is True
+
+
+def test_is_commentary_track_true_when_both_signals_present() -> None:
+    assert is_commentary_track(_stream(title="Commentary", is_commentary=True)) is True
+
+
+def test_is_commentary_track_false_when_neither_signal_present() -> None:
+    assert is_commentary_track(_stream(title="English", is_commentary=False)) is False
+    assert is_commentary_track(_stream(title=None, is_commentary=False)) is False
 
 
 # ---------------------------------------------------------------------------

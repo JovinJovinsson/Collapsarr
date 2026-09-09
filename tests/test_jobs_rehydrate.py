@@ -341,8 +341,11 @@ def test_rehydrate_reconstructs_set_default_audio_job_with_fresh_preference(
     (job,) = rehydrate_pending_jobs(session, queue)
 
     assert job.kind is JobKind.SET_DEFAULT_AUDIO
+    # Re-derived via the real `as_default_audio_preference` adapter (COL-250),
+    # so it also carries the persisted `ignore_commentary_tracks` column's own
+    # default (True).
     assert job.preference == DefaultAudioPreference(
-        language="en", channel_tier=DownmixTarget.FIVE_POINT_ONE
+        language="en", channel_tier=DownmixTarget.FIVE_POINT_ONE, ignore_commentary_tracks=True
     )
 
 

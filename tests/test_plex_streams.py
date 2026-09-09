@@ -8,7 +8,7 @@ payloads directly as plain dicts (no httpx/network involved), mirroring
 
 from __future__ import annotations
 
-from collapsarr.plex.streams import PlexAudioStream, parse_audio_streams
+from collapsarr.plex.streams import PlexAudioStream, is_commentary_track, parse_audio_streams
 
 
 def _metadata_payload(streams: list[object]) -> dict[str, object]:
@@ -243,3 +243,52 @@ def test_empty_stream_list_returns_empty_list() -> None:
     payload = _metadata_payload([])
 
     assert parse_audio_streams(payload) == []
+
+
+# ---------------------------------------------------------------------------
+# is_commentary_track: title-only detection, no native Plex disposition (COL-246).
+# ---------------------------------------------------------------------------
+
+
+def _stream(
+    *, title: str | None = None, extended_display_title: str | None = None
+) -> PlexAudioStream:
+    return PlexAudioStream(
+        id="1",
+        channels=2,
+        language="eng",
+        title=title,
+        extended_display_title=extended_display_title,
+        selected=False,
+    )
+
+
+def test_is_commentary_track_true_for_title_containing_comment() -> None:
+    assert is_commentary_track(_stream(title="Director's Commentary")) is True
+
+
+def test_is_commentary_track_true_for_extended_display_title_containing_comment() -> None:
+    assert (
+        is_commentary_track(
+            _stream(title=None, extended_display_title="English (Commentary, AC3 2.0)")
+        )
+        is True
+    )
+
+
+def test_is_commentary_track_match_is_case_insensitive() -> None:
+    assert is_commentary_track(_stream(title="COMMENTARY")) is True
+    assert is_commentary_track(_stream(title="commentary")) is True
+
+
+def test_is_commentary_track_false_when_neither_field_mentions_comment() -> None:
+    assert (
+        is_commentary_track(
+            _stream(title="English", extended_display_title="English (AC3 5.1)")
+        )
+        is False
+    )
+
+
+def test_is_commentary_track_false_when_both_fields_are_none() -> None:
+    assert is_commentary_track(_stream(title=None, extended_display_title=None)) is False

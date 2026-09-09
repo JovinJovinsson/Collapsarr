@@ -25,6 +25,8 @@ def _stream(
     language: str = "eng",
     codec: str = "flac",
     is_default: bool = False,
+    is_commentary: bool = False,
+    title: str | None = None,
 ) -> AudioStreamInfo:
     return AudioStreamInfo(
         index=index,
@@ -33,6 +35,8 @@ def _stream(
         channel_layout=f"{channels}ch",
         language=language,
         is_default=is_default,
+        is_commentary=is_commentary,
+        title=title,
     )
 
 
@@ -178,6 +182,111 @@ def test_unknown_language_preference_is_treated_like_any_other_language() -> Non
 
 
 # ---------------------------------------------------------------------------
+# Commentary exclusion (COL-250): ignore_commentary_tracks removes commentary
+# streams from the candidate pool at every resolution step, unless every
+# stream on the file is commentary.
+# ---------------------------------------------------------------------------
+
+
+def test_ignore_commentary_tracks_off_lets_a_commentary_track_win_exact_match() -> None:
+    """Default (``False``) preserves pre-COL-250 behavior: no filtering at all."""
+    streams = [
+        _stream(index=0, channels=6, language="eng"),
+        _stream(index=1, channels=2, language="eng", is_commentary=True),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=False
+    )
+
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[1]
+
+
+def test_ignore_commentary_tracks_excludes_exact_match_commentary_stream() -> None:
+    """A commentary track that would otherwise be the exact match is skipped."""
+    streams = [
+        _stream(index=0, channels=6, language="eng"),
+        _stream(index=1, channels=2, language="eng", is_commentary=True),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    # No non-commentary eng stereo track exists -> falls through to tier
+    # fallback within eng, landing on the non-commentary 6ch stream.
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[0]
+
+
+def test_ignore_commentary_tracks_detects_via_title_not_just_disposition_flag() -> None:
+    """Title-based detection (`is_commentary_track`'s other signal) is honored too."""
+    streams = [
+        _stream(index=0, channels=6, language="eng"),
+        _stream(
+            index=1, channels=6, language="eng", title="Director's Commentary", is_commentary=False
+        ),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    # Both are 6ch eng, tied on channel count -- the commentary-titled stream
+    # must be excluded from the tie-break entirely, leaving only streams[0].
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[0]
+
+
+def test_ignore_commentary_tracks_excludes_from_language_fallback() -> None:
+    streams = [
+        _stream(index=0, channels=2, language="jpn"),
+        _stream(index=1, channels=6, language="fre", is_commentary=True),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    # eng isn't present at all; fre's only track is commentary and excluded,
+    # so the best-available *non-commentary* stream overall wins: jpn.
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[0]
+
+
+def test_ignore_commentary_tracks_falls_back_to_commentary_when_all_streams_are_commentary() -> (
+    None
+):
+    """No non-commentary alternative anywhere -> filtering is skipped entirely."""
+    streams = [
+        _stream(index=0, channels=6, language="eng", is_commentary=True),
+        _stream(index=1, channels=2, language="eng", is_commentary=True),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[1]
+
+
+def test_ignore_commentary_tracks_true_is_a_noop_when_no_stream_is_commentary() -> None:
+    streams = [
+        _stream(index=0, channels=6, language="eng"),
+        _stream(index=1, channels=2, language="eng"),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[1]
+
+
+# ---------------------------------------------------------------------------
 # resolve_default_audio_output_index: resolve over the *final* output layout
 # (existing streams + newly-encoded targets), returning the output audio-relative
 # index that should carry the disposition, or None when nothing needs to change.
@@ -252,3 +361,19 @@ def test_output_index_is_none_when_final_layout_has_fewer_than_two_streams() -> 
 
     # No targets, single existing stream -> nothing to compare, nothing to change.
     assert resolve_default_audio_output_index(streams, [], preference) is None
+
+
+def test_output_index_excludes_an_existing_commentary_stream_from_the_winner(
+) -> None:
+    """A currently-default commentary stream is displaced by a non-commentary one."""
+    streams = [
+        _stream(index=0, channels=6, language="eng", is_default=True, is_commentary=True),
+        _stream(index=1, channels=2, language="eng", is_default=False),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    # Commentary stream is excluded from the candidate pool entirely, so the
+    # eng stereo stream wins the exact match even though it isn't yet default.
+    assert resolve_default_audio_output_index(streams, [], preference) == 1

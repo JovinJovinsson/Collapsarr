@@ -97,6 +97,15 @@ takes effect on the next claim with no restart -- see
 :attr:`~collapsarr.settings.models.GlobalSettings.auto_processing_paused`'s
 own docstring for exactly what it does and does not gate, distinct from
 ``auto_queue_paused`` above.
+
+``ignore_commentary_tracks`` (COL-244) follows the same "only change what's
+passed" rule as every other boolean field here (``ui_auth_enabled``,
+``default_tracked``, ``auto_set_default_audio``). Read via
+:func:`as_downmix_settings` by :func:`~collapsarr.downmix.targets.
+detect_qualifying_targets` (COL-249) for the downmix-eligibility check;
+see :attr:`~collapsarr.settings.models.GlobalSettings.
+ignore_commentary_tracks`'s own docstring for the remaining follow-up
+ticket (COL-250, Default Audio Track resolution) that has yet to consume it.
 """
 
 from __future__ import annotations
@@ -233,6 +242,7 @@ def update_global_settings(
     recently_processed_window_minutes: int | None = None,
     auto_queue_paused: bool | None = None,
     auto_processing_paused: bool | None = None,
+    ignore_commentary_tracks: bool | None = None,
 ) -> GlobalSettings:
     """Update the given fields on the settings row and return it.
 
@@ -315,6 +325,11 @@ def update_global_settings(
     below (:class:`ValueError` on a negative value; ``0`` is valid). Not yet
     read by any caller -- see :attr:`~collapsarr.settings.models.
     GlobalSettings.default_audio_delay_minutes`'s own docstring.
+
+    ``ignore_commentary_tracks`` (COL-244) follows the same "only change
+    what's passed" rule as every other boolean field here. Not yet read by
+    any caller -- see :attr:`~collapsarr.settings.models.GlobalSettings.
+    ignore_commentary_tracks`'s own docstring.
     """
     settings = get_global_settings(session)
 
@@ -389,6 +404,8 @@ def update_global_settings(
         settings.auto_queue_paused = auto_queue_paused
     if auto_processing_paused is not None:
         settings.auto_processing_paused = auto_processing_paused
+    if ignore_commentary_tracks is not None:
+        settings.ignore_commentary_tracks = ignore_commentary_tracks
 
     session.commit()
     session.refresh(settings)
@@ -524,6 +541,11 @@ def as_downmix_settings(settings: GlobalSettings) -> DownmixSettings:
     queue) consumes -- decoding the comma-joined ``enabled_targets``/
     ``language_allow_list`` columns back into the ``frozenset`` forms
     :class:`~collapsarr.downmix.targets.DownmixSettings` expects.
+
+    ``ignore_commentary_tracks`` (COL-244) is passed straight through --
+    :func:`~collapsarr.downmix.targets.detect_qualifying_targets` (COL-249)
+    is the first caller to actually read it, excluding commentary streams
+    from its channel-layout eligibility check when set.
     """
     return DownmixSettings(
         enabled_targets=_decode_targets(settings.enabled_targets),
@@ -532,6 +554,7 @@ def as_downmix_settings(settings: GlobalSettings) -> DownmixSettings:
         stereo_bitrate_kbps=settings.stereo_bitrate_kbps,
         surround_codec=settings.surround_codec,
         surround_bitrate_kbps=settings.surround_bitrate_kbps,
+        ignore_commentary_tracks=settings.ignore_commentary_tracks,
     )
 
 
@@ -550,10 +573,17 @@ def as_default_audio_preference(settings: GlobalSettings) -> DefaultAudioPrefere
     :func:`as_downmix_settings` decodes its own columns. Whether to *act* on the
     returned preference at all is the caller's ``auto_set_default_audio`` gate,
     not this adapter's concern.
+
+    ``ignore_commentary_tracks`` (COL-244/COL-250) is carried through
+    unconditionally from the row's own column -- unlike the language/tier
+    pair, it has no "unset" state (the column is ``NOT NULL``), so it's
+    always meaningful independent of whether the rest of the preference is
+    configured.
     """
     if settings.default_audio_language is None or settings.default_audio_channel_tier is None:
         return None
     return DefaultAudioPreference(
         language=settings.default_audio_language,
         channel_tier=DownmixTarget(settings.default_audio_channel_tier),
+        ignore_commentary_tracks=settings.ignore_commentary_tracks,
     )

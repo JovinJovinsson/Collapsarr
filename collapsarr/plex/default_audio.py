@@ -35,6 +35,13 @@ A stream list with fewer than two entries has nothing to compare, so
 change" -- without evaluating the preference at all, mirroring
 :func:`~collapsarr.downmix.default_audio.resolve_default_audio_stream`.
 
+**Commentary exclusion (COL-250):** identical to the local resolver's --
+when ``preference.ignore_commentary_tracks`` is set, a stream
+:func:`~collapsarr.plex.streams.is_commentary_track` flags is dropped from
+the candidate pool before any of the three steps run, unless every stream on
+the list is commentary (nothing left to prefer instead), in which case
+filtering is skipped and the three steps run over the unfiltered list.
+
 Pure function over plain data -- no I/O, no DB, not yet called from any Job
 (COL-240's explicit scope: the direct-Plex-API-write path that will call this
 is COL-245).
@@ -46,7 +53,7 @@ from collections.abc import Sequence
 
 from collapsarr.downmix.default_audio import DefaultAudioPreference
 from collapsarr.downmix.targets import DownmixTarget
-from collapsarr.plex.streams import PlexAudioStream
+from collapsarr.plex.streams import PlexAudioStream, is_commentary_track
 
 # Deliberately a private, module-local copy -- see
 # `collapsarr.downmix.default_audio`'s own copy of this exact mapping for why
@@ -63,22 +70,44 @@ def resolve_default_audio_stream(
 ) -> PlexAudioStream | None:
     """Return the Plex-reported stream that should carry Preferred Default Audio.
 
-    See the module docstring for the full three-step resolution order.
-    Returns ``None`` -- "nothing to change" -- when there are fewer than two
-    streams to compare, regardless of what ``preference`` says.
+    See the module docstring for the full three-step resolution order and
+    its "Commentary exclusion" section. Returns ``None`` -- "nothing to
+    change" -- when there are fewer than two streams to compare, regardless
+    of what ``preference`` says; that check is against the full, unfiltered
+    stream count, not the commentary-filtered candidate pool.
     """
     if len(streams) < 2:
         return None
 
-    exact_match = _find_exact_match(streams, preference)
+    candidates = _commentary_filtered(streams, preference)
+
+    exact_match = _find_exact_match(candidates, preference)
     if exact_match is not None:
         return exact_match
 
-    same_language = [stream for stream in streams if stream.language == preference.language]
+    same_language = [stream for stream in candidates if stream.language == preference.language]
     if same_language:
         return _best_available(same_language)
 
-    return _best_available(streams)
+    return _best_available(candidates)
+
+
+def _commentary_filtered(
+    streams: Sequence[PlexAudioStream], preference: DefaultAudioPreference
+) -> Sequence[PlexAudioStream]:
+    """Return the candidate pool resolution should choose among (COL-250).
+
+    Mirrors :func:`collapsarr.downmix.default_audio._commentary_filtered`
+    over Plex-reported streams: unchanged when ``preference.
+    ignore_commentary_tracks`` is ``False``; otherwise every
+    :func:`~collapsarr.plex.streams.is_commentary_track` stream is dropped
+    unless doing so would leave the pool empty, in which case the full,
+    unfiltered list is returned instead.
+    """
+    if not preference.ignore_commentary_tracks:
+        return streams
+    non_commentary = [stream for stream in streams if not is_commentary_track(stream)]
+    return non_commentary if non_commentary else streams
 
 
 def _find_exact_match(

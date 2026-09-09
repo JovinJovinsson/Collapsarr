@@ -233,6 +233,31 @@ on the file at all (a foreign-only-audio file), the best-available tier
 in whatever language the file has. Case (3) is expected fallback
 behavior, not a gap — a foreign-only file is never "wrong."
 
+When the global `ignore_commentary_tracks` setting is on (COL-244), a
+**Commentary Track** is dropped from the candidate pool before all three
+steps run (COL-250) — it can never win exact-match, tier-fallback, or
+language-fallback while a non-commentary stream exists anywhere on the
+file — *unless* every stream on the file is commentary, in which case
+filtering is skipped and the same three steps run over the commentary
+streams themselves (no non-commentary alternative to prefer instead).
+Both the local-ffprobe and Plex-metadata resolvers apply this identically.
+
+## Commentary Track
+
+An audio stream carrying director/cast/crew commentary rather than a
+normal program mix, detected from two independent sources (COL-246).
+Locally, `ffprobe`'s `disposition.comment` flag OR'd with a
+case-insensitive "comment" substring match on the stream's tag `title`
+(`collapsarr.downmix.probe.is_commentary_track`); via Plex, the same
+case-insensitive "comment" substring match against `title` and/or
+`extended_display_title` (`collapsarr.plex.streams.is_commentary_track`) —
+Plex exposes no disposition-flag equivalent, so its check is title-only.
+Local ffprobe and Plex metadata are independent signals; either can flag a
+stream regardless of what the other reports. Wired into **Preferred
+Default Audio** resolution as of COL-250 (gated on the global
+`ignore_commentary_tracks` setting, COL-244); downmix-eligibility exclusion
+is a separate concern (COL-249).
+
 ## Job
 
 One enqueued unit of work: a file plus its downmix target/language

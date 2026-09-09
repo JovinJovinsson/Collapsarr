@@ -37,6 +37,17 @@ Resolution order, strict and first-match-wins:
 A file with fewer than two audio streams (a single track, or none at all)
 has nothing to compare, so :func:`resolve_default_audio_stream` returns
 ``None`` -- "nothing to change" -- without evaluating the preference at all.
+
+**Commentary exclusion (COL-250):** when :attr:`DefaultAudioPreference.
+ignore_commentary_tracks` is set, a stream :func:`~collapsarr.downmix.probe.
+is_commentary_track` flags is dropped from the *candidate pool* before any of
+the three steps above run -- it can never win exact-match, tier-fallback, or
+language-fallback while a non-commentary alternative exists anywhere on the
+file. The one exception: if filtering would leave zero candidates (every
+stream on the file is commentary), filtering is skipped and the three steps
+run over the full, unfiltered stream list instead -- there is no
+non-commentary alternative to prefer, so the existing fallback rules apply to
+the commentary streams themselves rather than resolving to nothing.
 """
 
 from __future__ import annotations
@@ -44,7 +55,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from collapsarr.downmix.probe import AudioStreamInfo
+from collapsarr.downmix.probe import AudioStreamInfo, is_commentary_track
 from collapsarr.downmix.targets import DownmixTarget, QualifyingTarget
 
 # Deliberately a private, module-local copy rather than importing
@@ -70,10 +81,18 @@ class DefaultAudioPreference:
     this shape (and deciding what to do when either is unset) is a caller
     concern, same as :func:`~collapsarr.settings.service.as_downmix_settings`
     adapts settings into :class:`~collapsarr.downmix.targets.DownmixSettings`.
+
+    ``ignore_commentary_tracks`` (default ``False``) mirrors the persisted
+    row's global ``ignore_commentary_tracks`` toggle (COL-244) --
+    :func:`~collapsarr.settings.service.as_default_audio_preference` sets it
+    from that column, same as the two required fields above. See the module
+    docstring's "Commentary exclusion" section for exactly how resolution
+    uses it.
     """
 
     language: str
     channel_tier: DownmixTarget
+    ignore_commentary_tracks: bool = False
 
 
 def resolve_default_audio_stream(
@@ -81,23 +100,28 @@ def resolve_default_audio_stream(
 ) -> AudioStreamInfo | None:
     """Return the stream that should carry the Default Audio Track disposition.
 
-    See the module docstring for the full three-step resolution order.
-    Returns ``None`` -- "nothing to change" -- when there are fewer than two
-    streams to compare (a single-track file, or a file with no audio streams
-    at all), regardless of what ``preference`` says.
+    See the module docstring for the full three-step resolution order and
+    the "Commentary exclusion" section for how ``preference.
+    ignore_commentary_tracks`` affects the candidate pool. Returns ``None``
+    -- "nothing to change" -- when there are fewer than two streams to
+    compare (a single-track file, or a file with no audio streams at all),
+    regardless of what ``preference`` says; that check is against the full,
+    unfiltered stream count, not the commentary-filtered candidate pool.
     """
     if len(streams) < 2:
         return None
 
-    exact_match = _find_exact_match(streams, preference)
+    candidates = _commentary_filtered(streams, preference)
+
+    exact_match = _find_exact_match(candidates, preference)
     if exact_match is not None:
         return exact_match
 
-    same_language = [stream for stream in streams if stream.language == preference.language]
+    same_language = [stream for stream in candidates if stream.language == preference.language]
     if same_language:
         return _best_available(same_language)
 
-    return _best_available(streams)
+    return _best_available(candidates)
 
 
 def resolve_default_audio_output_index(
@@ -176,6 +200,26 @@ def _final_audio_layout(
             )
         )
     return layout
+
+
+def _commentary_filtered(
+    streams: Sequence[AudioStreamInfo], preference: DefaultAudioPreference
+) -> Sequence[AudioStreamInfo]:
+    """Return the candidate pool resolution should choose among (COL-250).
+
+    ``streams`` unchanged when ``preference.ignore_commentary_tracks`` is
+    ``False`` -- the pre-COL-250 behavior. Otherwise, every
+    :func:`~collapsarr.downmix.probe.is_commentary_track` stream is dropped
+    *unless* that would leave the pool empty (every stream on the file is
+    commentary), in which case filtering is skipped and ``streams`` is
+    returned unfiltered -- there is no non-commentary alternative to prefer,
+    so the existing fallback rules fall through to the commentary streams
+    themselves rather than resolving to nothing.
+    """
+    if not preference.ignore_commentary_tracks:
+        return streams
+    non_commentary = [stream for stream in streams if not is_commentary_track(stream)]
+    return non_commentary if non_commentary else streams
 
 
 def _find_exact_match(
