@@ -23,13 +23,15 @@ def _stream(
     channels: int,
     language: str = "eng",
     selected: bool = False,
+    title: str | None = None,
+    extended_display_title: str | None = None,
 ) -> PlexAudioStream:
     return PlexAudioStream(
         id=stream_id,
         channels=channels,
         language=language,
-        title=None,
-        extended_display_title=None,
+        title=title,
+        extended_display_title=extended_display_title,
         selected=selected,
     )
 
@@ -172,6 +174,94 @@ def test_unknown_language_preference_is_treated_like_any_other_language() -> Non
     result = resolve_default_audio_stream(streams, preference)
 
     assert result == streams[0]
+
+
+# ---------------------------------------------------------------------------
+# Commentary exclusion (COL-250): ignore_commentary_tracks removes commentary
+# streams from the candidate pool at every resolution step, unless every
+# stream on the list is commentary. Plex detection is title-only.
+# ---------------------------------------------------------------------------
+
+
+def test_ignore_commentary_tracks_off_lets_a_commentary_track_win_exact_match() -> None:
+    streams = [
+        _stream(stream_id="1", channels=6, language="eng"),
+        _stream(stream_id="2", channels=2, language="eng", title="Commentary"),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=False
+    )
+
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[1]
+
+
+def test_ignore_commentary_tracks_excludes_exact_match_commentary_stream() -> None:
+    streams = [
+        _stream(stream_id="1", channels=6, language="eng"),
+        _stream(stream_id="2", channels=2, language="eng", title="Commentary"),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[0]
+
+
+def test_ignore_commentary_tracks_detects_via_extended_display_title() -> None:
+    """Plex-only signal: ``extended_display_title`` is checked alongside ``title``."""
+    streams = [
+        _stream(stream_id="1", channels=6, language="eng"),
+        _stream(
+            stream_id="2",
+            channels=6,
+            language="eng",
+            extended_display_title="English (Director's Commentary)",
+        ),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    # Both tied at 6ch eng; the commentary one must be excluded from the tie.
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[0]
+
+
+def test_ignore_commentary_tracks_excludes_from_language_fallback() -> None:
+    streams = [
+        _stream(stream_id="1", channels=2, language="jpn"),
+        _stream(stream_id="2", channels=6, language="fre", title="Commentary"),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    # eng isn't present at all; fre's only track is commentary and excluded,
+    # so the best-available *non-commentary* stream overall wins: jpn.
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[0]
+
+
+def test_ignore_commentary_tracks_falls_back_to_commentary_when_all_streams_are_commentary() -> (
+    None
+):
+    streams = [
+        _stream(stream_id="1", channels=6, language="eng", title="Commentary"),
+        _stream(stream_id="2", channels=2, language="eng", title="Commentary"),
+    ]
+    preference = DefaultAudioPreference(
+        language="eng", channel_tier=DownmixTarget.STEREO, ignore_commentary_tracks=True
+    )
+
+    result = resolve_default_audio_stream(streams, preference)
+
+    assert result == streams[1]
 
 
 # ---------------------------------------------------------------------------

@@ -573,10 +573,17 @@ def as_default_audio_preference(settings: GlobalSettings) -> DefaultAudioPrefere
     :func:`as_downmix_settings` decodes its own columns. Whether to *act* on the
     returned preference at all is the caller's ``auto_set_default_audio`` gate,
     not this adapter's concern.
+
+    ``ignore_commentary_tracks`` (COL-244/COL-250) is carried through
+    unconditionally from the row's own column -- unlike the language/tier
+    pair, it has no "unset" state (the column is ``NOT NULL``), so it's
+    always meaningful independent of whether the rest of the preference is
+    configured.
     """
     if settings.default_audio_language is None or settings.default_audio_channel_tier is None:
         return None
     return DefaultAudioPreference(
         language=settings.default_audio_language,
         channel_tier=DownmixTarget(settings.default_audio_channel_tier),
+        ignore_commentary_tracks=settings.ignore_commentary_tracks,
     )
