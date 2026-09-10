@@ -395,6 +395,68 @@ def test_pipeline_reports_apply_failure_on_disposition_mismatch(tmp_path: Path) 
     assert binaries == ["ffprobe", "ffmpeg", "ffprobe", "ffprobe", "ffprobe"]
 
 
+def test_pipeline_with_explicit_stream_index_bypasses_already_correct_and_still_remuxes(
+    tmp_path: Path,
+) -> None:
+    """COL-253: an explicit ``stream_index`` always remuxes -- even targeting the stream
+    the auto-resolver would already consider correct, and even though the auto-resolve
+    winner for this same preference would be a *different* stream entirely (a:1)."""
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    calls: list[list[str]] = []
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        # a:0 is already default in both the pre- and post-swap probe --
+        # nothing about the disposition actually changes, proving the remux
+        # ran purely because `explicit_stream_index` was set, not because
+        # anything was "wrong" by the auto-resolve preference's own answer.
+        post_swap_audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,
+        calls=calls,
+    )
+
+    result = run_default_audio_pipeline(
+        original,
+        DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.STEREO),
+        runner=runner,  # type: ignore[arg-type]
+        explicit_stream_index=0,
+    )
+
+    assert result.outcome is PipelineOutcome.SUCCESS
+    assert result.success is True
+    binaries = [c[0] for c in calls]
+    assert binaries == ["ffprobe", "ffmpeg", "ffprobe", "ffprobe", "ffprobe"]
+    command = _ffmpeg_command(calls)
+    # a:0 (not a:1, the resolver's own pick for eng/Stereo) is the target.
+    assert command[command.index("-disposition:a:0") + 1] == "default"
+    assert command[command.index("-disposition:a:1") + 1] == "0"
+
+
+def test_pipeline_with_explicit_stream_index_out_of_range_hard_fails(tmp_path: Path) -> None:
+    """A stale/invalid ``stream_index`` (the file changed since it was selected) is a
+    hard failure -- no ffmpeg remux is ever attempted against a guessed stream."""
+    original = tmp_path / "movie.mkv"
+    original.write_bytes(b"")
+    calls: list[list[str]] = []
+    runner = _fake_runner(
+        original_path=original,
+        audio_payload=_ENG_5_1_DEFAULT_PLUS_STEREO_PAYLOAD,  # only 2 audio streams (0, 1)
+        calls=calls,
+    )
+
+    result = run_default_audio_pipeline(
+        original,
+        DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.STEREO),
+        runner=runner,  # type: ignore[arg-type]
+        explicit_stream_index=5,
+    )
+
+    assert result.outcome is PipelineOutcome.STREAM_INDEX_OUT_OF_RANGE
+    assert result.success is False
+    binaries = [c[0] for c in calls]
+    assert binaries == ["ffprobe"]  # probed once, but no ffmpeg remux attempted
+
+
 def test_pipeline_reports_apply_failure_when_post_swap_reprobe_itself_errors(
     tmp_path: Path,
 ) -> None:

@@ -440,6 +440,32 @@ class Job:
     new stream yet" as a distinct failure rather than silently resolving
     against a stale stream list -- see :mod:`collapsarr.plex.
     default_audio_write`'s ``PlexDefaultAudioOutcome.STREAM_NOT_YET_INGESTED``.
+
+    ``explicit_stream_index`` (COL-253) is the second, distinct way a
+    ``SET_DEFAULT_AUDIO`` job's target stream can be chosen: set only by the
+    file detail page's per-row "Set Default Audio" trigger
+    (:meth:`~collapsarr.jobs.scheduler.JobScheduler.trigger_set_default_audio`'s
+    ``stream_index`` parameter), ``None`` for every other trigger (the
+    whole-file manual trigger, the bulk trigger, and every downmix-triggered
+    automatic job -- all of which keep resolving their target via
+    ``preference`` against the persisted Preferred Default Audio setting,
+    unchanged). It is **not** the raw ffprobe ``index`` the caller supplied
+    -- it is that stream's *ordinal position within the audio-only stream
+    list* (0-based), already translated by :meth:`~collapsarr.jobs.
+    scheduler.JobScheduler.trigger_set_default_audio` at trigger time (see
+    its docstring for why: a Plex-reported stream carries no ffprobe-index
+    counterpart, but both sources enumerate a file's audio streams in the
+    same underlying container order, so ordinal position is the one
+    identifier that means the same physical track to both
+    :func:`~collapsarr.downmix.default_audio_pipeline.run_default_audio_pipeline`
+    and :func:`~collapsarr.plex.default_audio_write.apply_default_audio_via_plex`).
+    When set, both pipelines select this exact stream directly -- skipping
+    ``preference``-based auto-resolution and, crucially, skipping their own
+    "already correct" no-op check entirely: an explicit per-track trigger
+    always attempts the write, unconditionally, the one behavior this field
+    exists to enable (re-triggering a file whose disposition Collapsarr
+    already believes is correct, e.g. after a Plex-API write that silently
+    failed under the now-fixed COL-252 bug).
     """
 
     file_path: Path
@@ -456,6 +482,7 @@ class Job:
     cancellation: CancellationHandle | None = None
     scheduled_at: datetime | None = None
     expected_stream_count: int | None = None
+    explicit_stream_index: int | None = None
 
 
 def _run_context_for_log(job: Job) -> str:
@@ -1066,6 +1093,7 @@ class JobQueue:
         *,
         scheduled_at: datetime | None = None,
         expected_stream_count: int | None = None,
+        explicit_stream_index: int | None = None,
     ) -> Job:
         """Add a file + its Default Audio Track preference as a ``SET_DEFAULT_AUDIO`` job (COL-155).
 
@@ -1094,6 +1122,13 @@ class JobQueue:
         streams that already exist in the file -- there is nothing to wait
         on. See :attr:`Job.scheduled_at`/:attr:`Job.expected_stream_count`
         for what each does once the Job runs.
+
+        ``explicit_stream_index`` (COL-253) defaults to ``None`` -- every
+        caller except :meth:`~collapsarr.jobs.scheduler.JobScheduler.
+        trigger_set_default_audio`'s explicit per-track mode leaves it unset,
+        keeping the ordinary preference-based auto-resolve behavior. See
+        :attr:`Job.explicit_stream_index` for what a non-``None`` value does
+        once the Job runs.
         """
         job = Job(
             file_path=Path(file_path),
@@ -1102,6 +1137,7 @@ class JobQueue:
             preference=preference,
             scheduled_at=scheduled_at,
             expected_stream_count=expected_stream_count,
+            explicit_stream_index=explicit_stream_index,
         )
         return self._enqueue(job)
 
@@ -1676,7 +1712,8 @@ class JobQueue:
         executes the pipeline: ``DOWNMIX`` calls ``self._pipeline_runner``
         with ``job.settings`` and the full ``self._pipeline_kwargs``,
         ``SET_DEFAULT_AUDIO`` calls ``self._default_audio_pipeline_runner``
-        with ``job.preference``, ``job.expected_stream_count`` (COL-251), and
+        with ``job.preference``, ``job.expected_stream_count`` (COL-251),
+        ``job.explicit_stream_index`` (COL-253), and
         only the :data:`_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS` subset of
         ``self._pipeline_kwargs`` (COL-218 -- today, just ``ffmpeg_path``; see
         that constant's docstring for why the *whole* dict can't be forwarded)
@@ -1713,6 +1750,8 @@ class JobQueue:
                         # COL-251: per-Job, not part of `_pipeline_kwargs` --
                         # see `_SHARED_DEFAULT_AUDIO_PIPELINE_KWARGS`'s docstring.
                         expected_stream_count=job.expected_stream_count,
+                        # COL-253: likewise per-Job -- see `Job.explicit_stream_index`.
+                        explicit_stream_index=job.explicit_stream_index,
                         **shared_kwargs,
                     )
                 else:

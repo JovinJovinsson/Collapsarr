@@ -2246,6 +2246,145 @@ def test_trigger_set_default_audio_defaults_to_respecting_a_recently_processed_h
 
 
 # ---------------------------------------------------------------------------
+# Explicit per-track "Set Default Audio" trigger (COL-253)
+# ---------------------------------------------------------------------------
+
+# Simulates a real container: a video stream (not audio, so absent from this
+# audio-only probe result) precedes both audio streams, so their ffprobe
+# `index` values (2, 5) are offset from -- and don't equal -- their ordinal
+# position among audio streams only (0, 1). Both already carry the
+# disposition the auto-resolve winner would already match, so any test that
+# still enqueues against one of these proves the ALREADY_CORRECT gate was
+# genuinely bypassed, not just coincidentally not hit.
+_OFFSET_INDICES_ALREADY_CORRECT: list[AudioStreamInfo] = [
+    AudioStreamInfo(
+        index=2,
+        codec="ac3",
+        channels=6,
+        channel_layout="5.1(side)",
+        language="eng",
+        is_default=True,
+    ),
+    AudioStreamInfo(
+        index=5, codec="aac", channels=2, channel_layout="stereo", language="eng", is_default=False
+    ),
+]
+
+
+def test_trigger_set_default_audio_with_stream_index_bypasses_already_correct(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """An explicit ``stream_index`` always enqueues, even when the auto-resolve winner
+    already carries the disposition (COL-253's whole point)."""
+    _configure_preference(session_factory)
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_OFFSET_INDICES_ALREADY_CORRECT),
+        queue=queue,
+    )
+
+    # Target the stereo stream (ffprobe index 5), which is *not* the
+    # auto-resolve winner (the 5.1 stream, already default) -- proves this
+    # mode never calls the resolver at all, not just that it skips the
+    # correctness check on the resolver's own answer.
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv", stream_index=5)
+
+    assert outcome.skip_reason is None
+    job = outcome.job
+    assert job is not None
+    assert job.kind is JobKind.SET_DEFAULT_AUDIO
+    assert job.preference == _PREFERENCE
+    # Translated: ffprobe index 5 is ordinal position 1 among these two
+    # audio-only streams (index 2 is position 0, index 5 is position 1) --
+    # not the raw ffprobe index itself.
+    assert job.explicit_stream_index == 1
+
+
+def test_trigger_set_default_audio_with_stream_index_translates_ffprobe_index_to_ordinal_position(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Selecting the *first* stream by its (non-zero) ffprobe index still yields ordinal 0."""
+    _configure_preference(session_factory)
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_OFFSET_INDICES_ALREADY_CORRECT),
+        queue=queue,
+    )
+
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv", stream_index=2)
+
+    assert outcome.skip_reason is None
+    assert outcome.job is not None
+    assert outcome.job.explicit_stream_index == 0
+
+
+def test_trigger_set_default_audio_with_stream_index_not_found_is_reported_distinctly(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _configure_preference(session_factory)
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_OFFSET_INDICES_ALREADY_CORRECT)
+    )
+
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv", stream_index=99)
+
+    assert outcome.job is None
+    assert outcome.skip_reason is DefaultAudioSkipReason.STREAM_NOT_FOUND
+
+
+def test_trigger_set_default_audio_with_stream_index_still_requires_a_configured_preference(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """``stream_index`` bypasses ALREADY_CORRECT, not NO_PREFERENCE -- a Job still needs a
+    well-formed ``preference`` for job history, even though this mode never lets it choose
+    the target stream."""
+    scheduler = _make_scheduler(
+        settings, session_factory, probe=_probe_returning(_OFFSET_INDICES_ALREADY_CORRECT)
+    )
+
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv", stream_index=2)
+
+    assert outcome.job is None
+    assert outcome.skip_reason is DefaultAudioSkipReason.NO_PREFERENCE
+
+
+def test_trigger_set_default_audio_with_stream_index_still_skips_an_unprobeable_file(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _configure_preference(session_factory)
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_raising())
+
+    outcome = scheduler.trigger_set_default_audio("/media/movie.mkv", stream_index=0)
+
+    assert outcome.job is None
+    assert outcome.skip_reason is DefaultAudioSkipReason.UNPROBEABLE
+
+
+def test_trigger_set_default_audio_with_stream_index_still_respects_an_in_flight_duplicate(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    _configure_preference(session_factory)
+    queue = JobQueue(default_audio_pipeline_runner=_stub_default_audio_runner())
+    scheduler = _make_scheduler(
+        settings,
+        session_factory,
+        probe=_probe_returning(_OFFSET_INDICES_ALREADY_CORRECT),
+        queue=queue,
+    )
+
+    first = scheduler.trigger_set_default_audio("/media/movie.mkv", stream_index=2)
+    assert first.job is not None
+
+    second = scheduler.trigger_set_default_audio("/media/movie.mkv", stream_index=5)
+    assert second.job is None
+    assert second.skip_reason is DefaultAudioSkipReason.DUPLICATE
+
+
+# ---------------------------------------------------------------------------
 # Auto-Queue Limit / top-up (COL-171)
 # ---------------------------------------------------------------------------
 

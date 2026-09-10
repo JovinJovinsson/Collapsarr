@@ -354,11 +354,25 @@ class SetDefaultAudioTriggerRequest(BaseModel):
     :class:`ManualTriggerRequest` there is no allow-list-bypass option --
     the Default Audio Track fix isn't gated by a language allow-list at all,
     so there is nothing analogous to bypass.
+
+    ``stream_index`` (COL-253) is optional and switches the request into the
+    *explicit per-track* mode the file detail page's per-row "Set Default
+    Audio" button uses -- the ffprobe ``index`` of one specific audio
+    stream, the same value :class:`~collapsarr.media.routes.AudioStreamOut`'s
+    own ``index`` field already reports for that row. ``None`` (the default)
+    is the ordinary whole-file auto-resolve mode, unchanged: the target
+    stream is resolved against the persisted Preferred Default Audio
+    setting, and a file already carrying the resolved disposition is
+    skipped. When set, that resolution and its "already correct" skip are
+    both bypassed entirely -- the clicked stream is always the target,
+    unconditionally -- see :meth:`~collapsarr.jobs.scheduler.JobScheduler.
+    trigger_set_default_audio`'s own docstring for the full detail.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     file_path: str
+    stream_index: int | None = None
 
 
 class SetDefaultAudioTriggerResult(BaseModel):
@@ -372,10 +386,12 @@ class SetDefaultAudioTriggerResult(BaseModel):
     is configured, a duplicate (already queued / recently processed --
     reachable here only via the still-unbypassable active-job check, since
     this endpoint always bypasses the Recently-Processed Window, COL-206),
-    unprobeable, or the file already carries the correct disposition --
-    mirroring :meth:`collapsarr.jobs.scheduler.JobScheduler.
-    trigger_set_default_audio` returning a :class:`~collapsarr.jobs.
-    scheduler.SetDefaultAudioOutcome`.
+    unprobeable, the requested ``stream_index`` (COL-253) no longer matches
+    any currently-probed stream, or -- whole-file auto-resolve mode only,
+    never reachable when ``stream_index`` is set -- the file already carries
+    the correct disposition -- mirroring :meth:`collapsarr.jobs.scheduler.
+    JobScheduler.trigger_set_default_audio` returning a
+    :class:`~collapsarr.jobs.scheduler.SetDefaultAudioOutcome`.
     """
 
     enqueued: bool
@@ -807,10 +823,16 @@ def manual_set_default_audio_trigger_endpoint(
     the Recently-Processed Window cooldown, so it is never silently no-op'd
     by an unrelated prior job (e.g. a ``DOWNMIX`` job) on the same file. The
     window is the only thing bypassed; the "does this file need anything"
-    gate is unchanged, so a file that's already correct is still skipped.
-    The bulk endpoint below is unaffected -- it still respects the window.
+    gate is unchanged, so a file that's already correct is still skipped --
+    unless ``body.stream_index`` (COL-253) is set, which switches this into
+    the explicit per-track mode that bypasses the "already correct" gate
+    entirely (see :class:`SetDefaultAudioTriggerRequest`'s own docstring).
+    The bulk endpoint below is unaffected -- it still respects the window,
+    and has no ``stream_index`` equivalent (it always auto-resolves).
     """
-    outcome = scheduler.trigger_set_default_audio(body.file_path, bypass_dedup_window=True)
+    outcome = scheduler.trigger_set_default_audio(
+        body.file_path, bypass_dedup_window=True, stream_index=body.stream_index
+    )
     if outcome.job is None:
         return SetDefaultAudioTriggerResult(
             enqueued=False, job=None, skip_reason=outcome.skip_reason

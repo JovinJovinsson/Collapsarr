@@ -1076,7 +1076,19 @@ def test_enqueue_default_audio_creates_a_pending_set_default_audio_job() -> None
     assert job.kind is JobKind.SET_DEFAULT_AUDIO
     assert job.preference == _PREFERENCE
     assert job.status is JobStatus.PENDING
+    assert job.explicit_stream_index is None
     assert queue.list_jobs() == [job]
+
+
+def test_enqueue_default_audio_carries_an_explicit_stream_index_when_given() -> None:
+    """COL-253: the explicit per-track trigger's ordinal position lands on the Job."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+
+    job = queue.enqueue_default_audio(
+        "/media/movie.mkv", _PREFERENCE, explicit_stream_index=1
+    )
+
+    assert job.explicit_stream_index == 1
 
 
 def test_enqueue_creates_a_downmix_job_by_default() -> None:
@@ -1119,6 +1131,22 @@ def test_worker_pool_dispatches_set_default_audio_jobs_to_their_own_runner() -> 
     assert job.result is _SUCCESS
     assert default_audio_runner.calls == [(Path("/media/movie.mkv"), _PREFERENCE)]
     assert downmix_runner.calls == []  # the DOWNMIX runner is never touched
+
+
+def test_worker_pool_forwards_explicit_stream_index_to_the_runner() -> None:
+    """COL-253: `Job.explicit_stream_index` reaches the default_audio_pipeline_runner."""
+    default_audio_runner = _KwargsCapturingDefaultAudioRunner(_SUCCESS)
+    queue = JobQueue(default_audio_pipeline_runner=default_audio_runner)
+    job = queue.enqueue_default_audio(
+        "/media/movie.mkv", _PREFERENCE, explicit_stream_index=1
+    )
+
+    queue.start()
+    queue.wait_idle()
+
+    assert job.status is JobStatus.SUCCEEDED
+    assert len(default_audio_runner.kwargs_calls) == 1
+    assert default_audio_runner.kwargs_calls[0]["explicit_stream_index"] == 1
 
 
 class _KwargsCapturingDefaultAudioRunner:
@@ -1164,11 +1192,12 @@ def test_from_settings_threads_ffmpeg_path_to_set_default_audio_jobs_too(tmp_pat
 
 class _StrictDefaultAudioRunner:
     """A default_audio_pipeline_runner stub matching run_default_audio_pipeline's
-    exact kwarg surface -- ``ffmpeg_path``/``expected_stream_count`` only, no
-    catch-all ``**kwargs`` -- so a call with any other keyword raises
-    ``TypeError`` just like the real function would. Guards against a regression
-    where :meth:`JobQueue._run_job` forwards an unsupported ``pipeline_kwargs``
-    key to it (COL-218), or an unsupported per-Job kwarg (COL-251)."""
+    exact kwarg surface -- ``ffmpeg_path``/``expected_stream_count``/
+    ``explicit_stream_index`` only, no catch-all ``**kwargs`` -- so a call
+    with any other keyword raises ``TypeError`` just like the real function
+    would. Guards against a regression where :meth:`JobQueue._run_job`
+    forwards an unsupported ``pipeline_kwargs`` key to it (COL-218), or an
+    unsupported per-Job kwarg (COL-251, COL-253)."""
 
     def __init__(self, result: PipelineResult) -> None:
         self._result = result
@@ -1182,6 +1211,7 @@ class _StrictDefaultAudioRunner:
         cancel_handle: object = None,
         ffmpeg_path: str | None = None,
         expected_stream_count: int | None = None,
+        explicit_stream_index: int | None = None,
     ) -> PipelineResult:
         self.calls.append((file_path, preference, ffmpeg_path))
         return self._result

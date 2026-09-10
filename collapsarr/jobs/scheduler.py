@@ -318,12 +318,19 @@ class DefaultAudioSkipReason(Enum):
       only reachable there via the still-unbypassable active-job check; the
       window half is reachable only via the bulk endpoint, which never
       bypasses it.
+    - ``STREAM_NOT_FOUND`` (COL-253) -- only reachable when the caller passes
+      an explicit ``stream_index``: none of the file's *currently* probed
+      audio streams carries that ffprobe ``index`` any more (the file changed
+      on disk between the audio-streams table loading and the click). Never
+      reachable for the ordinary auto-resolve path -- that path never
+      references a caller-supplied stream index at all.
     """
 
     NO_PREFERENCE = "no_preference"
     ALREADY_CORRECT = "already_correct"
     UNPROBEABLE = "unprobeable"
     DUPLICATE = "duplicate"
+    STREAM_NOT_FOUND = "stream_not_found"
 
 
 @dataclass(slots=True, frozen=True)
@@ -777,6 +784,7 @@ class JobScheduler:
         *,
         session: Session | None = None,
         bypass_dedup_window: bool = False,
+        stream_index: int | None = None,
     ) -> SetDefaultAudioOutcome:
         """Manually trigger a Default Audio Track fix job for one file on demand (COL-155).
 
@@ -834,11 +842,66 @@ class JobScheduler:
         the window, the same way ``requeue_all_failed`` respects it for bulk
         requeue.
 
+        ``stream_index`` (COL-253) switches this call into the *explicit
+        per-track* mode the file detail page's per-row "Set Default Audio"
+        button (COL-253) uses, instead of the ordinary auto-resolve mode
+        every other caller (the whole-file manual trigger, the bulk trigger,
+        and every downmix-triggered automatic job) keeps using unchanged.
+        It is the ffprobe ``index`` of one specific audio stream -- the same
+        value :class:`~collapsarr.media.routes.AudioStreamOut`'s own
+        ``index`` field already reports for that row, so the frontend needs
+        no translation of its own. When supplied:
+
+        - Steps 1 (preference) and 2 (dedup) above still run unchanged -- an
+          explicit per-track trigger still needs a configured preference to
+          build a well-formed :class:`~collapsarr.jobs.queue.Job` (its
+          ``preference`` field feeds job-history's language/target columns
+          even though this mode never lets that preference choose the
+          target stream), and still respects the same active-job/window
+          de-duplication as every other trigger.
+        - Step 3 (probe) still runs -- not to resolve a winner, but to
+          translate ``stream_index`` (an absolute ffprobe ``index``, stable
+          only across streams of *every* type -- video, audio, subtitle --
+          in the container) into the target stream's *ordinal position
+          within the audio-only stream list* (0-based: the first audio
+          stream is ``0``, the second is ``1``, and so on, regardless of how
+          many video/subtitle streams precede them). That ordinal position
+          -- not the raw ffprobe ``index`` -- is what
+          :attr:`~collapsarr.jobs.queue.Job.explicit_stream_index` carries
+          onward: both the local ffmpeg-remux pipeline and the direct
+          Plex-API-write pipeline select their target stream by this same
+          ordinal position within *their own* audio-only stream list
+          (:func:`~collapsarr.downmix.default_audio_pipeline.
+          run_default_audio_pipeline`'s ``streams[explicit_stream_index]``,
+          :func:`~collapsarr.plex.default_audio_write.
+          apply_default_audio_via_plex`'s Plex-reported equivalent) -- the
+          one design question this ticket had to resolve: ffprobe's absolute
+          ``index`` has no Plex-side counterpart at all (a Plex-reported
+          stream carries no comparable index), but both sources enumerate a
+          file's audio streams in the same underlying container order, so
+          *ordinal position among audio streams only* is the one identifier
+          that means the same physical track on both sides. When no stream
+          in the current probe carries the requested ffprobe ``index`` any
+          more (the file changed between the audio-streams table loading and
+          the click), that is reported as
+          :attr:`DefaultAudioSkipReason.STREAM_NOT_FOUND` rather than
+          silently guessing.
+        - Step 4 (resolve the disposition winner against the preference,
+          then check whether it already -- and solely -- carries the
+          disposition) is skipped **entirely**: this mode never asks
+          whether the file is "already correct", the whole point of a
+          per-track trigger being that a user can force a re-apply
+          regardless of what Collapsarr currently believes the file's state
+          is (the scenario this exists for: a Plex-API write that silently
+          failed under the now-fixed COL-252 bug, leaving Collapsarr's
+          belief about the file's disposition stale/wrong).
+
         Returns a :class:`SetDefaultAudioOutcome` (COL-207): its ``job`` holds
         the created :class:`~collapsarr.jobs.queue.Job` on success, or its
         ``skip_reason`` names which :class:`DefaultAudioSkipReason` explains
         one of the "nothing to do" cases above (no preference configured,
-        duplicate, unprobeable, or the file already correct).
+        duplicate, unprobeable, the requested stream no longer exists, or --
+        auto-resolve mode only -- the file already correct).
         """
         path = Path(file_path)
 
@@ -862,18 +925,41 @@ class JobScheduler:
                 job=None, skip_reason=DefaultAudioSkipReason.UNPROBEABLE
             )
 
-        winner = resolve_default_audio_stream(streams, preference)
-        if winner is None or self._default_audio_already_correct(streams, winner):
-            return SetDefaultAudioOutcome(
-                job=None, skip_reason=DefaultAudioSkipReason.ALREADY_CORRECT
+        explicit_stream_index: int | None = None
+        if stream_index is None:
+            winner = resolve_default_audio_stream(streams, preference)
+            if winner is None or self._default_audio_already_correct(streams, winner):
+                return SetDefaultAudioOutcome(
+                    job=None, skip_reason=DefaultAudioSkipReason.ALREADY_CORRECT
+                )
+        else:
+            # COL-253: explicit per-track mode -- translate the caller's
+            # absolute ffprobe `index` into its ordinal position within this
+            # (audio-only) `streams` list; see the docstring above for why.
+            # Never calls `resolve_default_audio_stream`/
+            # `_default_audio_already_correct` -- this mode bypasses the
+            # ALREADY_CORRECT skip-reason path entirely.
+            explicit_stream_index = next(
+                (i for i, stream in enumerate(streams) if stream.index == stream_index), None
             )
+            if explicit_stream_index is None:
+                logger.warning(
+                    "skipping %s: no currently-probed audio stream has ffprobe index %d",
+                    path,
+                    stream_index,
+                )
+                return SetDefaultAudioOutcome(
+                    job=None, skip_reason=DefaultAudioSkipReason.STREAM_NOT_FOUND
+                )
 
         with self._enqueue_lock:
             if self._is_duplicate(path, session, bypass_dedup_window=bypass_dedup_window):
                 return SetDefaultAudioOutcome(
                     job=None, skip_reason=DefaultAudioSkipReason.DUPLICATE
                 )
-            job = self._queue.enqueue_default_audio(path, preference)
+            job = self._queue.enqueue_default_audio(
+                path, preference, explicit_stream_index=explicit_stream_index
+            )
             return SetDefaultAudioOutcome(job=job, skip_reason=None)
 
     def _resolve_default_audio_preference(

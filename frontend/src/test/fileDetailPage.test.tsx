@@ -573,6 +573,81 @@ describe("FileDetailPage", () => {
     expect(within(nonDefaultRow).queryByText("Default")).not.toBeInTheDocument();
   });
 
+  // --- Per-row "Set Default Audio" action (COL-253) ---------------------------
+
+  it('renders an "Actions" column with a per-row "Set Default Audio" button targeting that row\'s stream_index, tracked independently per row', async () => {
+    const { calls } = mockFetchRouter((url, init) => {
+      if (url === "/api/jobs/trigger-default-audio") {
+        const body = JSON.parse(String(init?.body)) as { file_path: string; stream_index?: number };
+        return {
+          ok: true,
+          body: {
+            enqueued: true,
+            job: { id: `job-for-stream-${body.stream_index}`, file_path: FILE_PATH, status: "pending" },
+          },
+        };
+      }
+      return defaultHandler()(url, init);
+    });
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    const defaultRow = (await screen.findByText("eng")).closest("tr") as HTMLElement;
+    const nonDefaultRow = (await screen.findByText("jpn")).closest("tr") as HTMLElement;
+
+    fireEvent.click(within(defaultRow).getByRole("button", { name: /^set default audio$/i }));
+    expect(await within(defaultRow).findByText(/job-for-stream-0/i)).toBeInTheDocument();
+    // Triggering the first row's action must not spuriously show a result on the second.
+    expect(within(nonDefaultRow).queryByText(/job enqueued/i)).not.toBeInTheDocument();
+
+    fireEvent.click(within(nonDefaultRow).getByRole("button", { name: /^set default audio$/i }));
+    expect(await within(nonDefaultRow).findByText(/job-for-stream-1/i)).toBeInTheDocument();
+    // The first row's own result must survive the second row's trigger.
+    expect(within(defaultRow).getByText(/job-for-stream-0/i)).toBeInTheDocument();
+
+    const triggerCalls = calls.filter((call) => call.url === "/api/jobs/trigger-default-audio");
+    expect(triggerCalls.map((call) => JSON.parse(String(call.init?.body)))).toEqual([
+      { file_path: FILE_PATH, stream_index: 0 },
+      { file_path: FILE_PATH, stream_index: 1 },
+    ]);
+  });
+
+  it('shows a skipped message for the "stream_not_found" reason when a row\'s "Set Default Audio" is skipped (COL-253)', async () => {
+    mockFetchRouter(
+      defaultHandler({
+        defaultAudioTrigger: {
+          ok: true,
+          body: { enqueued: false, job: null, skip_reason: "stream_not_found" },
+        },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    const defaultRow = (await screen.findByText("eng")).closest("tr") as HTMLElement;
+    fireEvent.click(within(defaultRow).getByRole("button", { name: /^set default audio$/i }));
+
+    expect(await within(defaultRow).findByText(/no job enqueued/i)).toBeInTheDocument();
+    expect(within(defaultRow).getByText(/no longer exists on this file/i)).toBeInTheDocument();
+  });
+
+  it('shows an error message when a row\'s "Set Default Audio" request fails', async () => {
+    mockFetchRouter(
+      defaultHandler({
+        defaultAudioTrigger: { ok: false, status: 503, body: { detail: "Job scheduler is not available." } },
+      }),
+    );
+    renderFileDetailPage("1");
+
+    await screen.findByText("Interstellar");
+    const defaultRow = (await screen.findByText("eng")).closest("tr") as HTMLElement;
+    fireEvent.click(within(defaultRow).getByRole("button", { name: /^set default audio$/i }));
+
+    expect(
+      await within(defaultRow).findByText(/couldn't trigger set default audio: job scheduler is not available\./i),
+    ).toBeInTheDocument();
+  });
+
   it("degrades gracefully instead of crashing when the file can't currently be probed (e.g. missing on disk)", async () => {
     mockFetchRouter(
       defaultHandler({

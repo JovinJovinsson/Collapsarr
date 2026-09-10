@@ -122,6 +122,14 @@ class PipelineOutcome(Enum):
     PROBE_FAILED = "probe_failed"
     REMUX_FAILED = "remux_failed"
     APPLY_FAILED = "apply_failed"
+    #: COL-253 -- :func:`~collapsarr.downmix.default_audio_pipeline.
+    #: run_default_audio_pipeline`'s explicit per-track mode only: the
+    #: caller-supplied ``explicit_stream_index`` (an ordinal position within
+    #: the audio-only stream list) is out of range for the file's *current*
+    #: probe -- the file changed on disk between the trigger and this Job
+    #: actually running. Never produced by :func:`run_downmix_pipeline` or by
+    #: :func:`run_default_audio_pipeline`'s ordinary auto-resolve mode.
+    STREAM_INDEX_OUT_OF_RANGE = "stream_index_out_of_range"
 
 
 @dataclass(frozen=True, slots=True)

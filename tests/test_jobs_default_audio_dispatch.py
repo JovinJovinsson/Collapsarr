@@ -65,6 +65,9 @@ class _StubPlexRunner:
         #: ``calls`` rather than added to that tuple, so every existing
         #: 5-tuple unpack at each call site keeps working unchanged.
         self.expected_stream_count_calls: list[int | None] = []
+        #: ``explicit_stream_index`` (COL-253), mirroring
+        #: ``expected_stream_count_calls`` above for the same reason.
+        self.explicit_stream_index_calls: list[int | None] = []
 
     def __call__(
         self,
@@ -76,9 +79,11 @@ class _StubPlexRunner:
         token: str,
         transport: httpx.BaseTransport | None = None,
         expected_stream_count: int | None = None,
+        explicit_stream_index: int | None = None,
     ) -> PlexDefaultAudioResult:
         self.calls.append((session, str(file_path), preference, base_url, token))
         self.expected_stream_count_calls.append(expected_stream_count)
+        self.explicit_stream_index_calls.append(explicit_stream_index)
         return self._result
 
 
@@ -184,6 +189,46 @@ def test_expected_stream_count_defaults_to_none_for_an_immediate_trigger(
     runner(FILE_PATH, _PREFERENCE)
 
     assert plex_runner.expected_stream_count_calls == [None]
+
+
+def test_explicit_stream_index_is_forwarded_to_the_plex_runner(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """COL-253: an explicit per-track trigger's stream index reaches the Plex mechanism."""
+    _configure_plex(session_factory)
+    plex_runner = _StubPlexRunner(_PLEX_SUCCESS)
+    runner = make_default_audio_pipeline_runner(session_factory, plex_runner=plex_runner)
+
+    runner(FILE_PATH, _PREFERENCE, explicit_stream_index=1)
+
+    assert plex_runner.explicit_stream_index_calls == [1]
+
+
+def test_explicit_stream_index_is_forwarded_to_the_remux_runner_too(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Not-configured branch: the same value reaches the remux mechanism via **kwargs."""
+    remux_runner = _StubRemuxRunner(_REMUX_SUCCESS)
+    runner = make_default_audio_pipeline_runner(session_factory, remux_runner=remux_runner)
+
+    runner(FILE_PATH, _PREFERENCE, cancel_handle=None, explicit_stream_index=1)
+
+    assert remux_runner.calls == [
+        (FILE_PATH, _PREFERENCE, {"cancel_handle": None, "explicit_stream_index": 1})
+    ]
+
+
+def test_explicit_stream_index_defaults_to_none_for_the_ordinary_auto_resolve_path(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Every trigger except the explicit per-track one leaves this unset (COL-253)."""
+    _configure_plex(session_factory)
+    plex_runner = _StubPlexRunner(_PLEX_SUCCESS)
+    runner = make_default_audio_pipeline_runner(session_factory, plex_runner=plex_runner)
+
+    runner(FILE_PATH, _PREFERENCE)
+
+    assert plex_runner.explicit_stream_index_calls == [None]
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +347,11 @@ def test_worker_pool_routes_a_set_default_audio_job_to_the_remux_mechanism_when_
         (
             FILE_PATH,
             _PREFERENCE,
-            {"cancel_handle": job.cancellation, "expected_stream_count": None},
+            {
+                "cancel_handle": job.cancellation,
+                "expected_stream_count": None,
+                "explicit_stream_index": None,
+            },
         )
     ]
     assert plex_runner.calls == []
