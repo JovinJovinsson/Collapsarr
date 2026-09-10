@@ -37,8 +37,11 @@ In order, for one file:
    reported as :attr:`PlexDefaultAudioOutcome.NOTHING_TO_DO`, a non-error
    success, no write attempted -- mirroring :func:`~collapsarr.downmix.
    default_audio_pipeline.run_default_audio_pipeline`'s own no-op contract.
-4. **PUT** the set-default write against the resolved stream's id
-   (:func:`~collapsarr.plex.client.set_default_audio_stream`).
+4. **PUT** the set-default write against the resolved stream's id and its
+   containing Part's id (``winner.part_id`` -- Plex's set-default-audio-track
+   write targets the Part, not the item's ``ratingKey``; see
+   :func:`~collapsarr.plex.client.set_default_audio_stream`'s docstring,
+   COL-252).
 5. **GET-verify**: fetch the item again and confirm the resolved stream is
    now flagged ``selected`` before reporting success. A verifying GET that
    itself fails to fetch is a distinct failure
@@ -221,7 +224,7 @@ def apply_default_audio_via_plex(
         )
 
     write_result = set_default_audio_stream(
-        base_url, token, rating_key, winner.id, transport=transport
+        base_url, token, winner.part_id, winner.id, transport=transport
     )
     if not write_result.ok:
         return _finish(

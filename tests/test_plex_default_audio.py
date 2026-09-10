@@ -25,9 +25,11 @@ def _stream(
     selected: bool = False,
     title: str | None = None,
     extended_display_title: str | None = None,
+    part_id: str = "1",
 ) -> PlexAudioStream:
     return PlexAudioStream(
         id=stream_id,
+        part_id=part_id,
         channels=channels,
         language=language,
         title=title,
