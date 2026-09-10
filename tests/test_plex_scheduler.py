@@ -236,6 +236,7 @@ def test_run_once_refreshes_default_audio_track_snapshot_from_plex(
                                 {
                                     "Part": [
                                         {
+                                            "id": 1,
                                             "Stream": [
                                                 {
                                                     "id": "1",

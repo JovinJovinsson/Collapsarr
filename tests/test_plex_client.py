@@ -332,8 +332,9 @@ def test_set_default_audio_stream_request_carries_method_path_token_and_stream_i
 
     request = seen["request"]
     assert request.method == "PUT"
-    assert request.url.path == "/library/metadata/999"
+    assert request.url.path == "/library/parts/999"
     assert request.url.params["audioStreamID"] == "42"
+    assert request.url.params["allParts"] == "1"
     assert request.headers["X-Plex-Token"] == "plex-token"
 
 

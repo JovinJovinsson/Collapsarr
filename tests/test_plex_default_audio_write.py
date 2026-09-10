@@ -27,6 +27,7 @@ BASE_URL = "http://plex.local:32400"
 TOKEN = "plex-token"
 FILE_PATH = "/media/movie.mkv"
 RATING_KEY = "12345"
+PART_ID = "1"  # matches the "id" of the Part in _metadata_payload below
 
 PREFERENCE = DefaultAudioPreference(language="eng", channel_tier=DownmixTarget.FIVE_POINT_ONE)
 
@@ -131,8 +132,9 @@ def test_success_performs_get_resolve_put_get_verify_and_reports_success(
         f"/library/metadata/{RATING_KEY}",
     ]
     assert len(put_requests) == 1
-    assert put_requests[0].url.path == f"/library/metadata/{RATING_KEY}"
+    assert put_requests[0].url.path == f"/library/parts/{PART_ID}"
     assert put_requests[0].url.params["audioStreamID"] == _WINNER_STREAM_ID
+    assert put_requests[0].url.params["allParts"] == "1"
     for request in seen:
         assert request.headers["X-Plex-Token"] == TOKEN
     # PUT happens strictly after the first GET and strictly before the second.

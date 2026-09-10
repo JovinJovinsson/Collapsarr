@@ -52,11 +52,15 @@ Default Audio Track Job (:mod:`collapsarr.plex.default_audio_write`):
   :mod:`collapsarr.plex.streams`. Used both to fetch an item's current
   stream list (before the write) and, called a second time, to verify the
   write actually took effect.
-* :func:`set_default_audio_stream` -- ``PUT /library/metadata/{ratingKey}``
-  with ``audioStreamID=<streamId>``, Plex's set-default-audio-track write
-  against one already-resolved stream id
-  (:class:`~collapsarr.plex.streams.PlexAudioStream.id`). Like
-  :func:`analyze_item`, Plex responds with an empty body, so success is
+* :func:`set_default_audio_stream` -- ``PUT /library/parts/{partId}`` with
+  ``audioStreamID=<streamId>`` and ``allParts=1``, Plex's real
+  set-default-audio-track write, which targets the media *Part*, not the
+  item's ``ratingKey`` (COL-252 -- the original ``/library/metadata/
+  {ratingKey}`` target was wrong and returned HTTP 400 against a real Plex
+  server). Takes one already-resolved stream id
+  (:class:`~collapsarr.plex.streams.PlexAudioStream.id`) and its containing
+  Part's id (:class:`~collapsarr.plex.streams.PlexAudioStream.part_id`).
+  Like :func:`analyze_item`, Plex responds with an empty body, so success is
   purely "the request was accepted".
 
 Every call authenticates with the ``X-Plex-Token`` header -- the token is
@@ -79,6 +83,7 @@ _SEARCH_PATH = "/search"
 _ANALYZE_PATH_TEMPLATE = "/library/metadata/{rating_key}/analyze"
 _POSTER_PATH_TEMPLATE = "/library/metadata/{rating_key}/thumb"
 _METADATA_PATH_TEMPLATE = "/library/metadata/{rating_key}"
+_PART_PATH_TEMPLATE = "/library/parts/{part_id}"
 _DEFAULT_TIMEOUT = 10.0
 _ERROR_BODY_LIMIT = 500
 _DEFAULT_POSTER_CONTENT_TYPE = "image/jpeg"
@@ -351,7 +356,7 @@ def get_item_metadata(
 def set_default_audio_stream(
     base_url: str,
     token: str,
-    rating_key: str,
+    part_id: str,
     stream_id: str,
     *,
     timeout: float = _DEFAULT_TIMEOUT,
@@ -359,23 +364,31 @@ def set_default_audio_stream(
 ) -> SetDefaultAudioResult:
     """Write a set-default-audio-track change against one already-resolved stream (COL-245).
 
-    ``PUT /library/metadata/{ratingKey}?audioStreamID={streamId}`` -- Plex
-    queues the change and responds with an empty body, so success is purely
-    "the request was accepted" (a 2xx status), the same contract
+    ``PUT /library/parts/{partId}?audioStreamID={streamId}&allParts=1`` --
+    Plex's set-default-audio-track write targets the media *Part*
+    (:class:`~collapsarr.plex.streams.PlexAudioStream.part_id`), not the
+    item's ``ratingKey`` (COL-252 -- the original ``/library/metadata/
+    {ratingKey}`` target returned HTTP 400 against a real Plex server).
+    ``allParts=1`` matches Plex's own web client's default-audio write,
+    applying the change across every part of a multi-part item. Plex queues
+    the change and responds with an empty body, so success is purely "the
+    request was accepted" (a 2xx status), the same contract
     :func:`analyze_item` has. Never raises -- see :func:`check_connectivity`'s
     docstring for the full "never raises" contract, which this mirrors.
     """
     if not base_url:
         return SetDefaultAudioResult(ok=False, error="No base URL configured")
 
-    path = _METADATA_PATH_TEMPLATE.format(rating_key=rating_key)
+    path = _PART_PATH_TEMPLATE.format(part_id=part_id)
     url = f"{base_url.rstrip('/')}{path}"
     client = _make_client(timeout, transport)
 
     try:
         with client:
             response = client.put(
-                url, headers=_auth_headers(token), params={"audioStreamID": stream_id}
+                url,
+                headers=_auth_headers(token),
+                params={"audioStreamID": stream_id, "allParts": 1},
             )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:

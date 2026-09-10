@@ -46,11 +46,16 @@ _UNDETERMINED_LANGUAGE_CODES = {"und"}
 class PlexAudioStream:
     """One audio ``Stream`` entry from a Plex metadata response.
 
-    ``id`` is Plex's own opaque per-stream id -- the value a later ticket's
-    set-default write passes back as the ``audioStreamID`` query param --
-    kept as the string Plex sends it as, never coerced to an int, the same
-    treatment :class:`~collapsarr.plex.client.PlexMediaItem.rating_key` gives
-    Plex's item ids. ``language`` is normalized the same way
+    ``id`` is Plex's own opaque per-stream id -- the value the set-default
+    write passes back as the ``audioStreamID`` query param -- kept as the
+    string Plex sends it as, never coerced to an int, the same treatment
+    :class:`~collapsarr.plex.client.PlexMediaItem.rating_key` gives Plex's
+    item ids. ``part_id`` is the id of the containing ``Media[].Part[]``
+    entry this stream was nested under (same string-coercion treatment as
+    ``id``) -- Plex's real set-default-audio-track write targets the *Part*,
+    not the item's ``ratingKey`` (COL-252), so this is the value
+    :func:`~collapsarr.plex.client.set_default_audio_stream` needs, not
+    ``id`` alone. ``language`` is normalized the same way
     :func:`collapsarr.downmix.probe._normalize_language` normalizes ffprobe's
     ``tags.language``: lowercased, with a missing or "und" tag folded into
     ``"unknown"`` -- so :mod:`collapsarr.plex.default_audio` compares
@@ -62,6 +67,7 @@ class PlexAudioStream:
     """
 
     id: str
+    part_id: str
     channels: int
     language: str
     title: str | None
@@ -92,8 +98,14 @@ def parse_audio_streams(payload: object) -> list[PlexAudioStream]:
     for entry in _as_dict_list(container.get("Metadata")):
         for media in _as_dict_list(entry.get("Media")):
             for part in _as_dict_list(media.get("Part")):
+                part_id = _coerce_id(part.get("id"))
+                if part_id is None:
+                    # No usable Part id -- the set-default write has nothing
+                    # to target for any stream nested under it, so skip the
+                    # whole part rather than parsing streams we can't act on.
+                    continue
                 for stream in _as_dict_list(part.get("Stream")):
-                    parsed = _parse_audio_stream(stream)
+                    parsed = _parse_audio_stream(stream, part_id)
                     if parsed is not None:
                         results.append(parsed)
 
@@ -107,15 +119,13 @@ def _as_dict_list(value: object) -> list[dict[str, object]]:
     return [entry for entry in value if isinstance(entry, dict)]
 
 
-def _parse_audio_stream(stream: dict[str, object]) -> PlexAudioStream | None:
+def _parse_audio_stream(stream: dict[str, object], part_id: str) -> PlexAudioStream | None:
     """Parse one ``Stream`` entry into a :class:`PlexAudioStream`, or ``None`` if unusable."""
     if stream.get("streamType") != _AUDIO_STREAM_TYPE:
         return None
 
-    raw_id = stream.get("id")
-    if isinstance(raw_id, int):
-        raw_id = str(raw_id)
-    if not isinstance(raw_id, str) or not raw_id:
+    raw_id = _coerce_id(stream.get("id"))
+    if raw_id is None:
         return None
 
     channels = stream.get("channels")
@@ -124,12 +134,26 @@ def _parse_audio_stream(stream: dict[str, object]) -> PlexAudioStream | None:
 
     return PlexAudioStream(
         id=raw_id,
+        part_id=part_id,
         channels=channels,
         language=_normalize_language(stream.get("languageCode")),
         title=_optional_str(stream.get("title")),
         extended_display_title=_optional_str(stream.get("extendedDisplayTitle")),
         selected=bool(stream.get("selected")),
     )
+
+
+def _coerce_id(value: object) -> str | None:
+    """Coerce a Plex ``id`` (int or non-empty string) to ``str``, else ``None``.
+
+    Shared by both the ``Stream`` id and the containing ``Part`` id -- Plex's
+    JSON sends either shape for either field.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not value:
+        return None
+    return value
 
 
 def _optional_str(value: object) -> str | None:

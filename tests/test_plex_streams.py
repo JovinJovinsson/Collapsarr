@@ -82,6 +82,7 @@ def test_parses_audio_stream_fields() -> None:
     assert result == [
         PlexAudioStream(
             id="101",
+            part_id="1",
             channels=6,
             language="eng",
             title="Commentary",
@@ -97,6 +98,72 @@ def test_stream_id_is_kept_as_string_when_already_a_string() -> None:
     result = parse_audio_streams(payload)
 
     assert result[0].id == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# Part id (COL-252): the set-default-audio write targets the containing Part,
+# not the item's ratingKey, so `part_id` must be captured off the payload's
+# ``Media[].Part[].id`` the same way `id` is off `Stream.id`.
+# ---------------------------------------------------------------------------
+
+
+def test_part_id_is_captured_and_coerced_to_string() -> None:
+    # _metadata_payload nests every stream under a Part whose ``id`` is the
+    # int ``1``.
+    payload = _metadata_payload([_audio_stream(stream_id=1)])
+
+    result = parse_audio_streams(payload)
+
+    assert result[0].part_id == "1"
+
+
+def test_part_id_is_kept_as_string_when_already_a_string() -> None:
+    payload: dict[str, object] = {
+        "MediaContainer": {
+            "Metadata": [
+                {
+                    "Media": [
+                        {
+                            "Part": [
+                                {
+                                    "id": "part-abc",
+                                    "Stream": [_audio_stream(stream_id=1)],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    result = parse_audio_streams(payload)
+
+    assert result[0].part_id == "part-abc"
+
+
+def test_part_missing_id_skips_every_stream_in_that_part() -> None:
+    payload: dict[str, object] = {
+        "MediaContainer": {
+            "Metadata": [
+                {
+                    "Media": [
+                        {
+                            "Part": [
+                                {"Stream": [_audio_stream(stream_id=1, channels=2)]},
+                                {"id": 20, "Stream": [_audio_stream(stream_id=2, channels=6)]},
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    result = parse_audio_streams(payload)
+
+    assert [stream.id for stream in result] == ["2"]
+    assert result[0].part_id == "20"
 
 
 def test_missing_title_and_extended_display_title_are_none() -> None:
@@ -133,8 +200,8 @@ def test_multiple_parts_are_flattened_in_order() -> None:
                     "Media": [
                         {
                             "Part": [
-                                {"Stream": [_audio_stream(stream_id=1, channels=2)]},
-                                {"Stream": [_audio_stream(stream_id=2, channels=6)]},
+                                {"id": 10, "Stream": [_audio_stream(stream_id=1, channels=2)]},
+                                {"id": 20, "Stream": [_audio_stream(stream_id=2, channels=6)]},
                             ]
                         }
                     ]
@@ -146,6 +213,7 @@ def test_multiple_parts_are_flattened_in_order() -> None:
     result = parse_audio_streams(payload)
 
     assert [stream.id for stream in result] == ["1", "2"]
+    assert [stream.part_id for stream in result] == ["10", "20"]
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +323,7 @@ def _stream(
 ) -> PlexAudioStream:
     return PlexAudioStream(
         id="1",
+        part_id="1",
         channels=2,
         language="eng",
         title=title,
