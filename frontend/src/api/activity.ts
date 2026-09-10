@@ -91,7 +91,8 @@ export async function triggerDownmix(input: ManualTriggerRequest): Promise<Manua
 /**
  * Manually enqueues a `SET_DEFAULT_AUDIO` job for one file
  * (`POST /api/jobs/trigger-default-audio`, COL-155), used by
- * `FileDetailPage`'s "Set Default Audio Track" action (COL-157).
+ * `FileDetailPage`'s whole-file "Set Default Audio Track" action (COL-157)
+ * and its per-row "Set Default Audio" action (COL-253, via `input.stream_index`).
  *
  * Mirrors {@link triggerDownmix}'s request/response handling: a `202` is
  * returned whether or not a job was enqueued -- the response's `enqueued`

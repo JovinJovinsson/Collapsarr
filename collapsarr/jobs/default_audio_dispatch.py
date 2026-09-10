@@ -139,9 +139,10 @@ def make_default_audio_pipeline_runner(
       ``remux_runner`` (default :func:`~collapsarr.downmix.
       default_audio_pipeline.run_default_audio_pipeline`) with every keyword
       argument :class:`~collapsarr.jobs.queue.JobQueue` forwards
-      (``cancel_handle``, and -- when configured -- ``ffmpeg_path``) and
-      returns its :class:`~collapsarr.downmix.pipeline.PipelineResult`
-      unchanged. ``plex_runner`` is never invoked on this branch.
+      (``cancel_handle``, ``explicit_stream_index`` (COL-253), and -- when
+      configured -- ``ffmpeg_path``) and returns its :class:`~collapsarr.
+      downmix.pipeline.PipelineResult` unchanged. ``plex_runner`` is never
+      invoked on this branch.
 
     Exactly one branch ever runs per call -- there is no path where both
     ``plex_runner`` and ``remux_runner`` execute for the same file (COL-247's
@@ -163,6 +164,12 @@ def make_default_audio_pipeline_runner(
         # receives it in **kwargs (run_default_audio_pipeline accepts and
         # ignores it, for call-signature parity; see its own docstring).
         expected_stream_count = kwargs.get("expected_stream_count")
+        # COL-253: likewise, an explicit per-track "Set Default Audio"
+        # trigger carries this via `JobQueue._run_job` (`Job.
+        # explicit_stream_index`); every other trigger leaves it unset
+        # (None). Same `.get()` (not popped) rationale as
+        # `expected_stream_count` above.
+        explicit_stream_index = kwargs.get("explicit_stream_index")
         with session_factory() as session:
             connection = get_plex_connection(session)
             if connection.is_configured:
@@ -174,6 +181,7 @@ def make_default_audio_pipeline_runner(
                     token=connection.token,
                     transport=transport,
                     expected_stream_count=expected_stream_count,
+                    explicit_stream_index=explicit_stream_index,
                 )
                 return _pipeline_result_from_plex(plex_result)
         # Not configured: the session above is already closed -- a remux can

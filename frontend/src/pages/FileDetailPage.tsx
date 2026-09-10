@@ -181,6 +181,17 @@ function buildStatusRows(file: WantedFile, history: JobHistoryEntry[]): StatusRo
  * the same page view. An unprobeable file (missing on disk, corrupt)
  * degrades to a message instead of a table, matching the backend's
  * `probeable: false` response rather than crashing the page.
+ *
+ * That table's "Actions" column (COL-253) adds a per-row "Set Default Audio"
+ * button, a second, distinct manual trigger alongside the whole-file one
+ * above: it always targets *exactly that row's* stream
+ * (`POST /api/jobs/trigger-default-audio` with `stream_index` set), bypassing
+ * the "already correct" skip gate the whole-file trigger and bulk trigger
+ * both still respect -- the one way to force a re-apply on a file Collapsarr
+ * already believes is correct (e.g. after a Plex-API write that silently
+ * failed under the now-fixed COL-252 bug). Tracked independently per row
+ * (`perTrackTriggerState`, keyed by `stream.index`) so triggering one row's
+ * fix never disables or overwrites another row's own in-flight/result state.
  */
 export function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
@@ -200,6 +211,15 @@ export function FileDetailPage() {
   >({
     status: "idle",
   });
+  /**
+   * Per-row "Set Default Audio" trigger state (COL-253), keyed by the
+   * clicked row's `stream.index` -- a plain object rather than one shared
+   * `TriggerState` since every row's action is independent (submitting one
+   * row's fix must not disable/overwrite another row's own result).
+   */
+  const [perTrackTriggerState, setPerTrackTriggerState] = useState<
+    Record<number, TriggerState<SetDefaultAudioTriggerResult>>
+  >({});
   const [extraLanguages, setExtraLanguages] = useState("");
   const [trackedPending, setTrackedPending] = useState(false);
   const [trackedError, setTrackedError] = useState<string | null>(null);
@@ -390,6 +410,45 @@ export function FileDetailPage() {
         status: "error",
         message: error instanceof Error ? error.message : "Unknown error.",
       });
+    }
+  }
+
+  /**
+   * Manually enqueues a `SET_DEFAULT_AUDIO` job targeting one *specific*
+   * audio stream (COL-253's per-row "Set Default Audio" button), via the
+   * same `POST /api/jobs/trigger-default-audio` endpoint as
+   * `handleTriggerDefaultAudio` above -- just with `stream_index` set. Unlike
+   * that whole-file action, this always runs against exactly the clicked
+   * row's stream, unconditionally: it bypasses the "already correct" skip
+   * gate entirely, so it stays usable to re-trigger a file whose write
+   * silently failed even when Collapsarr already believes that stream is
+   * default. Tracked independently per row (`perTrackTriggerState`) so
+   * triggering one row never disturbs another's in-flight/result state.
+   */
+  async function handleTriggerDefaultAudioForStream(streamIndex: number) {
+    if (fileState.status !== "ready") return;
+
+    setPerTrackTriggerState((previous) => ({
+      ...previous,
+      [streamIndex]: { status: "submitting" },
+    }));
+    try {
+      const result = await triggerSetDefaultAudio({
+        file_path: fileState.file.file_path,
+        stream_index: streamIndex,
+      });
+      setPerTrackTriggerState((previous) => ({
+        ...previous,
+        [streamIndex]: { status: "result", result },
+      }));
+    } catch (error: unknown) {
+      setPerTrackTriggerState((previous) => ({
+        ...previous,
+        [streamIndex]: {
+          status: "error",
+          message: error instanceof Error ? error.message : "Unknown error.",
+        },
+      }));
     }
   }
 
@@ -659,29 +718,73 @@ export function FileDetailPage() {
                       <th scope="col">Channels</th>
                       <th scope="col">Codec</th>
                       <th scope="col">Default Audio Track</th>
+                      <th scope="col">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {audioStreamsState.response.streams.map((stream) => (
-                      <tr key={stream.index}>
-                        <td>{stream.language}</td>
-                        <td>
-                          {stream.channel_layout} ({stream.channels}ch)
-                        </td>
-                        <td>{stream.codec}</td>
-                        <td>
-                          {stream.is_default ? (
-                            <span className="activity-table__status activity-table__status--succeeded">
-                              Default
-                            </span>
-                          ) : (
-                            <span className="activity-table__status activity-table__status--missing">
-                              —
-                            </span>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
+                    {audioStreamsState.response.streams.map((stream) => {
+                      const rowState = perTrackTriggerState[stream.index] ?? { status: "idle" };
+                      return (
+                        <tr key={stream.index}>
+                          <td>{stream.language}</td>
+                          <td>
+                            {stream.channel_layout} ({stream.channels}ch)
+                          </td>
+                          <td>{stream.codec}</td>
+                          <td>
+                            {stream.is_default ? (
+                              <span className="activity-table__status activity-table__status--succeeded">
+                                Default
+                              </span>
+                            ) : (
+                              <span className="activity-table__status activity-table__status--missing">
+                                —
+                              </span>
+                            )}
+                          </td>
+                          <td>
+                            <button
+                              type="button"
+                              className="btn btn--secondary btn--sm"
+                              onClick={() => handleTriggerDefaultAudioForStream(stream.index)}
+                              disabled={rowState.status === "submitting"}
+                            >
+                              {rowState.status === "submitting" ? "Setting…" : "Set Default Audio"}
+                            </button>
+                            {rowState.status === "error" && (
+                              <p className="form-error">
+                                Couldn&apos;t trigger Set Default Audio: {rowState.message}
+                              </p>
+                            )}
+                            {rowState.status === "result" && (
+                              <p
+                                className={
+                                  rowState.result.enqueued ? "form-success" : "form-hint"
+                                }
+                              >
+                                {rowState.result.enqueued && rowState.result.job ? (
+                                  <>
+                                    Job <code>{rowState.result.job.id}</code> enqueued —{" "}
+                                    <span
+                                      className={`activity-table__status activity-table__status--${rowState.result.job.status}`}
+                                    >
+                                      {STATUS_LABEL[rowState.result.job.status]}
+                                    </span>
+                                  </>
+                                ) : (
+                                  <>
+                                    No job enqueued —{" "}
+                                    {rowState.result.skip_reason
+                                      ? DEFAULT_AUDIO_SKIP_REASON_MESSAGE[rowState.result.skip_reason]
+                                      : "the file was skipped."}
+                                  </>
+                                )}
+                              </p>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               ))}

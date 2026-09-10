@@ -310,6 +310,93 @@ def test_expected_stream_count_unset_never_checks_the_count(session: Session) ->
 
 
 # ---------------------------------------------------------------------------
+# Explicit per-track "Set Default Audio" trigger (COL-253)
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_stream_index_bypasses_resolver_and_targets_that_stream_directly(
+    session: Session,
+) -> None:
+    """An explicit ``explicit_stream_index`` writes the stream at that ordinal position --
+    not `PREFERENCE`'s own auto-resolve winner (id "2") -- and writes it even though it's
+    already ``selected`` (id "1" in `_PRE_WRITE_STREAMS`), proving both the resolver and
+    any "already correct" no-op are bypassed."""
+    _mapped(session)
+    pre_payload = _metadata_payload(_PRE_WRITE_STREAMS)
+    verify_payload = _metadata_payload(_PRE_WRITE_STREAMS)  # unchanged: already selected
+    transport, seen = _sequenced_get_transport(get_payloads=[pre_payload, verify_payload])
+
+    result = apply_default_audio_via_plex(
+        session,
+        FILE_PATH,
+        PREFERENCE,
+        base_url=BASE_URL,
+        token=TOKEN,
+        transport=transport,
+        explicit_stream_index=0,
+    )
+
+    assert result == PlexDefaultAudioResult(
+        outcome=PlexDefaultAudioOutcome.SUCCESS,
+        success=True,
+        detail=result.detail,
+        rating_key=RATING_KEY,
+        stream_id="1",
+    )
+    put_requests = [r for r in seen if r.method == "PUT"]
+    assert len(put_requests) == 1
+    assert put_requests[0].url.params["audioStreamID"] == "1"
+
+
+def test_explicit_stream_index_out_of_range_hard_fails_without_writing(session: Session) -> None:
+    """A stale/invalid ordinal (Plex reports fewer streams than it requires) is a hard
+    failure -- no PUT is ever attempted against a guessed stream."""
+    _mapped(session)
+    pre_payload = _metadata_payload(_PRE_WRITE_STREAMS)  # only 2 audio streams (positions 0, 1)
+    transport, seen = _sequenced_get_transport(get_payloads=[pre_payload])
+
+    result = apply_default_audio_via_plex(
+        session,
+        FILE_PATH,
+        PREFERENCE,
+        base_url=BASE_URL,
+        token=TOKEN,
+        transport=transport,
+        explicit_stream_index=5,
+    )
+
+    assert result.outcome is PlexDefaultAudioOutcome.STREAM_INDEX_OUT_OF_RANGE
+    assert result.success is False
+    assert result.rating_key == RATING_KEY
+    assert result.stream_id is None
+    assert [r.method for r in seen] == ["GET"]  # no resolution, no PUT, no verify attempted
+
+
+def test_explicit_stream_index_unset_uses_the_ordinary_auto_resolve_path(
+    session: Session,
+) -> None:
+    """``explicit_stream_index=None`` (the default) is the unchanged, ordinary auto-resolve
+    mode -- targets `PREFERENCE`'s own winner (id "2"), not position 0."""
+    _mapped(session)
+    pre_payload = _metadata_payload(_PRE_WRITE_STREAMS)
+    verify_payload = _metadata_payload(
+        [
+            _stream_entry(stream_id="1", channels=2, selected=False),
+            _stream_entry(stream_id="2", channels=6, selected=True),
+        ]
+    )
+    transport, seen = _sequenced_get_transport(get_payloads=[pre_payload, verify_payload])
+
+    result = apply_default_audio_via_plex(
+        session, FILE_PATH, PREFERENCE, base_url=BASE_URL, token=TOKEN, transport=transport
+    )
+
+    assert result.outcome is PlexDefaultAudioOutcome.SUCCESS
+    put_requests = [r for r in seen if r.method == "PUT"]
+    assert put_requests[0].url.params["audioStreamID"] == _WINNER_STREAM_ID
+
+
+# ---------------------------------------------------------------------------
 # Additional failure modes, for completeness alongside the three AC-mandated cases.
 # ---------------------------------------------------------------------------
 

@@ -80,7 +80,7 @@ from collapsarr.downmix.default_audio import DefaultAudioPreference
 from .client import get_item_metadata, set_default_audio_stream
 from .default_audio import resolve_default_audio_stream
 from .library_sync import resolve_rating_key
-from .streams import parse_audio_streams
+from .streams import PlexAudioStream, parse_audio_streams
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,13 @@ class PlexDefaultAudioOutcome(Enum):
     RATING_KEY_UNRESOLVED = "rating_key_unresolved"
     STREAM_FETCH_FAILED = "stream_fetch_failed"
     STREAM_NOT_YET_INGESTED = "stream_not_yet_ingested"
+    #: COL-253 -- explicit per-track mode only (``explicit_stream_index`` set):
+    #: Plex currently reports fewer audio streams than ``explicit_stream_index``
+    #: requires. Mirrors ``STREAM_NOT_YET_INGESTED``'s "hard-fail on a
+    #: stream-count mismatch rather than guess" pattern, for the same reason --
+    #: silently resolving against the wrong ordinal position would apply the
+    #: fix to the wrong track.
+    STREAM_INDEX_OUT_OF_RANGE = "stream_index_out_of_range"
     WRITE_FAILED = "write_failed"
     VERIFY_FETCH_FAILED = "verify_fetch_failed"
     VERIFY_MISMATCH = "verify_mismatch"
@@ -137,6 +144,7 @@ def apply_default_audio_via_plex(
     token: str,
     transport: httpx.BaseTransport | None = None,
     expected_stream_count: int | None = None,
+    explicit_stream_index: int | None = None,
 ) -> PlexDefaultAudioResult:
     """Fix a single file's Default Audio Track disposition via a direct Plex API write.
 
@@ -156,6 +164,34 @@ def apply_default_audio_via_plex(
     reports *fewer* audio streams than this for the item, the write is
     aborted with :attr:`PlexDefaultAudioOutcome.STREAM_NOT_YET_INGESTED`
     before any resolution or write is attempted.
+
+    ``explicit_stream_index`` (COL-253) is the file detail page's per-row
+    "Set Default Audio" trigger's *explicit per-track* mode -- see
+    :attr:`~collapsarr.jobs.queue.Job.explicit_stream_index` for exactly what
+    it means (an ordinal position within the audio-only stream list, *not* a
+    Plex stream id -- Plex has no ffprobe-index counterpart at all, which is
+    exactly why ordinal position, not id-matching, is how this maps the
+    request onto one of Plex's reported streams) and why it exists. ``None``
+    (the default) is every other trigger, unchanged: the ordinary
+    auto-resolve mode below. When set:
+
+    - :func:`~collapsarr.plex.default_audio.resolve_default_audio_stream` is
+      never called -- the target stream is ``streams[explicit_stream_index]``
+      directly, a plain list index into this same call's freshly-fetched,
+      audio-only ``streams``. Fewer Plex-reported audio streams than
+      ``explicit_stream_index`` requires is a hard failure
+      (:attr:`PlexDefaultAudioOutcome.STREAM_INDEX_OUT_OF_RANGE`) rather than
+      guessing which stream was meant -- the same defensive pattern as the
+      ``expected_stream_count`` check above.
+    - There is no "nothing to do" no-op here either: this mode always
+      attempts the write, unconditionally, even when Plex already reports
+      the target stream as ``selected``. That is the one behavior this whole
+      mode exists for: re-triggering a file Collapsarr already believes is
+      correct (e.g. after a Plex-API write that silently failed under the
+      now-fixed COL-252 bug).
+
+    Every stage after stream selection (PUT, GET-verify) is unchanged
+    either way.
     """
     path_str = str(file_path)
 
@@ -208,20 +244,41 @@ def apply_default_audio_via_plex(
             logging.ERROR,
         )
 
-    winner = resolve_default_audio_stream(streams, preference)
-    if winner is None:
-        return _finish(
-            PlexDefaultAudioResult(
-                outcome=PlexDefaultAudioOutcome.NOTHING_TO_DO,
-                success=True,
-                detail=(
-                    f"Fewer than two audio streams to compare for ratingKey {rating_key} "
-                    f"(file {path_str!r}); nothing to do"
+    if explicit_stream_index is not None:
+        # COL-253: explicit per-track mode -- direct list index, no
+        # resolver, no "already correct"/"nothing to do" check. See the
+        # docstring above.
+        if not 0 <= explicit_stream_index < len(streams):
+            return _finish(
+                PlexDefaultAudioResult(
+                    outcome=PlexDefaultAudioOutcome.STREAM_INDEX_OUT_OF_RANGE,
+                    success=False,
+                    detail=(
+                        f"Plex reports {len(streams)} audio stream(s) for ratingKey "
+                        f"{rating_key} (file {path_str!r}), fewer than the requested stream "
+                        f"ordinal {explicit_stream_index} requires; no Plex API write attempted"
+                    ),
+                    rating_key=rating_key,
                 ),
-                rating_key=rating_key,
-            ),
-            logging.WARNING,
-        )
+                logging.ERROR,
+            )
+        winner: PlexAudioStream = streams[explicit_stream_index]
+    else:
+        resolved = resolve_default_audio_stream(streams, preference)
+        if resolved is None:
+            return _finish(
+                PlexDefaultAudioResult(
+                    outcome=PlexDefaultAudioOutcome.NOTHING_TO_DO,
+                    success=True,
+                    detail=(
+                        f"Fewer than two audio streams to compare for ratingKey {rating_key} "
+                        f"(file {path_str!r}); nothing to do"
+                    ),
+                    rating_key=rating_key,
+                ),
+                logging.WARNING,
+            )
+        winner = resolved
 
     write_result = set_default_audio_stream(
         base_url, token, winner.part_id, winner.id, transport=transport

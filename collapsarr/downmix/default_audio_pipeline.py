@@ -132,6 +132,7 @@ def run_default_audio_pipeline(
     runner: _Runner | None = None,
     cancel_handle: CancellationHandle | None = None,
     expected_stream_count: int | None = None,
+    explicit_stream_index: int | None = None,
 ) -> PipelineResult:
     """Fix a single file's Default Audio Track disposition, on demand, no downmixing.
 
@@ -144,6 +145,31 @@ def run_default_audio_pipeline(
     file, which already reflects the downmix's real output the instant the
     remux completed -- there is no Plex-ingestion race to guard against on
     this (no-Plex) path, unlike the direct Plex API write.
+
+    ``explicit_stream_index`` (COL-253) is the file detail page's per-row
+    "Set Default Audio" trigger's *explicit per-track* mode -- see
+    :attr:`~collapsarr.jobs.queue.Job.explicit_stream_index` for exactly what
+    it means (an ordinal position within the audio-only stream list, *not*
+    the raw ffprobe ``index``) and why it exists. ``None`` (the default) is
+    every other trigger, unchanged: the ordinary auto-resolve mode below.
+    When set:
+
+    - :func:`~collapsarr.downmix.default_audio.resolve_default_audio_stream`
+      is never called -- the target stream is ``streams[explicit_stream_index]``
+      directly, a plain list index into this same probe's audio-only
+      ``streams`` (out of range -- the file changed on disk since the
+      trigger -- is reported as
+      :attr:`~collapsarr.downmix.pipeline.PipelineOutcome.STREAM_INDEX_OUT_OF_RANGE`,
+      a hard failure, rather than guessing which stream was meant).
+    - :func:`_already_correct` is never called either -- this mode always
+      attempts the remux, unconditionally, even when the target stream
+      already carries the disposition. That is the one behavior this whole
+      mode exists for: re-triggering a file Collapsarr already believes is
+      correct (e.g. after a Plex-API write that silently failed under the
+      now-fixed COL-252 bug).
+
+    Every stage after stream selection (remux, validate-and-apply) is
+    unchanged either way.
 
     In order: :func:`~collapsarr.downmix.probe.probe_audio_streams`,
     :func:`~collapsarr.downmix.default_audio.resolve_default_audio_stream`,
@@ -222,33 +248,52 @@ def run_default_audio_pipeline(
             logging.ERROR,
         )
 
-    winner = resolve_default_audio_stream(streams, preference)
-    if winner is None:
-        return _finish(
-            PipelineResult(
-                outcome=PipelineOutcome.NOTHING_TO_DO,
-                success=True,
-                detail=(
-                    f"fewer than two audio streams to compare in {str(path)!r}; "
-                    "nothing to do"
+    if explicit_stream_index is not None:
+        # COL-253: explicit per-track mode -- direct list index, no
+        # resolver, no "already correct" check. See the docstring above.
+        if not 0 <= explicit_stream_index < len(streams):
+            return _finish(
+                PipelineResult(
+                    outcome=PipelineOutcome.STREAM_INDEX_OUT_OF_RANGE,
+                    success=False,
+                    detail=(
+                        f"{str(path)!r} has {len(streams)} audio stream(s) now, but the "
+                        f"requested stream ordinal {explicit_stream_index} is out of range; "
+                        "the file likely changed since the track was selected -- no ffmpeg "
+                        "remux attempted"
+                    ),
                 ),
-            ),
-            logging.WARNING,
-        )
+                logging.ERROR,
+            )
+        winner_index = explicit_stream_index
+    else:
+        winner = resolve_default_audio_stream(streams, preference)
+        if winner is None:
+            return _finish(
+                PipelineResult(
+                    outcome=PipelineOutcome.NOTHING_TO_DO,
+                    success=True,
+                    detail=(
+                        f"fewer than two audio streams to compare in {str(path)!r}; "
+                        "nothing to do"
+                    ),
+                ),
+                logging.WARNING,
+            )
 
-    winner_index = _index_of(streams, winner)
-    if _already_correct(streams, winner_index):
-        return _finish(
-            PipelineResult(
-                outcome=PipelineOutcome.NOTHING_TO_DO,
-                success=True,
-                detail=(
-                    f"Default Audio Track disposition in {str(path)!r} already "
-                    "matches the preference; nothing to do"
+        winner_index = _index_of(streams, winner)
+        if _already_correct(streams, winner_index):
+            return _finish(
+                PipelineResult(
+                    outcome=PipelineOutcome.NOTHING_TO_DO,
+                    success=True,
+                    detail=(
+                        f"Default Audio Track disposition in {str(path)!r} already "
+                        "matches the preference; nothing to do"
+                    ),
                 ),
-            ),
-            logging.WARNING,
-        )
+                logging.WARNING,
+            )
 
     remux_result = run_remux(
         path,

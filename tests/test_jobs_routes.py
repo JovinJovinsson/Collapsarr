@@ -171,6 +171,10 @@ class _FakeScheduler:
         #: ``default_audio_trigger_calls == [...]`` -- a list of bare paths
         #: -- don't need to change).
         self.default_audio_trigger_bypass_calls: list[bool] = []
+        #: COL-253's ``stream_index`` parameter, recorded per call in the
+        #: same parallel-list shape as ``default_audio_trigger_bypass_calls``
+        #: above, for the same reason.
+        self.default_audio_trigger_stream_index_calls: list[int | None] = []
         self.cancel_calls: list[UUID] = []
         self.bump_calls: list[UUID] = []
         self.clear_queue_calls: int = 0
@@ -211,9 +215,11 @@ class _FakeScheduler:
         *,
         session: Session | None = None,
         bypass_dedup_window: bool = False,
+        stream_index: int | None = None,
     ) -> SetDefaultAudioOutcome:
         self.default_audio_trigger_calls.append(file_path)
         self.default_audio_trigger_bypass_calls.append(bypass_dedup_window)
+        self.default_audio_trigger_stream_index_calls.append(stream_index)
         if self._default_audio_trigger_jobs_by_file is not None:
             job = self._default_audio_trigger_jobs_by_file.get(file_path)
         else:
@@ -886,6 +892,45 @@ def test_trigger_default_audio_always_bypasses_the_recently_processed_window(
     assert fake.default_audio_trigger_bypass_calls == [True]
 
 
+def test_trigger_default_audio_forwards_stream_index_to_the_scheduler(
+    client: TestClient,
+) -> None:
+    """COL-253: an optional ``stream_index`` in the request body reaches the scheduler."""
+    fake = _FakeScheduler(default_audio_trigger_job=_job("/media/movie.mkv"))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        client.post(
+            "/api/jobs/trigger-default-audio",
+            json={"file_path": "/media/movie.mkv", "stream_index": 2},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert fake.default_audio_trigger_stream_index_calls == [2]
+
+
+def test_trigger_default_audio_stream_index_defaults_to_none(client: TestClient) -> None:
+    """A request with no ``stream_index`` still reaches the scheduler -- as ``None``, the
+    ordinary whole-file auto-resolve mode."""
+    fake = _FakeScheduler(default_audio_trigger_job=_job("/media/movie.mkv"))
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        client.post(
+            "/api/jobs/trigger-default-audio",
+            json={"file_path": "/media/movie.mkv"},
+            headers=_auth_headers(client),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert fake.default_audio_trigger_stream_index_calls == [None]
+
+
 def test_trigger_default_audio_reports_not_enqueued_when_the_file_is_skipped(
     client: TestClient,
 ) -> None:
@@ -960,12 +1005,13 @@ def test_trigger_default_audio_wires_through_a_real_scheduler(settings: Settings
         DefaultAudioSkipReason.ALREADY_CORRECT,
         DefaultAudioSkipReason.UNPROBEABLE,
         DefaultAudioSkipReason.DUPLICATE,
+        DefaultAudioSkipReason.STREAM_NOT_FOUND,
     ],
 )
 def test_trigger_default_audio_reports_the_skip_reason_when_the_file_is_skipped(
     client: TestClient, reason: DefaultAudioSkipReason
 ) -> None:
-    """COL-207: each of the scheduler's four skip reasons surfaces on the response."""
+    """COL-207/COL-253: each of the scheduler's five skip reasons surfaces on the response."""
     fake = _FakeScheduler(default_audio_trigger_job=None, default_audio_skip_reason=reason)
     app = client.app
     assert isinstance(app, FastAPI)

@@ -98,17 +98,30 @@ export interface ManualTriggerResult {
  *
  * Unlike {@link ManualTriggerRequest} there is no allow-list-bypass option --
  * the Default Audio Track fix isn't gated by a language allow-list at all.
+ *
+ * `stream_index` (COL-253) is optional and switches the request into the
+ * *explicit per-track* mode the file detail page's per-row "Set Default
+ * Audio" button (COL-253) uses -- the ffprobe `index` of one specific audio
+ * stream, the same value {@link AudioStream}'s own `index` field already
+ * carries for that row (`types/audioStreams.ts`). `undefined`/omitted is the
+ * ordinary whole-file auto-resolve mode, unchanged: resolves the target
+ * stream against the persisted Preferred Default Audio setting, and skips a
+ * file that's already correct. When set, that resolution and its "already
+ * correct" skip are both bypassed entirely -- the clicked stream is always
+ * the target, unconditionally.
  */
 export interface SetDefaultAudioTriggerRequest {
   file_path: string;
+  stream_index?: number;
 }
 
-/** Matches `collapsarr.jobs.scheduler.DefaultAudioSkipReason`'s enum values (COL-207). */
+/** Matches `collapsarr.jobs.scheduler.DefaultAudioSkipReason`'s enum values (COL-207; COL-253). */
 export type DefaultAudioSkipReason =
   | "no_preference"
   | "already_correct"
   | "unprobeable"
-  | "duplicate";
+  | "duplicate"
+  | "stream_not_found";
 
 /**
  * Human-readable explanation for each {@link DefaultAudioSkipReason} (COL-207)
@@ -121,6 +134,7 @@ export const DEFAULT_AUDIO_SKIP_REASON_MESSAGE: Record<DefaultAudioSkipReason, s
   already_correct: "This file's Default Audio Track is already set correctly.",
   unprobeable: "The file's audio streams could not be probed.",
   duplicate: "A job for this file is already queued, running, or was processed too recently.",
+  stream_not_found: "That audio stream no longer exists on this file -- try reloading the page.",
 };
 
 /**
@@ -136,6 +150,7 @@ export const DEFAULT_AUDIO_SKIP_REASON_SHORT_LABEL: Record<DefaultAudioSkipReaso
   already_correct: "already correct",
   unprobeable: "unprobeable",
   duplicate: "duplicate",
+  stream_not_found: "stream not found",
 };
 
 /**
@@ -150,6 +165,7 @@ export const DEFAULT_AUDIO_SKIP_REASONS: readonly DefaultAudioSkipReason[] = [
   "already_correct",
   "unprobeable",
   "duplicate",
+  "stream_not_found",
 ];
 
 /**
