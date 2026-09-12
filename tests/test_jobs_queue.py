@@ -901,6 +901,96 @@ def test_run_job_logs_error_when_the_runner_raises_unexpectedly(
 
 
 # ---------------------------------------------------------------------------
+# COL-254: a post-pipeline side effect (history_recorder, tracked_media_
+# recorder, failure_notifier, plex_analyzer, the default-audio auto-schedule,
+# the job-terminal hook) raising must never (a) leave the job's in-memory
+# status stuck non-terminal, (b) leave `_active` incremented forever --
+# wedging `wait_idle`/`shutdown` -- or (c) kill the worker thread that ran
+# it, permanently shrinking the pool. It must, however, still be logged, not
+# silently swallowed.
+# ---------------------------------------------------------------------------
+
+
+def test_a_raising_history_recorder_does_not_orphan_a_succeeded_job_or_kill_the_worker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """This is the exact reported production symptom (COL-254): the pipeline actually
+    succeeded, but the terminal ``_record_history`` write raised, so the persisted
+    ``JobHistory`` row -- what the Queue page reads -- was never updated past ``running``,
+    and (pre-fix) the exception then killed the worker thread outright."""
+
+    def flaky_history_recorder(job: Job) -> None:
+        # Only the terminal write is flaky -- the earlier RUNNING record (job.status is
+        # still RUNNING at that point) always succeeds, matching the reported symptom
+        # exactly: the job *did* show up as running, then got stuck there.
+        if job.status is JobStatus.SUCCEEDED:
+            raise RuntimeError("history backend unreachable")
+
+    queue = JobQueue(
+        pipeline_runner=_stub_runner(_SUCCESS), history_recorder=flaky_history_recorder
+    )
+    job1 = queue.enqueue("/media/movie1.mkv", DownmixSettings())
+    job2 = queue.enqueue("/media/movie2.mkv", DownmixSettings())
+
+    queue.start()
+    with caplog.at_level(logging.ERROR, logger="collapsarr"):
+        # (b): a True return -- not a timeout -- proves `_active` was correctly
+        # decremented for job1 (in the `finally` block) despite the recorder raising.
+        assert queue.wait_idle(timeout=5) is True
+
+    # (a): job1's in-memory status is the real pipeline outcome (SUCCEEDED), not left
+    # dangling at RUNNING and not corrupted to FAILED by the recorder's own failure.
+    assert job1.status is JobStatus.SUCCEEDED
+    # (c): the single pool worker (DEFAULT_MAX_CONCURRENCY == 1) survived job1's failing
+    # side effect and went on to claim and run job2 to completion -- proof the worker
+    # thread didn't silently disappear from the pool.
+    assert job2.status is JobStatus.SUCCEEDED
+
+    # (d): logged via logger.exception, not silently swallowed -- once per job (each
+    # job's own terminal _record_history call raised independently).
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2
+    assert str(job1.id) in errors[0].message
+    assert "_record_history" in errors[0].message
+    assert errors[0].exc_info is not None
+    assert errors[0].exc_info[1] is not None
+    assert str(errors[0].exc_info[1]) == "history backend unreachable"
+
+
+def test_a_raising_terminal_hook_on_the_unexpected_pipeline_failure_path_does_not_wedge_the_worker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mirrors the test above, but for the ``except Exception`` branch of ``_run_job`` (the
+    pipeline-runner-crashed path) -- its own post-crash side-effect calls were equally
+    unguarded before COL-254."""
+
+    def raising_runner(file_path: Path, settings: DownmixSettings, **_: object) -> PipelineResult:
+        raise RuntimeError("ffmpeg vanished")
+
+    def raising_hook(job: Job) -> None:
+        raise RuntimeError("hook backend unreachable")
+
+    queue = JobQueue(pipeline_runner=raising_runner)
+    queue.set_job_terminal_hook(raising_hook)
+    job1 = queue.enqueue("/media/movie1.mkv", DownmixSettings())
+    job2 = queue.enqueue("/media/movie2.mkv", DownmixSettings())
+
+    queue.start()
+    with caplog.at_level(logging.ERROR, logger="collapsarr"):
+        assert queue.wait_idle(timeout=5) is True
+
+    assert job1.status is JobStatus.FAILED
+    assert job2.status is JobStatus.FAILED  # worker survived to claim + run job2 too
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    hook_errors = [r for r in errors if "_call_job_terminal_hook" in r.message]
+    assert len(hook_errors) == 2
+    assert hook_errors[0].exc_info is not None
+    assert hook_errors[0].exc_info[1] is not None
+    assert str(hook_errors[0].exc_info[1]) == "hook backend unreachable"
+
+
+# ---------------------------------------------------------------------------
 # Default Audio Track preference wiring: the persisted opt-in toggle and
 # (language, tier) preference must actually reach a real job dispatched
 # through a JobQueue built via from_settings. Through COL-152, that meant
