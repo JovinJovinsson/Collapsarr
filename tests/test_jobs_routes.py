@@ -102,6 +102,7 @@ class _FakeScheduler:
         default_audio_skip_reasons_by_file: dict[str, DefaultAudioSkipReason | None]
         | None = None,
         cancel_result: bool | None = True,
+        force_complete_result: bool | None = True,
         bump_result: bool | None = True,
         clear_queue_result: ClearQueueResult | None = None,
         process_now_job: Job | None = None,
@@ -139,6 +140,13 @@ class _FakeScheduler:
         #: (cancelled), ``False`` (too late). Defaults to ``True`` so a test
         #: that doesn't care about cancel behaviour still gets a sane value.
         self._cancel_result = cancel_result
+        #: COL-255's ``force_complete`` result, mirroring the real
+        #: :meth:`~collapsarr.jobs.scheduler.JobScheduler.force_complete`'s
+        #: three-way contract: ``None`` (404, "no such job"), ``True``
+        #: (force-completed), ``False`` (too late -- 409). Defaults to
+        #: ``True`` so a test that doesn't care about force-complete
+        #: behaviour still gets a sane value.
+        self._force_complete_result = force_complete_result
         #: COL-169's ``bump_job_to_front`` result, mirroring the real
         #: :meth:`~collapsarr.jobs.scheduler.JobScheduler.bump_job_to_front`'s
         #: three-way contract: ``None`` (404, "no such job"), ``True``
@@ -176,6 +184,7 @@ class _FakeScheduler:
         #: above, for the same reason.
         self.default_audio_trigger_stream_index_calls: list[int | None] = []
         self.cancel_calls: list[UUID] = []
+        self.force_complete_calls: list[UUID] = []
         self.bump_calls: list[UUID] = []
         self.clear_queue_calls: int = 0
         self.process_now_calls: list[str] = []
@@ -235,6 +244,10 @@ class _FakeScheduler:
     def cancel_job(self, job_id: UUID, *, session: Session | None = None) -> bool | None:
         self.cancel_calls.append(job_id)
         return self._cancel_result
+
+    def force_complete(self, job_id: UUID) -> bool | None:
+        self.force_complete_calls.append(job_id)
+        return self._force_complete_result
 
     def bump_job_to_front(self, job_id: UUID) -> bool | None:
         self.bump_calls.append(job_id)
@@ -1735,6 +1748,172 @@ def test_cancel_job_hard_kills_a_running_job_end_to_end(
         queue.shutdown()
 
 
+# --- POST /api/jobs/{job_id}/force-complete (COL-255) -------------------------
+#
+# HTTP-contract tests only -- request/response shape, the id ->
+# scheduler.force_complete(UUID) call, and the None/True/False -> 404/200/409
+# mapping -- via the same fake-scheduler dependency_overrides pattern as
+# DELETE /api/jobs/{job_id} above. Unlike that endpoint's cancelled=False,
+# a False outcome here is a 409, not a 200 -- see
+# test_force_complete_returns_409_when_too_late below.
+# JobScheduler.force_complete's own behaviour (the real JobQueue.force_complete
+# transition + terminal side-effect sequence) is exercised directly, with a
+# real queue, in tests/test_jobs_scheduler.py and tests/test_jobs_queue.py.
+
+
+def test_force_complete_returns_forced_true_on_success(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(force_complete_result=True)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            f"/api/jobs/{job_id}/force-complete", headers=_auth_headers(client)
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"forced": True}
+    assert fake.force_complete_calls == [job_id]
+
+
+def test_force_complete_returns_409_when_too_late(client: TestClient) -> None:
+    """A Job that finished naturally in the request/force-complete race is a genuine
+    error (409), not a silent no-op -- unlike DELETE's cancelled=False (COL-255 AC)."""
+    job_id = uuid4()
+    fake = _FakeScheduler(force_complete_result=False)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            f"/api/jobs/{job_id}/force-complete", headers=_auth_headers(client)
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert "detail" in response.json()
+    assert fake.force_complete_calls == [job_id]
+
+
+def test_force_complete_returns_404_for_a_job_not_in_the_live_queue(client: TestClient) -> None:
+    job_id = uuid4()
+    fake = _FakeScheduler(force_complete_result=None)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            f"/api/jobs/{job_id}/force-complete", headers=_auth_headers(client)
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.force_complete_calls == [job_id]
+
+
+def test_force_complete_returns_404_for_a_malformed_job_id_without_calling_the_scheduler(
+    client: TestClient,
+) -> None:
+    fake = _FakeScheduler()
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_job_scheduler] = lambda: fake
+    try:
+        response = client.post(
+            "/api/jobs/not-a-uuid/force-complete", headers=_auth_headers(client)
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert fake.force_complete_calls == []  # not a UUID at all -- never reaches the scheduler
+
+
+def test_force_complete_is_503_when_no_scheduler_is_wired(client: TestClient) -> None:
+    """The default app has no scheduler -> force-complete fails loudly, not silently."""
+    response = client.post(
+        f"/api/jobs/{uuid4()}/force-complete", headers=_auth_headers(client)
+    )
+    assert response.status_code == 503
+
+
+def test_force_complete_wires_through_a_real_scheduler(settings: Settings) -> None:
+    """End-to-end: a real enable_scheduler app, unknown id -> 404 (nothing to act on)."""
+    app = create_app(settings=settings, enable_scheduler=True)
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/jobs/{uuid4()}/force-complete", headers=_auth_headers(client)
+        )
+
+    assert response.status_code == 404
+
+
+def test_force_complete_marks_a_running_job_succeeded_end_to_end(
+    client: TestClient, settings: Settings
+) -> None:
+    """COL-255 end-to-end: POST against a RUNNING Job marks it SUCCEEDED immediately,
+    without waiting for its still-in-flight pipeline.
+
+    Wires a real :class:`JobScheduler` over a real running :class:`JobQueue` whose
+    pipeline runner blocks the claimed job -- so the request drives the full route ->
+    ``force_complete`` -> ``JobQueue.force_complete`` path while the pipeline is still
+    running, then releasing it proves the later (real) completion is discarded, not a
+    crash or a double-write.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
+    session_factory = app.state.session_factory
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def gated_runner(
+        file_path: Path, _settings: DownmixSettings, **_: object
+    ) -> PipelineResult:
+        started.set()
+        assert release.wait(timeout=5), "gated job was never released"
+        return PipelineResult(outcome=PipelineOutcome.REMUX_FAILED, success=False, detail="late")
+
+    surround = [
+        AudioStreamInfo(
+            index=0, codec="ac3", channels=6, channel_layout="5.1(side)", language="eng"
+        )
+    ]
+
+    queue = JobQueue(max_concurrency=1, pipeline_runner=gated_runner)
+    queue.start()
+    try:
+        scheduler = JobScheduler(queue, session_factory, settings, probe=lambda path: surround)
+        app.state.job_scheduler = scheduler
+
+        job = scheduler.trigger_file("/media/movie.mkv")
+        assert job is not None
+        assert started.wait(timeout=5)  # a worker claimed + is "running" it
+
+        response = client.post(
+            f"/api/jobs/{job.id}/force-complete", headers=_auth_headers(client)
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"forced": True}
+        assert job.status is JobStatus.SUCCEEDED
+
+        release.set()
+        assert queue.wait_idle(timeout=5) is True
+        # The pipeline's later (would-be FAILED) outcome was discarded -- not a crash,
+        # not clobbering the already-SUCCEEDED status.
+        finished = queue.get_job(job.id)
+        assert finished is not None
+        assert finished.status is JobStatus.SUCCEEDED
+    finally:
+        queue.shutdown()
+
+
 # --- POST /api/jobs/clear (COL-173) -------------------------------------------
 #
 # The empty/full-split shape and the id -> scheduler.clear_queue() call are
@@ -2255,6 +2434,14 @@ def test_bulk_trigger_default_audio_endpoint_requires_the_api_key(
 def test_cancel_job_endpoint_requires_the_api_key(client: TestClient, session: Session) -> None:
     update_global_settings(session, ui_auth_enabled=True)
     response = client.delete(f"/api/jobs/{uuid4()}")
+    assert response.status_code == 401
+
+
+def test_force_complete_endpoint_requires_the_api_key(
+    client: TestClient, session: Session
+) -> None:
+    update_global_settings(session, ui_auth_enabled=True)
+    response = client.post(f"/api/jobs/{uuid4()}/force-complete")
     assert response.status_code == 401
 
 

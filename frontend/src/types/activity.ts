@@ -282,6 +282,25 @@ export interface CancelJobResult {
 }
 
 /**
+ * Response for `POST /api/jobs/{job_id}/force-complete` (COL-255,
+ * `ForceCompleteResult`) -- `QueuePage`'s per-row "Force Complete" action on
+ * the currently-`running` row.
+ *
+ * `forced` is always `true` when this shape comes back at all: marking the
+ * Job `succeeded` immediately -- its `JobHistory` row, tracked-media, and
+ * Plex-analyze trigger all recorded exactly as a normal successful
+ * completion would. Unlike {@link CancelJobResult}/{@link BumpJobResult},
+ * there is no `forced: false` shape -- a Job that already left `running` by
+ * the time the request landed (the "finished naturally" race) is a `409`
+ * instead, surfaced by `api/activity.ts`'s `forceCompleteJob` as a thrown
+ * error with the backend's message, same as a `job_id` not present in the
+ * live queue at all (`404`).
+ */
+export interface ForceCompleteResult {
+  forced: boolean;
+}
+
+/**
  * Response for `POST /api/jobs/{job_id}/bump` (COL-169, `BumpJobResult`) --
  * `QueuePage`'s (COL-180) per-row "Process next" action.
  *
