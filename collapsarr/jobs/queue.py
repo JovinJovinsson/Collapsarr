@@ -1275,13 +1275,12 @@ class JobQueue:
         ``self._lock`` exactly like :meth:`cancel_running`'s status check:
         flips ``job.status`` straight to :attr:`JobStatus.SUCCEEDED` and
         stamps ``job.ended_at`` -- then, still on the calling (request)
-        thread and outside the lock, runs the very same terminal
-        side-effect sequence :meth:`_run_job` runs for a genuine success
-        (history, tracked-media, failure-notify (a no-op -- the job
-        succeeded), Plex-analyze, default-audio scheduling, and the
-        job-terminal hook), each still routed through :meth:`_run_side_effect`
-        (COL-254) so a misbehaving recorder can't crash this request or skip
-        a later one in the sequence.
+        thread and outside the lock, runs :meth:`_run_terminal_side_effects`
+        -- the very same terminal side-effect sequence :meth:`_run_job` runs
+        for a genuine success (history, tracked-media, failure-notify (a
+        no-op -- the job succeeded), Plex-analyze, default-audio scheduling,
+        and the job-terminal hook) -- so all three call sites share one copy
+        of that sequence (COL-255).
 
         ``job.result`` is left exactly as it was (``None`` for a job that
         hadn't reached its pipeline's own terminal write yet -- the normal
@@ -1313,20 +1312,7 @@ class JobQueue:
             job.status = JobStatus.SUCCEEDED
             job.ended_at = datetime.now(UTC)
         logger.info("job %s force-completed by user request", job.id)
-        self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
-        self._run_side_effect(
-            job, "_record_tracked_media", lambda: self._record_tracked_media(job)
-        )
-        self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
-        self._run_side_effect(
-            job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
-        )
-        self._run_side_effect(
-            job, "_schedule_default_audio_job", lambda: self._schedule_default_audio_job(job)
-        )
-        self._run_side_effect(
-            job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
-        )
+        self._run_terminal_side_effects(job)
         return True
 
     def bump_to_front(self, job_id: UUID) -> bool:
@@ -1804,7 +1790,12 @@ class JobQueue:
         for the swallow-and-log contract. This never touches ``job.status``
         itself: a side-effect failure only ever prevents that one side effect
         (and its own failure) from cascading, never flips a
-        already-determined ``SUCCEEDED``/``FAILED`` outcome.
+        already-determined ``SUCCEEDED``/``FAILED`` outcome. The six
+        post-pipeline calls themselves (both this method's two terminal
+        tails, below) live in one shared :meth:`_run_terminal_side_effects`
+        helper rather than being repeated at each tail -- :meth:`force_complete`
+        (COL-255) reuses that same helper as its own third call site, see
+        there.
 
         **Force Complete race (COL-255).** Before writing either terminal
         outcome (the crashed-pipeline ``except`` branch, or the ordinary
@@ -1888,17 +1879,7 @@ class JobQueue:
                     )
                     return
                 logger.exception("job %s failed with an unexpected error", job.id)
-                self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
-                self._run_side_effect(
-                    job, "_record_tracked_media", lambda: self._record_tracked_media(job)
-                )
-                self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
-                self._run_side_effect(
-                    job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
-                )
-                self._run_side_effect(
-                    job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
-                )
+                self._run_terminal_side_effects(job)
                 return
 
             with self._lock:
@@ -1917,20 +1898,7 @@ class JobQueue:
                 return
             if job.status is JobStatus.SUCCEEDED:
                 logger.info("job %s completed: file=%s -- %s", job.id, job.file_path, result.detail)
-            self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
-            self._run_side_effect(
-                job, "_record_tracked_media", lambda: self._record_tracked_media(job)
-            )
-            self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
-            self._run_side_effect(
-                job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
-            )
-            self._run_side_effect(
-                job, "_schedule_default_audio_job", lambda: self._schedule_default_audio_job(job)
-            )
-            self._run_side_effect(
-                job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
-            )
+            self._run_terminal_side_effects(job)
         finally:
             # Only now -- after every side effect -- is the job fully done, so
             # this is where wait_idle is allowed to observe it as no longer
@@ -1971,6 +1939,46 @@ class JobQueue:
             effect()
         except Exception:  # noqa: BLE001 - a side effect must never fail the job or the worker
             logger.exception("job %s: %s raised", job.id, label)
+
+    def _run_terminal_side_effects(self, job: Job) -> None:
+        """Run every terminal side effect for ``job``, in order (COL-254; extracted COL-255).
+
+        The exact six-call sequence -- history, tracked-media, failure-notify,
+        Plex-analyze, default-audio scheduling, and the job-terminal hook --
+        that runs once ``job`` has reached a terminal status. Three call sites
+        share this one copy instead of each repeating the sequence: both of
+        :meth:`_run_job`'s terminal tails (the ordinary completion branch and
+        the crashed-pipeline ``except`` branch) and :meth:`force_complete`
+        (COL-255) -- so a future seventh side effect, or a reordering, only
+        ever needs to change here.
+
+        Every one of the six is individually gated on ``job.status``/
+        ``job.kind`` by the side effect method itself (e.g.
+        :meth:`_notify_failure` is a no-op unless ``job.status is
+        JobStatus.FAILED``; :meth:`_schedule_default_audio_job` is a no-op
+        unless ``job.status is JobStatus.SUCCEEDED`` with a qualifying
+        ``DOWNMIX`` result) -- so calling the full sequence unconditionally
+        here, even from the crashed-pipeline ``except`` branch (which never
+        has anything for the ``SUCCEEDED``-only calls to do), is always safe
+        and changes no observable behaviour there. Each call is still routed
+        through :meth:`_run_side_effect` (COL-254), so one side effect
+        raising can never skip a later one in the sequence or crash the
+        caller.
+        """
+        self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
+        self._run_side_effect(
+            job, "_record_tracked_media", lambda: self._record_tracked_media(job)
+        )
+        self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
+        self._run_side_effect(
+            job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
+        )
+        self._run_side_effect(
+            job, "_schedule_default_audio_job", lambda: self._schedule_default_audio_job(job)
+        )
+        self._run_side_effect(
+            job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
+        )
 
     def _record_history(self, job: Job) -> None:
         """Persist ``job``'s current state, if configured to.
