@@ -1570,12 +1570,29 @@ class JobQueue:
         self.shutdown()
 
     def _worker_loop(self) -> None:
-        """One pool worker: claim the next job, run it, repeat until shutdown (COL-164)."""
+        """One pool worker: claim the next job, run it, repeat until shutdown (COL-164).
+
+        ``_run_job`` is designed to never raise -- every side effect it runs
+        after the pipeline result is known goes through
+        :meth:`_run_side_effect`, which catches and logs on ``job``'s behalf
+        (COL-254) -- but this loop wraps the call in its own defensive
+        ``try``/``except`` anyway, as a last-resort backstop: a worker thread
+        silently vanishing from the pool (because some future change to
+        ``_run_job`` reintroduces an unguarded call, say) would be far worse
+        than logging an unexpected exception and continuing to the next
+        claim. Deliberately broad -- anything that reaches here is already a
+        bug in ``_run_job``, not an expected outcome to discriminate on.
+        """
         while True:
             job = self._claim_next()
             if job is None:  # shutdown signalled while idle
                 return
-            self._run_job(job)
+            try:
+                self._run_job(job)
+            except Exception:  # noqa: BLE001 - a worker thread must never silently disappear
+                logger.exception(
+                    "job %s: _run_job raised unexpectedly -- worker continuing", job.id
+                )
 
     def _claim_next(self) -> Job | None:
         """Block until a job is claimable, atomically claim it, and return it.
@@ -1708,6 +1725,21 @@ class JobQueue:
         touches this particular ``job`` (each job is claimed by exactly one
         worker), so there is nothing left to race against.
 
+        Every one of those calls (both the ``RUNNING`` ``_record_history``
+        below and every post-pipeline one further down) is routed through
+        :meth:`_run_side_effect` rather than called directly (COL-254): a
+        recorder/notifier/hook raising must never (a) skip a *later* side
+        effect in the same sequence -- most importantly the terminal
+        ``_record_history`` write, which is what :func:`~collapsarr.jobs.
+        history.list_queue_jobs` (and so the Queue page) reads, so skipping
+        it is what left a job showing "Running" for 48+ hours after it had
+        actually finished -- or (b) propagate out of this method and kill the
+        calling worker thread. See :meth:`_run_side_effect`'s own docstring
+        for the swallow-and-log contract. This never touches ``job.status``
+        itself: a side-effect failure only ever prevents that one side effect
+        (and its own failure) from cascading, never flips a
+        already-determined ``SUCCEEDED``/``FAILED`` outcome.
+
         Dispatches on ``job.kind`` (COL-155) for which runner actually
         executes the pipeline: ``DOWNMIX`` calls ``self._pipeline_runner``
         with ``job.settings`` and the full ``self._pipeline_kwargs``,
@@ -1721,7 +1753,7 @@ class JobQueue:
         identical for both kinds.
         """
         try:
-            self._record_history(job)
+            self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
             logger.info(
                 "job %s started: kind=%s file=%s %s",
                 job.id,
@@ -1767,11 +1799,17 @@ class JobQueue:
                     job.status = JobStatus.FAILED
                     job.ended_at = datetime.now(UTC)
                 logger.exception("job %s failed with an unexpected error", job.id)
-                self._record_history(job)
-                self._record_tracked_media(job)
-                self._notify_failure(job)
-                self._trigger_plex_analyze(job)
-                self._call_job_terminal_hook(job)
+                self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
+                self._run_side_effect(
+                    job, "_record_tracked_media", lambda: self._record_tracked_media(job)
+                )
+                self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
+                self._run_side_effect(
+                    job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
+                )
+                self._run_side_effect(
+                    job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
+                )
                 return
 
             with self._lock:
@@ -1780,12 +1818,20 @@ class JobQueue:
                 job.ended_at = datetime.now(UTC)
             if job.status is JobStatus.SUCCEEDED:
                 logger.info("job %s completed: file=%s -- %s", job.id, job.file_path, result.detail)
-            self._record_history(job)
-            self._record_tracked_media(job)
-            self._notify_failure(job)
-            self._trigger_plex_analyze(job)
-            self._schedule_default_audio_job(job)
-            self._call_job_terminal_hook(job)
+            self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
+            self._run_side_effect(
+                job, "_record_tracked_media", lambda: self._record_tracked_media(job)
+            )
+            self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
+            self._run_side_effect(
+                job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
+            )
+            self._run_side_effect(
+                job, "_schedule_default_audio_job", lambda: self._schedule_default_audio_job(job)
+            )
+            self._run_side_effect(
+                job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
+            )
         finally:
             # Only now -- after every side effect -- is the job fully done, so
             # this is where wait_idle is allowed to observe it as no longer
@@ -1795,6 +1841,37 @@ class JobQueue:
             with self._cond:
                 self._active -= 1
                 self._cond.notify_all()
+
+    def _run_side_effect(self, job: Job, label: str, effect: Callable[[], None]) -> None:
+        """Run one post-pipeline (or pre-pipeline ``RUNNING``) side effect for ``job`` (COL-254).
+
+        Every call :meth:`_run_job` makes into a recorder/notifier/hook --
+        ``_record_history``, ``_record_tracked_media``, ``_notify_failure``,
+        ``_trigger_plex_analyze``, ``_schedule_default_audio_job``, and
+        ``_call_job_terminal_hook`` -- goes through this one helper instead of
+        being called directly, so the same safety net applies uniformly
+        rather than being (re)implemented -- and potentially missed -- at
+        each of those six call sites individually. ``effect`` is expected to
+        take no arguments (``job`` is closed over by the caller) purely so
+        this stays a single, reusable one-liner per call site.
+
+        Catches and logs (via ``logger.exception``, so the traceback survives
+        -- never silently swallowed) any exception ``effect`` raises. This is
+        deliberately broad: a side effect misbehaving must never be able to
+        (a) stop a *later* side effect in the same :meth:`_run_job` call from
+        running -- in particular, the terminal ``_record_history`` write,
+        whose absence is exactly what left a completed job showing "Running"
+        in the Queue page indefinitely (COL-254's reported symptom) -- or (b)
+        propagate out of :meth:`_run_job` and kill the calling worker thread,
+        permanently shrinking the pool by one. Deliberately does *not* touch
+        ``job.status`` in any way -- a side effect's own failure must never
+        flip an already-determined ``SUCCEEDED``/``FAILED`` outcome (or vice
+        versa); it can only ever fail to apply that one side effect.
+        """
+        try:
+            effect()
+        except Exception:  # noqa: BLE001 - a side effect must never fail the job or the worker
+            logger.exception("job %s: %s raised", job.id, label)
 
     def _record_history(self, job: Job) -> None:
         """Persist ``job``'s current state, if configured to.
@@ -1827,16 +1904,13 @@ class JobQueue:
         ``failure_notifier`` was configured. ``self._failure_notifier`` is
         expected to never raise on its own (COL-37's
         :func:`~collapsarr.jobs.failure_notify.notify_job_failure` guarantees
-        this), but it is called inside a defensive ``try``/``except`` anyway
-        -- a notification problem must never be able to fail the job it is
-        reporting on, or the worker thread running it.
+        this); the defensive catch-and-log for the case it does anyway lives
+        one level up, in :meth:`_run_side_effect` (COL-254), which every
+        caller of this method goes through rather than calling it directly.
         """
         if self._failure_notifier is None or job.status is not JobStatus.FAILED:
             return
-        try:
-            self._failure_notifier(job)
-        except Exception:  # noqa: BLE001 - a notifier failure must never fail the job
-            pass
+        self._failure_notifier(job)
 
     def _trigger_plex_analyze(self, job: Job) -> None:
         """Trigger a Plex Analyze call for ``job``'s file, if configured and it succeeded (COL-211).
@@ -1846,17 +1920,13 @@ class JobQueue:
         to never raise on its own (COL-211's :func:`~collapsarr.jobs.
         plex_analyze.trigger_plex_analyze` guarantees this -- it is itself a
         no-op, with no error surfaced, when Plex isn't configured or the file
-        doesn't resolve to a ratingKey), but it is called inside a defensive
-        ``try``/``except`` anyway, mirroring :meth:`_notify_failure` exactly
-        -- a Plex-side problem must never be able to fail the job it is
-        reporting on, or the worker thread running it.
+        doesn't resolve to a ratingKey); the defensive catch-and-log for the
+        case it does anyway lives one level up, in :meth:`_run_side_effect`
+        (COL-254), mirroring :meth:`_notify_failure` exactly.
         """
         if self._plex_analyzer is None or job.status is not JobStatus.SUCCEEDED:
             return
-        try:
-            self._plex_analyzer(job)
-        except Exception:  # noqa: BLE001 - a Plex problem must never fail the job
-            pass
+        self._plex_analyzer(job)
 
     def _schedule_default_audio_job(self, job: Job) -> None:
         """Enqueue a delayed follow-up ``SET_DEFAULT_AUDIO`` Job for a downmix, if armed (COL-251).
@@ -1885,10 +1955,10 @@ class JobQueue:
         as :meth:`_trigger_plex_analyze`, right after it, outside ``self._lock``
         -- safe to call back into :meth:`enqueue_default_audio` (which takes
         the lock itself) for the same reason documented on
-        :meth:`_call_job_terminal_hook`. Wrapped in a defensive
-        ``try``/``except``, mirroring :meth:`_trigger_plex_analyze`: a problem
-        scheduling the follow-up Job must never be able to fail the ``DOWNMIX``
-        job that just succeeded.
+        :meth:`_call_job_terminal_hook`. The defensive catch-and-log for a
+        problem scheduling the follow-up Job -- which must never be able to
+        fail the ``DOWNMIX`` job that just succeeded -- lives one level up,
+        in :meth:`_run_side_effect` (COL-254).
         """
         if self._default_audio_auto_schedule is None:
             return
@@ -1896,20 +1966,13 @@ class JobQueue:
             return
         if job.result is None or not job.result.tracks_added:
             return
-        try:
-            scheduled_at = self._now() + self._default_audio_auto_schedule.delay
-            self.enqueue_default_audio(
-                job.file_path,
-                self._default_audio_auto_schedule.preference,
-                scheduled_at=scheduled_at,
-                expected_stream_count=job.result.final_stream_count,
-            )
-        except Exception:  # noqa: BLE001 - must never fail the job it's reporting on
-            logger.exception(
-                "failed to schedule a follow-up Default Audio Track Job for %s (job %s)",
-                job.file_path,
-                job.id,
-            )
+        scheduled_at = self._now() + self._default_audio_auto_schedule.delay
+        self.enqueue_default_audio(
+            job.file_path,
+            self._default_audio_auto_schedule.preference,
+            scheduled_at=scheduled_at,
+            expected_stream_count=job.result.final_stream_count,
+        )
 
     def _call_job_terminal_hook(self, job: Job) -> None:
         """Invoke the job-terminal hook for ``job``, if one is configured (COL-171).
@@ -1929,13 +1992,11 @@ class JobQueue:
         hook that itself enqueues more work (as ``top_up`` does) can safely
         call back into this very :class:`JobQueue` (``list_jobs``/``enqueue``)
         without this thread already holding a lock those methods also need --
-        no deadlock, no reentrancy. Wrapped in a defensive ``try``/``except``,
-        same as :meth:`_notify_failure`: a hook problem must never fail the
-        job it just finished, or wedge the worker loop.
+        no deadlock, no reentrancy. The defensive catch-and-log for a hook
+        problem -- which must never fail the job it just finished, or wedge
+        the worker loop -- lives one level up, in :meth:`_run_side_effect`
+        (COL-254).
         """
         if self._job_terminal_hook is None:
             return
-        try:
-            self._job_terminal_hook(job)
-        except Exception:  # noqa: BLE001 - a hook failure must never fail the worker loop
-            logger.exception("job-terminal hook raised for job %s", job.id)
+        self._job_terminal_hook(job)
