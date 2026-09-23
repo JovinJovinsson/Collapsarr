@@ -1,7 +1,14 @@
 import { ListOrdered } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { bumpJobToFront, cancelJob, clearQueue, fetchJobQueue, processNow } from "../api/activity";
+import {
+  bumpJobToFront,
+  cancelJob,
+  clearQueue,
+  fetchJobQueue,
+  forceCompleteJob,
+  processNow,
+} from "../api/activity";
 import { fetchSettings, updateSettings } from "../api/settings";
 import { JOB_KIND_LABEL } from "../types/activity";
 import type { ClearQueueResult, JobHistoryEntry, JobStatus } from "../types/activity";
@@ -73,8 +80,8 @@ type LoadState =
   | { status: "error"; message: string }
   | { status: "ready"; entries: JobHistoryEntry[] };
 
-/** A per-row action `QueuePage` (COL-180, COL-229) can run. */
-type RowActionKind = "bump" | "cancel" | "processNow";
+/** A per-row action `QueuePage` (COL-180, COL-229, COL-255) can run. */
+type RowActionKind = "bump" | "cancel" | "processNow" | "forceComplete";
 
 /**
  * Which per-row action is currently in flight, keyed by `job_id` (COL-180).
@@ -92,7 +99,10 @@ type PendingActions = Partial<Record<string, RowActionKind>>;
  * which the backend documents as a normal, non-error outcome (the Job
  * simply started running, or finished, before the request landed) -- styled
  * the same muted way `FileDetailPage`'s skipped-trigger outcome is.
- * `"error"` is a genuine failure (network error, `404`, etc).
+ * `"error"` is a genuine failure (network error, `404`, etc) -- this also
+ * covers "Force Complete"'s (COL-255) own "too late" race: unlike
+ * `bumped`/`cancelled: false`, the backend reports that one as a `409`, not
+ * a quiet boolean, so it always lands here as `"error"`, not `"hint"`.
  */
 type ActionNotice = { tone: "hint" | "error"; text: string } | null;
 
@@ -118,6 +128,18 @@ type SettingsLoadState =
  * `pendingActions` only tracking one in-flight action per row.
  */
 type ProcessNowConfirmState = { entry: JobHistoryEntry } | null;
+
+/**
+ * The row currently showing the "Force Complete" confirm step (COL-255) --
+ * `null` when none is. Unlike {@link ProcessNowConfirmState} (which only
+ * opens after a first request comes back needing one), clicking "Force
+ * Complete" always opens this confirm step immediately -- mirroring the
+ * page-level "Clear queue" confirm's shape (open on click, call the endpoint
+ * only once explicitly confirmed) rather than "Process Now"'s conditional
+ * one. Only one row's confirm step is ever open at once, same as
+ * {@link ProcessNowConfirmState}.
+ */
+type ForceCompleteConfirmState = { entry: JobHistoryEntry } | null;
 
 /**
  * Result notice for the page-level "Clear queue" action (COL-181, COL-173).
@@ -233,6 +255,23 @@ function describeClearQueueResult(result: ClearQueueResult): string {
  *   requeue), whereas "Pause auto-queuing" only stops the scanner from
  *   adding new pending Jobs in the first place. Already-`running` Jobs are
  *   unaffected by either toggle.
+ *
+ * COL-255 adds a fourth per-row action, "Force Complete"
+ * (`forceCompleteJob`, `POST /api/jobs/{job_id}/force-complete`), gated to
+ * only the row currently `running` -- recovers from a hung/stuck Job without
+ * waiting for a fix or a restart. Clicking it always opens an inline confirm
+ * step first ({@link forceCompleteConfirm}, mirroring "Clear queue"'s
+ * `.view__confirm` pattern -- unlike "Process Now"'s conditional one) with
+ * the exact copy "By force completing you are claiming that this has been
+ * successful." and Ok/Cancel buttons; dismissing it sends no request.
+ * Confirming marks the Job `succeeded` immediately, recording its
+ * `JobHistory` row/tracked-media/Plex-analyze trigger exactly as a normal
+ * success would. A "too late" race (the Job already finished on its own
+ * between render and confirm) is a genuine error here, not a silent
+ * `hint`-toned no-op like "Process next"/"Cancel"'s -- the backend reports
+ * it as a `409`, surfaced through the shared {@link ActionNotice} banner,
+ * since the operator explicitly claimed success for a run that had already
+ * independently decided its own outcome.
  */
 export function QueuePage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
@@ -246,6 +285,7 @@ export function QueuePage() {
   const [clearingQueue, setClearingQueue] = useState(false);
   const [clearQueueNotice, setClearQueueNotice] = useState<ClearQueueNotice>(null);
   const [processNowConfirm, setProcessNowConfirm] = useState<ProcessNowConfirmState>(null);
+  const [forceCompleteConfirm, setForceCompleteConfirm] = useState<ForceCompleteConfirmState>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -453,6 +493,49 @@ export function QueuePage() {
   /** Dismisses the "Process Now" confirm step without calling the endpoint again (COL-229). */
   function handleDismissProcessNowConfirm(): void {
     setProcessNowConfirm(null);
+  }
+
+  /** Opens the inline "Force Complete" confirm step for `entry` (COL-255), clearing any stale notice. */
+  function handleForceCompleteClick(entry: JobHistoryEntry): void {
+    setActionNotice(null);
+    setForceCompleteConfirm({ entry });
+  }
+
+  /** Dismisses the "Force Complete" confirm step without calling the endpoint (COL-255). */
+  function handleDismissForceCompleteConfirm(): void {
+    setForceCompleteConfirm(null);
+  }
+
+  /**
+   * Calls the force-complete endpoint (`forceCompleteJob`, `POST
+   * /api/jobs/{job_id}/force-complete`, COL-255) for the confirming row.
+   * Mirrors {@link handleConfirmClearQueue}'s shape: the confirm step is
+   * dismissed only on success, so a failure leaves it open for a retry.
+   * Unlike {@link runRowAction}'s shared "too late" `hint`, a losing race
+   * here throws (the backend reports it as a `409`), so it always surfaces
+   * through the `catch` below as an `"error"` notice.
+   */
+  async function handleConfirmForceComplete(): Promise<void> {
+    if (forceCompleteConfirm === null) return;
+    const entry = forceCompleteConfirm.entry;
+    setPendingActions((prev) => ({ ...prev, [entry.job_id]: "forceComplete" }));
+    setActionNotice(null);
+    try {
+      await forceCompleteJob(entry.job_id);
+      setForceCompleteConfirm(null);
+    } catch (error) {
+      setActionNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to force-complete job.",
+      });
+    } finally {
+      setPendingActions((prev) => {
+        const next = { ...prev };
+        delete next[entry.job_id];
+        return next;
+      });
+    }
+    await refreshQueueSoon();
   }
 
   /**
@@ -685,6 +768,32 @@ export function QueuePage() {
         </div>
       )}
 
+      {forceCompleteConfirm && (
+        <div className="panel view__confirm" role="status">
+          <p>By force completing you are claiming that this has been successful.</p>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="btn btn--secondary"
+              onClick={() => void handleConfirmForceComplete()}
+              disabled={pendingActions[forceCompleteConfirm.entry.job_id] !== undefined}
+            >
+              {pendingActions[forceCompleteConfirm.entry.job_id] === "forceComplete"
+                ? "Completing…"
+                : "Ok"}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={handleDismissForceCompleteConfirm}
+              disabled={pendingActions[forceCompleteConfirm.entry.job_id] !== undefined}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {hasEntries && (
         <div className="activity-filters">
           <input
@@ -805,6 +914,16 @@ export function QueuePage() {
                           disabled={rowAction !== null}
                         >
                           {rowAction === "processNow" ? "Processing…" : "Process now"}
+                        </button>
+                      )}
+                      {entry.status === "running" && (
+                        <button
+                          type="button"
+                          className="btn btn--secondary btn--sm"
+                          onClick={() => handleForceCompleteClick(entry)}
+                          disabled={rowAction !== null}
+                        >
+                          Force Complete
                         </button>
                       )}
                       {canCancel && (

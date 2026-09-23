@@ -5,6 +5,7 @@ import type {
   BumpJobResult,
   CancelJobResult,
   ClearQueueResult,
+  ForceCompleteResult,
   JobHistoryEntry,
   ManualTriggerRequest,
   ManualTriggerResult,
@@ -217,6 +218,31 @@ export async function processNow(filePath: string, confirm = false): Promise<Pro
     throw new Error(await apiErrorMessage(response, `Failed to process job now (${response.status})`));
   }
   return (await response.json()) as ProcessNowResult;
+}
+
+/**
+ * Force-completes one currently-`running` Job immediately (`POST
+ * /api/jobs/{job_id}/force-complete`, COL-255) -- `QueuePage`'s per-row
+ * "Force Complete" action, gated to the row currently `running`. Marks the
+ * Job `succeeded` right away -- its `JobHistory` row, tracked-media, and
+ * Plex-analyze trigger all recorded exactly as a normal successful
+ * completion would -- without waiting for (or touching) its still-in-flight
+ * pipeline.
+ *
+ * Unlike {@link cancelJob}/{@link bumpJobToFront}, a "too late" race (the Job
+ * already reached its own terminal status naturally before this landed) is
+ * *not* folded into a `200` response with a boolean flag -- the backend
+ * raises a `409` instead (see `ForceCompleteResult`'s doc comment), so this
+ * throws for that case too, same as a genuine `404`.
+ */
+export async function forceCompleteJob(jobId: string): Promise<ForceCompleteResult> {
+  const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/force-complete`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Failed to force-complete job (${response.status})`));
+  }
+  return (await response.json()) as ForceCompleteResult;
 }
 
 /**

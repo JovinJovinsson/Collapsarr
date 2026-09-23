@@ -312,6 +312,25 @@ be interrupted (see
 mechanism, but additionally requeues the cancelled Jobs immediately,
 bypassing the Recently-Processed Window — see **Self-Update**.
 
+## Force Complete
+
+A per-Job recovery action, available only on the currently-`running` Queue
+row, for a Job stuck/hung on a pipeline call that will never return (e.g. a
+wedged `ffmpeg`). Gated behind an explicit confirm step ("By force
+completing you are claiming that this has been successful.") since it is an
+operator's claim, not a detected outcome — unlike **Cancel (job)**'s hard
+kill (which fails the Job out through the ordinary terminal path), Force
+Complete marks the Job `succeeded` immediately and runs the exact same
+terminal side effects a genuine success would (`JobHistory` row,
+tracked-media, Plex-analyze trigger). It does not touch the in-flight
+pipeline thread itself — if that thread later also finishes the same Job
+(succeeding or failing on its own), that second finalization is silently
+discarded, never a crash or a double-write, and never allowed to flip the
+already-`succeeded` status back. If the Job has already left `running` by
+the time the request lands (the pipeline finished naturally first), the
+request fails outright rather than silently no-op'ing — the operator's
+claim can no longer be honoured.
+
 ## Auto-Queue Limit
 
 The cap (default 5) on how many **Wanted** entries the scanner will

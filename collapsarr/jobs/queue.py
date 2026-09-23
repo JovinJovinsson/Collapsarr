@@ -1263,6 +1263,58 @@ class JobQueue:
             handle.cancel()
         return True
 
+    def force_complete(self, job_id: UUID) -> bool:
+        """Force a ``RUNNING`` job straight to ``SUCCEEDED`` -- "Force Complete" (COL-255).
+
+        Recovers from a hung/stuck job without waiting for a fix or a
+        restart: the caller is claiming "this has actually finished
+        successfully," so unlike :meth:`cancel_running` (COL-192 -- which
+        only signals the live subprocess and lets the ordinary
+        :meth:`_run_job` terminal path record the outcome, as ``FAILED``),
+        this method itself performs the terminal transition, under
+        ``self._lock`` exactly like :meth:`cancel_running`'s status check:
+        flips ``job.status`` straight to :attr:`JobStatus.SUCCEEDED` and
+        stamps ``job.ended_at`` -- then, still on the calling (request)
+        thread and outside the lock, runs :meth:`_run_terminal_side_effects`
+        -- the very same terminal side-effect sequence :meth:`_run_job` runs
+        for a genuine success (history, tracked-media, failure-notify (a
+        no-op -- the job succeeded), Plex-analyze, default-audio scheduling,
+        and the job-terminal hook) -- so all three call sites share one copy
+        of that sequence (COL-255).
+
+        ``job.result`` is left exactly as it was (``None`` for a job that
+        hadn't reached its pipeline's own terminal write yet -- the normal
+        case for a genuinely-hung job) -- :meth:`_record_tracked_media` and
+        :meth:`_schedule_default_audio_job` are both no-ops without a
+        ``tracks_added`` to work from, which is correct here: force-complete
+        has no way to know what the pipeline would actually have added, so it
+        claims nothing rather than guessing.
+
+        Does **not** touch the in-flight pipeline thread itself -- unlike
+        :meth:`cancel_running`, there is no subprocess to signal here; the
+        pipeline keeps running to its own completion or failure in the
+        background, on the worker thread that already claimed it. When it
+        eventually gets there, :meth:`_run_job` notices ``job.status`` is no
+        longer ``RUNNING`` and discards that run's outcome instead of
+        double-writing over this method's -- see :meth:`_run_job`'s own
+        docstring for that guard.
+
+        Returns ``True`` if ``job`` was ``RUNNING`` and has now been
+        force-completed, ``False`` (not an error) if it is unknown or no
+        longer ``RUNNING`` -- the same "too late" race :meth:`cancel_running`
+        reports, here because the pipeline itself already reached a terminal
+        status between the request and this call.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status is not JobStatus.RUNNING:
+                return False
+            job.status = JobStatus.SUCCEEDED
+            job.ended_at = datetime.now(UTC)
+        logger.info("job %s force-completed by user request", job.id)
+        self._run_terminal_side_effects(job)
+        return True
+
     def bump_to_front(self, job_id: UUID) -> bool:
         """Make a still-``PENDING`` job the next one a free worker claims (COL-164).
 
@@ -1738,7 +1790,23 @@ class JobQueue:
         for the swallow-and-log contract. This never touches ``job.status``
         itself: a side-effect failure only ever prevents that one side effect
         (and its own failure) from cascading, never flips a
-        already-determined ``SUCCEEDED``/``FAILED`` outcome.
+        already-determined ``SUCCEEDED``/``FAILED`` outcome. The six
+        post-pipeline calls themselves (both this method's two terminal
+        tails, below) live in one shared :meth:`_run_terminal_side_effects`
+        helper rather than being repeated at each tail -- :meth:`force_complete`
+        (COL-255) reuses that same helper as its own third call site, see
+        there.
+
+        **Force Complete race (COL-255).** Before writing either terminal
+        outcome (the crashed-pipeline ``except`` branch, or the ordinary
+        success/failure branch below it), this checks under ``self._lock``
+        whether ``job.status`` is still ``RUNNING``. If it isn't,
+        :meth:`force_complete` got there first while this thread was still
+        blocked in the pipeline call -- this run's outcome (and every one of
+        its terminal side effects) is discarded rather than overwriting the
+        already-``SUCCEEDED`` status or double-recording history/tracked-media/
+        the terminal hook. The ``finally`` below still runs either way, so the
+        worker slot is freed exactly as it would be for a normal completion.
 
         Dispatches on ``job.kind`` (COL-155) for which runner actually
         executes the pipeline: ``DOWNMIX`` calls ``self._pipeline_runner``
@@ -1795,43 +1863,42 @@ class JobQueue:
                     )
             except Exception as exc:  # noqa: BLE001 - captured as the job's outcome, not re-raised
                 with self._lock:
-                    job.error = exc
-                    job.status = JobStatus.FAILED
-                    job.ended_at = datetime.now(UTC)
+                    already_finalized = job.status is not JobStatus.RUNNING
+                    if not already_finalized:
+                        job.error = exc
+                        job.status = JobStatus.FAILED
+                        job.ended_at = datetime.now(UTC)
+                if already_finalized:
+                    # COL-255: force_complete already flipped this job to SUCCEEDED
+                    # (under the lock, while the pipeline above was still running) --
+                    # discard this run's outcome rather than clobbering that terminal
+                    # status or re-running the terminal side effects a second time.
+                    logger.exception(
+                        "job %s: pipeline raised after being force-completed -- discarding",
+                        job.id,
+                    )
+                    return
                 logger.exception("job %s failed with an unexpected error", job.id)
-                self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
-                self._run_side_effect(
-                    job, "_record_tracked_media", lambda: self._record_tracked_media(job)
-                )
-                self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
-                self._run_side_effect(
-                    job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
-                )
-                self._run_side_effect(
-                    job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
-                )
+                self._run_terminal_side_effects(job)
                 return
 
             with self._lock:
-                job.result = result
-                job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
-                job.ended_at = datetime.now(UTC)
+                already_finalized = job.status is not JobStatus.RUNNING
+                if not already_finalized:
+                    job.result = result
+                    job.status = JobStatus.SUCCEEDED if result.success else JobStatus.FAILED
+                    job.ended_at = datetime.now(UTC)
+            if already_finalized:
+                # COL-255: same guard as the except-branch above, for the ordinary
+                # (non-crashing) completion path -- force_complete got there first.
+                logger.info(
+                    "job %s: pipeline finished after being force-completed -- discarding",
+                    job.id,
+                )
+                return
             if job.status is JobStatus.SUCCEEDED:
                 logger.info("job %s completed: file=%s -- %s", job.id, job.file_path, result.detail)
-            self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
-            self._run_side_effect(
-                job, "_record_tracked_media", lambda: self._record_tracked_media(job)
-            )
-            self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
-            self._run_side_effect(
-                job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
-            )
-            self._run_side_effect(
-                job, "_schedule_default_audio_job", lambda: self._schedule_default_audio_job(job)
-            )
-            self._run_side_effect(
-                job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
-            )
+            self._run_terminal_side_effects(job)
         finally:
             # Only now -- after every side effect -- is the job fully done, so
             # this is where wait_idle is allowed to observe it as no longer
@@ -1872,6 +1939,46 @@ class JobQueue:
             effect()
         except Exception:  # noqa: BLE001 - a side effect must never fail the job or the worker
             logger.exception("job %s: %s raised", job.id, label)
+
+    def _run_terminal_side_effects(self, job: Job) -> None:
+        """Run every terminal side effect for ``job``, in order (COL-254; extracted COL-255).
+
+        The exact six-call sequence -- history, tracked-media, failure-notify,
+        Plex-analyze, default-audio scheduling, and the job-terminal hook --
+        that runs once ``job`` has reached a terminal status. Three call sites
+        share this one copy instead of each repeating the sequence: both of
+        :meth:`_run_job`'s terminal tails (the ordinary completion branch and
+        the crashed-pipeline ``except`` branch) and :meth:`force_complete`
+        (COL-255) -- so a future seventh side effect, or a reordering, only
+        ever needs to change here.
+
+        Every one of the six is individually gated on ``job.status``/
+        ``job.kind`` by the side effect method itself (e.g.
+        :meth:`_notify_failure` is a no-op unless ``job.status is
+        JobStatus.FAILED``; :meth:`_schedule_default_audio_job` is a no-op
+        unless ``job.status is JobStatus.SUCCEEDED`` with a qualifying
+        ``DOWNMIX`` result) -- so calling the full sequence unconditionally
+        here, even from the crashed-pipeline ``except`` branch (which never
+        has anything for the ``SUCCEEDED``-only calls to do), is always safe
+        and changes no observable behaviour there. Each call is still routed
+        through :meth:`_run_side_effect` (COL-254), so one side effect
+        raising can never skip a later one in the sequence or crash the
+        caller.
+        """
+        self._run_side_effect(job, "_record_history", lambda: self._record_history(job))
+        self._run_side_effect(
+            job, "_record_tracked_media", lambda: self._record_tracked_media(job)
+        )
+        self._run_side_effect(job, "_notify_failure", lambda: self._notify_failure(job))
+        self._run_side_effect(
+            job, "_trigger_plex_analyze", lambda: self._trigger_plex_analyze(job)
+        )
+        self._run_side_effect(
+            job, "_schedule_default_audio_job", lambda: self._schedule_default_audio_job(job)
+        )
+        self._run_side_effect(
+            job, "_call_job_terminal_hook", lambda: self._call_job_terminal_hook(job)
+        )
 
     def _record_history(self, job: Job) -> None:
         """Persist ``job``'s current state, if configured to.

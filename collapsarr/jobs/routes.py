@@ -6,7 +6,7 @@ a FastAPI :class:`~fastapi.APIRouter` mounted under ``/api`` by
 the API-key middleware (COL-26), every route here inherits key-based auth -- no
 per-route auth wiring is needed.
 
-Twelve endpoints, each wrapping an existing service without adding new job logic:
+Thirteen endpoints, each wrapping an existing service without adding new job logic:
 
 - ``GET /api/jobs/history`` -- lists persisted job history (COL-21,
   :func:`collapsarr.jobs.history.list_job_history`), optionally filtered by
@@ -111,6 +111,22 @@ Twelve endpoints, each wrapping an existing service without adding new job logic
   ``cancelled=False`` ("too late"); see :class:`CancelJobResult`. A ``job_id``
   not present in the live queue at all -- unknown, malformed, or already gone
   -- is a ``404``.
+- ``POST /api/jobs/{job_id}/force-complete`` -- the per-row "Force Complete"
+  action (COL-255): claims a hung/stuck ``RUNNING`` Job actually finished
+  successfully, without waiting for a fix or a restart
+  (:meth:`collapsarr.jobs.scheduler.JobScheduler.force_complete`). Marks the
+  Job ``SUCCEEDED`` immediately and runs the same terminal side-effect
+  sequence a genuine success would (history, tracked-media, Plex-analyze,
+  the job-terminal hook) -- it does not touch the in-flight pipeline thread
+  itself; if that thread later also finishes the same Job, the second
+  finalization is a no-op (:meth:`~collapsarr.jobs.queue.JobQueue._run_job`'s
+  own COL-255 guard), not a crash or a double-write. Reports
+  ``forced=True`` on success. Unlike ``DELETE /api/jobs/{job_id}``'s
+  ``cancelled=False``, a Job that already left ``RUNNING`` by the time the
+  request landed is a ``409``, not a quiet ``forced=False`` -- the caller
+  explicitly claimed success, and that claim can no longer be honoured
+  (see :class:`ForceCompleteResult`). A ``job_id`` not present in the live
+  queue at all is a ``404``.
 - ``POST /api/jobs/clear`` -- the batch "Clear queue" cancel action (COL-173):
   cancels every currently-``PENDING`` Job in one call via
   :meth:`collapsarr.jobs.scheduler.JobScheduler.clear_queue` (the bulk
@@ -475,6 +491,24 @@ class CancelJobResult(BaseModel):
     """
 
     cancelled: bool
+
+
+class ForceCompleteResult(BaseModel):
+    """Response for ``POST /api/jobs/{job_id}/force-complete`` (COL-255).
+
+    ``forced`` is ``True`` when the Job was ``RUNNING`` and has now been
+    marked ``SUCCEEDED`` -- its ``JobHistory`` row, tracked-media, and
+    Plex-analyze trigger all recorded exactly as a normal successful
+    completion would. Unlike :class:`CancelJobResult`/:class:`BumpJobResult`,
+    there is no ``forced: false`` shape: a Job that already left ``RUNNING``
+    by the time the request landed (the "finished naturally" race) is
+    reported as a ``409`` instead (see :func:`force_complete_endpoint`) --
+    force-completing is an explicit claim of success, so losing that race is
+    a genuine error to surface, not a silent no-op. A ``job_id`` not present
+    in the live queue at all is a ``404``.
+    """
+
+    forced: bool
 
 
 class ClearQueueResult(BaseModel):
@@ -917,6 +951,46 @@ def cancel_job_endpoint(
     if outcome is None:
         raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
     return CancelJobResult(cancelled=outcome)
+
+
+# --- POST /api/jobs/{job_id}/force-complete (COL-255) --------------------------
+
+
+@router.post("/jobs/{job_id}/force-complete", response_model=ForceCompleteResult)
+def force_complete_endpoint(
+    job_id: str,
+    scheduler: JobScheduler = Depends(get_job_scheduler),
+) -> ForceCompleteResult:
+    """Force one currently-``RUNNING`` Job straight to ``SUCCEEDED`` (COL-255).
+
+    Wraps :meth:`~collapsarr.jobs.scheduler.JobScheduler.force_complete` --
+    see there for the ``None``/``True``/``False`` result contract. A
+    ``job_id`` that isn't a valid UUID can't name any job at all, so it's
+    folded into the same ``404`` an unknown one gets, without calling the
+    scheduler -- mirroring :func:`cancel_job_endpoint`.
+
+    Unlike ``DELETE /api/jobs/{job_id}``'s ``cancelled=False`` (a normal,
+    silently-reported "too late" outcome), a Job that is no longer
+    ``RUNNING`` by the time this lands raises ``409`` instead of returning
+    ``forced=False``: the caller explicitly claimed this run succeeded, and
+    that claim can no longer be honoured -- the Job already independently
+    reached its own terminal status -- so the failure needs to reach the
+    operator, not be swallowed into a quiet boolean.
+    """
+    try:
+        job_uuid = UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id!r}") from None
+
+    outcome = scheduler.force_complete(job_uuid)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
+    if not outcome:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} is no longer running -- it already finished on its own.",
+        )
+    return ForceCompleteResult(forced=True)
 
 
 # --- POST /api/jobs/clear (COL-173) -------------------------------------------

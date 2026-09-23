@@ -639,6 +639,118 @@ def test_cancel_running_returns_false_for_a_terminal_job() -> None:
     assert queue.cancel_running(job.id) is False
 
 
+# ---------------------------------------------------------------------------
+# Force Complete a RUNNING job (COL-255): force_complete marks the job
+# SUCCEEDED immediately, without waiting for or touching its (still-running)
+# in-flight pipeline, and runs the same terminal side-effect sequence a
+# genuine success would.
+# ---------------------------------------------------------------------------
+
+
+def test_force_complete_marks_a_running_job_succeeded_and_runs_terminal_side_effects() -> None:
+    """COL-255 AC: force-completing a RUNNING job flips it to SUCCEEDED, stamps
+    ``ended_at``, and runs the same terminal side effects a genuine success would --
+    history, tracked-media, Plex-analyze, and the job-terminal hook -- even though the
+    pipeline itself is still running in the background, unaware it's been force-completed."""
+    runner = _GatedRunner()
+    history_calls: list[JobStatus] = []
+    tracked_media_calls: list[Job] = []
+    plex_calls: list[Job] = []
+    terminal_hook_calls: list[Job] = []
+    queue = JobQueue(
+        max_concurrency=1,
+        pipeline_runner=runner,
+        history_recorder=lambda job: history_calls.append(job.status),
+        tracked_media_recorder=tracked_media_calls.append,
+        plex_analyzer=plex_calls.append,
+    )
+    queue.set_job_terminal_hook(terminal_hook_calls.append)
+    queue.start()
+
+    job = queue.enqueue("/media/gate.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)  # worker claimed it; pipeline is blocked -- RUNNING
+
+    assert queue.force_complete(job.id) is True
+
+    assert job.status is JobStatus.SUCCEEDED
+    assert job.ended_at is not None
+    # PENDING (enqueue), RUNNING (claim), then SUCCEEDED (force_complete) -- the
+    # pipeline is still blocked, so there's no fourth, pipeline-driven terminal write yet.
+    assert history_calls == [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCEEDED]
+    # _record_tracked_media is still called (job.status is SUCCEEDED) -- but with
+    # job.result left None (the pipeline never got there), so the real production
+    # recorder (collapsarr.jobs.tracked_media.record_tracked_media) has nothing to
+    # claim was added and no-ops on its own.
+    assert tracked_media_calls == [job]
+    assert job.result is None
+    assert plex_calls == [job]
+    assert terminal_hook_calls == [job]
+
+    # Let the now-orphaned pipeline finish -- must not crash, flip the status back,
+    # or double-record any terminal side effect (COL-255's double-write guard).
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True
+    assert job.status is JobStatus.SUCCEEDED
+    assert history_calls == [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCEEDED]
+    assert tracked_media_calls == [job]
+    assert plex_calls == [job]
+    assert terminal_hook_calls == [job]
+
+
+def test_force_complete_race_with_the_pipeline_failing_afterward_is_a_noop_not_a_crash() -> None:
+    """COL-255 AC: if the in-flight pipeline's own completion races force_complete and
+    would have reported FAILED, that outcome must be discarded, not crash the worker or
+    overwrite the already-SUCCEEDED status."""
+    runner = _GatedRunner(result=_FAILED)
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    job = queue.enqueue("/media/gate.mkv", DownmixSettings())
+    assert runner.started.wait(timeout=5)
+
+    assert queue.force_complete(job.id) is True
+    assert job.status is JobStatus.SUCCEEDED
+
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True  # worker survives, slot frees normally
+    assert job.status is JobStatus.SUCCEEDED  # not clobbered to FAILED
+    assert job.error is None
+
+
+def test_force_complete_returns_false_for_a_still_pending_job() -> None:
+    """force_complete is RUNNING-only: a not-yet-claimed job is left untouched."""
+    runner = _GatedRunner()
+    queue = JobQueue(max_concurrency=1, pipeline_runner=runner)
+    queue.start()
+
+    queue.enqueue("/media/gate.mkv", DownmixSettings())  # worker claims + blocks here
+    assert runner.started.wait(timeout=5)
+    pending = queue.enqueue("/media/pending.mkv", DownmixSettings())
+
+    assert queue.force_complete(pending.id) is False
+    assert pending.status is JobStatus.PENDING
+
+    runner.release.set()
+    assert queue.wait_idle(timeout=5) is True
+
+
+def test_force_complete_returns_false_for_an_unknown_job() -> None:
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    assert queue.force_complete(uuid4()) is False
+
+
+def test_force_complete_returns_false_for_a_terminal_job() -> None:
+    """A job that already finished naturally is "too late" -- force_complete is a no-op
+    (False), the same race shape cancel_running reports."""
+    queue = JobQueue(pipeline_runner=_stub_runner(_SUCCESS))
+    queue.start()
+    job = queue.enqueue("/media/movie.mkv", DownmixSettings())
+    assert queue.wait_idle(timeout=5) is True
+    assert job.status is JobStatus.SUCCEEDED
+
+    assert queue.force_complete(job.id) is False
+
+
 def test_shutdown_lets_an_in_flight_job_finish_then_stops_the_pool() -> None:
     runner = _GatedRunner()
     queue = JobQueue(max_concurrency=1, pipeline_runner=runner)

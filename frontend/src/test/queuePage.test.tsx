@@ -596,6 +596,144 @@ describe("QueuePage", () => {
     });
   });
 
+  describe('"Force Complete" (COL-255)', () => {
+    it('shows "Force Complete" only on the running row', async () => {
+      mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      expect(
+        within(runningRow).getByRole("button", { name: /force complete/i }),
+      ).toBeInTheDocument();
+
+      const pendingRow = screen.getByText("Show.S01E01").closest("tr") as HTMLElement;
+      expect(
+        within(pendingRow).queryByRole("button", { name: /force complete/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("shows an inline confirm step with the exact copy, without calling the endpoint yet", async () => {
+      const fetchMock = mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(runningRow).getByRole("button", { name: /force complete/i }));
+
+      const confirmPanel = (
+        await screen.findByText(
+          /by force completing you are claiming that this has been successful\./i,
+        )
+      ).closest(".view__confirm") as HTMLElement;
+      expect(within(confirmPanel).getByRole("button", { name: /^ok$/i })).toBeInTheDocument();
+      expect(within(confirmPanel).getByRole("button", { name: /^cancel$/i })).toBeInTheDocument();
+      // Only the mount-time queue poll + settings load have happened so far --
+      // the force-complete endpoint itself hasn't been called yet.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('dismisses the confirm step via "Cancel" without calling the endpoint', async () => {
+      const fetchMock = mockFetchQueue([queueResponse]);
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(runningRow).getByRole("button", { name: /force complete/i }));
+
+      const confirmPanel = (
+        await screen.findByText(
+          /by force completing you are claiming that this has been successful\./i,
+        )
+      ).closest(".view__confirm") as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /^cancel$/i }));
+
+      expect(
+        screen.queryByText(/by force completing you are claiming that this has been successful\./i),
+      ).not.toBeInTheDocument();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("calls POST /api/jobs/{job_id}/force-complete on confirm, dismisses the panel, and refreshes the queue", async () => {
+      const refreshedQueue = [pendingJobLowerPriority, pendingJobHigherPriority];
+      const fetchMock = mockFetchWithAction([queueResponse, refreshedQueue], (url, init) => {
+        expect(url).toContain(`/api/jobs/${runningJob.job_id}/force-complete`);
+        expect(init?.method).toBe("POST");
+        return { ok: true, body: { forced: true } };
+      });
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(runningRow).getByRole("button", { name: /force complete/i }));
+
+      const confirmPanel = (
+        await screen.findByText(
+          /by force completing you are claiming that this has been successful\./i,
+        )
+      ).closest(".view__confirm") as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /^ok$/i }));
+
+      // The confirm step is dismissed once the endpoint call succeeds.
+      await waitFor(() =>
+        expect(
+          screen.queryByText(
+            /by force completing you are claiming that this has been successful\./i,
+          ),
+        ).not.toBeInTheDocument(),
+      );
+      // Mount (queue poll + settings load) + the force-complete POST + the post-confirm refresh queue poll.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+      // The now-`succeeded` job drops out of the live queue (`GET /api/jobs/queue`
+      // only ever returns pending/running rows) -- reflected on refresh.
+      await waitFor(() => expect(screen.queryByText("Interstellar")).not.toBeInTheDocument());
+    });
+
+    it("shows an error notice and keeps the confirm step open when the race is lost (409)", async () => {
+      const fetchMock = mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: false,
+        status: 409,
+        body: { detail: "Job 11111111-1111-1111-1111-111111111111 is no longer running -- it already finished on its own." },
+      }));
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(runningRow).getByRole("button", { name: /force complete/i }));
+
+      const confirmPanel = (
+        await screen.findByText(
+          /by force completing you are claiming that this has been successful\./i,
+        )
+      ).closest(".view__confirm") as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /^ok$/i }));
+
+      // A losing race is a genuine error notice, not a silent no-op or a crash.
+      expect(await screen.findByText(/already finished on its own/i)).toBeInTheDocument();
+      // Still open for a retry, unlike the success path above.
+      expect(
+        screen.getByText(/by force completing you are claiming that this has been successful\./i),
+      ).toBeInTheDocument();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    });
+
+    it("surfaces a clear error message when the request fails outright (404)", async () => {
+      mockFetchWithAction([queueResponse, queueResponse], () => ({
+        ok: false,
+        status: 404,
+        body: { detail: "No such job: 11111111-1111-1111-1111-111111111111" },
+      }));
+      render(<QueuePage />);
+
+      const runningRow = (await screen.findByText("Interstellar")).closest("tr") as HTMLElement;
+      fireEvent.click(within(runningRow).getByRole("button", { name: /force complete/i }));
+
+      const confirmPanel = (
+        await screen.findByText(
+          /by force completing you are claiming that this has been successful\./i,
+        )
+      ).closest(".view__confirm") as HTMLElement;
+      fireEvent.click(within(confirmPanel).getByRole("button", { name: /^ok$/i }));
+
+      expect(await screen.findByText(/no such job/i)).toBeInTheDocument();
+    });
+  });
+
   describe("polling", () => {
     beforeEach(() => {
       vi.useFakeTimers();

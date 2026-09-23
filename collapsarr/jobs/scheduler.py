@@ -1202,6 +1202,45 @@ class JobScheduler:
         delete_job_history(session, job_id)
         return True
 
+    # -- Force Complete (COL-255) -----------------------------------------------
+
+    def force_complete(self, job_id: UUID) -> bool | None:
+        """Force one ``RUNNING`` Job straight to ``SUCCEEDED`` -- "Force Complete" (COL-255).
+
+        The entry point ``POST /api/jobs/{job_id}/force-complete``
+        (:mod:`collapsarr.jobs.routes`) calls, mirroring :meth:`cancel_job`'s
+        thin-route shape but delegating the whole terminal transition (status
+        flip, ``ended_at`` stamp, and the full success side-effect sequence --
+        history, tracked-media, Plex-analyze, the job-terminal hook) to
+        :meth:`~collapsarr.jobs.queue.JobQueue.force_complete` in one call --
+        unlike :meth:`cancel_job`, there is no separate ``JobHistory`` row to
+        delete or explicit :meth:`top_up` to run here: the terminal hook
+        :meth:`~collapsarr.jobs.queue.JobQueue.force_complete` itself invokes
+        (wired to :meth:`_top_up_on_job_terminal` in :meth:`__init__`, same as
+        every other job-terminal path) already covers that, exactly as it
+        would for a genuine success.
+
+        Three-way result, matching :meth:`cancel_job`'s ``None``/``True``/
+        ``False`` contract:
+
+        * ``None`` -- ``job_id`` names no Job the live queue knows about at
+          all. The route reports this as ``404``.
+        * ``True`` -- the Job was ``RUNNING`` and has now been
+          force-completed.
+        * ``False`` -- the Job exists but is no longer ``RUNNING``: it
+          reached its own terminal status naturally in the race between the
+          request landing and this call. Unlike :meth:`cancel_job`'s
+          ``False`` (a normal, silently-reported "too late" outcome), the
+          route reports this one as a genuine error (``409``) -- the caller
+          explicitly asked to claim success for a run that, by the time the
+          request landed, had already independently decided its own outcome;
+          silently no-op'ing that would leave the operator believing their
+          claim took effect when it didn't (COL-255's acceptance criteria).
+        """
+        if self._queue.get_job(job_id) is None:
+            return None
+        return self._queue.force_complete(job_id)
+
     # -- Bump to front (COL-169) -----------------------------------------------
 
     def bump_job_to_front(self, job_id: UUID) -> bool | None:

@@ -1131,6 +1131,70 @@ def test_cancel_job_opens_its_own_session_when_none_is_given(
 
 
 # ---------------------------------------------------------------------------
+# force_complete (COL-255)
+# ---------------------------------------------------------------------------
+
+
+def test_force_complete_marks_a_running_job_succeeded(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    # Simulate a worker having claimed the job, exactly as JobQueue._claim_next
+    # does the instant it flips it to RUNNING (mirrors test_cancel_job_hard_kills_a_running_job).
+    job.status = JobStatus.RUNNING
+    job.cancellation = CancellationHandle()
+
+    outcome = scheduler.force_complete(job.id)
+
+    assert outcome is True
+    assert job.status is JobStatus.SUCCEEDED
+    assert job.ended_at is not None
+
+
+def test_force_complete_reports_too_late_for_a_terminal_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """A Job that finished naturally between the request and the call is a no-op (False) --
+    the scheduler leaves it exactly as it was; the route surfaces this as an error (COL-255)."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    job.status = JobStatus.FAILED
+
+    outcome = scheduler.force_complete(job.id)
+
+    assert outcome is False
+    assert job.status is JobStatus.FAILED  # left exactly as it was
+
+
+def test_force_complete_reports_too_late_for_a_still_pending_job(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    """force_complete is RUNNING-only -- a not-yet-claimed Job is left untouched."""
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+    job = scheduler.trigger_file("/media/movie.mkv")
+    assert job is not None
+    assert job.status is JobStatus.PENDING
+
+    outcome = scheduler.force_complete(job.id)
+
+    assert outcome is False
+    assert job.status is JobStatus.PENDING
+
+
+def test_force_complete_returns_none_for_an_id_not_in_the_live_queue(
+    settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    scheduler = _make_scheduler(settings, session_factory, probe=_probe_returning(_SURROUND))
+
+    outcome = scheduler.force_complete(uuid4())
+
+    assert outcome is None
+
+
+# ---------------------------------------------------------------------------
 # bump_job_to_front (COL-169)
 # ---------------------------------------------------------------------------
 
