@@ -128,7 +128,7 @@ from ..plex import (
     get_plex_connection,
     resolve_rating_key,
 )
-from ..plex.streams import PlexAudioStream, parse_audio_streams
+from ..plex.streams import PlexAudioStream, parse_audio_streams, selected_stream
 from ..settings.service import as_downmix_settings, get_global_settings
 from ..url_base import external_path
 from .models import MediaTargetStatus, TrackedMediaFile
@@ -368,15 +368,17 @@ def _plex_selected_stream_position(streams: list[PlexAudioStream]) -> int | None
     ``None`` when no stream in ``streams`` is flagged ``selected`` (Plex
     reports no current default) -- a genuine, trustworthy "no default"
     answer, not a failure (see :func:`get_file_audio_streams_endpoint`'s
-    caller). On the rare malformed item reporting more than one ``selected``
-    stream, the first one wins, mirroring
-    :func:`collapsarr.plex.default_audio_snapshot._selected_stream`'s own
-    tie-break stance.
+    caller). Delegates the actual scan/tie-break to
+    :func:`collapsarr.plex.streams.selected_stream` (shared with
+    :mod:`collapsarr.plex.default_audio_snapshot`, COL-248) and converts its
+    result to a position via ``list.index`` -- safe because Plex's ``id`` is
+    unique per stream, so no two distinct entries in ``streams`` can compare
+    equal.
     """
-    for position, stream in enumerate(streams):
-        if stream.selected:
-            return position
-    return None
+    winner = selected_stream(streams)
+    if winner is None:
+        return None
+    return streams.index(winner)
 
 
 def _apply_plex_default_override(

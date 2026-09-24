@@ -54,7 +54,7 @@ from collapsarr.media.models import TrackedMediaFile
 
 from .client import ItemMetadataResult, get_item_metadata
 from .models import PlexLibraryItem
-from .streams import PlexAudioStream, parse_audio_streams
+from .streams import parse_audio_streams, selected_stream
 
 logger = logging.getLogger(__name__)
 
@@ -80,22 +80,6 @@ _CHANNEL_LAYOUT_NAMES: dict[int, str] = {2: "stereo", 3: "2.1", 6: "5.1"}
 def _channel_layout_for(channels: int) -> str:
     """Map a Plex-reported channel count to the same display vocabulary ffprobe uses."""
     return _CHANNEL_LAYOUT_NAMES.get(channels, f"{channels}ch")
-
-
-def _selected_stream(streams: list[PlexAudioStream]) -> PlexAudioStream | None:
-    """Return the stream Plex currently flags ``selected``, if any.
-
-    On the rare malformed item reporting more than one selected stream, the
-    first one wins -- picking a single deterministic winner is what matters
-    here, mirroring :func:`collapsarr.media.service._current_default_stream`'s
-    own tie-break stance (there is no channel-count signal to prefer one
-    over another the way :mod:`collapsarr.plex.default_audio`'s preference
-    resolution does elsewhere in this package).
-    """
-    for stream in streams:
-        if stream.selected:
-            return stream
-    return None
 
 
 def refresh_default_audio_snapshots(
@@ -140,7 +124,7 @@ def refresh_default_audio_snapshots(
             )
             continue
 
-        selected = _selected_stream(parse_audio_streams(metadata_result.payload))
+        selected = selected_stream(parse_audio_streams(metadata_result.payload))
         media.current_default_language = selected.language if selected else None
         media.current_default_channel_layout = (
             _channel_layout_for(selected.channels) if selected else None
