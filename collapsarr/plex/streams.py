@@ -168,6 +168,28 @@ def _normalize_language(raw_language_code: object) -> str:
     return _UNKNOWN_LANGUAGE
 
 
+def selected_stream(streams: list[PlexAudioStream]) -> PlexAudioStream | None:
+    """Return the stream Plex currently flags ``selected``, if any.
+
+    ``None`` when no stream in ``streams`` is flagged ``selected`` -- a
+    genuine "Plex reports no current default" answer, not a failure. On the
+    rare malformed item reporting more than one ``selected`` stream, the
+    first one wins -- picking a single deterministic winner is what matters
+    here, mirroring :func:`collapsarr.media.service._current_default_stream`'s
+    own tie-break stance (there is no channel-count signal to prefer one
+    over another the way :mod:`collapsarr.plex.default_audio`'s preference
+    resolution does elsewhere in this package). Shared by
+    :mod:`collapsarr.plex.default_audio_snapshot` (COL-248) and
+    :mod:`collapsarr.media.routes` (COL-256), which both need "which stream
+    does Plex currently prefer" but differ in whether they want the stream
+    itself or its list-position.
+    """
+    for stream in streams:
+        if stream.selected:
+            return stream
+    return None
+
+
 def is_commentary_track(stream: PlexAudioStream) -> bool:
     """Whether ``stream`` looks like a commentary track, from title alone (COL-246).
 

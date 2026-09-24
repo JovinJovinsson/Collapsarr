@@ -6,9 +6,12 @@
 
 /**
  * One of a file's current audio streams, as live-probed via ffprobe on this
- * request -- never a stored/cached value. `is_default` mirrors ffprobe's
- * `disposition.default`: whether this stream currently carries the
- * container's Default Audio Track disposition.
+ * request -- never a stored/cached value. `is_default` reflects whether
+ * this stream currently carries the Default Audio Track badge: sourced
+ * from ffprobe's `disposition.default` by default, but overridden from
+ * Plex's own live-reported selected stream when Plex is configured and
+ * resolvable (COL-256), since a Plex-API-driven "Set Default Audio Track"
+ * write never touches the local file's disposition flags.
  */
 export interface AudioStream {
   index: number;
