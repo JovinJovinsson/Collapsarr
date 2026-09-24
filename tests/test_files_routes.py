@@ -37,8 +37,9 @@ from collapsarr.downmix.targets import DownmixSettings, DownmixTarget
 from collapsarr.health import DiskUsage
 from collapsarr.library.service import sync_library
 from collapsarr.main import create_app
+from collapsarr.media.models import TrackedMediaFile
 from collapsarr.media.service import upsert_tracked_media
-from collapsarr.plex.client import PosterImageResult
+from collapsarr.plex.client import ItemMetadataResult, PosterImageResult
 from collapsarr.plex.models import PLEX_CONNECTION_ID, PlexConnection, PlexLibraryItem
 from collapsarr.settings.service import get_global_settings, update_global_settings
 
@@ -265,6 +266,265 @@ def test_audio_streams_endpoint_degrades_gracefully_for_an_unprobeable_file(
     assert body["probeable"] is False
     assert body["streams"] == []
     assert "no such file" in body["error"]
+
+
+# --- Plex-aware `is_default` override (COL-256) ------------------------------
+#
+# On a Plex-connected deployment, the "Set Default Audio Track" job writes
+# directly to Plex's API and never touches the local file (see
+# `collapsarr.plex.default_audio_write`) -- so raw local ffprobe disposition
+# flags can be stale, or even show *every* stream as default at once, while
+# Plex itself has exactly one stream selected. These cases assert the
+# endpoint sources `is_default` from Plex's own live-reported selected
+# stream (matched to the local probe list by position, not id) whenever Plex
+# is configured and resolvable, with a soft-fail back to raw local
+# disposition otherwise.
+
+
+def _plex_stream_entry(*, stream_id: str, selected: bool) -> dict[str, object]:
+    return {
+        "id": stream_id,
+        "streamType": 2,
+        "channels": 6,
+        "languageCode": "eng",
+        "selected": selected,
+    }
+
+
+def _plex_metadata_payload(streams: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "MediaContainer": {
+            "Metadata": [{"Media": [{"id": 1, "Part": [{"id": 1, "Stream": streams}]}]}]
+        }
+    }
+
+
+def _seed_plex_connected_file(
+    session: Session, *, file_path: str = "/media/movie.mkv", rating_key: str = "555"
+) -> TrackedMediaFile:
+    session.add(
+        PlexConnection(id=PLEX_CONNECTION_ID, base_url="http://plex.local:32400", token="tok")
+    )
+    media = upsert_tracked_media(
+        session,
+        file_path=file_path,
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+    session.add(PlexLibraryItem(file_path=file_path, rating_key=rating_key, section_key="1"))
+    session.commit()
+    return media
+
+
+def test_audio_streams_endpoint_overrides_stale_local_defaults_from_plexs_selected_stream(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression this ticket fixes: the local file has *both* streams
+    flagged default (stale disposition), but Plex reports exactly one
+    selected stream (the second one) -- the response must show only that
+    one as default, matching Plex's live state."""
+    media = _seed_plex_connected_file(session)
+
+    probed = [
+        AudioStreamInfo(
+            index=0,
+            codec="eac3",
+            channels=6,
+            channel_layout="5.1",
+            language="eng",
+            is_default=True,
+        ),
+        AudioStreamInfo(
+            index=1,
+            codec="aac",
+            channels=2,
+            channel_layout="stereo",
+            language="jpn",
+            is_default=True,
+        ),
+    ]
+    monkeypatch.setattr(
+        "collapsarr.media.routes.probe_audio_streams", lambda *_a, **_k: probed
+    )
+
+    payload = _plex_metadata_payload(
+        [
+            _plex_stream_entry(stream_id="101", selected=False),
+            _plex_stream_entry(stream_id="102", selected=True),
+        ]
+    )
+    monkeypatch.setattr(
+        "collapsarr.media.routes.get_item_metadata",
+        lambda *_a, **_k: ItemMetadataResult(ok=True, payload=payload),
+    )
+
+    response = client.get(f"/api/files/{media.id}/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    defaults = [stream["is_default"] for stream in body["streams"]]
+    assert defaults == [False, True]
+
+
+def test_audio_streams_endpoint_shows_no_default_when_plex_reports_none_selected(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plex resolves and reports *no* stream currently selected -- trusted as
+    a genuine answer (every stream non-default), not a resolution failure,
+    even though the local probe still has one flagged default."""
+    media = _seed_plex_connected_file(session)
+
+    probed = [
+        AudioStreamInfo(
+            index=0, codec="eac3", channels=6, channel_layout="5.1", language="eng", is_default=True
+        ),
+    ]
+    monkeypatch.setattr(
+        "collapsarr.media.routes.probe_audio_streams", lambda *_a, **_k: probed
+    )
+
+    payload = _plex_metadata_payload([_plex_stream_entry(stream_id="101", selected=False)])
+    monkeypatch.setattr(
+        "collapsarr.media.routes.get_item_metadata",
+        lambda *_a, **_k: ItemMetadataResult(ok=True, payload=payload),
+    )
+
+    response = client.get(f"/api/files/{media.id}/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [stream["is_default"] for stream in body["streams"]] == [False]
+
+
+def test_audio_streams_endpoint_falls_back_to_local_when_plex_is_not_configured(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default (unconfigured) `PlexConnection` row -- untouched local
+    disposition flags pass straight through, exactly the pre-COL-256
+    behavior."""
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+    probed = [
+        AudioStreamInfo(
+            index=0, codec="eac3", channels=6, channel_layout="5.1", language="eng", is_default=True
+        ),
+    ]
+    monkeypatch.setattr(
+        "collapsarr.media.routes.probe_audio_streams", lambda *_a, **_k: probed
+    )
+
+    def _unexpected_call(*_a: object, **_k: object) -> ItemMetadataResult:
+        raise AssertionError("get_item_metadata must not be called when Plex isn't configured")
+
+    monkeypatch.setattr("collapsarr.media.routes.get_item_metadata", _unexpected_call)
+
+    response = client.get(f"/api/files/{media.id}/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["streams"][0]["is_default"] is True
+
+
+def test_audio_streams_endpoint_falls_back_to_local_when_the_rating_key_never_resolves(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plex is configured but the file has no mapping-table row and no
+    bridged Library node for the live fallback -- soft-fails to local
+    disposition, same as the poster endpoints' own miss case."""
+    session.add(
+        PlexConnection(id=PLEX_CONNECTION_ID, base_url="http://plex.local:32400", token="tok")
+    )
+    media = upsert_tracked_media(
+        session,
+        file_path="/media/movie.mkv",
+        streams=[_stream(channels=8)],
+        settings=DownmixSettings(enabled_targets=ALL_TARGETS),
+    )
+    probed = [
+        AudioStreamInfo(
+            index=0, codec="eac3", channels=6, channel_layout="5.1", language="eng", is_default=True
+        ),
+    ]
+    monkeypatch.setattr(
+        "collapsarr.media.routes.probe_audio_streams", lambda *_a, **_k: probed
+    )
+
+    response = client.get(f"/api/files/{media.id}/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["streams"][0]["is_default"] is True
+
+
+def test_audio_streams_endpoint_falls_back_to_local_when_the_plex_metadata_fetch_fails(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient Plex fetch failure soft-fails to local disposition rather
+    than surfacing an error or a broken table."""
+    media = _seed_plex_connected_file(session)
+    probed = [
+        AudioStreamInfo(
+            index=0, codec="eac3", channels=6, channel_layout="5.1", language="eng", is_default=True
+        ),
+    ]
+    monkeypatch.setattr(
+        "collapsarr.media.routes.probe_audio_streams", lambda *_a, **_k: probed
+    )
+    monkeypatch.setattr(
+        "collapsarr.media.routes.get_item_metadata",
+        lambda *_a, **_k: ItemMetadataResult(ok=False, error="HTTP 500: boom"),
+    )
+
+    response = client.get(f"/api/files/{media.id}/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["streams"][0]["is_default"] is True
+
+
+def test_audio_streams_endpoint_falls_back_to_local_on_a_stream_count_mismatch(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plex reports a different number of audio streams than the local probe
+    -- position can no longer be trusted to identify the same physical
+    stream on both sides, so this soft-fails to local disposition rather
+    than risking a wrong override."""
+    media = _seed_plex_connected_file(session)
+    probed = [
+        AudioStreamInfo(
+            index=0,
+            codec="eac3",
+            channels=6,
+            channel_layout="5.1",
+            language="eng",
+            is_default=True,
+        ),
+        AudioStreamInfo(
+            index=1,
+            codec="aac",
+            channels=2,
+            channel_layout="stereo",
+            language="jpn",
+            is_default=False,
+        ),
+    ]
+    monkeypatch.setattr(
+        "collapsarr.media.routes.probe_audio_streams", lambda *_a, **_k: probed
+    )
+    # Plex reports only one audio stream -- a count mismatch against the two
+    # locally-probed streams above.
+    payload = _plex_metadata_payload([_plex_stream_entry(stream_id="101", selected=True)])
+    monkeypatch.setattr(
+        "collapsarr.media.routes.get_item_metadata",
+        lambda *_a, **_k: ItemMetadataResult(ok=True, payload=payload),
+    )
+
+    response = client.get(f"/api/files/{media.id}/audio-streams", headers=_auth_headers(client))
+
+    assert response.status_code == 200, response.text
+    defaults = [stream["is_default"] for stream in response.json()["streams"]]
+    assert defaults == [True, False]
 
 
 def test_audio_streams_endpoint_returns_not_found_for_an_id_that_never_existed(

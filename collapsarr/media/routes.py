@@ -22,12 +22,35 @@ reuses the same id lookup to report the file's *current, live* audio-stream
 layout -- the same :func:`~collapsarr.downmix.probe.probe_audio_streams`
 call the downmix/default-audio pipelines use, run fresh on every request
 (never cached or stored), so the response always reflects the file's actual
-state on disk right now, including whichever stream currently carries the
-Default Audio Track disposition. An unprobeable file (missing on disk,
-corrupt, ffprobe unavailable) degrades to ``probeable=False`` with an
-``error`` message rather than raising -- this endpoint still 404s on an
-unknown ``file_id``, but a *known* file that merely can't be probed right
-now is a ``200`` with an empty/unprobeable payload, not a failed request.
+state on disk right now. An unprobeable file (missing on disk, corrupt,
+ffprobe unavailable) degrades to ``probeable=False`` with an ``error``
+message rather than raising -- this endpoint still 404s on an unknown
+``file_id``, but a *known* file that merely can't be probed right now is a
+``200`` with an empty/unprobeable payload, not a failed request.
+
+Each stream's ``is_default`` badge is **Plex-aware** (COL-256): raw local
+ffprobe disposition flags can go stale or, on a file with more than one
+flagged default (typically left over from before a Plex-API-driven "Set
+Default Audio Track" write, which never touches the local file at all --
+see :mod:`collapsarr.plex.default_audio_write`), even show *every* stream
+as default simultaneously, even though Plex itself has exactly one stream
+selected. When Plex is configured and the file's ``ratingKey`` resolves
+(:func:`_resolve_media_rating_key`, the same resolution the poster
+endpoints below use), ``is_default`` is instead sourced from Plex's own
+live-reported *selected* stream
+(:attr:`~collapsarr.plex.streams.PlexAudioStream.selected`), matched to the
+local probe list by **list position** (the Nth Plex-reported audio stream
+is taken to be the same physical stream as the Nth locally-probed audio
+stream), not by id -- Plex's stream ``id`` and ffprobe's stream ``index``
+are different id spaces with no shared key. That position mapping is only
+trusted when both lists report the same stream *count*; a count mismatch
+(or any Plex resolution/fetch failure -- not configured, mapping miss,
+metadata fetch error) soft-fails back to the raw local ffprobe disposition
+flags exactly as before, mirroring the poster endpoints' own
+soft-fail-to-placeholder stance below. A successful Plex read that reports
+*no* selected stream at all is trusted as-is (every stream shown as
+non-default) rather than falling back, since that is itself a genuine,
+authoritative answer -- not a resolution failure.
 
 A fourth endpoint, ``GET /api/files/{file_id}/poster`` (COL-205, wired to a
 real Plex poster by COL-212), returns poster metadata for a file. It resolves
@@ -98,7 +121,14 @@ from ..downmix.probe import AudioStreamInfo, FfprobeError, probe_audio_streams
 from ..downmix.targets import DownmixTarget
 from ..library.models import LibraryNode
 from ..library.service import get_node_by_source_id, list_nodes, resolve_tracked
-from ..plex import PlexConnection, fetch_poster_image, get_plex_connection, resolve_rating_key
+from ..plex import (
+    PlexConnection,
+    fetch_poster_image,
+    get_item_metadata,
+    get_plex_connection,
+    resolve_rating_key,
+)
+from ..plex.streams import PlexAudioStream, parse_audio_streams
 from ..settings.service import as_downmix_settings, get_global_settings
 from ..url_base import external_path
 from .models import MediaTargetStatus, TrackedMediaFile
@@ -145,8 +175,10 @@ class AudioStreamOut(BaseModel):
     channels: int
     channel_layout: str
     language: str
-    #: Whether this stream currently carries the container's Default Audio
-    #: Track disposition (ffprobe's ``disposition.default``).
+    #: Whether this stream currently carries the Default Audio Track badge.
+    #: Sourced from ffprobe's ``disposition.default`` by default, but
+    #: overridden from Plex's own live-reported selected stream when Plex is
+    #: configured and resolvable (COL-256) -- see the module docstring.
     is_default: bool
 
     @classmethod
@@ -306,6 +338,86 @@ def get_file_endpoint(file_id: int, session: Session = Depends(get_session)) -> 
     return _to_wanted_file(session, media, enabled_targets=enabled_targets, nodes_cache=nodes_cache)
 
 
+def _resolve_media_rating_key(
+    session: Session, media: TrackedMediaFile, connection: PlexConnection
+) -> str | None:
+    """Resolve ``media``'s Plex ``ratingKey``, or ``None`` (soft-fail, never raises).
+
+    Shared by the audio-streams and both poster endpoints below. Callers
+    fetch ``connection`` once (:func:`collapsarr.plex.get_plex_connection`)
+    and pass it in here rather than this helper re-fetching it itself -- the
+    poster-image endpoint needs the same row's ``base_url``/``token`` again
+    right after this call to fetch the actual bytes, so fetching it once per
+    request avoids a redundant round trip. Returns ``None`` whenever
+    :attr:`~collapsarr.plex.models.PlexConnection.is_configured` is ``False``,
+    so no caller issues a live query against a still-blank connection;
+    otherwise defers entirely to :func:`collapsarr.plex.resolve_rating_key`
+    (mapping table, then a single live fallback query, then give up silently
+    -- see its own docstring).
+    """
+    if not connection.is_configured:
+        return None
+    return resolve_rating_key(
+        session, media.file_path, base_url=connection.base_url, token=connection.token
+    )
+
+
+def _plex_selected_stream_position(streams: list[PlexAudioStream]) -> int | None:
+    """Return the list-position (0-indexed) of Plex's currently ``selected`` stream, if any.
+
+    ``None`` when no stream in ``streams`` is flagged ``selected`` (Plex
+    reports no current default) -- a genuine, trustworthy "no default"
+    answer, not a failure (see :func:`get_file_audio_streams_endpoint`'s
+    caller). On the rare malformed item reporting more than one ``selected``
+    stream, the first one wins, mirroring
+    :func:`collapsarr.plex.default_audio_snapshot._selected_stream`'s own
+    tie-break stance.
+    """
+    for position, stream in enumerate(streams):
+        if stream.selected:
+            return position
+    return None
+
+
+def _apply_plex_default_override(
+    session: Session, media: TrackedMediaFile, streams_out: list[AudioStreamOut]
+) -> list[AudioStreamOut]:
+    """Override ``streams_out``'s ``is_default`` flags from Plex, when safely resolvable (COL-256).
+
+    Resolves ``media``'s Plex ``ratingKey`` (:func:`_resolve_media_rating_key`)
+    and, on a hit, fetches its current stream list
+    (:func:`collapsarr.plex.get_item_metadata`) and locates the Plex-reported
+    *selected* stream's list-position (:func:`_plex_selected_stream_position`).
+    That position is matched against ``streams_out`` by **index, not id** --
+    Plex's own stream ``id`` and ffprobe's stream ``index`` are unrelated id
+    spaces -- and is only trusted when both lists report the exact same
+    stream *count*, since a count mismatch means position no longer reliably
+    identifies "the same physical stream" on both sides. On any soft-fail
+    (Plex not configured, ``ratingKey`` unresolved, the metadata fetch
+    failing, or a stream-count mismatch), ``streams_out`` is returned
+    unchanged -- the caller's raw local ffprobe disposition flags, exactly
+    the pre-COL-256 behavior.
+    """
+    connection = get_plex_connection(session)
+    rating_key = _resolve_media_rating_key(session, media, connection)
+    if rating_key is None:
+        return streams_out
+
+    metadata_result = get_item_metadata(connection.base_url, connection.token, rating_key)
+    if not metadata_result.ok:
+        return streams_out
+
+    plex_streams = parse_audio_streams(metadata_result.payload)
+    if len(plex_streams) != len(streams_out):
+        return streams_out
+
+    selected_position = _plex_selected_stream_position(plex_streams)
+    return [
+        stream.model_copy(update={"is_default": position == selected_position})
+        for position, stream in enumerate(streams_out)
+    ]
+
+
 @router.get("/files/{file_id}/audio-streams", response_model=AudioStreamsResponse)
 def get_file_audio_streams_endpoint(
     file_id: int, session: Session = Depends(get_session)
@@ -322,6 +434,12 @@ def get_file_audio_streams_endpoint(
     ``probeable=False`` instead, matching how the manual-trigger endpoints
     treat an unprobeable file as a reportable outcome rather than a hard
     failure.
+
+    Each stream's ``is_default`` is then made **Plex-aware**
+    (:func:`_apply_plex_default_override`, COL-256) -- see the module
+    docstring for why raw local disposition alone can be stale/misleading on
+    a Plex-connected deployment, and this override's soft-fail-to-local
+    fallback.
     """
     media = get_tracked_media_by_id(session, file_id)
     if media is None:
@@ -332,34 +450,10 @@ def get_file_audio_streams_endpoint(
     except FfprobeError as exc:
         return AudioStreamsResponse(probeable=False, error=str(exc), streams=[])
 
-    return AudioStreamsResponse(
-        probeable=True,
-        streams=[AudioStreamOut.from_probe(stream) for stream in streams],
-    )
+    streams_out = [AudioStreamOut.from_probe(stream) for stream in streams]
+    streams_out = _apply_plex_default_override(session, media, streams_out)
 
-
-def _resolve_poster_rating_key(
-    session: Session, media: TrackedMediaFile, connection: PlexConnection
-) -> str | None:
-    """Resolve ``media``'s Plex ``ratingKey`` for the poster endpoints, or ``None``.
-
-    Shared by both poster endpoints below, each of which fetches ``connection``
-    once (:func:`collapsarr.plex.get_plex_connection`) and passes it in here,
-    rather than this helper re-fetching it itself -- the image endpoint needs
-    the same row's ``base_url``/``token`` again right after this call to fetch
-    the actual bytes, so fetching it once per request avoids a redundant round
-    trip. Returns ``None`` (soft-fail, never raises) whenever
-    :attr:`~collapsarr.plex.models.PlexConnection.is_configured` is ``False``,
-    so neither endpoint issues a live query against a still-blank connection;
-    otherwise defers entirely to :func:`collapsarr.plex.resolve_rating_key`
-    (mapping table, then a single live fallback query, then give up silently
-    -- see its own docstring).
-    """
-    if not connection.is_configured:
-        return None
-    return resolve_rating_key(
-        session, media.file_path, base_url=connection.base_url, token=connection.token
-    )
+    return AudioStreamsResponse(probeable=True, streams=streams_out)
 
 
 @router.get("/files/{file_id}/poster", response_model=FilePosterResponse)
@@ -368,7 +462,7 @@ def get_file_poster_endpoint(
 ) -> FilePosterResponse:
     """Return poster metadata for a tracked file (COL-205, real Plex resolution since COL-212).
 
-    Resolves the file's Plex ``ratingKey`` (:func:`_resolve_poster_rating_key`)
+    Resolves the file's Plex ``ratingKey`` (:func:`_resolve_media_rating_key`)
     and, on a hit, returns ``status="available"`` with ``poster_url`` pointing
     at ``GET /api/files/{file_id}/poster/image`` -- the endpoint below that
     actually streams the image bytes. ``poster_url`` is re-prefixed with the
@@ -391,7 +485,7 @@ def get_file_poster_endpoint(
         raise HTTPException(status_code=404, detail=f"No tracked file with id={file_id}.")
 
     connection = get_plex_connection(session)
-    rating_key = _resolve_poster_rating_key(session, media, connection)
+    rating_key = _resolve_media_rating_key(session, media, connection)
     if rating_key is None:
         return FilePosterResponse(file_id=media.id, status="placeholder", poster_url=None)
 
@@ -407,7 +501,7 @@ def get_file_poster_image_endpoint(
     """Stream a tracked file's actual Plex poster image bytes, server-side (COL-212).
 
     What a ``poster_url`` from ``GET /api/files/{file_id}/poster`` points at.
-    Re-resolves the same ``ratingKey`` (:func:`_resolve_poster_rating_key`)
+    Re-resolves the same ``ratingKey`` (:func:`_resolve_media_rating_key`)
     and, on a hit, fetches the image via
     :func:`collapsarr.plex.fetch_poster_image` and returns it directly with
     Plex's reported ``Content-Type`` -- the ``X-Plex-Token`` this proxies with
@@ -426,7 +520,7 @@ def get_file_poster_image_endpoint(
         raise HTTPException(status_code=404, detail=f"No tracked file with id={file_id}.")
 
     connection = get_plex_connection(session)
-    rating_key = _resolve_poster_rating_key(session, media, connection)
+    rating_key = _resolve_media_rating_key(session, media, connection)
     if rating_key is None:
         raise HTTPException(status_code=404, detail="No poster available for this file.")
 
